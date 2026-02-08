@@ -12,6 +12,7 @@ export interface PtySession {
   commandCount: number;
   title: string;
   titleLocked: boolean;
+  titleGenerated: boolean;
   cwd: string;
   presetCommand: string;
   themeId: string;
@@ -55,6 +56,7 @@ export class PtyManager {
       commandCount: 0,
       title: presetCommand ? `${presetCommand}:新会话` : '终端:新会话',
       titleLocked: false,
+      titleGenerated: false,
       cwd,
       presetCommand,
       themeId,
@@ -104,10 +106,11 @@ export class PtyManager {
       }
     }
 
-    // 检测回车键，计数命令，只在前2次命令时触发总结
+    // 检测回车键，计数命令
     if (data === '\r') {
       session.commandCount++;
-      if (session.commandCount <= 2) {
+      // 标题未成功生成时持续重试（前10次命令内）
+      if (!session.titleGenerated && session.commandCount <= 10) {
         this.triggerSummarize(id);
       }
       // 每次执行命令时触发快照
@@ -186,6 +189,7 @@ export class PtyManager {
       const summary = await aiSummarize(source);
       const prefix = session.presetCommand || '终端';
       session.title = `${prefix}:${summary}`;
+      session.titleGenerated = true;
       // 总结后清理
       session.buffer = session.buffer.slice(-500);
       session.userInputs = session.userInputs.slice(-5);

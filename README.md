@@ -1,4 +1,4 @@
-# DuoCLI
+# DuoCLI — 多开 CLI 神器
 
 一个为 AI 编程时代设计的多终端管理器。基于 Electron，专为同时运行多个 AI 编程助手（Claude Code、Codex CLI、Gemini CLI 等）的工作流而打造。
 

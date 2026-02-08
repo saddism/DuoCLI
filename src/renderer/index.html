@@ -20,11 +20,15 @@
     <select id="preset-select" class="toolbar-select">
       <option value="">空终端</option>
       <option value="claude">Claude</option>
+      <option value="claude --dangerously-skip-permissions">Claude (全自动)</option>
       <option value="codex">Codex</option>
+      <option value="codex --full-auto">Codex (全自动)</option>
       <option value="kimi">Kimi</option>
+      <option value="kimi --yolo">Kimi (全自动)</option>
       <option value="opencode">OpenCode</option>
       <option value="agent">Cursor (agent)</option>
       <option value="gemini">Gemini</option>
+      <option value="gemini --yolo">Gemini (全自动)</option>
     </select>
 
     <label>配色:</label>
@@ -62,8 +66,8 @@
     <div id="sidebar">
       <div id="sidebar-tabs">
         <button class="sidebar-tab active" data-tab="sessions">会话</button>
-        <button class="sidebar-tab" data-tab="snapshots">快照</button>
-        <button class="sidebar-tab" data-tab="ai-config">AI</button>
+        <button class="sidebar-tab" data-tab="snapshots">历史</button>
+        <button class="sidebar-tab" data-tab="ai-config">&#128295; AI</button>
       </div>
 
       <!-- 会话 Tab -->
@@ -91,13 +95,20 @@
       <!-- AI 配置 Tab -->
       <div id="tab-ai-config" class="tab-content">
         <div id="ai-config-desc">
-          用于自动为终端会话生成标题。扫描本机 AI 工具配置，测试通过后选择一个作为默认服务。
+          用于自动生成会话标题和快照总结。DuoCLI 不提供任何 AI 服务，也不需要你额外配置 API Key —— 只是读取你本机已有的 AI 工具配置（Claude、Codex、Gemini 等）。你原来能用什么，这里就能用什么。
         </div>
         <div id="ai-config-actions">
-          <button id="ai-scan-btn" class="toolbar-btn ai-btn">扫描配置</button>
-          <button id="ai-test-btn" class="toolbar-btn ai-btn" disabled>测试连通</button>
+          <button id="ai-scan-btn" class="toolbar-btn ai-btn" style="width:100%">扫描并测试</button>
         </div>
         <div id="ai-provider-list"></div>
+      </div>
+
+      <!-- 版权信息 -->
+      <div id="sidebar-footer">
+        <div class="footer-line">DuoCLI — 多开 CLI 神器</div>
+        <div class="footer-line">by 大壮好大</div>
+        <div class="footer-line"><a id="footer-github" href="#">GitHub</a></div>
+        <div class="footer-tip">如果你喜欢这个软件，只需关注公众号「壮哥的壮」，然后心中默念"大壮好大"，每天祈祷 +1</div>
       </div>
     </div>
   </div>

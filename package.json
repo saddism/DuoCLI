@@ -8,7 +8,7 @@
     "build:preload": "tsc -p tsconfig.preload.json",
     "build:renderer": "esbuild src/renderer/app.ts --bundle --outfile=dist/renderer/app.js --platform=browser --external:electron",
     "build:ts": "npm run build:main && npm run build:preload && npm run build:renderer",
-    "copy:html": "node -e \"const fs=require('fs'),p=require('path');const d=p.join('dist','renderer');fs.mkdirSync(d,{recursive:true});fs.copyFileSync(p.join('src','renderer','index.html'),p.join(d,'index.html'));fs.copyFileSync(p.join('src','renderer','styles.css'),p.join(d,'styles.css'));\"",
+    "copy:html": "node -e \"const fs=require('fs'),p=require('path');const d=p.join('dist','renderer');fs.mkdirSync(d,{recursive:true});fs.copyFileSync(p.join('src','renderer','index.html'),p.join(d,'index.html'));fs.copyFileSync(p.join('src','renderer','styles.css'),p.join(d,'styles.css'));fs.copyFileSync(p.join('src','renderer','qrcode.jpg'),p.join(d,'qrcode.jpg'));\"",
     "start": "npm run build:ts && npm run copy:html && electron .",
     "rebuild": "electron-rebuild",
     "build": "npm run build:ts && npm run copy:html && electron-builder",
@@ -24,6 +24,8 @@
     "electron-builder": "^25.1.8",
     "electron-rebuild": "^3.2.9",
     "esbuild": "^0.27.3",
+    "png-to-ico": "^3.0.1",
+    "sharp": "^0.34.5",
     "typescript": "^5.3.0"
   },
   "dependencies": {
@@ -33,16 +35,47 @@
   },
   "build": {
     "appId": "com.duocli.app",
+    "productName": "DuoCLI",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "node_modules/**/*",
+      "!node_modules/.cache",
+      "!node_modules/sharp",
+      "!node_modules/png-to-ico"
+    ],
+    "extraResources": [
+      {
+        "from": "node_modules/@xterm/xterm/css/xterm.css",
+        "to": "xterm.css"
+      }
+    ],
     "mac": {
-      "icon": "build/icon.icns"
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["x64", "arm64"]
+        }
+      ],
+      "category": "public.app-category.developer-tools"
     },
     "win": {
       "icon": "build/icon.ico",
       "target": "nsis"
     },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico"
+    },
     "linux": {
       "icon": "build/icon.png",
-      "target": "AppImage"
+      "target": "AppImage",
+      "category": "Development"
     }
   }
 }

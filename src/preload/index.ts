@@ -66,6 +66,9 @@ contextBridge.exposeInMainWorld('duocli', {
   // 在 Finder 中打开目录
   openFolder: (folderPath: string) => ipcRenderer.invoke('shell:open-folder', folderPath),
 
+  // 打开外部链接
+  openUrl: (url: string) => ipcRenderer.invoke('shell:open-url', url),
+
   // AI 配置 API
   aiScan: () => ipcRenderer.invoke('ai:scan'),
   aiTestAll: () => ipcRenderer.invoke('ai:test-all'),

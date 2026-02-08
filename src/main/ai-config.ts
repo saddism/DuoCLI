@@ -28,7 +28,9 @@ const TEST_DEFS: Record<string, TestDef> = {
   anthropic: { testPath: '/v1/messages', testMethod: 'POST', authStyle: 'anthropic' },
   codex:     { testPath: '/v1/models', testMethod: 'GET', authStyle: 'bearer' },
   gemini:    { testPath: '/v1beta/models', testMethod: 'GET', authStyle: 'gemini-query' },
-  kimi:      { testPath: '/v1/models', testMethod: 'GET', authStyle: 'bearer' },
+  deepseek:  { testPath: '/v1/models', testMethod: 'GET', authStyle: 'bearer' },
+  minimax:   { testPath: '/v1/models', testMethod: 'GET', authStyle: 'bearer' },
+  zhipu:     { testPath: '/v1/models', testMethod: 'GET', authStyle: 'bearer' },
   opencode:  { testPath: '/v1/messages', testMethod: 'POST', authStyle: 'anthropic' },
   ollama:    { testPath: '/api/tags', testMethod: 'GET', authStyle: 'none' },
 };
@@ -44,7 +46,9 @@ export class AIConfigManager {
     this.scanClaude(home);
     this.scanCodex(home);
     this.scanGemini(home);
-    this.scanKimi(home);
+    this.scanDeepSeek(home);
+    this.scanMiniMax(home);
+    this.scanZhipu(home);
     this.scanOpenCode(home);
     this.scanAider(home);
     this.scanOllama();
@@ -134,30 +138,71 @@ export class AIConfigManager {
     } catch { /* ignore */ }
   }
 
-  // ========== Kimi ==========
-  private scanKimi(home: string): void {
-    const tomlPath = path.join(home, '.kimi', 'config.toml');
-    try {
-      if (!fs.existsSync(tomlPath)) return;
-      const toml = fs.readFileSync(tomlPath, 'utf-8');
-      // 提取 base_url
-      const urlMatch = toml.match(/base_url\s*=\s*"([^"]+)"/);
-      const baseUrl = urlMatch ? urlMatch[1] : 'https://api.kimi.com/coding/v1';
-      // 提取 default_model
-      const modelMatch = toml.match(/default_model\s*=\s*"([^"]+)"/);
-      const model = modelMatch ? modelMatch[1] : 'kimi-for-coding';
-      // Kimi 用 OAuth，api_key 可能为空
-      const keyMatch = toml.match(/api_key\s*=\s*"([^"]*)"/);
-      const apiKey = keyMatch ? keyMatch[1] : '';
+  // ========== DeepSeek ==========
+  private scanDeepSeek(home: string): void {
+    // 从 shell 环境变量扫描
+    const rcFiles = [path.join(home, '.zshrc'), path.join(home, '.bashrc')];
+    for (const rcFile of rcFiles) {
+      try {
+        if (!fs.existsSync(rcFile)) continue;
+        const vars = this.parseShellExports(fs.readFileSync(rcFile, 'utf-8'));
+        const apiKey = vars.get('DEEPSEEK_API_KEY') || '';
+        if (!apiKey) continue;
+        const baseUrl = vars.get('DEEPSEEK_BASE_URL') || 'https://api.deepseek.com';
+        this.providers.push({
+          id: 'deepseek', name: 'DeepSeek',
+          apiKey, baseUrl: baseUrl.replace(/\/+$/, ''), model: 'deepseek-chat',
+          availableModels: ['deepseek-chat', 'deepseek-reasoner'],
+          apiFormat: 'openai',
+          source: `~/${path.basename(rcFile)}`, status: 'pending',
+        });
+        return;
+      } catch { /* ignore */ }
+    }
+  }
 
-      this.providers.push({
-        id: 'kimi', name: 'Kimi (Moonshot)',
-        apiKey: apiKey || '(OAuth)', baseUrl: baseUrl.replace(/\/+$/, ''), model,
-        availableModels: [model],
-        apiFormat: 'openai',
-        source: '~/.kimi/config.toml', status: 'pending',
-      });
-    } catch { /* ignore */ }
+  // ========== MiniMax ==========
+  private scanMiniMax(home: string): void {
+    const rcFiles = [path.join(home, '.zshrc'), path.join(home, '.bashrc')];
+    for (const rcFile of rcFiles) {
+      try {
+        if (!fs.existsSync(rcFile)) continue;
+        const vars = this.parseShellExports(fs.readFileSync(rcFile, 'utf-8'));
+        const apiKey = vars.get('MINIMAX_API_KEY') || '';
+        if (!apiKey) continue;
+        const baseUrl = vars.get('MINIMAX_BASE_URL') || 'https://api.minimaxi.com/v1';
+        this.providers.push({
+          id: 'minimax', name: 'MiniMax',
+          apiKey, baseUrl: baseUrl.replace(/\/+$/, ''), model: 'MiniMax-M2.1',
+          availableModels: ['MiniMax-M2.1', 'MiniMax-M2.1-lightning', 'MiniMax-M2'],
+          apiFormat: 'openai',
+          source: `~/${path.basename(rcFile)}`, status: 'pending',
+        });
+        return;
+      } catch { /* ignore */ }
+    }
+  }
+
+  // ========== ZhipuAI (GLM) ==========
+  private scanZhipu(home: string): void {
+    const rcFiles = [path.join(home, '.zshrc'), path.join(home, '.bashrc')];
+    for (const rcFile of rcFiles) {
+      try {
+        if (!fs.existsSync(rcFile)) continue;
+        const vars = this.parseShellExports(fs.readFileSync(rcFile, 'utf-8'));
+        const apiKey = vars.get('ZHIPUAI_API_KEY') || '';
+        if (!apiKey) continue;
+        const baseUrl = vars.get('ZHIPUAI_BASE_URL') || 'https://open.bigmodel.cn/api/paas/v4';
+        this.providers.push({
+          id: 'zhipu', name: 'ZhipuAI (GLM)',
+          apiKey, baseUrl: baseUrl.replace(/\/+$/, ''), model: 'glm-4.7',
+          availableModels: ['glm-4.7', 'glm-4.5', 'glm-4.5-air'],
+          apiFormat: 'openai',
+          source: `~/${path.basename(rcFile)}`, status: 'pending',
+        });
+        return;
+      } catch { /* ignore */ }
+    }
   }
 
   // ========== OpenCode ==========
@@ -277,6 +322,54 @@ export class AIConfigManager {
           model: 'gemini-2.0-flash',
           availableModels: ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.0-flash-lite'],
           apiFormat: 'gemini',
+          source: '~/.zshrc', status: 'pending',
+        });
+      }
+    }
+
+    // 如果还没有 deepseek，从 shell 补充
+    if (!this.providers.some(p => p.id === 'deepseek')) {
+      const key = vars.get('DEEPSEEK_API_KEY') || '';
+      if (key) {
+        this.providers.push({
+          id: 'deepseek', name: 'DeepSeek (Shell)',
+          apiKey: key,
+          baseUrl: (vars.get('DEEPSEEK_BASE_URL') || 'https://api.deepseek.com').replace(/\/+$/, ''),
+          model: 'deepseek-chat',
+          availableModels: ['deepseek-chat', 'deepseek-reasoner'],
+          apiFormat: 'openai',
+          source: '~/.zshrc', status: 'pending',
+        });
+      }
+    }
+
+    // 如果还没有 minimax，从 shell 补充
+    if (!this.providers.some(p => p.id === 'minimax')) {
+      const key = vars.get('MINIMAX_API_KEY') || '';
+      if (key) {
+        this.providers.push({
+          id: 'minimax', name: 'MiniMax (Shell)',
+          apiKey: key,
+          baseUrl: (vars.get('MINIMAX_BASE_URL') || 'https://api.minimaxi.com/v1').replace(/\/+$/, ''),
+          model: 'MiniMax-M2.1',
+          availableModels: ['MiniMax-M2.1', 'MiniMax-M2.1-lightning', 'MiniMax-M2'],
+          apiFormat: 'openai',
+          source: '~/.zshrc', status: 'pending',
+        });
+      }
+    }
+
+    // 如果还没有 zhipu，从 shell 补充
+    if (!this.providers.some(p => p.id === 'zhipu')) {
+      const key = vars.get('ZHIPUAI_API_KEY') || '';
+      if (key) {
+        this.providers.push({
+          id: 'zhipu', name: 'ZhipuAI (Shell)',
+          apiKey: key,
+          baseUrl: (vars.get('ZHIPUAI_BASE_URL') || 'https://open.bigmodel.cn/api/paas/v4').replace(/\/+$/, ''),
+          model: 'glm-4.7',
+          availableModels: ['glm-4.7', 'glm-4.5', 'glm-4.5-air'],
+          apiFormat: 'openai',
           source: '~/.zshrc', status: 'pending',
         });
       }

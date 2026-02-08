@@ -233,6 +233,14 @@ html, body {
   height: 100%;
 }
 
+.terminal-container .xterm-viewport {
+  overflow-y: auto !important;
+}
+
+.terminal-container .xterm-screen {
+  height: 100%;
+}
+
 /* 右侧边栏 */
 #sidebar {
   width: var(--sidebar-width);
@@ -728,9 +736,7 @@ html, body {
 .snapshot-file-path {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  word-break: break-all;
   color: var(--text-secondary);
 }
 
@@ -1026,4 +1032,77 @@ html, body {
 .term-context-item:hover {
   background: var(--accent, #0078d4);
   color: #fff;
+}
+
+/* 侧边栏底部版权 */
+#sidebar-footer {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-color);
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-align: center;
+  flex-shrink: 0;
+  line-height: 1.6;
+  opacity: 0.7;
+}
+
+#sidebar-footer:hover {
+  opacity: 1;
+}
+
+.footer-line {
+  white-space: nowrap;
+}
+
+.footer-line a {
+  color: var(--accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.footer-line a:hover {
+  text-decoration: underline;
+}
+
+.footer-tip {
+  margin-top: 6px;
+  font-size: 9px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  opacity: 0.8;
+  cursor: pointer;
+}
+
+.footer-tip:hover {
+  color: var(--accent);
+  opacity: 1;
+}
+
+/* 二维码弹窗 */
+.qrcode-dialog {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 20px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.qrcode-img {
+  width: 200px;
+  height: 200px;
+  border-radius: 6px;
+}
+
+.qrcode-text {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.qrcode-sub {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
 }

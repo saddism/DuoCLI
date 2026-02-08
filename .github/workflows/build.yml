@@ -1,0 +1,66 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npm run build:ts
+      - run: npm run copy:html
+      - run: npx electron-builder --mac --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-build
+          path: release/*.dmg
+
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npm run build:ts
+      - run: npm run copy:html
+      - run: npx electron-builder --win --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-build
+          path: release/*.exe
+
+  release:
+    needs: [build-mac, build-win]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-build
+          path: artifacts/mac
+      - uses: actions/download-artifact@v4
+        with:
+          name: win-build
+          path: artifacts/win
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/mac/*.dmg
+            artifacts/win/*.exe
+          body: |
+            ## DuoCLI 安装说明
+
+            **macOS 用户：** 下载 .dmg 文件，打开后拖入 Applications。首次打开如提示"无法验证开发者"，右键点击应用 → 打开 即可。
+
+            **Windows 用户：** 下载 .exe 安装包，双击安装。如弹出 SmartScreen 警告，点击"更多信息" → "仍要运行"。

@@ -2,41 +2,22 @@
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" style="stop-color:#1a1a2e"/>
-      <stop offset="100%" style="stop-color:#16213e"/>
+      <stop offset="100%" style="stop-color:#0f0f23"/>
     </linearGradient>
-    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+    <linearGradient id="text-grad" x1="0%" y1="0%" x2="100%" y2="0%">
       <stop offset="0%" style="stop-color:#0078d4"/>
-      <stop offset="100%" style="stop-color:#00b4d8"/>
+      <stop offset="50%" style="stop-color:#00b4d8"/>
+      <stop offset="100%" style="stop-color:#0078d4"/>
     </linearGradient>
   </defs>
   <!-- 圆角背景 -->
   <rect x="32" y="32" width="960" height="960" rx="220" ry="220" fill="url(#bg)"/>
-  <!-- 终端窗口外框 -->
-  <rect x="160" y="200" width="704" height="560" rx="32" ry="32" fill="#0d1117" stroke="#30363d" stroke-width="4"/>
-  <!-- 标题栏 -->
-  <rect x="160" y="200" width="704" height="56" rx="32" ry="0" fill="#161b22"/>
-  <rect x="160" y="232" width="704" height="24" fill="#161b22"/>
-  <!-- 三个小圆点 -->
-  <circle cx="208" cy="228" r="12" fill="#ff5f56"/>
-  <circle cx="248" cy="228" r="12" fill="#ffbd2e"/>
-  <circle cx="288" cy="228" r="12" fill="#27c93f"/>
-  <!-- 提示符 > -->
-  <text x="210" y="340" font-family="Menlo, Monaco, monospace" font-size="64" font-weight="bold" fill="#0078d4">❯</text>
-  <!-- Duo 文字 -->
-  <text x="280" y="340" font-family="Menlo, Monaco, monospace" font-size="64" font-weight="bold" fill="#e6edf3">Duo</text>
-  <!-- CLI 文字 -->
-  <text x="490" y="340" font-family="Menlo, Monaco, monospace" font-size="64" font-weight="bold" fill="#00b4d8">CLI</text>
-  <!-- 光标闪烁线 -->
-  <rect x="210" y="380" width="480" height="3" rx="1" fill="url(#accent)" opacity="0.6"/>
-  <!-- 第二行模拟输出 -->
-  <text x="210" y="440" font-family="Menlo, Monaco, monospace" font-size="40" fill="#7d8590">$ multi-terminal manager</text>
-  <!-- 第三行 -->
-  <text x="210" y="500" font-family="Menlo, Monaco, monospace" font-size="40" fill="#3fb950">✓ ready</text>
-  <!-- 底部两个小终端窗口示意（代表 Duo = 双） -->
-  <rect x="210" y="560" width="200" height="120" rx="12" fill="#0d1117" stroke="#0078d4" stroke-width="3"/>
-  <rect x="210" y="560" width="200" height="24" rx="12" ry="0" fill="#0078d4" opacity="0.3"/>
-  <rect x="210" y="578" width="200" height="6" fill="#0078d4" opacity="0.3"/>
-  <rect x="460" y="560" width="200" height="120" rx="12" fill="#0d1117" stroke="#00b4d8" stroke-width="3"/>
-  <rect x="460" y="560" width="200" height="24" rx="12" ry="0" fill="#00b4d8" opacity="0.3"/>
-  <rect x="460" y="578" width="200" height="6" fill="#00b4d8" opacity="0.3"/>
+  <!-- 细微边框 -->
+  <rect x="32" y="32" width="960" height="960" rx="220" ry="220" fill="none" stroke="#0078d4" stroke-width="3" opacity="0.3"/>
+  <!-- DUO 主文字 -->
+  <text x="512" y="545" font-family="-apple-system, 'Helvetica Neue', Arial, sans-serif" font-size="320" font-weight="800" fill="url(#text-grad)" text-anchor="middle" letter-spacing="-10">DUO</text>
+  <!-- 底部光标线 -->
+  <rect x="280" y="600" width="464" height="6" rx="3" fill="#0078d4" opacity="0.5"/>
+  <!-- 底部小字 CLI -->
+  <text x="512" y="700" font-family="Menlo, Monaco, 'Courier New', monospace" font-size="72" font-weight="600" fill="#7d8590" text-anchor="middle" letter-spacing="20">CLI</text>
 </svg>

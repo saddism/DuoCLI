@@ -48,6 +48,7 @@ declare global {
       filewatcherSelectEditor: () => Promise<string | null>;
       filewatcherGetEditor: () => Promise<string | null>;
       openFolder: (folderPath: string) => Promise<void>;
+      openUrl: (url: string) => Promise<void>;
       onFileChange: (cb: (filename: string, eventType: string) => void) => void;
       // AI 配置 API
       aiScan: () => Promise<AIProviderInfo[]>;
@@ -107,7 +108,6 @@ let expandedSnapshotId: string | null = null;
 // AI 配置相关 DOM
 const tabAiConfig = document.getElementById('tab-ai-config')!;
 const aiScanBtn = document.getElementById('ai-scan-btn')!;
-const aiTestBtn = document.getElementById('ai-test-btn')! as HTMLButtonElement;
 const aiProviderList = document.getElementById('ai-provider-list')!;
 
 // 文件监听状态（全局）
@@ -246,19 +246,24 @@ function startTitleEdit(id: string, titleSpan: HTMLElement): void {
 function renderSessionList(): void {
   const activeId = termManager.getActiveId();
   sessionList.innerHTML = '';
-  sessionTitles.forEach((title, id) => {
+  // 按创建顺序倒序排列（新建的在最上面）
+  const sortedIds = Array.from(sessionTitles.keys()).reverse();
+  for (const id of sortedIds) {
+    const title = sessionTitles.get(id)!;
     const item = document.createElement('div');
     item.className = 'session-item' + (id === activeId ? ' active' : '');
     const dot = document.createElement('span');
     dot.className = 'session-color-dot';
-    if (sessionUnread.has(id)) {
+    const lastUpdate = sessionUpdateTimes.get(id) || 0;
+    const isRecentlyActive = (Date.now() - lastUpdate) < 60000;
+    if (sessionUnread.has(id) || isRecentlyActive) {
       dot.style.backgroundColor = '#73c991';
     } else {
       dot.style.backgroundColor = '#555';
     }
     const titleSpan = document.createElement('span');
     titleSpan.className = 'session-title';
-    titleSpan.textContent = title;
+    titleSpan.textContent = title.charAt(0).toUpperCase() + title.slice(1);
     titleSpan.addEventListener('dblclick', (e) => {
       e.stopPropagation();
       startTitleEdit(id, titleSpan);
@@ -279,7 +284,7 @@ function renderSessionList(): void {
     item.appendChild(infoWrap);
     item.appendChild(closeBtn);
     sessionList.appendChild(item);
-  });
+  }
 }
 
 function renderArchivedList(): void {
@@ -432,8 +437,7 @@ async function refreshAiConfig(): Promise<void> {
   if (saved?.providerId) selectedAiProviderId = saved.providerId;
   const providers = await window.duocli.aiGetProviders();
   if (providers.length === 0) {
-    aiProviderList.innerHTML = '<div class="snapshot-notice">点击「扫描配置」发现可用 AI 服务</div>';
-    aiTestBtn.disabled = true;
+    aiProviderList.innerHTML = '<div class="snapshot-notice">点击「扫描并测试」发现可用 AI 服务</div>';
   } else {
     renderAiProviders(providers);
   }
@@ -445,23 +449,16 @@ async function handleAiScan(): Promise<void> {
   try {
     const providers = await window.duocli.aiScan();
     renderAiProviders(providers);
-    aiTestBtn.disabled = providers.length === 0;
+    if (providers.length > 0) {
+      aiScanBtn.textContent = '测试中...';
+      const tested = await window.duocli.aiTestAll();
+      renderAiProviders(tested);
+    }
   } catch {
     aiProviderList.innerHTML = '<div class="snapshot-notice">扫描失败</div>';
   }
-  aiScanBtn.textContent = '扫描配置';
+  aiScanBtn.textContent = '扫描并测试';
   (aiScanBtn as HTMLButtonElement).disabled = false;
-}
-
-async function handleAiTestAll(): Promise<void> {
-  aiTestBtn.textContent = '测试中...';
-  aiTestBtn.disabled = true;
-  try {
-    const providers = await window.duocli.aiTestAll();
-    renderAiProviders(providers);
-  } catch { /* ignore */ }
-  aiTestBtn.textContent = '测试连通';
-  aiTestBtn.disabled = false;
 }
 
 async function handleAiSelect(providerId: string): Promise<void> {
@@ -893,7 +890,6 @@ snapshotCreateBtn.addEventListener('click', async () => {
 
 // AI 配置按钮
 aiScanBtn.addEventListener('click', () => handleAiScan());
-aiTestBtn.addEventListener('click', () => handleAiTestAll());
 
 // 已归档折叠/展开
 archivedHeader.addEventListener('click', () => {
@@ -1036,3 +1032,30 @@ setInterval(() => {
   if (sessionTitles.size > 0) renderSessionList();
   if (archivedSessions.size > 0) renderArchivedList();
 }, 60000);
+
+// ========== 版权信息交互 ==========
+
+// GitHub 链接
+document.getElementById('footer-github')!.addEventListener('click', (e) => {
+  e.preventDefault();
+  window.duocli.openUrl('https://github.com/saddism/DuoCLI');
+});
+
+// 点击提示文字弹出二维码
+document.querySelector('.footer-tip')!.addEventListener('click', () => {
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  const dialog = document.createElement('div');
+  dialog.className = 'qrcode-dialog';
+  dialog.innerHTML = `
+    <img src="qrcode.jpg" class="qrcode-img" />
+    <div class="qrcode-text">扫码关注「壮哥的壮」</div>
+    <div class="qrcode-sub">心中默念"大壮好大"，祈祷 +1</div>
+  `;
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  dialog.addEventListener('click', () => overlay.remove());
+});

@@ -315,6 +315,11 @@ function registerIPC(): void {
     shell.showItemInFolder(folderPath);
   });
 
+  // 打开外部链接
+  ipcMain.handle('shell:open-url', (_e, url: string) => {
+    shell.openExternal(url);
+  });
+
   // ========== AI 配置 IPC ==========
 
   ipcMain.handle('ai:scan', async () => {

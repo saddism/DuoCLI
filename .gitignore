@@ -25,7 +25,3 @@ npm-debug.log*
 # Temp
 *.tmp
 *.bak
-
-# iconset (generated from icon.png)
-build/icon.iconset/
-build/icon.icns
