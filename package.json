@@ -1,0 +1,48 @@
+{
+  "name": "duocli",
+  "version": "1.0.0",
+  "description": "Electron多终端窗口管理器，集成Ollama自动总结",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:preload": "tsc -p tsconfig.preload.json",
+    "build:renderer": "esbuild src/renderer/app.ts --bundle --outfile=dist/renderer/app.js --platform=browser --external:electron",
+    "build:ts": "npm run build:main && npm run build:preload && npm run build:renderer",
+    "copy:html": "node -e \"const fs=require('fs'),p=require('path');const d=p.join('dist','renderer');fs.mkdirSync(d,{recursive:true});fs.copyFileSync(p.join('src','renderer','index.html'),p.join(d,'index.html'));fs.copyFileSync(p.join('src','renderer','styles.css'),p.join(d,'styles.css'));\"",
+    "start": "npm run build:ts && npm run copy:html && electron .",
+    "rebuild": "electron-rebuild",
+    "build": "npm run build:ts && npm run copy:html && electron-builder",
+    "build:mac": "npm run build:ts && npm run copy:html && electron-builder --mac",
+    "build:win": "npm run build:ts && npm run copy:html && electron-builder --win",
+    "build:linux": "npm run build:ts && npm run copy:html && electron-builder --linux"
+  },
+  "author": "大壮好大",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
+    "electron-rebuild": "^3.2.9",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "node-pty": "^1.0.0"
+  },
+  "build": {
+    "appId": "com.duocli.app",
+    "mac": {
+      "icon": "build/icon.icns"
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": "nsis"
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "target": "AppImage"
+    }
+  }
+}

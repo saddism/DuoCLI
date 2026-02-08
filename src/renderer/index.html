@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DuoCLI</title>
+  <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- 顶部工具栏 -->
+  <div id="toolbar">
+    <label>工作目录:</label>
+    <input id="cwd-input" type="text" placeholder="输入路径或点击浏览..." />
+    <button id="cwd-browse-btn" class="toolbar-btn">浏览</button>
+    <button id="cwd-open-btn" class="toolbar-icon-btn" title="在 Finder 中打开">&#128193;</button>
+
+    <label>CLI:</label>
+    <select id="preset-select" class="toolbar-select">
+      <option value="">空终端</option>
+      <option value="claude">Claude</option>
+      <option value="codex">Codex</option>
+      <option value="kimi">Kimi</option>
+      <option value="opencode">OpenCode</option>
+      <option value="agent">Cursor (agent)</option>
+      <option value="gemini">Gemini</option>
+    </select>
+
+    <label>配色:</label>
+    <div id="theme-select" class="custom-select">
+      <div class="custom-select-display" id="theme-display">
+        <span class="theme-dot" style="background:#0078d4"></span>VS Code Dark
+      </div>
+      <div class="custom-select-dropdown" id="theme-dropdown">
+        <div class="custom-select-option" data-value="vscode-dark"><span class="theme-dot" style="background:#0078d4"></span>VS Code Dark</div>
+        <div class="custom-select-option" data-value="monokai"><span class="theme-dot" style="background:#a6e22e"></span>Monokai</div>
+        <div class="custom-select-option" data-value="dracula"><span class="theme-dot" style="background:#bd93f9"></span>Dracula</div>
+        <div class="custom-select-option" data-value="solarized-dark"><span class="theme-dot" style="background:#268bd2"></span>Solarized Dark</div>
+        <div class="custom-select-option" data-value="one-dark"><span class="theme-dot" style="background:#61afef"></span>One Dark</div>
+        <div class="custom-select-option" data-value="nord"><span class="theme-dot" style="background:#88c0d0"></span>Nord</div>
+      </div>
+    </div>
+
+    <button id="toolbar-new-btn" class="toolbar-btn">+ 新建终端</button>
+  </div>
+
+  <!-- 主体 -->
+  <div id="main">
+    <div id="terminal-area">
+      <div id="terminal-content">
+        <div id="empty-state">选择工作目录后点击「新建终端」开始</div>
+      </div>
+      <div id="file-statusbar">
+        <span id="file-statusbar-icon">&#9998;</span>
+        <div id="file-statusbar-files">
+          <span class="file-statusbar-placeholder">等待文件变化...</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="sidebar">
+      <div id="sidebar-tabs">
+        <button class="sidebar-tab active" data-tab="sessions">会话</button>
+        <button class="sidebar-tab" data-tab="snapshots">快照</button>
+        <button class="sidebar-tab" data-tab="ai-config">AI</button>
+      </div>
+
+      <!-- 会话 Tab -->
+      <div id="tab-sessions" class="tab-content active">
+        <div id="session-list"></div>
+        <div id="archived-section">
+          <div id="archived-header">
+            <span id="archived-toggle">&#9654;</span>
+            <span>已归档</span>
+            <span id="archived-count">0</span>
+          </div>
+          <div id="archived-list" class="collapsed"></div>
+        </div>
+      </div>
+
+      <!-- 快照 Tab -->
+      <div id="tab-snapshots" class="tab-content">
+        <div id="snapshot-not-git" class="snapshot-notice">当前工作目录不是 Git 仓库</div>
+        <div id="snapshot-actions">
+          <button id="snapshot-create-btn" class="toolbar-btn snapshot-btn">手动创建快照</button>
+        </div>
+        <div id="snapshot-list"></div>
+      </div>
+
+      <!-- AI 配置 Tab -->
+      <div id="tab-ai-config" class="tab-content">
+        <div id="ai-config-desc">
+          用于自动为终端会话生成标题。扫描本机 AI 工具配置，测试通过后选择一个作为默认服务。
+        </div>
+        <div id="ai-config-actions">
+          <button id="ai-scan-btn" class="toolbar-btn ai-btn">扫描配置</button>
+          <button id="ai-test-btn" class="toolbar-btn ai-btn" disabled>测试连通</button>
+        </div>
+        <div id="ai-provider-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

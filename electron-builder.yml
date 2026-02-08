@@ -1,0 +1,16 @@
+appId: com.duocli.app
+productName: DuoCLI
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch:
+        - arm64
+  icon: build/icon.png
+files:
+  - dist/**/*
+  - node_modules/**/*
+  - "!node_modules/.cache"
+asar: true
+directories:
+  output: release
