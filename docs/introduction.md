@@ -107,7 +107,7 @@ DuoCLI 会自动扫描你机器上已有的 AI 工具配置：
 
 `~/.claude`、`~/.codex`、`~/.gemini`、`~/.kimi`、环境变量里的 API Key……全部自动发现，不用重复配置。
 
-扫描完点一下「测试连通」，选一个能用的就行。Kimi 包月买了不用浪费，直接选上。
+扫描完点一下「扫描并测试」，选一个能用的就行。Kimi 包月买了不用浪费，直接选上。
 
 ### 文件路径点不开？→ 看到哪儿点哪儿
 
@@ -122,7 +122,7 @@ DuoCLI 会自动扫描你机器上已有的 AI 工具配置：
 ## 怎么用
 
 ```bash
-git clone https://github.com/nicekate/DuoCLI.git
+git clone https://github.com/saddism/DuoCLI.git
 cd DuoCLI
 npm install
 npm run rebuild
@@ -155,6 +155,6 @@ Electron + node-pty + xterm.js + TypeScript + esbuild
 
 如果你也在同时用多个 AI 编程工具，或者被终端的各种反人类体验折磨过，试试 DuoCLI。
 
-**GitHub:** https://github.com/nicekate/DuoCLI
+**GitHub:** https://github.com/saddism/DuoCLI
 
 觉得有用的话，给个 Star 吧。反正不要钱。

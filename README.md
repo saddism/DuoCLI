@@ -1,6 +1,6 @@
 # DuoCLI — 多开 CLI 神器
 
-一个为 AI 编程时代设计的多终端管理器。基于 Electron，专为同时运行多个 AI 编程助手（Claude Code、Codex CLI、Gemini CLI 等）的工作流而打造。
+一个为 AI 编程时代设计的多终端管理器。基于 Electron，专为同时运行多个 AI 编程助手（Claude Code、Codex CLI、Gemini CLI、Kimi 等）的工作流而打造。
 
 ## 为什么需要 DuoCLI
 
@@ -14,17 +14,65 @@
 DuoCLI 的解决方案：
 
 - **AI 自动命名** — 根据终端内容自动生成标题（如 "Claude:重构登录模块"），零配置复用本机已有的 AI 配置
-- **Git 快照保护** — AI 修改代码前自动创建快照，支持逐文件 diff 查看和回滚
+- **Git 历史保护** — AI 修改代码前自动创建快照，支持逐文件 diff 查看、撤销变更和时间机器还原
 - **多终端并行** — 一个窗口管理所有 AI 终端，支持归档和恢复
+- **全自动模式** — 一键启动 Claude/Codex/Gemini/Kimi 的全自动模式，无需手动输入参数
 - **文件路径可点击** — 终端输出中的文件路径自动识别为链接，点击直接用编辑器打开
 - **6 套配色方案** — 不同任务用不同颜色，一眼区分
+
+## 截图
+
+![主界面](docs/images/main-ui.png)
+
+![历史与 Diff](docs/images/snapshot.png)
+
+![AI 配置](docs/images/ai-config.png)
+
+## 安装
+
+### 下载安装包
+
+前往 [Releases](https://github.com/saddism/DuoCLI/releases) 下载：
+
+- **macOS** — `.dmg` 文件，打开后拖入 Applications。首次打开如提示"无法验证开发者"，右键点击应用 → 打开即可
+- **Windows** — `.exe` 安装包，双击安装。如弹出 SmartScreen 警告，点击"更多信息" → "仍要运行"
+
+### 从源码构建
+
+```bash
+git clone https://github.com/saddism/DuoCLI.git
+cd DuoCLI
+
+# 安装依赖
+npm install
+
+# 重新编译原生模块（node-pty）
+npm run rebuild
+
+# 开发模式运行
+npm start
+
+# 构建 macOS 应用
+npm run build:mac
+
+# 构建 Windows 应用（需在 Windows 上执行）
+npm run build:win
+```
+
+### 系统要求
+
+- macOS / Windows / Linux
+- Node.js >= 18（从源码构建时需要）
+- Git（历史功能需要）
+- Windows 用户从源码构建需安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（编译 node-pty）
 
 ## 功能特性
 
 ### 多终端会话管理
 
 - 创建多个独立终端，每个可指定预设命令（Claude、Codex、Gemini、Kimi 等）
-- 会话列表实时显示标题和最后活跃时间
+- 支持普通模式和全自动模式（Claude `--dangerously-skip-permissions`、Codex `--full-auto`、Gemini/Kimi `--yolo`）
+- 会话列表实时显示标题和最后活跃时间，新建会话排在最上方
 - 支持归档/恢复 — 暂时不用的终端可以归档隐藏，进程不会被杀掉
 - 双击会话标题可手动重命名
 - 非活跃会话有新输出时显示未读标记
@@ -32,16 +80,19 @@ DuoCLI 的解决方案：
 ### AI 智能标题
 
 - 自动调用 AI 分析终端输出，生成简短的中文标题
-- 支持多种 AI 后端：Anthropic Claude、OpenAI、Google Gemini、本地 Ollama
-- 自动扫描本机已有的 AI 工具配置（`~/.claude`、`~/.codex`、`~/.gemini` 等），零配置即用
+- 首次生成失败时自动重试（最多 10 次）
+- 支持多种 AI 后端：Anthropic Claude、OpenAI、Google Gemini、DeepSeek、MiniMax、ZhipuAI、本地 Ollama
+- 自动扫描本机已有的 AI 工具配置，零配置即用
 - 可在 AI 配置面板中选择不同的模型
 
-### Git 快照与回滚
+### Git 历史与回滚
 
 - 检测到 AI 输入时自动创建 Git 快照（使用独立孤儿分支 `_duocli_snapshots`，不污染项目历史）
 - 支持手动创建快照
 - 展开查看每个快照的变更文件列表和 diff（带颜色高亮）
-- 支持逐文件恢复或整体回滚
+- **撤销本次变更** — 回滚这次快照记录的变更文件
+- **还原到此时刻** — 把整个项目恢复到某个快照时的完整状态（时间机器），操作前自动创建备份
+- 撤销/还原后的记录会显示删除线标记，视觉区分已回滚的历史
 - AI 自动生成快照变更总结
 
 ### 文件路径链接
@@ -61,56 +112,18 @@ DuoCLI 的解决方案：
 
 内置 6 套配色方案：VS Code Dark、Monokai、Dracula、Solarized Dark、One Dark、Nord
 
-## 截图
-
-![主界面](docs/images/main-ui.png)
-
-![快照与 Diff](docs/images/snapshot.png)
-
-![AI 配置](docs/images/ai-config.png)
-
-## 安装
-
-### 从源码构建
-
-```bash
-git clone https://github.com/nicekate/DuoCLI.git
-cd DuoCLI
-
-# 安装依赖
-npm install
-
-# 重新编译原生模块（node-pty）
-npm run rebuild
-
-# 开发模式运行
-npm start
-
-# 构建 macOS 应用
-npm run build:mac
-```
-
-### 系统要求
-
-- macOS / Windows / Linux
-- Node.js >= 18
-- Git（快照功能需要）
-- Windows 用户需安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（编译 node-pty）
-
 ## 使用方法
 
 1. 启动后在顶部设置**工作目录**
-2. 选择**预设命令**（Claude、Codex、Gemini 等，或留空打开普通终端）
+2. 选择**预设命令**（Claude、Codex、Gemini 等，或留空打开普通终端；带"全自动"后缀的选项会自动附加对应参数）
 3. 选择**配色方案**
 4. 点击 **"+ 新建终端"**
 
 ### AI 配置
 
-首次使用时，切换到右侧 **"AI"** 标签页：
+DuoCLI 不提供任何 AI 服务，也不需要额外配置 API Key — 只是读取你本机已有的 AI 工具配置。你原来能用什么，这里就能用什么。
 
-1. **扫描配置** — 自动检测本机已安装的 AI 工具配置
-2. **测试连通** — 验证各 API 是否可用
-3. 选择一个测试通过的服务作为默认 AI 后端
+切换到右侧 **"AI"** 标签页，点击 **"扫描并测试"**，自动检测并验证本机可用的 AI 服务，然后选择一个作为默认后端。
 
 支持自动扫描的配置来源：
 
@@ -119,20 +132,24 @@ npm run build:mac
 | Claude Code | `~/.claude/settings.json` |
 | Codex CLI | `~/.codex/config.json`、`~/.codex/config.toml` |
 | Gemini CLI | `~/.gemini/.env` |
-| Kimi | `~/.kimi/config.toml` |
 | OpenCode | `~/.config/opencode/opencode.json` |
 | Aider | `~/.aider/env.sh` |
+| DeepSeek | Shell 环境变量 `DEEPSEEK_API_KEY` |
+| MiniMax | Shell 环境变量 `MINIMAX_API_KEY` |
+| ZhipuAI | Shell 环境变量 `ZHIPUAI_API_KEY` |
 | Ollama | 本地 `http://127.0.0.1:11434` |
-| Shell 环境变量 | `~/.zshrc`、`~/.bashrc` 中的 `ANTHROPIC_API_KEY` 等 |
+| Shell 环境变量 | `~/.zshrc`、`~/.bashrc` 中的 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`GEMINI_API_KEY` 等 |
 
-### 快照
+### 历史
 
-切换到右侧 **"快照"** 标签页（需要工作目录是 Git 仓库）：
+切换到右侧 **"历史"** 标签页（需要工作目录是 Git 仓库）：
 
 - 快照在 AI 输入时自动创建
 - 点击快照条目展开查看变更文件
 - 点击文件名查看 diff
-- **"恢复"** 回滚单个文件，**"全部回滚"** 恢复整个快照
+- **"恢复"** 回滚单个文件
+- **"撤销本次变更"** 回滚这次快照的所有变更文件
+- **"还原到此时刻"** 把整个项目恢复到该快照时的完整状态
 
 快照存储在 Git 孤儿分支 `_duocli_snapshots` 上，不影响项目分支和提交历史。
 
