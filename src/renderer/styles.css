@@ -819,6 +819,26 @@ html, body {
   word-break: break-all;
 }
 
+/* 已撤销/已还原的快照 */
+.snapshot-item.reverted {
+  opacity: 0.5;
+}
+
+.snapshot-item.reverted .snapshot-time,
+.snapshot-item.reverted .snapshot-msg {
+  text-decoration: line-through;
+}
+
+.snapshot-reverted-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--border-color);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 /* 文件 diff 块 */
 .snapshot-file-wrapper {
   /* wrapper 无特殊样式 */

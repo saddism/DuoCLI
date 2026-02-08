@@ -104,6 +104,10 @@ const snapshotListEl = document.getElementById('snapshot-list')!;
 
 // 快照状态
 let expandedSnapshotId: string | null = null;
+// 已撤销/已还原的快照记录：snapId → '已撤销' | '已还原'
+const revertedSnapshots: Map<string, string> = new Map();
+// 当前快照列表缓存（用于还原标记）
+let cachedSnapshots: Array<{ id: string; message: string; timestamp: number; fileCount: number }> = [];
 
 // AI 配置相关 DOM
 const tabAiConfig = document.getElementById('tab-ai-config')!;
@@ -599,6 +603,7 @@ function snapshotTimeStr(ts: number): string {
 }
 
 function renderSnapshotList(snapshots: Array<{ id: string; message: string; timestamp: number; fileCount: number }>): void {
+  cachedSnapshots = snapshots;
   snapshotListEl.innerHTML = '';
   if (snapshots.length === 0) {
     snapshotListEl.innerHTML = '<div class="snapshot-notice">暂无快照</div>';
@@ -606,7 +611,8 @@ function renderSnapshotList(snapshots: Array<{ id: string; message: string; time
   }
   for (const snap of snapshots) {
     const item = document.createElement('div');
-    item.className = 'snapshot-item' + (snap.id === expandedSnapshotId ? ' expanded' : '');
+    const revertLabel = revertedSnapshots.get(snap.id);
+    item.className = 'snapshot-item' + (snap.id === expandedSnapshotId ? ' expanded' : '') + (revertLabel ? ' reverted' : '');
 
     const header = document.createElement('div');
     header.className = 'snapshot-header';
@@ -615,11 +621,21 @@ function renderSnapshotList(snapshots: Array<{ id: string; message: string; time
     time.className = 'snapshot-time';
     time.textContent = snapshotTimeStr(snap.timestamp);
 
+    // 已撤销/已还原标签
+    if (revertLabel) {
+      const badge = document.createElement('span');
+      badge.className = 'snapshot-reverted-badge';
+      badge.textContent = revertLabel;
+      header.appendChild(time);
+      header.appendChild(badge);
+    } else {
+      header.appendChild(time);
+    }
+
     const count = document.createElement('span');
     count.className = 'snapshot-file-count';
     count.textContent = `${snap.fileCount} 文件`;
 
-    header.appendChild(time);
     header.appendChild(count);
 
     const msg = document.createElement('div');
@@ -832,6 +848,8 @@ async function handleRollbackAll(snapId: string): Promise<void> {
     } else {
       alert(`${result.total} 个文件内容与回滚目标一致，无需变更`);
     }
+    revertedSnapshots.set(snapId, '已撤销');
+    await refreshSnapshots();
   } catch {
     alert('回滚失败');
   }
@@ -853,6 +871,12 @@ async function handleRestoreTo(snapId: string): Promise<void> {
       msg += '\n\n已自动创建还原前备份快照';
     }
     alert(msg);
+    // 标记该快照及其上方所有快照为"已还原"
+    let found = false;
+    for (let i = cachedSnapshots.length - 1; i >= 0; i--) {
+      if (cachedSnapshots[i].id === snapId) found = true;
+      if (found) revertedSnapshots.set(cachedSnapshots[i].id, '已还原');
+    }
     await refreshSnapshots();
   } catch {
     alert('还原失败');
