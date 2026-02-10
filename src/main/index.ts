@@ -136,21 +136,27 @@ function createWindow(): void {
   });
 }
 
+function safeSend(channel: string, ...args: unknown[]): void {
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send(channel, ...args);
+  }
+}
+
 function setupPtyManager(): void {
   ptyManager = new PtyManager({
     onData: (id, data) => {
-      mainWindow?.webContents.send('pty:data', id, data);
+      safeSend('pty:data', id, data);
     },
     onTitleUpdate: (id, title) => {
-      mainWindow?.webContents.send('pty:title-update', id, title);
+      safeSend('pty:title-update', id, title);
     },
     onExit: (id) => {
-      mainWindow?.webContents.send('pty:exit', id);
+      safeSend('pty:exit', id);
     },
     onPasteInput: (id, cwd) => {
       snapshotManager.createSnapshot(cwd, '快照中...').then(async (commitId) => {
         if (commitId) {
-          mainWindow?.webContents.send('snapshot:created', commitId);
+          safeSend('snapshot:created', commitId);
           // 异步用 AI 生成快照标题
           try {
             const diff = await snapshotManager.getSnapshotDiff(cwd, commitId);
@@ -158,7 +164,7 @@ function setupPtyManager(): void {
               const summary = await aiDiffSummary(diff);
               if (summary) {
                 await snapshotManager.updateMessage(cwd, commitId, summary);
-                mainWindow?.webContents.send('snapshot:created', commitId);
+                safeSend('snapshot:created', commitId);
               }
             }
           } catch { /* 静默失败 */ }

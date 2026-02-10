@@ -12,7 +12,11 @@
   <!-- 顶部工具栏 -->
   <div id="toolbar">
     <label>工作目录:</label>
-    <input id="cwd-input" type="text" placeholder="输入路径或点击浏览..." />
+    <div id="cwd-wrapper">
+      <input id="cwd-input" type="text" placeholder="输入路径或点击浏览..." />
+      <button id="cwd-recent-btn" class="cwd-recent-toggle" title="最近目录">&#9660;</button>
+      <div id="cwd-recent-dropdown" class="cwd-recent-dropdown"></div>
+    </div>
     <button id="cwd-browse-btn" class="toolbar-btn">浏览</button>
     <button id="cwd-open-btn" class="toolbar-icon-btn" title="在 Finder 中打开">&#128193;</button>
 
@@ -37,6 +41,7 @@
         <span class="theme-dot" style="background:#0078d4"></span>VS Code Dark
       </div>
       <div class="custom-select-dropdown" id="theme-dropdown">
+        <div class="custom-select-option" data-value="auto"><span class="theme-dot" style="background:conic-gradient(#e06c75,#e5c07b,#98c379,#56b6c2,#61afef,#c678dd,#e06c75)"></span>自动配色</div>
         <div class="custom-select-option" data-value="vscode-dark"><span class="theme-dot" style="background:#0078d4"></span>VS Code Dark</div>
         <div class="custom-select-option" data-value="monokai"><span class="theme-dot" style="background:#a6e22e"></span>Monokai</div>
         <div class="custom-select-option" data-value="dracula"><span class="theme-dot" style="background:#bd93f9"></span>Dracula</div>

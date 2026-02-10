@@ -446,7 +446,13 @@ export class TerminalManager {
 
   write(id: string, data: string): void {
     const inst = this.instances.get(id);
-    if (inst) inst.terminal.write(data);
+    if (!inst) return;
+    // 写入前判断是否在底部附近（容差 3 行），是则写入后自动滚到底
+    const buf = inst.terminal.buffer.active;
+    const nearBottom = buf.baseY - buf.viewportY <= 3;
+    inst.terminal.write(data, () => {
+      if (nearBottom) inst.terminal.scrollToBottom();
+    });
   }
 
   destroy(id: string): string | null {

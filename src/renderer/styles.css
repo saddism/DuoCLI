@@ -38,7 +38,7 @@ html, body {
   padding: 0 12px;
   gap: 10px;
   -webkit-app-region: drag;
-  overflow: hidden;
+  overflow: visible;
 }
 
 #toolbar > * {
@@ -51,10 +51,19 @@ html, body {
   white-space: nowrap;
 }
 
+#cwd-wrapper {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
 #cwd-input {
   flex: 1;
   min-width: 0;
   padding: 4px 8px;
+  padding-right: 24px;
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 4px;
@@ -69,6 +78,67 @@ html, body {
 
 #cwd-input::placeholder {
   color: var(--text-secondary);
+}
+
+.cwd-recent-toggle {
+  position: absolute;
+  right: 2px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 9px;
+  cursor: pointer;
+  padding: 2px 4px;
+  line-height: 1;
+  border-radius: 2px;
+}
+
+.cwd-recent-toggle:hover {
+  color: var(--text-primary);
+  background: var(--hover-bg);
+}
+
+.cwd-recent-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 2px;
+  background: var(--bg-toolbar);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  z-index: 1000;
+  max-height: 240px;
+  overflow-y: auto;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+}
+
+.cwd-recent-dropdown.open {
+  display: block;
+}
+
+.cwd-recent-item {
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cwd-recent-item:hover {
+  background: var(--hover-bg);
+}
+
+.cwd-recent-empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: center;
 }
 
 .toolbar-select {
@@ -620,6 +690,53 @@ html, body {
 .file-statusbar-item:hover {
   background: var(--accent);
   color: #fff;
+}
+
+/* 会话分组头 */
+.session-group-header {
+  display: flex;
+  align-items: center;
+  padding: 6px 12px 4px;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  user-select: none;
+  border-left: 3px solid transparent;
+}
+
+.session-group-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.session-group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.session-group-count {
+  background: var(--border-color);
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+/* 分组内会话项 active 状态覆盖背景 */
+.session-item.active {
+  background: var(--active-bg);
+  border-left-color: var(--accent);
+}
+
+.session-item:hover {
+  filter: brightness(1.15);
 }
 
 /* 已归档区域 */

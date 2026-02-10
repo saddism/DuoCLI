@@ -86,10 +86,27 @@ const sessionDisplayNames: Map<string, string> = new Map();
 // 归档：终端进程仍在运行，只是从活跃列表隐藏
 const archivedSessions: Map<string, { title: string; themeId: string; updateTime: number; cwd: string; displayName: string }> = new Map();
 
+// 最近工作目录
+const RECENT_CWD_KEY = 'duocli_recent_cwds';
+const MAX_RECENT_CWDS = 8;
+
+function getRecentCwds(): string[] {
+  try { return JSON.parse(localStorage.getItem(RECENT_CWD_KEY) || '[]'); } catch { return []; }
+}
+
+function addRecentCwd(cwd: string): void {
+  const list = getRecentCwds().filter(p => p !== cwd);
+  list.unshift(cwd);
+  if (list.length > MAX_RECENT_CWDS) list.length = MAX_RECENT_CWDS;
+  localStorage.setItem(RECENT_CWD_KEY, JSON.stringify(list));
+}
+
 // DOM 元素
 const cwdInput = document.getElementById('cwd-input') as HTMLInputElement;
 const cwdBrowseBtn = document.getElementById('cwd-browse-btn')!;
 const cwdOpenBtn = document.getElementById('cwd-open-btn')!;
+const cwdRecentBtn = document.getElementById('cwd-recent-btn')!;
+const cwdRecentDropdown = document.getElementById('cwd-recent-dropdown')!;
 const presetSelect = document.getElementById('preset-select') as HTMLSelectElement;
 const themeSelect = document.getElementById('theme-select')!;
 const themeDisplay = document.getElementById('theme-display')!;
@@ -172,6 +189,7 @@ if (lastPreset) {
 
 // 自定义配色下拉组件
 const themeColorMap: Record<string, string> = {
+  'auto': '',
   'vscode-dark': '#0078d4',
   'monokai': '#a6e22e',
   'dracula': '#bd93f9',
@@ -179,11 +197,10 @@ const themeColorMap: Record<string, string> = {
   'one-dark': '#61afef',
   'nord': '#88c0d0',
 };
-let currentThemeId = localStorage.getItem('duocli_theme') || 'vscode-dark';
+let currentThemeId = 'auto';
 
 function setThemeValue(value: string): void {
   currentThemeId = value;
-  localStorage.setItem('duocli_theme', value);
   const opt = themeDropdown.querySelector(`[data-value="${value}"]`);
   if (opt) {
     themeDisplay.innerHTML = opt.innerHTML;
@@ -213,6 +230,68 @@ document.addEventListener('click', () => {
 // 启动时恢复保存的配色
 setThemeValue(currentThemeId);
 
+// ========== 路径自动颜色 ==========
+
+// 高区分度色板（12 色，HSL 均匀分布，饱和度高）
+const PATH_COLORS = [
+  '#e06c75', '#e5c07b', '#98c379', '#56b6c2',
+  '#61afef', '#c678dd', '#f78c6c', '#d19a66',
+  '#7ec699', '#82aaff', '#c792ea', '#ff5370',
+];
+
+function cwdToColor(cwd: string): string {
+  if (!cwd) return PATH_COLORS[0];
+  let hash = 0;
+  for (let i = 0; i < cwd.length; i++) {
+    hash = ((hash << 5) - hash + cwd.charCodeAt(i)) | 0;
+  }
+  return PATH_COLORS[Math.abs(hash) % PATH_COLORS.length];
+}
+
+// 取路径最后一段作为项目名
+function cwdShortName(cwd: string): string {
+  if (!cwd) return '未知项目';
+  const parts = cwd.replace(/\/+$/, '').split('/');
+  return parts[parts.length - 1] || cwd;
+}
+
+// 自动配色：根据 cwd 映射到一个实际主题，尽量让不同项目分配到不同主题
+const AUTO_THEME_LIST = ['vscode-dark', 'monokai', 'dracula', 'solarized-dark', 'one-dark', 'nord'];
+const autoThemeCache: Map<string, string> = new Map(); // cwd → themeId
+
+function cwdHash(cwd: string): number {
+  let h = 0;
+  for (let i = 0; i < cwd.length; i++) {
+    h = ((h << 5) - h + cwd.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h);
+}
+
+function cwdToThemeId(cwd: string): string {
+  if (!cwd) return AUTO_THEME_LIST[0];
+  const cached = autoThemeCache.get(cwd);
+  if (cached) return cached;
+
+  // 已被占用的主题
+  const usedThemes = new Set(autoThemeCache.values());
+  // 优先选未被占用的主题
+  const available = AUTO_THEME_LIST.filter(t => !usedThemes.has(t));
+  const hash = cwdHash(cwd);
+  let theme: string;
+  if (available.length > 0) {
+    theme = available[hash % available.length];
+  } else {
+    theme = AUTO_THEME_LIST[hash % AUTO_THEME_LIST.length];
+  }
+  autoThemeCache.set(cwd, theme);
+  return theme;
+}
+
+// 解析实际 themeId：auto 时根据 cwd 决定
+function resolveThemeId(themeId: string, cwd: string): string {
+  return themeId === 'auto' ? cwdToThemeId(cwd) : themeId;
+}
+
 // ========== 工具函数 ==========
 
 function friendlyTime(ts: number): string {
@@ -233,19 +312,20 @@ function updateEmptyState(): void {
 function updateSessionTitleBar(): void {
   const activeId = termManager.getActiveId();
   if (activeId) {
+    const cwd = sessionCwds.get(activeId) || '';
+    // 左上角标题条：显示当前终端工作目录
+    sessionTitleText.textContent = cwd || 'DuoCLI';
+    sessionTitleText.title = cwd || '';
+    // macOS 系统窗口标题：保留完整信息
     const title = sessionTitles.get(activeId) || '';
     const displayName = sessionDisplayNames.get(activeId) || '';
-    // 组装标题：DuoCLI-Claude全自动-修改项目样式
     const parts = ['DuoCLI'];
     if (displayName) parts.push(displayName);
     if (title && title !== '新会话') parts.push(title);
-    const fullTitle = parts.join('-');
-    // 内部标题条
-    sessionTitleText.textContent = fullTitle;
-    // macOS 系统窗口标题
-    window.duocli.setWindowTitle(fullTitle);
+    window.duocli.setWindowTitle(parts.join('-'));
   } else {
     sessionTitleText.textContent = '';
+    sessionTitleText.title = '';
     window.duocli.setWindowTitle('DuoCLI');
   }
 }
@@ -309,83 +389,109 @@ function startTitleEdit(id: string, titleSpan: HTMLElement): void {
 function renderSessionList(): void {
   const activeId = termManager.getActiveId();
   sessionList.innerHTML = '';
+
   // pinned 优先，再按创建顺序倒序
   const allIds = Array.from(sessionTitles.keys()).reverse();
   const sortedIds = [
     ...allIds.filter(id => pinnedSessions.has(id)),
     ...allIds.filter(id => !pinnedSessions.has(id)),
   ];
+
+  // 按 cwd 分组（保持排序顺序）
+  const groups: Map<string, string[]> = new Map();
   for (const id of sortedIds) {
-    const title = sessionTitles.get(id)!;
-    const isPinned = pinnedSessions.has(id);
-    const item = document.createElement('div');
-    item.className = 'session-item' + (id === activeId ? ' active' : '') + (isPinned ? ' pinned' : '');
-    const dot = document.createElement('span');
-    dot.className = 'session-color-dot';
-    if (sessionUnread.has(id)) {
-      dot.style.backgroundColor = '#73c991'; // 绿：等待输入
-    } else if (sessionBusy.has(id)) {
-      dot.style.backgroundColor = '#e5a100'; // 黄：工作中
-    } else {
-      dot.style.backgroundColor = '#555';    // 灰：无活动
-    }
-    // Pin 按钮
-    const pinBtn = document.createElement('button');
-    pinBtn.className = 'session-pin' + (isPinned ? ' pinned' : '');
-    pinBtn.textContent = '\u{1F4CC}';
-    pinBtn.title = isPinned ? '取消置顶' : '置顶';
-    pinBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (pinnedSessions.has(id)) {
-        pinnedSessions.delete(id);
+    const cwd = sessionCwds.get(id) || '';
+    if (!groups.has(cwd)) groups.set(cwd, []);
+    groups.get(cwd)!.push(id);
+  }
+
+  for (const [cwd, ids] of groups) {
+    const color = cwdToColor(cwd);
+
+    // 分组头
+    const groupHeader = document.createElement('div');
+    groupHeader.className = 'session-group-header';
+    groupHeader.style.borderLeftColor = color;
+    const groupName = document.createElement('span');
+    groupName.className = 'session-group-name';
+    groupName.textContent = cwdShortName(cwd);
+    groupName.title = cwd;
+    const groupCount = document.createElement('span');
+    groupCount.className = 'session-group-count';
+    groupCount.textContent = String(ids.length);
+    groupHeader.appendChild(groupName);
+    groupHeader.appendChild(groupCount);
+    sessionList.appendChild(groupHeader);
+
+    // 该组下的会话
+    for (const id of ids) {
+      const title = sessionTitles.get(id)!;
+      const isPinned = pinnedSessions.has(id);
+      const item = document.createElement('div');
+      item.className = 'session-item' + (id === activeId ? ' active' : '') + (isPinned ? ' pinned' : '');
+      // 路径颜色染背景
+      item.style.backgroundColor = color + '12'; // 约 7% 透明度
+
+      const dot = document.createElement('span');
+      dot.className = 'session-color-dot';
+      if (sessionUnread.has(id)) {
+        dot.style.backgroundColor = '#73c991';
+      } else if (sessionBusy.has(id)) {
+        dot.style.backgroundColor = '#e5a100';
       } else {
-        pinnedSessions.add(id);
+        dot.style.backgroundColor = '#666';
       }
-      renderSessionList();
-    });
-    const titleSpan = document.createElement('span');
-    titleSpan.className = 'session-title';
-    titleSpan.textContent = title;
-    titleSpan.addEventListener('dblclick', (e) => {
-      e.stopPropagation();
-      startTitleEdit(id, titleSpan);
-    });
-    // 第二行：时间 + displayName
-    const metaRow = document.createElement('div');
-    metaRow.className = 'session-meta-row';
-    const timeSpan = document.createElement('span');
-    timeSpan.className = 'session-time';
-    timeSpan.textContent = friendlyTime(sessionUpdateTimes.get(id) || Date.now());
-    metaRow.appendChild(timeSpan);
-    const displayName = sessionDisplayNames.get(id);
-    if (displayName) {
-      const nameSpan = document.createElement('span');
-      nameSpan.className = 'session-display-name';
-      nameSpan.textContent = displayName;
-      metaRow.appendChild(nameSpan);
+
+      const pinBtn = document.createElement('button');
+      pinBtn.className = 'session-pin' + (isPinned ? ' pinned' : '');
+      pinBtn.textContent = '\u{1F4CC}';
+      pinBtn.title = isPinned ? '取消置顶' : '置顶';
+      pinBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (pinnedSessions.has(id)) pinnedSessions.delete(id);
+        else pinnedSessions.add(id);
+        renderSessionList();
+      });
+
+      const titleSpan = document.createElement('span');
+      titleSpan.className = 'session-title';
+      titleSpan.textContent = title;
+      titleSpan.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        startTitleEdit(id, titleSpan);
+      });
+
+      const metaRow = document.createElement('div');
+      metaRow.className = 'session-meta-row';
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'session-time';
+      timeSpan.textContent = friendlyTime(sessionUpdateTimes.get(id) || Date.now());
+      metaRow.appendChild(timeSpan);
+      const displayName = sessionDisplayNames.get(id);
+      if (displayName) {
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'session-display-name';
+        nameSpan.textContent = displayName;
+        metaRow.appendChild(nameSpan);
+      }
+
+      const infoWrap = document.createElement('div');
+      infoWrap.className = 'session-info';
+      infoWrap.appendChild(titleSpan);
+      infoWrap.appendChild(metaRow);
+
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'session-close';
+      closeBtn.textContent = '\u00d7';
+      closeBtn.addEventListener('click', (e) => { e.stopPropagation(); handleCloseClick(id); });
+
+      item.addEventListener('click', () => switchSession(id));
+      item.appendChild(dot);
+      item.appendChild(pinBtn);
+      item.appendChild(infoWrap);
+      item.appendChild(closeBtn);
+      sessionList.appendChild(item);
     }
-    const infoWrap = document.createElement('div');
-    infoWrap.className = 'session-info';
-    infoWrap.appendChild(titleSpan);
-    infoWrap.appendChild(metaRow);
-    const cwd = sessionCwds.get(id);
-    if (cwd) {
-      const cwdSpan = document.createElement('span');
-      cwdSpan.className = 'session-cwd';
-      cwdSpan.textContent = cwd;
-      cwdSpan.title = cwd;
-      infoWrap.appendChild(cwdSpan);
-    }
-    const closeBtn = document.createElement('button');
-    closeBtn.className = 'session-close';
-    closeBtn.textContent = '\u00d7';
-    closeBtn.addEventListener('click', (e) => { e.stopPropagation(); handleCloseClick(id); });
-    item.addEventListener('click', () => switchSession(id));
-    item.appendChild(dot);
-    item.appendChild(pinBtn);
-    item.appendChild(infoWrap);
-    item.appendChild(closeBtn);
-    sessionList.appendChild(item);
   }
 }
 
@@ -433,7 +539,7 @@ function renderArchivedList(): void {
 async function createSession(): Promise<void> {
   if (!currentCwd) { alert('请先选择工作目录'); return; }
   const preset = presetSelect.value;
-  const themeId = currentThemeId;
+  const themeId = resolveThemeId(currentThemeId, currentCwd);
   lastPreset = preset;
   localStorage.setItem('duocli_preset', preset);
   const result = await window.duocli.createPty(currentCwd, preset, themeId);
@@ -460,11 +566,9 @@ async function createSession(): Promise<void> {
 
 function switchSession(id: string): void {
   termManager.switchTo(id);
+  // 只清除"等待输入"（绿点），不清除"工作中"（黄点）
+  // 用户查看了就不算未读，但工作中状态应由数据流驱动
   sessionUnread.delete(id);
-  sessionBusy.delete(id);
-  clearTimeout(unreadTimers.get(id));
-  unreadTimers.delete(id);
-  recentDataBuffer.delete(id);
   renderSessionList();
   updateSessionTitleBar();
   renderFileStatusbar();
@@ -559,7 +663,7 @@ function destroySession(id: string): void {
 
 async function browseCwd(): Promise<void> {
   const folder = await window.duocli.selectFolder(currentCwd || undefined);
-  if (folder) { currentCwd = folder; cwdInput.value = folder; localStorage.setItem('duocli_cwd', folder); startFileWatcher(folder); }
+  if (folder) { currentCwd = folder; cwdInput.value = folder; localStorage.setItem('duocli_cwd', folder); addRecentCwd(folder); startFileWatcher(folder); }
 }
 
 // ========== 文件监听 ==========
@@ -1162,7 +1266,51 @@ async function handleRestoreTo(snapId: string): Promise<void> {
 
 cwdBrowseBtn.addEventListener('click', browseCwd);
 cwdOpenBtn.addEventListener('click', () => { if (currentCwd) window.duocli.openFolder(currentCwd); });
-cwdInput.addEventListener('change', () => { const v = cwdInput.value.trim(); if (v) { currentCwd = v; localStorage.setItem('duocli_cwd', v); startFileWatcher(v); } });
+
+// 最近工作目录下拉
+function renderRecentCwdDropdown(): void {
+  cwdRecentDropdown.innerHTML = '';
+  const list = getRecentCwds();
+  if (list.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'cwd-recent-empty';
+    empty.textContent = '暂无最近目录';
+    cwdRecentDropdown.appendChild(empty);
+    return;
+  }
+  for (const path of list) {
+    const item = document.createElement('div');
+    item.className = 'cwd-recent-item';
+    item.textContent = path;
+    item.title = path;
+    item.addEventListener('click', () => {
+      currentCwd = path;
+      cwdInput.value = path;
+      localStorage.setItem('duocli_cwd', path);
+      addRecentCwd(path);
+      startFileWatcher(path);
+      cwdRecentDropdown.classList.remove('open');
+    });
+    cwdRecentDropdown.appendChild(item);
+  }
+}
+
+cwdRecentBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const isOpen = cwdRecentDropdown.classList.contains('open');
+  if (isOpen) {
+    cwdRecentDropdown.classList.remove('open');
+  } else {
+    renderRecentCwdDropdown();
+    cwdRecentDropdown.classList.add('open');
+  }
+});
+
+document.addEventListener('click', () => {
+  cwdRecentDropdown.classList.remove('open');
+});
+cwdRecentDropdown.addEventListener('click', (e) => { e.stopPropagation(); });
+cwdInput.addEventListener('change', () => { const v = cwdInput.value.trim(); if (v) { currentCwd = v; localStorage.setItem('duocli_cwd', v); addRecentCwd(v); startFileWatcher(v); } });
 cwdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') cwdInput.blur(); });
 toolbarNewBtn.addEventListener('click', () => { createSession(); });
 
@@ -1216,13 +1364,13 @@ window.duocli.onPtyData((id, data) => {
   if (archivedSessions.has(id)) {
     archivedSessions.get(id)!.updateTime = Date.now();
   }
-  // 非活跃会话：立即标记工作中（黄点），检测完成后转为等待输入（绿点）
+  // 所有会话都追踪状态（工作中/等待输入），确保切换查看后状态不丢失
   const activeId = termManager.getActiveId();
-  if (id !== activeId && (sessionTitles.has(id) || archivedSessions.has(id))) {
-    // 立即标记为工作中（黄点）
+  if (sessionTitles.has(id) || archivedSessions.has(id)) {
+    // 标记为工作中（黄点）
     if (!sessionUnread.has(id) && !sessionBusy.has(id)) {
       sessionBusy.add(id);
-      renderSessionList();
+      if (id !== activeId) renderSessionList();
     }
 
     // 累积最近数据用于提示符检测（保留最后 500 字符）
@@ -1239,10 +1387,11 @@ window.duocli.onPtyData((id, data) => {
       unreadTimers.delete(id);
       recentDataBuffer.delete(id);
       sessionBusy.delete(id);
-      if (!sessionUnread.has(id)) {
+      // 当前活跃会话不标绿点（用户正在看着）
+      if (id !== activeId && !sessionUnread.has(id)) {
         sessionUnread.add(id);
-        renderSessionList();
       }
+      if (id !== activeId) renderSessionList();
     } else {
       // 未检测到提示符 → 重置静默计时器（5 秒无新数据后转为等待输入）
       clearTimeout(unreadTimers.get(id));
@@ -1250,10 +1399,11 @@ window.duocli.onPtyData((id, data) => {
         unreadTimers.delete(id);
         recentDataBuffer.delete(id);
         sessionBusy.delete(id);
-        if (!sessionUnread.has(id)) {
+        const currentActiveId = termManager.getActiveId();
+        if (id !== currentActiveId && !sessionUnread.has(id)) {
           sessionUnread.add(id);
-          renderSessionList();
         }
+        renderSessionList();
       }, 5000));
     }
   }
