@@ -300,9 +300,11 @@ export class TerminalManager {
   private activeId: string | null = null;
   private terminalArea: HTMLElement;
   private resizeObserver: ResizeObserver;
+  private onResize: ((id: string, cols: number, rows: number) => void) | null = null;
 
-  constructor(terminalArea: HTMLElement) {
+  constructor(terminalArea: HTMLElement, onResize?: (id: string, cols: number, rows: number) => void) {
     this.terminalArea = terminalArea;
+    this.onResize = onResize || null;
     this.resizeObserver = new ResizeObserver(() => {
       this.fitActive();
     });
@@ -418,6 +420,10 @@ export class TerminalManager {
     // 延迟fit确保DOM更新
     setTimeout(() => {
       target.fitAddon.fit();
+      if (this.onResize) {
+        const { cols, rows } = target.terminal;
+        this.onResize(target.id, cols, rows);
+      }
       target.terminal.focus();
     }, 50);
   }
@@ -467,6 +473,10 @@ export class TerminalManager {
     const inst = this.instances.get(this.activeId);
     if (inst) {
       inst.fitAddon.fit();
+      if (this.onResize) {
+        const { cols, rows } = inst.terminal;
+        this.onResize(inst.id, cols, rows);
+      }
     }
   }
 

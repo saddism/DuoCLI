@@ -158,7 +158,9 @@ const pinnedSessions: Set<string> = new Set();
 const historyFlushTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
 
 // 终端管理器
-const termManager = new TerminalManager(terminalContent);
+const termManager = new TerminalManager(terminalContent, (id, cols, rows) => {
+  window.duocli.resizePty(id, cols, rows);
+});
 
 // 恢复上次的工作目录和预设命令
 if (savedCwd) {
