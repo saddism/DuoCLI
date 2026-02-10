@@ -1,6 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 contextBridge.exposeInMainWorld('duocli', {
+  // 设置窗口标题
+  setWindowTitle: (title: string) => ipcRenderer.send('window:set-title', title),
+
   // 创建终端
   createPty: (cwd: string, presetCommand: string, themeId: string) =>
     ipcRenderer.invoke('pty:create', cwd, presetCommand, themeId),
@@ -76,4 +79,15 @@ contextBridge.exposeInMainWorld('duocli', {
   aiSelect: (providerId: string) => ipcRenderer.invoke('ai:select', providerId),
   aiSetModel: (providerId: string, model: string) => ipcRenderer.invoke('ai:set-model', providerId, model),
   aiGetSelected: () => ipcRenderer.invoke('ai:get-selected'),
+
+  // 会话历史 API
+  sessionHistoryInit: (sessionId: string, title: string) => ipcRenderer.invoke('session-history:init', sessionId, title),
+  sessionHistoryAppend: (sessionId: string, data: string) => ipcRenderer.send('session-history:append', sessionId, data),
+  sessionHistoryFlush: (sessionId: string) => ipcRenderer.invoke('session-history:flush', sessionId),
+  sessionHistoryFinish: (sessionId: string) => ipcRenderer.invoke('session-history:finish', sessionId),
+  sessionHistoryRename: (sessionId: string, newTitle: string) => ipcRenderer.invoke('session-history:rename', sessionId, newTitle),
+  sessionHistoryList: () => ipcRenderer.invoke('session-history:list'),
+  sessionHistoryRead: (filename: string) => ipcRenderer.invoke('session-history:read', filename),
+  sessionHistoryDelete: (filename: string) => ipcRenderer.invoke('session-history:delete', filename),
+  sessionHistorySummarize: (filename: string) => ipcRenderer.invoke('session-history:summarize', filename),
 });

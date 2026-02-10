@@ -18,12 +18,13 @@ let selectedAiProviderId: string | null = null;
 declare global {
   interface Window {
     duocli: {
-      createPty: (cwd: string, presetCommand: string, themeId: string) => Promise<{ id: string; title: string; themeId: string }>;
+      setWindowTitle: (title: string) => void;
+      createPty: (cwd: string, presetCommand: string, themeId: string) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string }>;
       writePty: (id: string, data: string) => void;
       resizePty: (id: string, cols: number, rows: number) => void;
       destroyPty: (id: string) => void;
       renamePty: (id: string, title: string) => void;
-      getSessions: () => Promise<Array<{ id: string; title: string; themeId: string }>>;
+      getSessions: () => Promise<Array<{ id: string; title: string; themeId: string; cwd: string; displayName: string }>>;
       selectFolder: (currentPath?: string) => Promise<string | null>;
       onPtyData: (cb: (id: string, data: string) => void) => void;
       onTitleUpdate: (cb: (id: string, title: string) => void) => void;
@@ -57,6 +58,16 @@ declare global {
       aiSelect: (providerId: string) => Promise<boolean>;
       aiSetModel: (providerId: string, model: string) => Promise<boolean>;
       aiGetSelected: () => Promise<{ providerId: string | null; model: string | null }>;
+      // 会话历史 API
+      sessionHistoryInit: (sessionId: string, title: string) => Promise<string>;
+      sessionHistoryAppend: (sessionId: string, data: string) => void;
+      sessionHistoryFlush: (sessionId: string) => Promise<void>;
+      sessionHistoryFinish: (sessionId: string) => Promise<void>;
+      sessionHistoryRename: (sessionId: string, newTitle: string) => Promise<void>;
+      sessionHistoryList: () => Promise<Array<{ filename: string; size: number; mtime: number }>>;
+      sessionHistoryRead: (filename: string) => Promise<string>;
+      sessionHistoryDelete: (filename: string) => Promise<void>;
+      sessionHistorySummarize: (filename: string) => Promise<string>;
     };
   }
 }
@@ -68,8 +79,12 @@ let lastPreset = localStorage.getItem('duocli_preset') || '';
 const sessionTitles: Map<string, string> = new Map();
 const sessionThemes: Map<string, string> = new Map();
 const sessionUpdateTimes: Map<string, number> = new Map();
+// 会话工作目录
+const sessionCwds: Map<string, string> = new Map();
+// 会话显示名称（如 Claude全自动、Codex 等）
+const sessionDisplayNames: Map<string, string> = new Map();
 // 归档：终端进程仍在运行，只是从活跃列表隐藏
-const archivedSessions: Map<string, { title: string; themeId: string; updateTime: number }> = new Map();
+const archivedSessions: Map<string, { title: string; themeId: string; updateTime: number; cwd: string; displayName: string }> = new Map();
 
 // DOM 元素
 const cwdInput = document.getElementById('cwd-input') as HTMLInputElement;
@@ -88,6 +103,13 @@ const archivedHeader = document.getElementById('archived-header')!;
 const archivedToggle = document.getElementById('archived-toggle')!;
 const archivedList = document.getElementById('archived-list')!;
 const archivedCount = document.getElementById('archived-count')!;
+const sessionTitleText = document.getElementById('session-title-text')!;
+
+// 历史对话 DOM
+const historyHeader = document.getElementById('history-header')!;
+const historyToggle = document.getElementById('history-toggle')!;
+const historyList = document.getElementById('history-list')!;
+const historyCount = document.getElementById('history-count')!;
 
 // 文件状态栏 DOM
 const fileStatusbar = document.getElementById('file-statusbar')!;
@@ -123,6 +145,11 @@ let currentEditorName: string | null = null;
 const sessionUnread: Set<string> = new Set();
 // 手动改过标题的会话（不再自动更新）
 const sessionTitleLocked: Set<string> = new Set();
+// 置顶会话
+const pinnedSessions: Set<string> = new Set();
+
+// 会话历史 buffer 刷盘
+const historyFlushTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
 
 // 终端管理器
 const termManager = new TerminalManager(terminalContent);
@@ -195,6 +222,26 @@ function updateEmptyState(): void {
   emptyState.style.display = termManager.hasInstances() ? 'none' : 'flex';
 }
 
+function updateSessionTitleBar(): void {
+  const activeId = termManager.getActiveId();
+  if (activeId) {
+    const title = sessionTitles.get(activeId) || '';
+    const displayName = sessionDisplayNames.get(activeId) || '';
+    // 组装标题：DuoCLI-Claude全自动-修改项目样式
+    const parts = ['DuoCLI'];
+    if (displayName) parts.push(displayName);
+    if (title && title !== '新会话') parts.push(title);
+    const fullTitle = parts.join('-');
+    // 内部标题条
+    sessionTitleText.textContent = fullTitle;
+    // macOS 系统窗口标题
+    window.duocli.setWindowTitle(fullTitle);
+  } else {
+    sessionTitleText.textContent = '';
+    window.duocli.setWindowTitle('DuoCLI');
+  }
+}
+
 // 确认弹窗
 function showConfirmDialog(title: string): Promise<'close' | 'archive' | 'cancel'> {
   return new Promise((resolve) => {
@@ -231,12 +278,16 @@ function startTitleEdit(id: string, titleSpan: HTMLElement): void {
   titleSpan.replaceWith(input);
   input.focus();
   input.select();
+  let committed = false;
   const commit = () => {
+    if (committed) return;
+    committed = true;
     const val = input.value.trim();
     if (val && val !== current) {
       sessionTitles.set(id, val);
       sessionTitleLocked.add(id);
       window.duocli.renamePty(id, val);
+      window.duocli.sessionHistoryRename(id, val);
     }
     renderSessionList();
   };
@@ -250,12 +301,17 @@ function startTitleEdit(id: string, titleSpan: HTMLElement): void {
 function renderSessionList(): void {
   const activeId = termManager.getActiveId();
   sessionList.innerHTML = '';
-  // 按创建顺序倒序排列（新建的在最上面）
-  const sortedIds = Array.from(sessionTitles.keys()).reverse();
+  // pinned 优先，再按创建顺序倒序
+  const allIds = Array.from(sessionTitles.keys()).reverse();
+  const sortedIds = [
+    ...allIds.filter(id => pinnedSessions.has(id)),
+    ...allIds.filter(id => !pinnedSessions.has(id)),
+  ];
   for (const id of sortedIds) {
     const title = sessionTitles.get(id)!;
+    const isPinned = pinnedSessions.has(id);
     const item = document.createElement('div');
-    item.className = 'session-item' + (id === activeId ? ' active' : '');
+    item.className = 'session-item' + (id === activeId ? ' active' : '') + (isPinned ? ' pinned' : '');
     const dot = document.createElement('span');
     dot.className = 'session-color-dot';
     const lastUpdate = sessionUpdateTimes.get(id) || 0;
@@ -265,26 +321,60 @@ function renderSessionList(): void {
     } else {
       dot.style.backgroundColor = '#555';
     }
+    // Pin 按钮
+    const pinBtn = document.createElement('button');
+    pinBtn.className = 'session-pin' + (isPinned ? ' pinned' : '');
+    pinBtn.textContent = '\u{1F4CC}';
+    pinBtn.title = isPinned ? '取消置顶' : '置顶';
+    pinBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (pinnedSessions.has(id)) {
+        pinnedSessions.delete(id);
+      } else {
+        pinnedSessions.add(id);
+      }
+      renderSessionList();
+    });
     const titleSpan = document.createElement('span');
     titleSpan.className = 'session-title';
-    titleSpan.textContent = title.charAt(0).toUpperCase() + title.slice(1);
+    titleSpan.textContent = title;
     titleSpan.addEventListener('dblclick', (e) => {
       e.stopPropagation();
       startTitleEdit(id, titleSpan);
     });
+    // 第二行：时间 + displayName
+    const metaRow = document.createElement('div');
+    metaRow.className = 'session-meta-row';
     const timeSpan = document.createElement('span');
     timeSpan.className = 'session-time';
     timeSpan.textContent = friendlyTime(sessionUpdateTimes.get(id) || Date.now());
+    metaRow.appendChild(timeSpan);
+    const displayName = sessionDisplayNames.get(id);
+    if (displayName) {
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'session-display-name';
+      nameSpan.textContent = displayName;
+      metaRow.appendChild(nameSpan);
+    }
     const infoWrap = document.createElement('div');
     infoWrap.className = 'session-info';
     infoWrap.appendChild(titleSpan);
-    infoWrap.appendChild(timeSpan);
+    infoWrap.appendChild(metaRow);
+    const cwd = sessionCwds.get(id);
+    if (cwd) {
+      const cwdSpan = document.createElement('span');
+      cwdSpan.className = 'session-cwd';
+      cwdSpan.textContent = cwd;
+      cwdSpan.title = cwd;
+      infoWrap.appendChild(cwdSpan);
+    }
     const closeBtn = document.createElement('button');
     closeBtn.className = 'session-close';
     closeBtn.textContent = '\u00d7';
     closeBtn.addEventListener('click', (e) => { e.stopPropagation(); handleCloseClick(id); });
     item.addEventListener('click', () => switchSession(id));
     item.appendChild(dot);
+    item.appendChild(pinBtn);
     item.appendChild(infoWrap);
     item.appendChild(closeBtn);
     sessionList.appendChild(item);
@@ -342,9 +432,18 @@ async function createSession(): Promise<void> {
   sessionTitles.set(result.id, result.title);
   sessionThemes.set(result.id, result.themeId);
   sessionUpdateTimes.set(result.id, Date.now());
+  sessionCwds.set(result.id, result.cwd);
+  sessionDisplayNames.set(result.id, result.displayName);
+  // 初始化会话历史记录
+  window.duocli.sessionHistoryInit(result.id, result.title);
+  const flushTimer = setInterval(() => {
+    window.duocli.sessionHistoryFlush(result.id);
+  }, 2000);
+  historyFlushTimers.set(result.id, flushTimer);
   termManager.create(result.id, result.themeId, currentCwd, (data) => { window.duocli.writePty(result.id, data); });
   updateEmptyState();
   renderSessionList();
+  updateSessionTitleBar();
   setTimeout(() => {
     const dims = termManager.getActiveDimensions();
     if (dims) window.duocli.resizePty(result.id, dims.cols, dims.rows);
@@ -355,6 +454,7 @@ function switchSession(id: string): void {
   termManager.switchTo(id);
   sessionUnread.delete(id);
   renderSessionList();
+  updateSessionTitleBar();
   renderFileStatusbar();
   const dims = termManager.getActiveDimensions();
   if (dims) window.duocli.resizePty(id, dims.cols, dims.rows);
@@ -377,10 +477,14 @@ function archiveSession(id: string): void {
   const title = sessionTitles.get(id) || '终端';
   const themeId = sessionThemes.get(id) || 'vscode-dark';
   const updateTime = sessionUpdateTimes.get(id) || Date.now();
-  archivedSessions.set(id, { title, themeId, updateTime });
+  const cwd = sessionCwds.get(id) || '';
+  const displayName = sessionDisplayNames.get(id) || '';
+  archivedSessions.set(id, { title, themeId, updateTime, cwd, displayName });
   sessionTitles.delete(id);
   sessionThemes.delete(id);
   sessionUpdateTimes.delete(id);
+  sessionCwds.delete(id);
+  sessionDisplayNames.delete(id);
   // 隐藏终端但不销毁
   termManager.hide(id);
   updateEmptyState();
@@ -396,6 +500,8 @@ function restoreSession(id: string): void {
   sessionTitles.set(id, info.title);
   sessionThemes.set(id, info.themeId);
   sessionUpdateTimes.set(id, info.updateTime);
+  if (info.cwd) sessionCwds.set(id, info.cwd);
+  if (info.displayName) sessionDisplayNames.set(id, info.displayName);
   sessionUnread.delete(id);
   termManager.switchTo(id);
   updateEmptyState();
@@ -408,6 +514,10 @@ function restoreSession(id: string): void {
 
 // 彻底关闭终端
 function destroySession(id: string): void {
+  // 结束会话历史记录
+  const flushTimer = historyFlushTimers.get(id);
+  if (flushTimer) { clearInterval(flushTimer); historyFlushTimers.delete(id); }
+  window.duocli.sessionHistoryFinish(id);
   window.duocli.destroyPty(id);
   sessionTitles.delete(id);
   sessionThemes.delete(id);
@@ -415,10 +525,16 @@ function destroySession(id: string): void {
   archivedSessions.delete(id);
   sessionUnread.delete(id);
   sessionTitleLocked.delete(id);
+  pinnedSessions.delete(id);
+  sessionCwds.delete(id);
+  sessionDisplayNames.delete(id);
   termManager.destroy(id);
   updateEmptyState();
   renderSessionList();
   renderArchivedList();
+  updateSessionTitleBar();
+  // 刷新历史对话列表
+  if (!historyList.classList.contains('collapsed')) refreshHistory();
 }
 
 async function browseCwd(): Promise<void> {
@@ -564,6 +680,145 @@ function renderAiProviders(providers: AIProviderInfo[]): void {
     item.appendChild(selectBtn);
     aiProviderList.appendChild(item);
   }
+}
+
+// ========== 历史对话 ==========
+
+async function refreshHistory(): Promise<void> {
+  const items = await window.duocli.sessionHistoryList();
+  historyCount.textContent = String(items.length);
+  historyList.innerHTML = '';
+  if (items.length === 0) {
+    historyList.innerHTML = '<div class="snapshot-notice">暂无历史对话</div>';
+    return;
+  }
+  for (const item of items) {
+    const title = item.filename.replace(/_\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.txt$/, '').replace(/_/g, ' ');
+    const el = document.createElement('div');
+    el.className = 'history-item';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'history-item-title';
+    titleEl.textContent = title;
+
+    const metaEl = document.createElement('div');
+    metaEl.className = 'history-item-meta';
+    const sizeKB = (item.size / 1024).toFixed(1);
+    metaEl.textContent = `${friendlyTime(item.mtime)} · ${sizeKB} KB`;
+
+    const actionsEl = document.createElement('div');
+    actionsEl.className = 'history-item-actions';
+
+    const viewBtn = document.createElement('button');
+    viewBtn.className = 'history-action-btn';
+    viewBtn.textContent = '查看全文';
+    viewBtn.addEventListener('click', (e) => { e.stopPropagation(); showHistoryDialog(item.filename, title); });
+
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'history-action-btn';
+    copyBtn.textContent = '复制';
+    copyBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const content = await window.duocli.sessionHistoryRead(item.filename);
+      navigator.clipboard.writeText(content);
+      copyBtn.textContent = '已复制';
+      setTimeout(() => { copyBtn.textContent = '复制'; }, 1500);
+    });
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'history-action-btn danger';
+    delBtn.textContent = '删除';
+    delBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await window.duocli.sessionHistoryDelete(item.filename);
+      refreshHistory();
+    });
+
+    actionsEl.appendChild(viewBtn);
+    actionsEl.appendChild(copyBtn);
+    actionsEl.appendChild(delBtn);
+    el.appendChild(titleEl);
+    el.appendChild(metaEl);
+    el.appendChild(actionsEl);
+
+    el.addEventListener('click', () => showHistoryDialog(item.filename, title));
+    historyList.appendChild(el);
+  }
+}
+
+async function showHistoryDialog(filename: string, title: string): Promise<void> {
+  const content = await window.duocli.sessionHistoryRead(filename);
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+
+  const dialog = document.createElement('div');
+  dialog.className = 'history-dialog';
+
+  // 头部
+  const header = document.createElement('div');
+  header.className = 'history-dialog-header';
+  const titleEl = document.createElement('span');
+  titleEl.className = 'history-dialog-title';
+  titleEl.textContent = title;
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'history-dialog-close';
+  closeBtn.textContent = '\u00d7';
+  closeBtn.addEventListener('click', () => overlay.remove());
+  header.appendChild(titleEl);
+  header.appendChild(closeBtn);
+
+  // 总结区域（初始隐藏）
+  const summaryBox = document.createElement('div');
+  summaryBox.className = 'history-summary-box';
+  summaryBox.style.display = 'none';
+
+  // 操作按钮
+  const actions = document.createElement('div');
+  actions.className = 'history-dialog-actions';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'toolbar-btn';
+  copyBtn.textContent = '复制全文';
+  copyBtn.addEventListener('click', () => {
+    navigator.clipboard.writeText(content);
+    copyBtn.textContent = '已复制';
+    setTimeout(() => { copyBtn.textContent = '复制全文'; }, 1500);
+  });
+
+  const summarizeBtn = document.createElement('button');
+  summarizeBtn.className = 'toolbar-btn';
+  summarizeBtn.style.background = '#e5a100';
+  summarizeBtn.textContent = 'AI 总结';
+  summarizeBtn.addEventListener('click', async () => {
+    summaryBox.style.display = 'block';
+    summaryBox.textContent = '正在生成总结...';
+    summarizeBtn.textContent = '总结中...';
+    (summarizeBtn as HTMLButtonElement).disabled = true;
+    try {
+      const summary = await window.duocli.sessionHistorySummarize(filename);
+      summaryBox.textContent = summary || '(无法生成总结)';
+    } catch {
+      summaryBox.textContent = '(总结生成失败)';
+    }
+    summarizeBtn.textContent = 'AI 总结';
+    (summarizeBtn as HTMLButtonElement).disabled = false;
+  });
+
+  actions.appendChild(copyBtn);
+  actions.appendChild(summarizeBtn);
+
+  // 内容区域
+  const contentEl = document.createElement('div');
+  contentEl.className = 'history-dialog-content';
+  contentEl.textContent = content;
+
+  dialog.appendChild(header);
+  dialog.appendChild(summaryBox);
+  dialog.appendChild(actions);
+  dialog.appendChild(contentEl);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
 }
 
 // ========== 快照功能 ==========
@@ -921,10 +1176,20 @@ archivedHeader.addEventListener('click', () => {
   archivedToggle.classList.toggle('expanded');
 });
 
+// 历史对话折叠/展开
+historyHeader.addEventListener('click', () => {
+  const wasCollapsed = historyList.classList.contains('collapsed');
+  historyList.classList.toggle('collapsed');
+  historyToggle.classList.toggle('expanded');
+  if (wasCollapsed) refreshHistory();
+});
+
 // ========== IPC 监听 ==========
 
 window.duocli.onPtyData((id, data) => {
   termManager.write(id, data);
+  // 追加到会话历史 buffer
+  window.duocli.sessionHistoryAppend(id, data);
   if (sessionTitles.has(id)) {
     sessionUpdateTimes.set(id, Date.now());
   }
@@ -947,6 +1212,9 @@ window.duocli.onTitleUpdate((id, title) => {
     sessionTitles.set(id, title);
     sessionUpdateTimes.set(id, Date.now());
     renderSessionList();
+    updateSessionTitleBar();
+    // 同步重命名历史文件
+    window.duocli.sessionHistoryRename(id, title);
   }
   if (archivedSessions.has(id)) {
     const info = archivedSessions.get(id)!;
@@ -957,16 +1225,25 @@ window.duocli.onTitleUpdate((id, title) => {
 });
 
 window.duocli.onPtyExit((id) => {
+  // 结束会话历史记录
+  const flushTimer = historyFlushTimers.get(id);
+  if (flushTimer) { clearInterval(flushTimer); historyFlushTimers.delete(id); }
+  window.duocli.sessionHistoryFinish(id);
   sessionTitles.delete(id);
   sessionThemes.delete(id);
   sessionUpdateTimes.delete(id);
   archivedSessions.delete(id);
   sessionUnread.delete(id);
   sessionTitleLocked.delete(id);
+  pinnedSessions.delete(id);
+  sessionCwds.delete(id);
+  sessionDisplayNames.delete(id);
   termManager.destroy(id);
   updateEmptyState();
   renderSessionList();
   renderArchivedList();
+  updateSessionTitleBar();
+  if (!historyList.classList.contains('collapsed')) refreshHistory();
 });
 
 // 监听快照自动创建事件

@@ -178,9 +178,25 @@ class FilePathLinkProvider implements ILinkProvider {
     const line = this.terminal.buffer.active.getLine(y - 1);
     if (!line) { callback(undefined); return; }
 
+    // 读取行文本，跳过宽字符（中文等）后面的空 cell
+    // 同时记录 textIndex → cellIndex 映射，用于计算链接坐标
     let text = '';
+    const textToCellStart: number[] = []; // textToCellStart[textIdx] = cellIdx
     for (let i = 0; i < line.length; i++) {
-      text += line.getCell(i)?.getChars() || ' ';
+      const cell = line.getCell(i);
+      const chars = cell?.getChars() || '';
+      const width = cell?.getWidth() || 1;
+      if (chars.length > 0) {
+        for (let c = 0; c < chars.length; c++) {
+          textToCellStart.push(i);
+        }
+        text += chars;
+      } else if (width === 0) {
+        // 宽字符的第二个 cell，跳过
+      } else {
+        textToCellStart.push(i);
+        text += ' ';
+      }
     }
 
     const cwd = this.getCwd();
@@ -225,9 +241,12 @@ class FilePathLinkProvider implements ILinkProvider {
       }
       if (resolved.endsWith('/')) resolved = resolved.slice(0, -1);
 
-      const startX = m.index + 1;
+      // 用 textToCellStart 映射把 text index 转换为 cell index
+      const cellStart = (textToCellStart[m.index] ?? m.index) + 1;
+      const endTextIdx = m.index + m.display.length - 1;
+      const cellEnd = (textToCellStart[endTextIdx] ?? endTextIdx) + 1;
       links.push({
-        range: { start: { x: startX, y }, end: { x: startX + m.display.length - 1, y } },
+        range: { start: { x: cellStart, y }, end: { x: cellEnd, y } },
         text: m.display,
         activate: () => { this.onClickCallback(resolved); },
       });
@@ -298,6 +317,8 @@ export class TerminalManager {
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
       cursorBlink: true,
       allowProposedApi: true,
+      scrollback: 10000,
+      scrollOnOutput: true,
     });
 
     const fitAddon = new FitAddon();
@@ -357,6 +378,28 @@ export class TerminalManager {
         }
       } catch { /* 静默失败 */ }
     }, true);
+
+    // 浮动"滚到底部"按钮
+    const scrollBtn = document.createElement('button');
+    scrollBtn.className = 'scroll-bottom-btn';
+    scrollBtn.textContent = '⬇';
+    scrollBtn.title = '滚到底部';
+    scrollBtn.style.display = 'none';
+    container.appendChild(scrollBtn);
+
+    scrollBtn.addEventListener('click', () => {
+      terminal.scrollToBottom();
+      scrollBtn.style.display = 'none';
+    });
+
+    // 监听滚动：不在底部时显示按钮
+    const checkScroll = () => {
+      const buf = terminal.buffer.active;
+      const atBottom = buf.viewportY >= buf.baseY;
+      scrollBtn.style.display = atBottom ? 'none' : 'block';
+    };
+    terminal.onScroll(() => checkScroll());
+    terminal.onWriteParsed(() => checkScroll());
 
     this.instances.set(id, { id, terminal, fitAddon, container, themeId });
     this.switchTo(id);

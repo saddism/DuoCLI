@@ -38,6 +38,7 @@ html, body {
   padding: 0 12px;
   gap: 10px;
   -webkit-app-region: drag;
+  overflow: hidden;
 }
 
 #toolbar > * {
@@ -78,6 +79,9 @@ html, body {
   color: var(--text-primary);
   font-size: 12px;
   outline: none;
+  max-width: 160px;
+  flex-shrink: 1;
+  min-width: 0;
 }
 
 .toolbar-select:focus {
@@ -87,7 +91,7 @@ html, body {
 /* 自定义配色下拉 */
 .custom-select {
   position: relative;
-  min-width: 130px;
+  min-width: 100px;
 }
 
 .custom-select-display {
@@ -211,6 +215,31 @@ html, body {
   background: var(--bg-primary);
 }
 
+/* 会话标题栏 */
+#session-title-bar {
+  height: 28px;
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  flex-shrink: 0;
+}
+
+#session-title-bar:empty,
+#session-title-bar:not(:has(#session-title-text:not(:empty))) {
+  display: none;
+}
+
+#session-title-text {
+  font-size: 12px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
 #terminal-content {
   flex: 1;
   min-height: 0;
@@ -239,6 +268,32 @@ html, body {
 
 .terminal-container .xterm-screen {
   height: 100%;
+}
+
+.scroll-bottom-btn {
+  position: absolute;
+  right: 20px;
+  bottom: 16px;
+  z-index: 10;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid var(--border-color);
+  background: var(--bg-sidebar);
+  color: var(--text-primary);
+  font-size: 14px;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.scroll-bottom-btn:hover {
+  opacity: 1;
+  background: var(--accent);
+  color: #fff;
 }
 
 /* 右侧边栏 */
@@ -338,9 +393,33 @@ html, body {
   font-size: 13px;
 }
 
+.session-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .session-time {
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+.session-display-name {
+  font-size: 10px;
+  color: var(--accent);
+  opacity: 0.8;
+  white-space: nowrap;
+}
+
+.session-cwd {
+  font-size: 10px;
+  color: var(--text-secondary);
+  opacity: 0.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
 }
 
 .session-close {
@@ -366,6 +445,45 @@ html, body {
 .session-close:hover {
   background: var(--danger);
   color: #fff;
+}
+
+/* Pin 置顶按钮 */
+.session-pin {
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  flex-shrink: 0;
+}
+
+.session-item:hover .session-pin {
+  opacity: 0.6;
+}
+
+.session-pin.pinned {
+  opacity: 1;
+  color: #e5a100;
+}
+
+.session-pin:hover {
+  opacity: 1 !important;
+}
+
+/* 置顶会话左边框金色 */
+.session-item.pinned {
+  border-left-color: #e5a100;
+}
+
+.session-item.pinned.active {
+  border-left-color: #e5a100;
 }
 
 .session-title-input {
@@ -548,6 +666,112 @@ html, body {
 
 #archived-list.collapsed {
   display: none;
+}
+
+/* 历史对话区域 */
+#history-section {
+  border-top: 1px solid var(--border-color);
+}
+
+#history-header {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  cursor: pointer;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+#history-header:hover {
+  background: var(--hover-bg);
+}
+
+#history-toggle {
+  font-size: 10px;
+  transition: transform 0.2s;
+}
+
+#history-toggle.expanded {
+  transform: rotate(90deg);
+}
+
+#history-count {
+  margin-left: auto;
+  background: var(--border-color);
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+}
+
+#history-list {
+  overflow-y: auto;
+  max-height: 300px;
+}
+
+#history-list.collapsed {
+  display: none;
+}
+
+.history-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  border-left: 3px solid transparent;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.history-item:hover {
+  background: var(--hover-bg);
+}
+
+.history-item-title {
+  font-size: 12px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-item-meta {
+  font-size: 10px;
+  color: var(--text-secondary);
+  display: flex;
+  gap: 8px;
+}
+
+.history-item-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  opacity: 0;
+}
+
+.history-item:hover .history-item-actions {
+  opacity: 1;
+}
+
+.history-action-btn {
+  padding: 2px 8px;
+  font-size: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.history-action-btn:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.history-action-btn.danger:hover {
+  background: var(--danger);
+  border-color: var(--danger);
 }
 
 /* 确认弹窗 */
@@ -1125,4 +1349,84 @@ html, body {
   margin-top: 4px;
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+/* 历史对话全文弹窗 */
+.history-dialog {
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 16px;
+  width: 80vw;
+  max-width: 800px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.history-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.history-dialog-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.history-dialog-close {
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 16px;
+  cursor: pointer;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.history-dialog-close:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.history-dialog-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.history-dialog-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: #1a1a1a;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 12px;
+  font-family: Menlo, Monaco, 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text-primary);
+}
+
+.history-summary-box {
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  background: rgba(0, 120, 212, 0.08);
+  border-left: 2px solid var(--accent);
+  border-radius: 3px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  flex-shrink: 0;
 }

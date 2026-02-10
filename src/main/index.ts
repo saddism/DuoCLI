@@ -2,10 +2,10 @@ import { app, BrowserWindow, ipcMain, dialog, clipboard, nativeImage, shell } fr
 import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
-import { PtyManager } from './pty-manager';
+import { PtyManager, getDisplayName } from './pty-manager';
 import { SnapshotManager } from './snapshot-manager';
 import { AIConfigManager } from './ai-config';
-import { setAIConfig, aiDiffSummary } from './ollama';
+import { setAIConfig, aiDiffSummary, aiSummarize } from './ollama';
 
 // 文件监听器
 let fileWatcher: fs.FSWatcher | null = null;
@@ -14,6 +14,38 @@ let watchingCwd: string | null = null;
 import * as os from 'os';
 
 const PASTE_IMAGE_DIR = path.join(os.tmpdir(), 'duocli-paste');
+
+// 会话历史目录
+const SESSION_HISTORY_DIR = path.join(app.getPath('userData'), 'session-history');
+const MAX_HISTORY_FILES = 50;
+// 内存 buffer：sessionId → 待写入数据
+const historyBuffers: Map<string, string> = new Map();
+// sessionId → 文件路径映射
+const historyFilePaths: Map<string, string> = new Map();
+
+function ensureHistoryDir(): void {
+  if (!fs.existsSync(SESSION_HISTORY_DIR)) {
+    fs.mkdirSync(SESSION_HISTORY_DIR, { recursive: true });
+  }
+}
+
+function sanitizeFilename(name: string): string {
+  return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').substring(0, 80);
+}
+
+function cleanupOldHistory(): void {
+  try {
+    const files = fs.readdirSync(SESSION_HISTORY_DIR)
+      .filter(f => f.endsWith('.txt'))
+      .map(f => ({ name: f, time: fs.statSync(path.join(SESSION_HISTORY_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.time - a.time);
+    if (files.length > MAX_HISTORY_FILES) {
+      for (const f of files.slice(MAX_HISTORY_FILES)) {
+        fs.unlinkSync(path.join(SESSION_HISTORY_DIR, f.name));
+      }
+    }
+  } catch { /* ignore */ }
+}
 
 // AI 偏好持久化
 function getPreferencePath(): string {
@@ -81,6 +113,27 @@ function createWindow(): void {
   });
 
   mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+
+  // 关闭窗口时，如果有活跃终端则弹确认
+  mainWindow.on('close', (e) => {
+    const sessions = ptyManager.getAllSessions();
+    if (sessions.length === 0 || !mainWindow) return;
+    e.preventDefault();
+    dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: '关闭 DuoCLI',
+      message: `当前有 ${sessions.length} 个终端正在运行`,
+      detail: '关闭应用后所有终端进程都会被终止，确定要关闭吗？',
+      buttons: ['取消', '关闭'],
+      defaultId: 0,
+      cancelId: 0,
+    }).then(({ response }) => {
+      if (response === 1) {
+        mainWindow?.removeAllListeners('close');
+        mainWindow?.close();
+      }
+    });
+  });
 }
 
 function setupPtyManager(): void {
@@ -116,6 +169,11 @@ function setupPtyManager(): void {
 }
 
 function registerIPC(): void {
+  // 设置窗口标题
+  ipcMain.on('window:set-title', (_e, title: string) => {
+    if (mainWindow) mainWindow.setTitle(title);
+  });
+
   // 创建终端
   ipcMain.handle('pty:create', (_e, cwd: string, presetCommand: string, themeId: string) => {
     const session = ptyManager.create(cwd, presetCommand, themeId);
@@ -123,6 +181,8 @@ function registerIPC(): void {
       id: session.id,
       title: session.title,
       themeId: session.themeId,
+      cwd: session.cwd,
+      displayName: getDisplayName(session.presetCommand),
     };
   });
 
@@ -152,6 +212,8 @@ function registerIPC(): void {
       id: s.id,
       title: s.title,
       themeId: s.themeId,
+      cwd: s.cwd,
+      displayName: getDisplayName(s.presetCommand),
     }));
   });
 
@@ -385,6 +447,96 @@ function registerIPC(): void {
 
   ipcMain.handle('ai:get-selected', () => {
     return loadAiPreferenceData();
+  });
+
+  // ========== 会话历史 IPC ==========
+
+  ipcMain.handle('session-history:init', (_e, sessionId: string, title: string) => {
+    ensureHistoryDir();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const safeName = sanitizeFilename(title);
+    const filename = `${safeName}_${ts}.txt`;
+    const filePath = path.join(SESSION_HISTORY_DIR, filename);
+    historyFilePaths.set(sessionId, filePath);
+    historyBuffers.set(sessionId, '');
+    return filename;
+  });
+
+  ipcMain.on('session-history:append', (_e, sessionId: string, data: string) => {
+    // 剥离 ANSI 转义序列，保存干净文本
+    const clean = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+    const existing = historyBuffers.get(sessionId) || '';
+    historyBuffers.set(sessionId, existing + clean);
+  });
+
+  ipcMain.handle('session-history:flush', (_e, sessionId: string) => {
+    const buf = historyBuffers.get(sessionId);
+    const filePath = historyFilePaths.get(sessionId);
+    if (!buf || !filePath) return;
+    try {
+      fs.appendFileSync(filePath, buf);
+      historyBuffers.set(sessionId, '');
+    } catch { /* ignore */ }
+  });
+
+  ipcMain.handle('session-history:finish', (_e, sessionId: string) => {
+    const buf = historyBuffers.get(sessionId);
+    const filePath = historyFilePaths.get(sessionId);
+    if (buf && filePath) {
+      try { fs.appendFileSync(filePath, buf); } catch { /* ignore */ }
+    }
+    historyBuffers.delete(sessionId);
+    historyFilePaths.delete(sessionId);
+    cleanupOldHistory();
+  });
+
+  ipcMain.handle('session-history:rename', (_e, sessionId: string, newTitle: string) => {
+    const oldPath = historyFilePaths.get(sessionId);
+    if (!oldPath || !fs.existsSync(oldPath)) return;
+    const oldName = path.basename(oldPath);
+    const tsPart = oldName.substring(oldName.lastIndexOf('_'));
+    const safeName = sanitizeFilename(newTitle);
+    const newFilename = `${safeName}${tsPart}`;
+    const newPath = path.join(SESSION_HISTORY_DIR, newFilename);
+    try {
+      fs.renameSync(oldPath, newPath);
+      historyFilePaths.set(sessionId, newPath);
+    } catch { /* ignore */ }
+  });
+
+  ipcMain.handle('session-history:list', () => {
+    ensureHistoryDir();
+    try {
+      return fs.readdirSync(SESSION_HISTORY_DIR)
+        .filter(f => f.endsWith('.txt'))
+        .map(f => {
+          const stat = fs.statSync(path.join(SESSION_HISTORY_DIR, f));
+          return { filename: f, size: stat.size, mtime: stat.mtimeMs };
+        })
+        .sort((a, b) => b.mtime - a.mtime);
+    } catch { return []; }
+  });
+
+  ipcMain.handle('session-history:read', (_e, filename: string) => {
+    const filePath = path.join(SESSION_HISTORY_DIR, filename);
+    try { return fs.readFileSync(filePath, 'utf-8'); } catch { return ''; }
+  });
+
+  ipcMain.handle('session-history:delete', (_e, filename: string) => {
+    const filePath = path.join(SESSION_HISTORY_DIR, filename);
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  });
+
+  ipcMain.handle('session-history:summarize', async (_e, filename: string) => {
+    const filePath = path.join(SESSION_HISTORY_DIR, filename);
+    try {
+      const raw = fs.readFileSync(filePath, 'utf-8');
+      if (!raw.trim()) return '(空会话)';
+      // 取最后 3000 字符用于总结
+      const text = raw.slice(-3000);
+      const summary = await aiSummarize(text);
+      return summary || '(无法生成总结)';
+    } catch { return '(读取失败)'; }
   });
 }
 

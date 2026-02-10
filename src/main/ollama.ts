@@ -35,8 +35,27 @@ export function getAIConfig(): AIClientConfig | null {
   return currentConfig;
 }
 
+// 过滤终端输出中的 ASCII art、ANSI 转义序列和装饰性内容
+function cleanTerminalOutput(raw: string): string {
+  const lines = raw.split('\n');
+  const cleaned: string[] = [];
+  for (const line of lines) {
+    // 去掉 ANSI 转义序列
+    const plain = line.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '').trim();
+    if (!plain) continue;
+    // 跳过 ASCII art 行：主要由非字母数字字符组成（如 ╭╰│─═╗╔║▓░▒█ 等）
+    const alphanumCount = (plain.match(/[a-zA-Z0-9\u4e00-\u9fff]/g) || []).length;
+    if (plain.length > 5 && alphanumCount / plain.length < 0.3) continue;
+    // 跳过纯重复字符行（如 ====、----、****）
+    if (/^(.)\1{4,}$/.test(plain)) continue;
+    cleaned.push(plain);
+  }
+  return cleaned.join('\n');
+}
+
 export async function aiSummarize(buffer: string): Promise<string> {
-  const text = buffer.slice(-1000);
+  const raw = buffer.slice(-1000);
+  const text = cleanTerminalOutput(raw);
 
   aiLog('========== aiSummarize 开始 ==========');
   aiLog(`输入文本长度: ${text.length}`);

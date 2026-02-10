@@ -52,6 +52,9 @@
   <!-- 主体 -->
   <div id="main">
     <div id="terminal-area">
+      <div id="session-title-bar">
+        <span id="session-title-text"></span>
+      </div>
       <div id="terminal-content">
         <div id="empty-state">选择工作目录后点击「新建终端」开始</div>
       </div>
@@ -80,6 +83,14 @@
             <span id="archived-count">0</span>
           </div>
           <div id="archived-list" class="collapsed"></div>
+        </div>
+        <div id="history-section">
+          <div id="history-header">
+            <span id="history-toggle">&#9654;</span>
+            <span>历史对话</span>
+            <span id="history-count">0</span>
+          </div>
+          <div id="history-list" class="collapsed"></div>
         </div>
       </div>
 

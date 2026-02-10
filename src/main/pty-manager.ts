@@ -25,6 +25,24 @@ interface PtyManagerEvents {
   onPasteInput?: (id: string, cwd: string) => void;
 }
 
+// 命令 → 友好显示名称映射
+const PRESET_DISPLAY_NAMES: Record<string, string> = {
+  'claude': 'Claude',
+  'claude --dangerously-skip-permissions': 'Claude全自动',
+  'codex': 'Codex',
+  'codex --full-auto': 'Codex全自动',
+  'kimi': 'Kimi',
+  'kimi --yolo': 'Kimi全自动',
+  'opencode': 'OpenCode',
+  'agent': 'Cursor',
+  'gemini': 'Gemini',
+  'gemini --yolo': 'Gemini全自动',
+};
+
+export function getDisplayName(presetCommand: string): string {
+  return PRESET_DISPLAY_NAMES[presetCommand] || presetCommand || '终端';
+}
+
 export class PtyManager {
   private sessions: Map<string, PtySession> = new Map();
   private nextId = 1;
@@ -54,7 +72,7 @@ export class PtyManager {
       buffer: '',
       userInputs: [],
       commandCount: 0,
-      title: presetCommand ? `${presetCommand}:新会话` : '终端:新会话',
+      title: '新会话',
       titleLocked: false,
       titleGenerated: false,
       cwd,
@@ -187,8 +205,7 @@ export class PtyManager {
         ? session.userInputs.join('\n')
         : session.buffer;
       const summary = await aiSummarize(source);
-      const prefix = session.presetCommand || '终端';
-      session.title = `${prefix}:${summary}`;
+      session.title = summary;
       session.titleGenerated = true;
       // 总结后清理
       session.buffer = session.buffer.slice(-500);
