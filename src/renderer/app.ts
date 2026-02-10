@@ -429,8 +429,8 @@ function renderSessionList(): void {
       const isPinned = pinnedSessions.has(id);
       const item = document.createElement('div');
       item.className = 'session-item' + (id === activeId ? ' active' : '') + (isPinned ? ' pinned' : '');
-      // 路径颜色染背景
-      item.style.backgroundColor = color + '12'; // 约 7% 透明度
+      // 路径颜色通过 CSS 变量传递，避免内联样式覆盖 active 背景
+      item.style.setProperty('--group-color', color + '12');
 
       const dot = document.createElement('span');
       dot.className = 'session-color-dot';
@@ -565,11 +565,13 @@ async function createSession(): Promise<void> {
 }
 
 function switchSession(id: string): void {
+  const prev = termManager.getActiveId();
   termManager.switchTo(id);
   // 只清除"等待输入"（绿点），不清除"工作中"（黄点）
   // 用户查看了就不算未读，但工作中状态应由数据流驱动
-  sessionUnread.delete(id);
-  renderSessionList();
+  const hadUnread = sessionUnread.delete(id);
+  // 切换到不同会话才重渲染列表，避免重建 DOM 导致 dblclick 无法触发
+  if (prev !== id || hadUnread) renderSessionList();
   updateSessionTitleBar();
   renderFileStatusbar();
   const dims = termManager.getActiveDimensions();
