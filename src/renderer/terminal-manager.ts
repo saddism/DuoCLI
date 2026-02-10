@@ -1,5 +1,6 @@
 import { Terminal, IBufferLine, ILinkProvider, ILink } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { WebLinksAddon } from '@xterm/addon-web-links';
 
 // 终端配色方案
 const THEMES: Record<string, any> = {
@@ -332,6 +333,7 @@ export class TerminalManager {
     this.terminalArea.appendChild(container);
 
     terminal.open(container);
+    terminal.loadAddon(new WebLinksAddon());
     terminal.onData((data) => onData(data));
 
     // 注册文件路径链接检测
