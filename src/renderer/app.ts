@@ -143,6 +143,10 @@ let currentEditorName: string | null = null;
 
 // 未读消息状态
 const sessionUnread: Set<string> = new Set();
+// 未读延迟计时器（静默超时检测）
+const unreadTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+// 最近收到的数据缓冲（用于提示符检测）
+const recentDataBuffer: Map<string, string> = new Map();
 // 手动改过标题的会话（不再自动更新）
 const sessionTitleLocked: Set<string> = new Set();
 // 置顶会话
@@ -314,9 +318,7 @@ function renderSessionList(): void {
     item.className = 'session-item' + (id === activeId ? ' active' : '') + (isPinned ? ' pinned' : '');
     const dot = document.createElement('span');
     dot.className = 'session-color-dot';
-    const lastUpdate = sessionUpdateTimes.get(id) || 0;
-    const isRecentlyActive = (Date.now() - lastUpdate) < 60000;
-    if (sessionUnread.has(id) || isRecentlyActive) {
+    if (sessionUnread.has(id)) {
       dot.style.backgroundColor = '#73c991';
     } else {
       dot.style.backgroundColor = '#555';
@@ -453,6 +455,9 @@ async function createSession(): Promise<void> {
 function switchSession(id: string): void {
   termManager.switchTo(id);
   sessionUnread.delete(id);
+  clearTimeout(unreadTimers.get(id));
+  unreadTimers.delete(id);
+  recentDataBuffer.delete(id);
   renderSessionList();
   updateSessionTitleBar();
   renderFileStatusbar();
@@ -503,6 +508,9 @@ function restoreSession(id: string): void {
   if (info.cwd) sessionCwds.set(id, info.cwd);
   if (info.displayName) sessionDisplayNames.set(id, info.displayName);
   sessionUnread.delete(id);
+  clearTimeout(unreadTimers.get(id));
+  unreadTimers.delete(id);
+  recentDataBuffer.delete(id);
   termManager.switchTo(id);
   updateEmptyState();
   renderSessionList();
@@ -524,6 +532,9 @@ function destroySession(id: string): void {
   sessionUpdateTimes.delete(id);
   archivedSessions.delete(id);
   sessionUnread.delete(id);
+  clearTimeout(unreadTimers.get(id));
+  unreadTimers.delete(id);
+  recentDataBuffer.delete(id);
   sessionTitleLocked.delete(id);
   pinnedSessions.delete(id);
   sessionCwds.delete(id);
@@ -1196,12 +1207,37 @@ window.duocli.onPtyData((id, data) => {
   if (archivedSessions.has(id)) {
     archivedSessions.get(id)!.updateTime = Date.now();
   }
-  // 非活跃会话收到数据 → 标记未读
+  // 非活跃会话：延迟检测 AI 是否完成工作后再标记未读
   const activeId = termManager.getActiveId();
   if (id !== activeId && (sessionTitles.has(id) || archivedSessions.has(id))) {
-    if (!sessionUnread.has(id)) {
-      sessionUnread.add(id);
-      renderSessionList();
+    // 累积最近数据用于提示符检测（保留最后 500 字符）
+    const prev = recentDataBuffer.get(id) || '';
+    recentDataBuffer.set(id, (prev + data).slice(-500));
+
+    // 去掉 ANSI 转义后检测 AI CLI 提示符
+    const plain = recentDataBuffer.get(id)!.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+    const hasPrompt = /[❯›\$>]\s*$/.test(plain.trimEnd());
+
+    if (hasPrompt) {
+      // 检测到提示符 → 立即标记未读
+      clearTimeout(unreadTimers.get(id));
+      unreadTimers.delete(id);
+      recentDataBuffer.delete(id);
+      if (!sessionUnread.has(id)) {
+        sessionUnread.add(id);
+        renderSessionList();
+      }
+    } else {
+      // 未检测到提示符 → 重置静默计时器（5 秒无新数据后标记未读）
+      clearTimeout(unreadTimers.get(id));
+      unreadTimers.set(id, setTimeout(() => {
+        unreadTimers.delete(id);
+        recentDataBuffer.delete(id);
+        if (!sessionUnread.has(id)) {
+          sessionUnread.add(id);
+          renderSessionList();
+        }
+      }, 5000));
     }
   }
 });
@@ -1234,6 +1270,9 @@ window.duocli.onPtyExit((id) => {
   sessionUpdateTimes.delete(id);
   archivedSessions.delete(id);
   sessionUnread.delete(id);
+  clearTimeout(unreadTimers.get(id));
+  unreadTimers.delete(id);
+  recentDataBuffer.delete(id);
   sessionTitleLocked.delete(id);
   pinnedSessions.delete(id);
   sessionCwds.delete(id);

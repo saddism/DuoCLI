@@ -23,6 +23,8 @@ const SUMMARIZE_PROMPT = '你是终端会话总结助手。根据以下终端输
 
 const DIFF_SUMMARY_PROMPT = '你是代码变更总结助手。根据以下 git diff 内容，用中文简要总结修改了什么（不超过50个字）。只关注实际的代码逻辑变化，忽略空行和格式变化。只输出总结文字，不要引号和解释。';
 
+const SESSION_SUMMARY_PROMPT = '你是终端会话总结助手。请根据以下终端对话记录，用中文写一份 500-1000 字的详细总结。内容应包括：\n1. 用户的核心需求和目标\n2. 讨论过程中的关键决策和方案选择\n3. 实际执行的代码修改和操作\n4. 最终结果和遗留问题（如有）\n\n请用清晰的段落组织，不要用列表堆砌。忽略 ASCII art、ANSI 转义序列等装饰内容，只关注实际的对话内容。';
+
 // 当前选中的 provider 配置
 let currentConfig: AIClientConfig | null = null;
 
@@ -100,6 +102,41 @@ export async function aiSummarize(buffer: string): Promise<string> {
   }
 }
 
+// AI 总结会话历史（详细版，500-1000 字）
+export async function aiSessionSummarize(buffer: string): Promise<string> {
+  const text = cleanTerminalOutput(buffer.slice(-8000));
+
+  aiLog('========== aiSessionSummarize 开始 ==========');
+  aiLog(`输入文本长度: ${text.length}`);
+
+  if (!currentConfig) {
+    return '(未配置 AI 服务，无法生成总结)';
+  }
+
+  try {
+    let result: string;
+    switch (currentConfig.apiFormat) {
+      case 'anthropic':
+        result = await anthropicCall(text, currentConfig, SESSION_SUMMARY_PROMPT, 1500, 0);
+        break;
+      case 'openai':
+        result = await openaiCall(text, currentConfig, SESSION_SUMMARY_PROMPT, 1500, 0);
+        break;
+      case 'gemini':
+        result = await geminiCall(text, currentConfig, SESSION_SUMMARY_PROMPT, 1500, 0);
+        break;
+      default:
+        return '(当前 AI 服务不支持会话总结)';
+    }
+    aiLog(`会话总结结果长度: ${result.length}`);
+    aiLog('========== aiSessionSummarize 结束 ==========\n');
+    return result || '(无法生成总结)';
+  } catch (e: any) {
+    aiLog(`会话总结异常: ${e.message}`);
+    return '(总结生成失败)';
+  }
+}
+
 // AI 总结 diff 变更内容
 export async function aiDiffSummary(diff: string): Promise<string> {
   const text = diff.slice(-3000);
@@ -165,7 +202,7 @@ function fallbackDiffSummary(diff: string): string {
 }
 
 // Anthropic 格式调用
-function anthropicCall(text: string, config: AIClientConfig, prompt: string = SUMMARIZE_PROMPT, maxTokens: number = 50): Promise<string> {
+function anthropicCall(text: string, config: AIClientConfig, prompt: string = SUMMARIZE_PROMPT, maxTokens: number = 50, maxLen: number = 30): Promise<string> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       model: config.model,
@@ -221,8 +258,9 @@ function anthropicCall(text: string, config: AIClientConfig, prompt: string = SU
         try {
           const json = JSON.parse(data);
           const content = json.content?.[0]?.text || '';
-          const result = content.trim().replace(/["""]/g, '').slice(0, 30) || '终端会话';
-          aiLog(`解析结果: "${result}"`);
+          const cleaned = content.trim().replace(/["""]/g, '');
+          const result = (maxLen > 0 ? cleaned.slice(0, maxLen) : cleaned) || '终端会话';
+          aiLog(`解析结果: "${result.slice(0, 100)}..."`);
           resolve(result);
         } catch (e: any) {
           aiLog(`JSON 解析失败: ${e.message}`);
@@ -239,7 +277,7 @@ function anthropicCall(text: string, config: AIClientConfig, prompt: string = SU
 }
 
 // OpenAI 格式调用
-function openaiCall(text: string, config: AIClientConfig, prompt: string = SUMMARIZE_PROMPT, maxTokens: number = 50): Promise<string> {
+function openaiCall(text: string, config: AIClientConfig, prompt: string = SUMMARIZE_PROMPT, maxTokens: number = 50, maxLen: number = 30): Promise<string> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       model: config.model,
@@ -297,8 +335,9 @@ function openaiCall(text: string, config: AIClientConfig, prompt: string = SUMMA
         try {
           const json = JSON.parse(data);
           const content = json.choices?.[0]?.message?.content || '';
-          const result = content.trim().replace(/["""]/g, '').slice(0, 30) || '终端会话';
-          aiLog(`解析结果: "${result}"`);
+          const cleaned = content.trim().replace(/["""]/g, '');
+          const result = (maxLen > 0 ? cleaned.slice(0, maxLen) : cleaned) || '终端会话';
+          aiLog(`解析结果: "${result.slice(0, 100)}..."`);
           resolve(result);
         } catch (e: any) {
           aiLog(`JSON 解析失败: ${e.message}`);
@@ -315,7 +354,7 @@ function openaiCall(text: string, config: AIClientConfig, prompt: string = SUMMA
 }
 
 // Gemini 原生格式调用
-function geminiCall(text: string, config: AIClientConfig, prompt: string = SUMMARIZE_PROMPT, maxTokens: number = 50): Promise<string> {
+function geminiCall(text: string, config: AIClientConfig, prompt: string = SUMMARIZE_PROMPT, maxTokens: number = 50, maxLen: number = 30): Promise<string> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       contents: [{ parts: [{ text: `${prompt}\n\n${text}` }] }],
@@ -366,8 +405,9 @@ function geminiCall(text: string, config: AIClientConfig, prompt: string = SUMMA
           const parts = json.candidates?.[0]?.content?.parts || [];
           const textParts = parts.filter((p: any) => p.text && !p.thought);
           const content = textParts.map((p: any) => p.text).join('') || '';
-          const result = content.trim().replace(/["""]/g, '').slice(0, 30) || '终端会话';
-          aiLog(`解析结果: "${result}"`);
+          const cleaned = content.trim().replace(/["""]/g, '');
+          const result = (maxLen > 0 ? cleaned.slice(0, maxLen) : cleaned) || '终端会话';
+          aiLog(`解析结果: "${result.slice(0, 100)}..."`);
           resolve(result);
         } catch (e: any) {
           aiLog(`JSON 解析失败: ${e.message}`);

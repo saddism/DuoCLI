@@ -1429,4 +1429,7 @@ html, body {
   line-height: 1.5;
   color: var(--text-secondary);
   flex-shrink: 0;
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
 }

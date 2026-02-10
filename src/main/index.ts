@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import { PtyManager, getDisplayName } from './pty-manager';
 import { SnapshotManager } from './snapshot-manager';
 import { AIConfigManager } from './ai-config';
-import { setAIConfig, aiDiffSummary, aiSummarize } from './ollama';
+import { setAIConfig, aiDiffSummary, aiSummarize, aiSessionSummarize } from './ollama';
 
 // 文件监听器
 let fileWatcher: fs.FSWatcher | null = null;
@@ -532,9 +532,7 @@ function registerIPC(): void {
     try {
       const raw = fs.readFileSync(filePath, 'utf-8');
       if (!raw.trim()) return '(空会话)';
-      // 取最后 3000 字符用于总结
-      const text = raw.slice(-3000);
-      const summary = await aiSummarize(text);
+      const summary = await aiSessionSummarize(raw);
       return summary || '(无法生成总结)';
     } catch { return '(读取失败)'; }
   });
