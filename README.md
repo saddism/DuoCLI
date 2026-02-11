@@ -36,41 +36,27 @@ DuoCLI 的解决方案：
 
 ## 安装
 
-### 下载安装包
-
-前往 [Releases](https://github.com/saddism/DuoCLI/releases) 下载：
-
-- **macOS** — `.dmg` 文件，打开后拖入 Applications。首次打开如提示"无法验证开发者"，右键点击应用 → 打开即可
-- **Windows** — `.exe` 安装包，双击安装。如弹出 SmartScreen 警告，点击"更多信息" → "仍要运行"
-
-### 从源码构建
-
 ```bash
 git clone https://github.com/saddism/DuoCLI.git
 cd DuoCLI
-
-# 安装依赖
 npm install
+npm run rebuild   # 编译原生模块（node-pty）
+npm start         # 开发模式运行
+```
 
-# 重新编译原生模块（node-pty）
-npm run rebuild
+构建安装包：
 
-# 开发模式运行
-npm start
-
-# 构建 macOS 应用
-npm run build:mac
-
-# 构建 Windows 应用（需在 Windows 上执行）
-npm run build:win
+```bash
+npm run build:mac   # macOS
+npm run build:win   # Windows（需在 Windows 上执行）
 ```
 
 ### 系统要求
 
 - macOS / Windows / Linux
-- Node.js >= 18（从源码构建时需要）
+- Node.js >= 18
 - Git（历史功能需要）
-- Windows 用户从源码构建需安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（编译 node-pty）
+- Windows 需安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（编译 node-pty）
 
 ## 功能特性
 
