@@ -86,6 +86,242 @@ const sessionDisplayNames: Map<string, string> = new Map();
 // 归档：终端进程仍在运行，只是从活跃列表隐藏
 const archivedSessions: Map<string, { title: string; themeId: string; updateTime: number; cwd: string; displayName: string }> = new Map();
 
+// ========== 自定义预设 ==========
+
+interface CustomPreset {
+  id: string;
+  name: string;
+  command: string;
+  autoFlag: string;
+}
+
+const CUSTOM_PRESETS_KEY = 'duocli_custom_presets';
+let customPresetNextId = 1;
+
+function getCustomPresets(): CustomPreset[] {
+  try { return JSON.parse(localStorage.getItem(CUSTOM_PRESETS_KEY) || '[]'); } catch { return []; }
+}
+
+function saveCustomPresets(list: CustomPreset[]): void {
+  localStorage.setItem(CUSTOM_PRESETS_KEY, JSON.stringify(list));
+}
+
+// 内置 option 的 HTML（从 index.html 中提取，作为 renderPresetSelect 的基础）
+const BUILTIN_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '', label: '空终端' },
+  { value: 'claude', label: 'Claude' },
+  { value: 'claude --dangerously-skip-permissions', label: 'Claude (全自动)' },
+  { value: 'codex', label: 'Codex' },
+  { value: 'codex --full-auto', label: 'Codex (全自动)' },
+  { value: 'kimi', label: 'Kimi' },
+  { value: 'kimi --yolo', label: 'Kimi (全自动)' },
+  { value: 'opencode', label: 'OpenCode' },
+  { value: 'agent', label: 'Cursor (agent)' },
+  { value: 'gemini', label: 'Gemini' },
+  { value: 'gemini --yolo', label: 'Gemini (全自动)' },
+];
+
+function renderPresetSelect(): void {
+  const prev = presetSelect.value;
+  presetSelect.innerHTML = '';
+
+  // 内置选项
+  for (const opt of BUILTIN_OPTIONS) {
+    const el = document.createElement('option');
+    el.value = opt.value;
+    el.textContent = opt.label;
+    presetSelect.appendChild(el);
+  }
+
+  // 自定义预设
+  const customs = getCustomPresets();
+  if (customs.length > 0) {
+    const sep = document.createElement('option');
+    sep.disabled = true;
+    sep.textContent = '── 自定义 ──';
+    presetSelect.appendChild(sep);
+
+    for (const p of customs) {
+      const el = document.createElement('option');
+      el.value = p.command;
+      el.textContent = p.name;
+      presetSelect.appendChild(el);
+
+      if (p.autoFlag) {
+        const autoEl = document.createElement('option');
+        autoEl.value = p.command + ' ' + p.autoFlag;
+        autoEl.textContent = p.name + ' (全自动)';
+        presetSelect.appendChild(autoEl);
+      }
+    }
+  }
+
+  // 恢复之前的选中值
+  presetSelect.value = prev;
+  // 如果之前的值不存在了，回退到空终端
+  if (presetSelect.selectedIndex === -1) presetSelect.value = '';
+}
+
+function showPresetDialog(preset?: CustomPreset): Promise<CustomPreset | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    const dialog = document.createElement('div');
+    dialog.className = 'confirm-dialog';
+
+    const isEdit = !!preset;
+    dialog.innerHTML = `
+      <h3>${isEdit ? '编辑' : '新建'}自定义 CLI 预设</h3>
+      <div class="preset-form">
+        <div class="preset-form-field">
+          <label>名称</label>
+          <input type="text" id="preset-name-input" placeholder="如 Aider、Cursor 等" value="${preset?.name || ''}" />
+        </div>
+        <div class="preset-form-field">
+          <label>命令</label>
+          <input type="text" id="preset-cmd-input" placeholder="如 aider、cursor 等" value="${preset?.command || ''}" />
+        </div>
+        <div class="preset-form-field">
+          <label>全自动参数（可选）</label>
+          <input type="text" id="preset-auto-input" placeholder="如 --yes、--yolo 等，留空表示无全自动模式" value="${preset?.autoFlag || ''}" />
+        </div>
+      </div>
+      <div class="confirm-buttons" style="margin-top:16px">
+        <button class="btn-cancel">取消</button>
+        <button class="btn-close-confirm" style="background:var(--accent)">保存</button>
+      </div>`;
+
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const nameInput = dialog.querySelector('#preset-name-input') as HTMLInputElement;
+    const cmdInput = dialog.querySelector('#preset-cmd-input') as HTMLInputElement;
+    const autoInput = dialog.querySelector('#preset-auto-input') as HTMLInputElement;
+
+    nameInput.focus();
+
+    const cleanup = (result: CustomPreset | null) => { overlay.remove(); resolve(result); };
+
+    dialog.querySelector('.btn-cancel')!.addEventListener('click', () => cleanup(null));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(null); });
+
+    dialog.querySelector('.btn-close-confirm')!.addEventListener('click', () => {
+      const name = nameInput.value.trim();
+      const command = cmdInput.value.trim();
+      if (!name || !command) {
+        nameInput.style.borderColor = name ? '' : 'var(--danger)';
+        cmdInput.style.borderColor = command ? '' : 'var(--danger)';
+        return;
+      }
+      const id = preset?.id || `custom-${customPresetNextId++}`;
+      cleanup({ id, name, command, autoFlag: autoInput.value.trim() });
+    });
+
+    // Enter 键保存
+    const handleEnter = (e: KeyboardEvent) => {
+      if (e.key === 'Enter') dialog.querySelector<HTMLButtonElement>('.btn-close-confirm')!.click();
+      if (e.key === 'Escape') cleanup(null);
+    };
+    nameInput.addEventListener('keydown', handleEnter);
+    cmdInput.addEventListener('keydown', handleEnter);
+    autoInput.addEventListener('keydown', handleEnter);
+  });
+}
+
+function showPresetManageDialog(): void {
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  const dialog = document.createElement('div');
+  dialog.className = 'confirm-dialog';
+  dialog.style.minWidth = '360px';
+
+  function render() {
+    const customs = getCustomPresets();
+    dialog.innerHTML = `<h3>管理自定义预设</h3>`;
+
+    const listEl = document.createElement('div');
+    listEl.className = 'preset-manage-list';
+
+    if (customs.length === 0) {
+      listEl.innerHTML = '<div class="preset-manage-empty">暂无自定义预设，点击工具栏 "+" 按钮新建</div>';
+    } else {
+      for (const p of customs) {
+        const item = document.createElement('div');
+        item.className = 'preset-manage-item';
+
+        const info = document.createElement('div');
+        info.className = 'preset-manage-item-info';
+        const nameEl = document.createElement('div');
+        nameEl.className = 'preset-manage-item-name';
+        nameEl.textContent = p.name;
+        const cmdEl = document.createElement('div');
+        cmdEl.className = 'preset-manage-item-cmd';
+        cmdEl.textContent = p.command + (p.autoFlag ? ` (全自动: ${p.autoFlag})` : '');
+        info.appendChild(nameEl);
+        info.appendChild(cmdEl);
+
+        const actions = document.createElement('div');
+        actions.className = 'preset-manage-item-actions';
+
+        const editBtn = document.createElement('button');
+        editBtn.textContent = '编辑';
+        editBtn.addEventListener('click', async () => {
+          const edited = await showPresetDialog(p);
+          if (edited) {
+            const list = getCustomPresets();
+            const idx = list.findIndex(x => x.id === p.id);
+            if (idx !== -1) { list[idx] = edited; saveCustomPresets(list); }
+            renderPresetSelect();
+            render();
+          }
+        });
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'danger';
+        delBtn.textContent = '删除';
+        delBtn.addEventListener('click', () => {
+          const list = getCustomPresets().filter(x => x.id !== p.id);
+          saveCustomPresets(list);
+          renderPresetSelect();
+          render();
+        });
+
+        actions.appendChild(editBtn);
+        actions.appendChild(delBtn);
+        item.appendChild(info);
+        item.appendChild(actions);
+        listEl.appendChild(item);
+      }
+    }
+
+    dialog.appendChild(listEl);
+
+    const btns = document.createElement('div');
+    btns.className = 'confirm-buttons';
+    btns.style.marginTop = '16px';
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'btn-cancel';
+    closeBtn.textContent = '关闭';
+    closeBtn.addEventListener('click', () => overlay.remove());
+    btns.appendChild(closeBtn);
+    dialog.appendChild(btns);
+  }
+
+  render();
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+}
+
+// 初始化自定义预设 ID 计数器
+(function initCustomPresetId() {
+  const customs = getCustomPresets();
+  for (const p of customs) {
+    const m = p.id.match(/^custom-(\d+)$/);
+    if (m) customPresetNextId = Math.max(customPresetNextId, parseInt(m[1]) + 1);
+  }
+})();
+
 // 最近工作目录
 const RECENT_CWD_KEY = 'duocli_recent_cwds';
 const MAX_RECENT_CWDS = 8;
@@ -108,6 +344,8 @@ const cwdOpenBtn = document.getElementById('cwd-open-btn')!;
 const cwdRecentBtn = document.getElementById('cwd-recent-btn')!;
 const cwdRecentDropdown = document.getElementById('cwd-recent-dropdown')!;
 const presetSelect = document.getElementById('preset-select') as HTMLSelectElement;
+const presetAddBtn = document.getElementById('preset-add-btn')!;
+const presetManageBtn = document.getElementById('preset-manage-btn')!;
 const themeSelect = document.getElementById('theme-select')!;
 const themeDisplay = document.getElementById('theme-display')!;
 const themeDropdown = document.getElementById('theme-dropdown')!;
@@ -183,6 +421,8 @@ const termManager = new TerminalManager(terminalContent, (id, cols, rows) => {
 if (savedCwd) {
   cwdInput.value = savedCwd;
 }
+// 初始化 preset select（含自定义预设），然后恢复上次选中
+renderPresetSelect();
 if (lastPreset) {
   presetSelect.value = lastPreset;
 }
@@ -229,6 +469,41 @@ document.addEventListener('click', () => {
 
 // 启动时恢复保存的配色
 setThemeValue(currentThemeId);
+
+// ========== CLI 标签颜色 ==========
+
+// 已知 CLI → 固定颜色（文字色, 背景色）
+const CLI_TAG_COLORS: Record<string, [string, string]> = {
+  'Claude':       ['#d4a574', '#3d2e1e'],
+  'Claude全自动':  ['#e5a100', '#3d3010'],
+  'Codex':        ['#73c991', '#1e3328'],
+  'Codex全自动':   ['#56d4a0', '#1a3d2e'],
+  'Kimi':         ['#c678dd', '#2e1e3d'],
+  'Kimi全自动':    ['#d19ae8', '#33204a'],
+  'OpenCode':     ['#61afef', '#1e2e3d'],
+  'Cursor':       ['#56b6c2', '#1e3338'],
+  'Gemini':       ['#82aaff', '#1e2540'],
+  'Gemini全自动':  ['#99bbff', '#222d4a'],
+};
+
+function getCliTagColors(displayName: string): [string, string] {
+  // 精确匹配
+  if (CLI_TAG_COLORS[displayName]) return CLI_TAG_COLORS[displayName];
+  // 前缀匹配（自定义预设的"全自动"变体）
+  for (const key of Object.keys(CLI_TAG_COLORS)) {
+    if (displayName.startsWith(key)) return CLI_TAG_COLORS[key];
+  }
+  // 未知 CLI：用 hash 从色板中选一个
+  let h = 0;
+  for (let i = 0; i < displayName.length; i++) {
+    h = ((h << 5) - h + displayName.charCodeAt(i)) | 0;
+  }
+  const palette: Array<[string, string]> = [
+    ['#e06c75', '#3d1e22'], ['#e5c07b', '#3d3520'], ['#98c379', '#253320'],
+    ['#f78c6c', '#3d2518'], ['#c792ea', '#2e1e3d'], ['#ff5370', '#3d1825'],
+  ];
+  return palette[Math.abs(h) % palette.length];
+}
 
 // ========== 路径自动颜色 ==========
 
@@ -472,6 +747,9 @@ function renderSessionList(): void {
         const nameSpan = document.createElement('span');
         nameSpan.className = 'session-display-name';
         nameSpan.textContent = displayName;
+        const [tagColor, tagBg] = getCliTagColors(displayName);
+        nameSpan.style.setProperty('--cli-tag-color', tagColor);
+        nameSpan.style.setProperty('--cli-tag-bg', tagBg);
         metaRow.appendChild(nameSpan);
       }
 
@@ -548,6 +826,15 @@ async function createSession(): Promise<void> {
   sessionUpdateTimes.set(result.id, Date.now());
   sessionCwds.set(result.id, result.cwd);
   sessionDisplayNames.set(result.id, result.displayName);
+  // 自定义预设：用用户定义的名称覆盖后端 fallback
+  const customPreset = getCustomPresets().find(p =>
+    preset === p.command || (p.autoFlag && preset === p.command + ' ' + p.autoFlag)
+  );
+  if (customPreset) {
+    const isAuto = customPreset.autoFlag && preset === customPreset.command + ' ' + customPreset.autoFlag;
+    const displayName = isAuto ? customPreset.name + '全自动' : customPreset.name;
+    sessionDisplayNames.set(result.id, displayName);
+  }
   // 初始化会话历史记录
   window.duocli.sessionHistoryInit(result.id, result.title);
   const flushTimer = setInterval(() => {
@@ -1315,6 +1602,23 @@ cwdRecentDropdown.addEventListener('click', (e) => { e.stopPropagation(); });
 cwdInput.addEventListener('change', () => { const v = cwdInput.value.trim(); if (v) { currentCwd = v; localStorage.setItem('duocli_cwd', v); addRecentCwd(v); startFileWatcher(v); } });
 cwdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') cwdInput.blur(); });
 toolbarNewBtn.addEventListener('click', () => { createSession(); });
+
+// 自定义预设按钮
+presetAddBtn.addEventListener('click', async () => {
+  const result = await showPresetDialog();
+  if (result) {
+    const list = getCustomPresets();
+    list.push(result);
+    saveCustomPresets(list);
+    renderPresetSelect();
+    // 自动选中新建的预设
+    presetSelect.value = result.command;
+  }
+});
+
+presetManageBtn.addEventListener('click', () => {
+  showPresetManageDialog();
+});
 
 // Tab 切换
 sidebarTabs.forEach((tab) => {
