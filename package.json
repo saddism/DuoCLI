@@ -1,7 +1,7 @@
 {
   "name": "duocli",
   "version": "1.0.0",
-  "description": "手机电脑实时同步的 AI 编程终端 — 局域网无线连接，随时随地写代码",
+  "description": "手机电脑实时同步的 AI 编程终端 | AI Coding Terminal with Real-time Mobile-Desktop Sync — Wireless LAN connection, code from anywhere",
   "main": "dist/main/index.js",
   "scripts": {
     "build:main": "tsc -p tsconfig.main.json",
