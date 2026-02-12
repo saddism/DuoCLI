@@ -8,6 +8,7 @@ export interface PtySession {
   id: string;
   ptyProcess: pty.IPty;
   buffer: string;
+  rawBuffer: string;          // 完整 ANSI 输出，用于远程终端回放
   userInputs: string[];
   commandCount: number;
   title: string;
@@ -23,6 +24,7 @@ interface PtyManagerEvents {
   onTitleUpdate: (id: string, title: string) => void;
   onExit: (id: string) => void;
   onPasteInput?: (id: string, cwd: string) => void;
+  onRawData?: (id: string, data: string) => void;
 }
 
 // 命令 → 友好显示名称映射
@@ -70,6 +72,7 @@ export class PtyManager {
       id,
       ptyProcess,
       buffer: '',
+      rawBuffer: '',
       userInputs: [],
       commandCount: 0,
       title: '新会话',
@@ -86,7 +89,13 @@ export class PtyManager {
       if (session.buffer.length > 5000) {
         session.buffer = session.buffer.slice(-2500);
       }
+      // rawBuffer 用于远程终端回放（保留更多）
+      session.rawBuffer += data;
+      if (session.rawBuffer.length > 200000) {
+        session.rawBuffer = session.rawBuffer.slice(-200000);
+      }
       this.events.onData(id, data);
+      this.events.onRawData?.(id, data);
     });
 
     ptyProcess.onExit(() => {

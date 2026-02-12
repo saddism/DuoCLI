@@ -310,6 +310,12 @@ export class TerminalManager {
       this.fitActive();
     });
     this.resizeObserver.observe(terminalArea);
+
+    // 窗口重新获得焦点时，重新 fit 并同步 pty 尺寸
+    // 解决手机端远程控制后桌面端终端尺寸不同步的问题
+    window.addEventListener('focus', () => {
+      this.fitActive();
+    });
   }
 
   create(id: string, themeId: string, cwd: string, onData: (data: string) => void): void {

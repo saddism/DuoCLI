@@ -67,7 +67,18 @@ jobs:
             artifacts/mac/*.dmg
             artifacts/win/*.exe
           body: |
-            ## DuoCLI 安装说明
+            ## DuoCLI — 在手机上用 Claude Code
+
+            手机电脑实时同步的 AI 编程终端。连上同一个 WiFi，手机和电脑共享同一个终端会话，双向实时同步。
+
+            **亮点功能：**
+            - 📱 手机电脑实时同步 — 手机上打的字电脑上实时出现，反过来也一样
+            - 🔄 多终端并行管理 — 同时跑 Claude Code、Codex、Gemini、Kimi
+            - 📸 Git 快照与回滚 — AI 改代码前自动快照，一键撤销
+            - 🤖 AI 智能标题 — 自动识别终端内容生成标题
+            - 🔔 Web Push 通知 — AI 跑完任务手机推送提醒
+
+            **安装说明：**
 
             **macOS 用户：** 下载 .dmg 文件，打开后拖入 Applications。首次打开如提示"无法验证开发者"，右键点击应用 → 打开 即可。
 

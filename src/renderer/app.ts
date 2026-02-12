@@ -29,6 +29,7 @@ declare global {
       onPtyData: (cb: (id: string, data: string) => void) => void;
       onTitleUpdate: (cb: (id: string, title: string) => void) => void;
       onPtyExit: (cb: (id: string) => void) => void;
+      onRemoteCreated: (cb: (sessionInfo: { id: string; title: string; themeId: string; cwd: string; displayName: string }) => void) => void;
       // 快照 API
       snapshotCheckRepo: (cwd: string) => Promise<boolean>;
       snapshotCreate: (cwd: string, message?: string) => Promise<string | null>;
@@ -1757,6 +1758,30 @@ window.duocli.onPtyExit((id) => {
   renderArchivedList();
   updateSessionTitleBar();
   if (!historyList.classList.contains('collapsed')) refreshHistory();
+});
+
+// 手机端远程创建了会话，桌面端同步显示
+window.duocli.onRemoteCreated((info) => {
+  sessionTitles.set(info.id, info.title);
+  sessionThemes.set(info.id, info.themeId);
+  sessionUpdateTimes.set(info.id, Date.now());
+  sessionCwds.set(info.id, info.cwd);
+  sessionDisplayNames.set(info.id, info.displayName);
+  // 初始化会话历史
+  window.duocli.sessionHistoryInit(info.id, info.title);
+  const flushTimer = setInterval(() => {
+    window.duocli.sessionHistoryFlush(info.id);
+  }, 2000);
+  historyFlushTimers.set(info.id, flushTimer);
+  // 创建 xterm 实例（桌面端也能看到和操作）
+  termManager.create(info.id, info.themeId, info.cwd, (data) => { window.duocli.writePty(info.id, data); });
+  updateEmptyState();
+  renderSessionList();
+  updateSessionTitleBar();
+  setTimeout(() => {
+    const dims = termManager.getActiveDimensions();
+    if (dims) window.duocli.resizePty(info.id, dims.cols, dims.rows);
+  }, 100);
 });
 
 // 监听快照自动创建事件

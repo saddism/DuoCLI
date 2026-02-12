@@ -25,3 +25,6 @@ npm-debug.log*
 # Temp
 *.tmp
 *.bak
+
+# FRP config (private)
+frp/

@@ -40,6 +40,9 @@ contextBridge.exposeInMainWorld('duocli', {
   onPtyExit: (cb: (id: string) => void) =>
     ipcRenderer.on('pty:exit', (_e, id) => cb(id)),
 
+  onRemoteCreated: (cb: (sessionInfo: any) => void) =>
+    ipcRenderer.on('pty:remote-created', (_e, info) => cb(info)),
+
   // 快照 API
   snapshotCheckRepo: (cwd: string) => ipcRenderer.invoke('snapshot:check-repo', cwd),
   snapshotCreate: (cwd: string, message?: string) => ipcRenderer.invoke('snapshot:create', cwd, message),

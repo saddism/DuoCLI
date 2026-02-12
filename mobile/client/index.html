@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1a1a2e">
+  <title>DuoCLI</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="stylesheet" href="xterm.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- 登录页 -->
+  <div id="login-page" class="page active">
+    <div class="login-box">
+      <h1>🖥 DuoCLI</h1>
+      <p>远程终端控制</p>
+      <div id="server-info" class="server-info"></div>
+      <input type="password" id="token-input" placeholder="输入 Token" autocomplete="off">
+      <button id="login-btn">连接</button>
+      <div id="login-error" class="error"></div>
+    </div>
+  </div>
+
+  <!-- 主页面 -->
+  <div id="main-page" class="page">
+    <header id="header">
+      <div class="header-left">
+        <h2>DuoCLI</h2>
+      </div>
+      <div class="header-right">
+        <button id="new-session-btn" class="icon-btn" title="新建会话">＋</button>
+      </div>
+    </header>
+    <div id="session-list" class="session-list"></div>
+    <div id="empty-state" class="empty-state">
+      <p>暂无会话</p>
+      <p>点击右上角 ＋ 创建新终端</p>
+    </div>
+  </div>
+
+  <!-- 会话详情页 -->
+  <div id="detail-page" class="page">
+    <header id="detail-header">
+      <button id="back-btn" class="icon-btn">←</button>
+      <div class="detail-title">
+        <span id="detail-name"></span>
+        <span id="detail-status" class="status-dot"></span>
+      </div>
+      <button id="delete-btn" class="icon-btn danger" title="终止会话">✕</button>
+    </header>
+
+    <!-- xterm.js 终端 -->
+    <div id="terminal-container"></div>
+
+    <!-- 快捷键栏 -->
+    <div id="shortcut-bar">
+      <button class="key-btn" data-key="\x1b[A">↑</button>
+      <button class="key-btn" data-key="\x1b[B">↓</button>
+      <button class="key-btn" data-key="\x1b[D">←</button>
+      <button class="key-btn" data-key="\x1b[C">→</button>
+      <button class="key-btn" data-key="\x7f">⌫</button>
+      <button class="key-btn" data-key="\r">↵</button>
+      <button class="key-btn" data-key="\t">Tab</button>
+      <button class="key-btn" data-key="\x03">^C</button>
+      <button class="key-btn" data-key="y\r">y</button>
+    </div>
+
+    <!-- 输入区域 -->
+    <div id="input-area">
+      <input type="file" id="file-input" accept="image/*,*/*" multiple hidden>
+      <button id="upload-btn" class="icon-btn-sm" title="上传文件">📎</button>
+      <textarea id="msg-input" rows="1" placeholder="输入消息..." enterkeyhint="send" autocomplete="off"></textarea>
+      <button id="send-btn">发送</button>
+    </div>
+  </div>
+
+  <!-- 新建会话弹窗 -->
+  <div id="new-session-modal" class="modal">
+    <div class="modal-content">
+      <h3>新建会话</h3>
+      <label>工作目录</label>
+      <input type="text" id="new-cwd" placeholder="~" value="">
+      <label>预设命令</label>
+      <select id="new-preset">
+        <option value="">纯终端 (shell)</option>
+        <option value="claude" selected>Claude Code</option>
+        <option value="claude --dangerously-skip-permissions">Claude 全自动</option>
+        <option value="codex">Codex</option>
+        <option value="codex --full-auto">Codex 全自动</option>
+        <option value="gemini">Gemini</option>
+        <option value="gemini --yolo">Gemini 全自动</option>
+        <option value="kimi">Kimi</option>
+        <option value="kimi --yolo">Kimi 全自动</option>
+      </select>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="btn-secondary">取消</button>
+        <button id="modal-create" class="btn-primary">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="xterm.js"></script>
+  <script src="addon-fit.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

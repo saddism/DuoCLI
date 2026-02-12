@@ -6,6 +6,7 @@ import { PtyManager, getDisplayName } from './pty-manager';
 import { SnapshotManager } from './snapshot-manager';
 import { AIConfigManager } from './ai-config';
 import { setAIConfig, aiDiffSummary, aiSummarize, aiSessionSummarize } from './ollama';
+import { startRemoteServer, pushRawDataToRemote, sendRemotePush } from './remote-server';
 
 // 文件监听器
 let fileWatcher: fs.FSWatcher | null = null;
@@ -147,10 +148,18 @@ function setupPtyManager(): void {
     onData: (id, data) => {
       safeSend('pty:data', id, data);
     },
+    onRawData: (id, data) => {
+      pushRawDataToRemote(id, data);
+    },
     onTitleUpdate: (id, title) => {
       safeSend('pty:title-update', id, title);
     },
     onExit: (id) => {
+      // 推送通知到手机端
+      const session = ptyManager.getSession(id);
+      const title = session?.title || '终端';
+      sendRemotePush('会话已结束', title, id);
+
       safeSend('pty:exit', id);
     },
     onPasteInput: (id, cwd) => {
@@ -548,6 +557,15 @@ app.whenReady().then(async () => {
   setupPtyManager();
   registerIPC();
   createWindow();
+
+  // 启动远程访问服务器（手机端）
+  startRemoteServer(ptyManager, (sessionInfo) => {
+    // 手机端创建了会话，通知桌面端 renderer 刷新
+    safeSend('pty:remote-created', sessionInfo);
+  }, (id) => {
+    // 手机端销毁了会话，通知桌面端 renderer
+    safeSend('pty:exit', id);
+  });
 
   // 自动扫描并选择 AI 服务
   try {
