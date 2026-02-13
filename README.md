@@ -80,14 +80,27 @@ AI 编程助手跑一个任务经常要好几分钟。以前你只能干坐在�
 
 ### 截图
 
+**桌面端主界面**
 <p align="center">
   <img src="docs/images/main-ui.png" alt="主界面" width="700"/>
 </p>
 
+**手机端 AI 工具选择** — 支持 Claude、Codex、Gemini、Kimi 等多种 AI 编程助手
+<p align="center">
+  <img src="docs/images/mobile-ai-selector.jpg" alt="手机端 AI 工具选择" width="350"/>
+</p>
+
+**手机端实时操作 Claude Code** — 躺在床上也能写代码
+<p align="center">
+  <img src="docs/images/mobile-claude-demo.jpg" alt="手机端 Claude Code 操作" width="350"/>
+</p>
+
+**历史与 Diff 对比**
 <p align="center">
   <img src="docs/images/snapshot.png" alt="历史与 Diff" width="700"/>
 </p>
 
+**AI 配置自动扫描**
 <p align="center">
   <img src="docs/images/ai-config.png" alt="AI 配置" width="700"/>
 </p>
@@ -253,14 +266,27 @@ AI coding assistants often take several minutes to run a task. Previously, you'd
 
 ### Screenshots
 
+**Desktop Main Interface**
 <p align="center">
   <img src="docs/images/main-ui.png" alt="Main Interface" width="700"/>
 </p>
 
+**Mobile AI Tool Selection** — Supports Claude, Codex, Gemini, Kimi and more
+<p align="center">
+  <img src="docs/images/mobile-ai-selector.jpg" alt="Mobile AI Tool Selection" width="350"/>
+</p>
+
+**Mobile Claude Code Operation** — Code from your bed
+<p align="center">
+  <img src="docs/images/mobile-claude-demo.jpg" alt="Mobile Claude Code Demo" width="350"/>
+</p>
+
+**History & Diff**
 <p align="center">
   <img src="docs/images/snapshot.png" alt="History and Diff" width="700"/>
 </p>
 
+**AI Configuration Auto-Scan**
 <p align="center">
   <img src="docs/images/ai-config.png" alt="AI Configuration" width="700"/>
 </p>
