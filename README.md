@@ -180,14 +180,6 @@ npm run build:linux # Linux
 - **配置持久化** — 催工文本和参数自动保存，重启不丢失
 - **手机端远程控制** — 手机上也能开关催工、修改配置
 
-#### Claude 供应商管理
-
-一个 Claude Code，多个 API 后端。DuoCLI 让你在创建终端时选择不同的模型供应商，无需手动改配置文件。
-
-- 支持 Anthropic 官方、MiniMax、DeepSeek、GLM（智谱）等兼容 API
-- 自定义供应商：填入 Base URL 和 API Key 即可
-- 会话列表显示当前供应商标签，一眼区分
-
 #### AI 智能标题
 
 - 自动调用 AI 分析终端输出，生成简短的中文标题
@@ -407,14 +399,6 @@ Keep your AI working non-stop. Configure a prompt message and DuoCLI will automa
 - **Per-session configuration** — Each terminal session has its own auto-continue settings, independent of others
 - **Persistent configuration** — Auto-continue text and parameters are saved automatically, survive restarts
 - **Remote control from mobile** — Toggle auto-continue and modify settings from your phone
-
-#### Claude Provider Management
-
-One Claude Code, multiple API backends. DuoCLI lets you select different model providers when creating terminals, no need to manually edit config files.
-
-- Supports Anthropic official, MiniMax, DeepSeek, GLM (Zhipu), and other compatible APIs
-- Custom providers: just enter Base URL and API Key
-- Session list shows current provider tag at a glance
 
 #### AI Smart Titles
 
