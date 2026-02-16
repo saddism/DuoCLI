@@ -9,59 +9,132 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <!-- 顶部工具栏 -->
-  <div id="toolbar">
-    <label>工作目录:</label>
-    <div id="cwd-wrapper">
-      <input id="cwd-input" type="text" placeholder="输入路径或点击浏览..." />
-      <button id="cwd-recent-btn" class="cwd-recent-toggle" title="最近目录">&#9660;</button>
-      <div id="cwd-recent-dropdown" class="cwd-recent-dropdown"></div>
-    </div>
-    <button id="cwd-browse-btn" class="toolbar-btn">浏览</button>
-    <button id="cwd-open-btn" class="toolbar-icon-btn" title="在 Finder 中打开">&#128193;</button>
-
-    <label>CLI:</label>
-    <select id="preset-select" class="toolbar-select">
-      <option value="">空终端</option>
-      <option value="claude">Claude</option>
-      <option value="claude --dangerously-skip-permissions">Claude (全自动)</option>
-      <option value="codex">Codex</option>
-      <option value="codex --full-auto">Codex (全自动)</option>
-      <option value="kimi">Kimi</option>
-      <option value="kimi --yolo">Kimi (全自动)</option>
-      <option value="opencode">OpenCode</option>
-      <option value="agent">Cursor (agent)</option>
-      <option value="gemini">Gemini</option>
-      <option value="gemini --yolo">Gemini (全自动)</option>
-    </select>
-    <button id="preset-add-btn" class="toolbar-icon-btn" title="新建自定义 CLI 预设">+</button>
-    <button id="preset-manage-btn" class="toolbar-icon-btn" title="管理自定义预设">&#9881;</button>
-
-    <label>配色:</label>
-    <div id="theme-select" class="custom-select">
-      <div class="custom-select-display" id="theme-display">
-        <span class="theme-dot" style="background:#0078d4"></span>VS Code Dark
+  <!-- 新建终端弹窗 -->
+  <div id="new-session-overlay" class="new-session-overlay">
+    <div id="new-session-dialog" class="new-session-dialog">
+      <div class="new-session-header">
+        <h3>新建终端</h3>
+        <button id="new-session-close" class="new-session-close" title="关闭">&times;</button>
       </div>
-      <div class="custom-select-dropdown" id="theme-dropdown">
-        <div class="custom-select-option" data-value="auto"><span class="theme-dot" style="background:conic-gradient(#e06c75,#e5c07b,#98c379,#56b6c2,#61afef,#c678dd,#e06c75)"></span>自动配色</div>
-        <div class="custom-select-option" data-value="vscode-dark"><span class="theme-dot" style="background:#0078d4"></span>VS Code Dark</div>
-        <div class="custom-select-option" data-value="monokai"><span class="theme-dot" style="background:#a6e22e"></span>Monokai</div>
-        <div class="custom-select-option" data-value="dracula"><span class="theme-dot" style="background:#bd93f9"></span>Dracula</div>
-        <div class="custom-select-option" data-value="solarized-dark"><span class="theme-dot" style="background:#268bd2"></span>Solarized Dark</div>
-        <div class="custom-select-option" data-value="one-dark"><span class="theme-dot" style="background:#61afef"></span>One Dark</div>
-        <div class="custom-select-option" data-value="nord"><span class="theme-dot" style="background:#88c0d0"></span>Nord</div>
+
+      <div class="new-session-body">
+        <label>工作目录</label>
+        <div class="new-session-row">
+          <div id="cwd-wrapper">
+            <input id="cwd-input" type="text" placeholder="输入路径或点击浏览..." />
+            <button id="cwd-recent-btn" class="cwd-recent-toggle" title="最近目录">&#9660;</button>
+            <div id="cwd-recent-dropdown" class="cwd-recent-dropdown"></div>
+          </div>
+          <button id="cwd-browse-btn" class="toolbar-btn">浏览</button>
+          <button id="cwd-open-btn" class="toolbar-icon-btn" title="在 Finder 中打开">&#128193;</button>
+        </div>
+
+        <label>CLI</label>
+        <div class="new-session-row">
+          <select id="preset-select" class="toolbar-select">
+            <option value="">空终端</option>
+            <option value="claude">Claude</option>
+            <option value="claude --dangerously-skip-permissions">Claude (全自动)</option>
+            <option value="codex">Codex</option>
+            <option value="codex -c sandbox_mode=&quot;danger-full-access&quot; -c approval=&quot;never&quot; -c network=&quot;enabled&quot;">Codex (全自动)</option>
+            <option value="kimi">Kimi</option>
+            <option value="kimi --yolo">Kimi (全自动)</option>
+            <option value="opencode">OpenCode</option>
+            <option value="agent">Cursor (agent)</option>
+            <option value="gemini">Gemini</option>
+            <option value="gemini --yolo">Gemini (全自动)</option>
+          </select>
+          <button id="preset-add-btn" class="toolbar-icon-btn" title="新建自定义 CLI 预设">+</button>
+          <button id="preset-manage-btn" class="toolbar-icon-btn" title="管理自定义预设">&#9881;</button>
+        </div>
+
+        <div id="claude-provider-row" class="new-session-row-sub" style="display:none">
+          <label>供应商</label>
+          <div class="new-session-row">
+            <select id="claude-provider-select" class="toolbar-select"></select>
+            <button id="claude-provider-manage-btn" class="toolbar-icon-btn" title="管理供应商">&#9881;</button>
+          </div>
+        </div>
+
+        <label>配色</label>
+        <div class="new-session-row">
+          <div id="theme-select" class="custom-select">
+            <div class="custom-select-display" id="theme-display">
+              <span class="theme-dot" style="background:#0078d4"></span>VS Code Dark
+            </div>
+            <div class="custom-select-dropdown" id="theme-dropdown">
+              <div class="custom-select-option" data-value="auto"><span class="theme-dot" style="background:conic-gradient(#e06c75,#e5c07b,#98c379,#56b6c2,#61afef,#c678dd,#e06c75)"></span>自动配色</div>
+              <div class="custom-select-option" data-value="vscode-dark"><span class="theme-dot" style="background:#0078d4"></span>VS Code Dark</div>
+              <div class="custom-select-option" data-value="monokai"><span class="theme-dot" style="background:#a6e22e"></span>Monokai</div>
+              <div class="custom-select-option" data-value="dracula"><span class="theme-dot" style="background:#bd93f9"></span>Dracula</div>
+              <div class="custom-select-option" data-value="solarized-dark"><span class="theme-dot" style="background:#268bd2"></span>Solarized Dark</div>
+              <div class="custom-select-option" data-value="one-dark"><span class="theme-dot" style="background:#61afef"></span>One Dark</div>
+              <div class="custom-select-option" data-value="nord"><span class="theme-dot" style="background:#88c0d0"></span>Nord</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="confirm-buttons">
+        <button id="new-session-cancel" class="btn-cancel">取消</button>
+        <button id="new-session-create" class="toolbar-btn">创建终端</button>
       </div>
     </div>
+  </div>
 
-    <button id="toolbar-new-btn" class="toolbar-btn">+ 新建终端</button>
+  <!-- 催工配置弹窗 -->
+  <div id="auto-continue-overlay" class="new-session-overlay">
+    <div class="new-session-dialog" style="width: min(400px, calc(100vw - 40px));">
+      <div class="new-session-header">
+        <h3>催工配置</h3>
+        <button id="auto-continue-dialog-close" class="new-session-close" title="关闭">&times;</button>
+      </div>
+      <div class="new-session-body">
+        <label>自动发送的内容</label>
+        <textarea id="auto-continue-message" rows="4" placeholder="请输入自动发送的内容，支持多行" style="width:100%;resize:vertical;padding:6px 8px;background:var(--bg-primary);border:1px solid var(--border-color);border-radius:4px;color:var(--text-primary);font-size:12px;outline:none;font-family:inherit;"></textarea>
+        <label>间隔时间（分钟）</label>
+        <input id="auto-continue-interval" type="number" min="1" placeholder="分钟" />
+        <div style="margin-top: 8px;">
+          <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+            <input id="auto-continue-auto-agree" type="checkbox" checked />
+            开启自动同意（权限提示自动确认）
+          </label>
+        </div>
+        <div id="auto-agree-delay-row" style="margin-top: 6px;">
+          <label>自动同意延后时间（秒）</label>
+          <input id="auto-continue-agree-delay" type="number" min="0" value="5" placeholder="秒" />
+        </div>
+        <div style="margin-top: 8px;">
+          <label>发送延迟（秒）<span style="font-size:10px;color:#888;">— 文字写入后等待多久再发送回车</span></label>
+          <input id="auto-continue-send-delay" type="number" min="0" value="2" placeholder="秒" />
+        </div>
+      </div>
+      <div class="confirm-buttons" style="margin-top: 12px;">
+        <button id="auto-continue-cancel" class="btn-cancel">取消</button>
+        <button id="auto-continue-save" class="toolbar-btn">保存</button>
+      </div>
+    </div>
   </div>
 
   <!-- 主体 -->
   <div id="main">
-    <div id="terminal-area">
-      <div id="session-title-bar">
-        <span id="session-title-text"></span>
+    <!-- 左侧目录树收起按钮 -->
+    <div id="file-tree-toggle" class="panel-toggle" title="收起/展开目录树">&#9664;</div>
+
+    <div id="file-tree-panel">
+      <div id="file-tree-header">
+        <span id="file-tree-path">目录</span>
+        <button id="file-tree-refresh-btn" class="toolbar-icon-btn" title="刷新目录">&#8635;</button>
       </div>
+      <div id="file-tree-list">
+        <div class="file-tree-empty">选择会话后显示当前目录</div>
+      </div>
+    </div>
+
+    <!-- 左侧拖拽条 -->
+    <div id="file-tree-resizer" class="resizer"></div>
+
+    <div id="terminal-area">
       <div id="terminal-content">
         <div id="empty-state">选择工作目录后点击「新建终端」开始</div>
       </div>
@@ -73,7 +146,22 @@
       </div>
     </div>
 
+    <!-- 右侧拖拽条 -->
+    <div id="sidebar-resizer" class="resizer"></div>
+
+    <!-- 右侧边栏收起按钮 -->
+    <div id="sidebar-toggle" class="panel-toggle" title="收起/展开会话列表">&#9654;</div>
+
     <div id="sidebar">
+      <div id="sidebar-topbar">
+        <button id="toolbar-new-btn" class="toolbar-btn">+ 新建终端</button>
+      </div>
+      <!-- 远程服务器连接信息 -->
+      <div id="remote-server-info" class="remote-server-info" style="display: none;">
+        <div class="remote-info-title">手机访问</div>
+        <div class="remote-info-url"></div>
+        <div class="remote-info-token"></div>
+      </div>
       <div id="sidebar-tabs">
         <button class="sidebar-tab active" data-tab="sessions">会话</button>
         <button class="sidebar-tab" data-tab="snapshots">历史</button>

@@ -17,6 +17,7 @@ export interface PtySession {
   cwd: string;
   presetCommand: string;
   themeId: string;
+  provider: string | null;    // 实际使用的模型提供商 (如 MiniMax, GLM 等)
 }
 
 interface PtyManagerEvents {
@@ -33,6 +34,7 @@ const PRESET_DISPLAY_NAMES: Record<string, string> = {
   'claude --dangerously-skip-permissions': 'Claude全自动',
   'codex': 'Codex',
   'codex --full-auto': 'Codex全自动',
+  'codex -c sandbox_mode="danger-full-access" -c approval="never" -c network="enabled"': 'Codex全自动',
   'kimi': 'Kimi',
   'kimi --yolo': 'Kimi全自动',
   'opencode': 'OpenCode',
@@ -54,18 +56,20 @@ export class PtyManager {
     this.events = events;
   }
 
-  create(cwd: string, presetCommand: string, themeId: string): PtySession {
+  create(cwd: string, presetCommand: string, themeId: string, envOverrides?: Record<string, string>): PtySession {
     const id = `term-${this.nextId++}`;
     const shell = process.platform === 'win32'
       ? (process.env.COMSPEC || 'cmd.exe')
       : (process.env.SHELL || '/bin/zsh');
+
+    const env = { ...process.env, ...(envOverrides || {}) } as { [key: string]: string };
 
     const ptyProcess = pty.spawn(shell, [], {
       name: 'xterm-256color',
       cols: 80,
       rows: 24,
       cwd,
-      env: { ...process.env } as { [key: string]: string },
+      env,
     });
 
     const session: PtySession = {
@@ -81,6 +85,7 @@ export class PtyManager {
       cwd,
       presetCommand,
       themeId,
+      provider: null,
     };
 
     ptyProcess.onData((data: string) => {
@@ -150,7 +155,10 @@ export class PtyManager {
   resize(id: string, cols: number, rows: number): void {
     const session = this.sessions.get(id);
     if (!session) return;
-    session.ptyProcess.resize(cols, rows);
+    // 过滤无效尺寸，node-pty resize(0,0) 会抛异常
+    if (cols > 0 && rows > 0) {
+      session.ptyProcess.resize(cols, rows);
+    }
   }
 
   destroy(id: string): void {

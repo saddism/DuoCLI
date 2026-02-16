@@ -37,6 +37,8 @@ html, body {
   inset: 0;
   flex-direction: column;
   overflow: hidden;
+  /* 防止子元素溢出导致页面高度变化 */
+  contain: strict;
 }
 .page.active {
   display: flex;
@@ -222,13 +224,50 @@ header h2 {
   text-overflow: ellipsis;
 }
 
+.session-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-title-row .session-title {
+  flex: 1;
+  min-width: 0;
+}
+
 .session-meta {
   color: var(--text2);
-  font-size: 13px;
+  font-size: 12px;
   margin-top: 3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.session-time {
+  flex-shrink: 0;
+}
+
+.session-cwd {
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+
+.cli-tag {
+  display: inline-block;
+  font-size: 10px;
+  line-height: 1.6;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+  color: var(--cli-c);
+  background: var(--cli-bg);
 }
 
 .session-arrow {
@@ -287,21 +326,89 @@ header h2 {
   overflow: hidden;
   background: #1a1a2e;
   touch-action: pan-y;
+  position: relative;
+}
+
+/* 终端加载中遮罩 */
+.terminal-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: #1a1a2e;
+  color: var(--text2);
+  font-size: 14px;
+  z-index: 10;
+  transition: opacity 0.3s;
+}
+
+.terminal-loading.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.loading-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 #terminal-container .xterm {
   height: 100%;
   padding: 4px;
+  /* 防止内容变化导致布局重排 */
+  transform: translateZ(0);
 }
 
 #terminal-container .xterm-viewport {
   overflow-y: scroll !important;
   -webkit-overflow-scrolling: touch;
   touch-action: pan-y;
+  /* 隐藏滚动条，只保留触摸滚动功能 */
+  scrollbar-width: none !important;
+  -ms-overflow-style: none;
+}
+
+#terminal-container .xterm-viewport::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
 }
 
 #terminal-container .xterm-screen {
   touch-action: pan-y;
+}
+
+.copy-toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(88px + var(--safe-bottom));
+  transform: translateX(-50%) translateY(10px);
+  background: rgba(20, 20, 30, 0.95);
+  color: #fff;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 12px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  z-index: 30;
+}
+
+.copy-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
 }
 
 /* ========== 快捷键栏 ========== */
@@ -310,8 +417,8 @@ header h2 {
 
 #shortcut-bar {
   display: flex;
-  gap: 6px;
-  padding: 8px 14px;
+  gap: 4px;
+  padding: 6px 10px;
   background: var(--bg2);
   border-top: 1px solid var(--border);
   overflow-x: auto;
@@ -324,12 +431,12 @@ header h2 {
 }
 
 .key-btn {
-  padding: 8px 14px;
+  padding: 6px 10px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 6px;
   background: var(--bg);
   color: var(--text);
-  font-size: 13px;
+  font-size: 14px;
   font-family: 'SF Mono', 'Menlo', monospace;
   white-space: nowrap;
   cursor: pointer;
@@ -468,7 +575,15 @@ header h2 {
   color: var(--text);
   font-size: 15px;
   outline: none;
-  -webkit-appearance: none;
+}
+
+.modal-content input[type="checkbox"] {
+  -webkit-appearance: checkbox;
+  width: auto;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: none;
 }
 
 .modal-content select {
@@ -476,6 +591,9 @@ header h2 {
   background-repeat: no-repeat;
   background-position: right 14px center;
   padding-right: 36px;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
 }
 
 .modal-actions {
@@ -511,6 +629,30 @@ header h2 {
   padding: 8px;
   color: var(--text2);
   font-size: 13px;
+}
+
+/* ========== 催工标签 ========== */
+
+.ac-label {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 12px;
+  cursor: pointer;
+  background: #555;
+  color: #aaa;
+  flex-shrink: 0;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: background 0.2s, color 0.2s;
+}
+
+.ac-label.enabled {
+  background: #4caf50;
+  color: #fff;
+}
+
+.ac-label:active {
+  opacity: 0.7;
 }
 
 /* ========== 滚动条 ========== */

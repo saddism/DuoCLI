@@ -10,10 +10,52 @@ let term = null;
 let fitAddon = null;
 let ws = null;
 let wsHeartbeat = null;
+let copyToastTimer = null;
+let isUserScrolling = false;
+let scrollToBottomTimer = null;
+
+// ========== 催工（自动继续）==========
+// 手机端只做 UI，实际配置存在桌面端，通过 API 读写
 
 // ========== 工具函数 ==========
 
 function $(id) { return document.getElementById(id); }
+
+// CLI 标签颜色映射 [文字色, 背景色]，与桌面端保持一致
+const CLI_TAG_COLORS = {
+  'Claude':       ['#d4a574', '#3d2e1e'],
+  'Claude全自动':  ['#e5a100', '#3d3010'],
+  'Codex':        ['#73c991', '#1e3328'],
+  'Codex全自动':   ['#56d4a0', '#1a3d2e'],
+  'Kimi':         ['#c678dd', '#2e1e3d'],
+  'Kimi全自动':    ['#d19ae8', '#33204a'],
+  'OpenCode':     ['#61afef', '#1e2e3d'],
+  'Cursor':       ['#56b6c2', '#1e3338'],
+  'Gemini':       ['#82aaff', '#1e2540'],
+  'Gemini全自动':  ['#99bbff', '#222d4a'],
+};
+
+function getCliTagColors(name) {
+  if (CLI_TAG_COLORS[name]) return CLI_TAG_COLORS[name];
+  for (const key of Object.keys(CLI_TAG_COLORS)) {
+    if (name.startsWith(key)) return CLI_TAG_COLORS[key];
+  }
+  // 未知 CLI：hash 选色
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = ((h << 5) - h + name.charCodeAt(i)) | 0;
+  const palette = [
+    ['#e06c75', '#3d1e22'], ['#e5c07b', '#3d3520'], ['#98c379', '#253320'],
+    ['#f78c6c', '#3d2518'], ['#c792ea', '#2e1e3d'], ['#ff5370', '#3d1825'],
+  ];
+  return palette[Math.abs(h) % palette.length];
+}
+
+function hideTerminalLoading() {
+  const el = $('terminal-loading');
+  if (el && !el.classList.contains('hidden')) {
+    el.classList.add('hidden');
+  }
+}
 
 function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json' };
@@ -40,6 +82,116 @@ function escHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text || '');
+  if (!value) return false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {}
+
+  // iOS Safari 兜底
+  const ta = document.createElement('textarea');
+  ta.value = value;
+  ta.setAttribute('readonly', 'readonly');
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0, ta.value.length);
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {}
+  document.body.removeChild(ta);
+  return ok;
+}
+
+function showCopyToast(text) {
+  let toast = $('copy-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'copy-toast';
+    toast.className = 'copy-toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = text;
+  toast.classList.add('show');
+  if (copyToastTimer) clearTimeout(copyToastTimer);
+  copyToastTimer = setTimeout(() => {
+    toast.classList.remove('show');
+  }, 1200);
+}
+
+// ========== 催工核心逻辑（通过 API 读写桌面端配置）==========
+
+async function getAutoContinueConfig(sessionId) {
+  try {
+    return await api(`/api/sessions/${sessionId}/auto-continue`);
+  } catch {
+    return null;
+  }
+}
+
+async function saveAutoContinueConfig(sessionId, config) {
+  try {
+    await api(`/api/sessions/${sessionId}/auto-continue`, {
+      method: 'PUT',
+      body: JSON.stringify(config),
+    });
+  } catch (e) {
+    console.error('[AutoContinue] 保存失败', e);
+  }
+}
+
+async function toggleAutoContinue(sessionId, enabled) {
+  const config = await getAutoContinueConfig(sessionId) || {};
+  config.enabled = enabled;
+  await saveAutoContinueConfig(sessionId, config);
+  updateDetailAutoContinueUI(config);
+}
+
+async function showAutoContinueConfigModal(sessionId) {
+  const config = await getAutoContinueConfig(sessionId) || {};
+  const modal = $('auto-continue-modal');
+  $('ac-message').value = config.message || '继续';
+  $('ac-interval').value = String(Math.round((config.intervalMs || 600000) / 60000));
+  $('ac-auto-agree').checked = config.autoAgree !== false;
+  $('ac-agree-delay').value = String(config.autoAgreeDelaySec ?? 5);
+  $('ac-agree-delay-row').style.display = $('ac-auto-agree').checked ? '' : 'none';
+  modal.classList.add('active');
+}
+
+function updateDetailAutoContinueUI(config) {
+  const label = $('detail-ac-label');
+  if (label) {
+    const enabled = config && config.enabled;
+    label.textContent = '催';
+    label.className = 'ac-label' + (enabled ? ' enabled' : '');
+  }
+}
+
+function getLineTextByTouchY(clientY) {
+  if (!term) return '';
+  const container = $('terminal-container');
+  const rect = container.getBoundingClientRect();
+  const rowsEl = container.querySelector('.xterm-rows');
+  const firstRow = rowsEl?.children?.[0];
+  const rowHeight = firstRow?.getBoundingClientRect().height || 18;
+  const yInTerminal = clientY - rect.top;
+  const visualRow = Math.max(0, Math.floor(yInTerminal / rowHeight));
+  const buffer = term.buffer.active;
+  const lineIndex = Math.min(
+    Math.max(0, buffer.viewportY + visualRow),
+    Math.max(0, buffer.length - 1),
+  );
+  const line = buffer.getLine(lineIndex);
+  return line ? line.translateToString(true).trim() : '';
 }
 
 // ========== 登录 ==========
@@ -84,6 +236,7 @@ $('token-input').addEventListener('keydown', e => {
 async function enterMain() {
   showPage('main-page');
   await refreshSessions();
+  await refreshRecentCwdOptions();
   startSSE();
   subscribePush();
 }
@@ -94,6 +247,27 @@ async function refreshSessions() {
     renderSessionList(sessions);
   } catch (e) {
     console.error('刷新会话失败', e);
+  }
+}
+
+async function refreshRecentCwdOptions() {
+  const select = $('new-cwd');
+  if (!select) return;
+  try {
+    const res = await api('/api/recent-cwds');
+    const items = Array.isArray(res?.items) ? res.items : [];
+    // 保留第一个默认选项
+    const defaultOpt = select.querySelector('option');
+    select.innerHTML = '';
+    if (defaultOpt) select.appendChild(defaultOpt);
+    for (const p of items) {
+      const opt = document.createElement('option');
+      opt.value = p;
+      opt.textContent = p;
+      select.appendChild(opt);
+    }
+  } catch {
+    // 保留默认选项
   }
 }
 
@@ -108,16 +282,28 @@ function renderSessionList(sessions) {
   }
 
   empty.style.display = 'none';
-  list.innerHTML = sessions.map(s => `
+  list.innerHTML = sessions.map(s => {
+    const dn = s.displayName || '';
+    const [tagColor, tagBg] = dn ? getCliTagColors(dn) : ['', ''];
+    const tagHtml = dn
+      ? `<span class="cli-tag" style="--cli-c:${tagColor};--cli-bg:${tagBg}">${escHtml(dn)}</span>`
+      : '';
+    return `
     <div class="session-card" data-id="${s.id}">
       <div class="status-dot ${s.status}"></div>
       <div class="session-info">
-        <div class="session-title">${escHtml(s.title || s.presetCommand || '终端')}</div>
-        <div class="session-meta">${escHtml(s.cwd)} · ${formatTime(s.createdAt)}</div>
+        <div class="session-title-row">
+          <div class="session-title">${escHtml(s.title || s.presetCommand || '终端')}</div>
+          ${tagHtml}
+        </div>
+        <div class="session-meta">
+          <span class="session-time">${formatTime(s.createdAt)}</span>
+          <span class="session-cwd">${escHtml(s.cwd)}</span>
+        </div>
       </div>
       <div class="session-arrow">›</div>
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
 
   list.querySelectorAll('.session-card').forEach(card => {
     card.onclick = () => openSession(card.dataset.id);
@@ -151,6 +337,30 @@ function startSSE() {
 
 function stopSSE() {
   if (sseSource) { sseSource.close(); sseSource = null; }
+}
+
+// 发送输入：普通文本走 input_b64；回车统一补发 hex(0d)，避免仅靠字符串换行不执行
+function sendInputWithHexEnter(raw) {
+  if (!raw) return;
+  let chunk = '';
+  const flushChunk = () => {
+    if (!chunk) return;
+    wsSend({ type: 'input', data: chunk });
+    chunk = '';
+  };
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === '\r' || ch === '\n') {
+      flushChunk();
+      // CRLF 只发一次回车
+      if (ch === '\n' && i > 0 && raw[i - 1] === '\r') continue;
+      wsSendHex('0d');
+    } else {
+      chunk += ch;
+    }
+  }
+  flushChunk();
 }
 
 // ========== xterm.js 终端 ==========
@@ -187,27 +397,35 @@ function createTerminal() {
     scrollback: 5000,
     convertEol: false,
     allowProposedApi: true,
+    // 禁用光标样式同步，减少渲染
+    cursorStyle: 'block',
+    cursorInactiveStyle: 'none',
   });
 
   fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
 
   const container = $('terminal-container');
+  // 清除旧终端 DOM，但保留 loading 遮罩
+  const loading = $('terminal-loading');
   container.innerHTML = '';
+  if (loading) container.appendChild(loading);
+  // 显示 loading
+  if (loading) loading.classList.remove('hidden');
   term.open(container);
 
   // 终端键盘输入 → WebSocket
-  // iOS 键盘"发送"可能发 \n 而非 \r，统一替换为 \r
   term.onData((data) => {
-    wsSend({ type: 'input', data: data.replace(/\n/g, '\r') });
+    sendInputWithHexEnter(data);
   });
 
   // 窗口大小变化 → resize
   window.addEventListener('resize', handleResize);
 
   // 返回 Promise，确保终端完全 ready 后再做后续操作（如连接 WebSocket）
+  // 双重 rAF 确保页面切换后 DOM 布局完成，避免 fit 算出 0 列 0 行
   return new Promise((resolve) => {
-    requestAnimationFrame(() => {
+    requestAnimationFrame(() => { requestAnimationFrame(() => {
       fitAddon.fit();
       // 移动端：禁止点击终端区域弹出键盘
       const xtermTextarea = container.querySelector('.xterm-helper-textarea');
@@ -218,6 +436,7 @@ function createTerminal() {
       // 移动端触摸滚动：xterm.js 默认拦截触摸事件，手动实现滚动
       let touchLastY = 0;
       const screen = container.querySelector('.xterm-screen');
+      const viewport = container.querySelector('.xterm-viewport');
       if (screen) {
         screen.addEventListener('touchstart', (e) => {
           if (e.touches.length === 1) {
@@ -230,7 +449,7 @@ function createTerminal() {
             const currentY = e.touches[0].clientY;
             const deltaY = touchLastY - currentY;
             touchLastY = currentY;
-            const lines = Math.round(deltaY / 20);
+            const lines = Math.round(deltaY / 8);
             if (lines !== 0) {
               term.scrollLines(lines);
             }
@@ -238,15 +457,71 @@ function createTerminal() {
         }, { passive: true });
       }
 
+      // 检测用户手动滚动状态：触摸时标记为用户滚动，滚动结束后恢复
+      if (viewport) {
+        let scrollTimeout = null;
+        const onUserScroll = () => {
+          isUserScrolling = true;
+          if (scrollTimeout) clearTimeout(scrollTimeout);
+          scrollTimeout = setTimeout(() => {
+            isUserScrolling = false;
+          }, 1000); // 停止滚动 1 秒后恢复自动滚动
+        };
+        viewport.addEventListener('touchstart', onUserScroll, { passive: true });
+        viewport.addEventListener('touchmove', onUserScroll, { passive: true });
+      }
+
+      if (!container.dataset.copyBound) {
+        // 长按复制：优先复制已选中文本；未选择时复制当前按住行
+        let copyPressTimer = null;
+        let copyStartX = 0;
+        let copyStartY = 0;
+        let copyLineY = 0;
+        const cancelCopyPress = () => {
+          if (copyPressTimer) {
+            clearTimeout(copyPressTimer);
+            copyPressTimer = null;
+          }
+        };
+        container.addEventListener('touchstart', (e) => {
+          if (!term || e.touches.length !== 1) return;
+          const t = e.touches[0];
+          copyStartX = t.clientX;
+          copyStartY = t.clientY;
+          copyLineY = t.clientY;
+          cancelCopyPress();
+          copyPressTimer = setTimeout(async () => {
+            let text = term.hasSelection() ? term.getSelection().trim() : '';
+            if (!text) text = getLineTextByTouchY(copyLineY);
+            if (!text) {
+              showCopyToast('当前无可复制内容');
+              return;
+            }
+            const ok = await copyTextToClipboard(text);
+            showCopyToast(ok ? '已复制到剪贴板' : '复制失败');
+          }, 520);
+        }, { passive: true });
+        container.addEventListener('touchmove', (e) => {
+          if (!copyPressTimer || e.touches.length !== 1) return;
+          const t = e.touches[0];
+          if (Math.abs(t.clientX - copyStartX) > 10 || Math.abs(t.clientY - copyStartY) > 10) {
+            cancelCopyPress();
+          }
+        }, { passive: true });
+        container.addEventListener('touchend', cancelCopyPress, { passive: true });
+        container.addEventListener('touchcancel', cancelCopyPress, { passive: true });
+        container.dataset.copyBound = '1';
+      }
+
       resolve(term);
-    });
+    }); });
   });
 }
 
 function handleResize() {
   if (!fitAddon || !term) return;
   fitAddon.fit();
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === WebSocket.OPEN && term.cols > 0 && term.rows > 0) {
     wsSend({ type: 'resize', cols: term.cols, rows: term.rows });
   }
 }
@@ -271,13 +546,17 @@ function connectWebSocket(sessionId) {
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
+    console.log('[ws] onopen, term exists=', !!term);
     // 重连时清空终端，避免 replay 叠加
     if (term) term.reset();
     // 订阅会话
     wsSend({ type: 'subscribe', sessionId });
-    // 发送当前终端尺寸
-    if (term) {
+    // 发送当前终端尺寸（过滤无效值，避免 pty resize(0,0) 异常）
+    if (term && term.cols > 0 && term.rows > 0) {
+      console.log('[ws] sending resize', term.cols, term.rows);
       wsSend({ type: 'resize', cols: term.cols, rows: term.rows });
+    } else {
+      console.log('[ws] skipping resize, cols=', term?.cols, 'rows=', term?.rows);
     }
     // 心跳保活，防止 iOS Safari 后台杀连接
     clearInterval(wsHeartbeat);
@@ -286,20 +565,46 @@ function connectWebSocket(sessionId) {
     }, 15000);
   };
 
+  let replayReceived = false;
+  let replayRetryTimer = null;
+
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
       if (!term) return;
 
       if (msg.type === 'replay') {
+        replayReceived = true;
+        console.log('[ws] replay received, data length=', (msg.data || '').length);
         // 先彻底清空，再写入 replay 内容，避免残留
         term.reset();
-        term.write(msg.data, () => {
-          // replay 写完后滚到底部
-          term.scrollToBottom();
-        });
+        if (msg.data) {
+          // 有内容，隐藏 loading 并写入
+          hideTerminalLoading();
+          term.write(msg.data, () => {
+            if (!isUserScrolling) {
+              term.scrollToBottom();
+            }
+          });
+        }
+        // 如果 replay 为空（新建会话时 pty 刚启动），延迟重新订阅以获取最新 buffer
+        if (!msg.data && !replayRetryTimer) {
+          replayRetryTimer = setTimeout(() => {
+            if (ws && ws.readyState === WebSocket.OPEN && currentSessionId === sessionId) {
+              wsSend({ type: 'subscribe', sessionId });
+            }
+          }, 800);
+        }
       } else if (msg.type === 'output') {
+        hideTerminalLoading();
         term.write(msg.data);
+        // 用户手动滚动时不自动滚到底部，避免死循环
+        if (!isUserScrolling) {
+          if (scrollToBottomTimer) clearTimeout(scrollToBottomTimer);
+          scrollToBottomTimer = setTimeout(() => {
+            term.scrollToBottom();
+          }, 50);
+        }
       }
     } catch {}
   };
@@ -345,6 +650,7 @@ function wsSend(data) {
 // ========== 会话详情 ==========
 
 async function openSession(id) {
+  console.log('[openSession] start, id=', id);
   currentSessionId = id;
   showPage('detail-page');
 
@@ -359,8 +665,14 @@ async function openSession(id) {
   } catch {}
 
   // 创建终端并连接 WebSocket（等终端 ready 后再连，避免 replay 数据丢失）
+  console.log('[openSession] creating terminal...');
   await createTerminal();
+  console.log('[openSession] terminal ready, cols=', term?.cols, 'rows=', term?.rows);
   connectWebSocket(id);
+  console.log('[openSession] connectWebSocket called');
+
+  // 初始化催工 UI（从桌面端读取配置）
+  getAutoContinueConfig(id).then(config => updateDetailAutoContinueUI(config));
 }
 
 // 返回按钮
@@ -369,6 +681,58 @@ $('back-btn').onclick = () => {
   closeTerminal();
   showPage('main-page');
   refreshSessions();
+};
+
+// 催工开关：点击标签切换
+$('detail-ac-label').onclick = async () => {
+  if (!currentSessionId) return;
+  const config = await getAutoContinueConfig(currentSessionId) || {};
+  await toggleAutoContinue(currentSessionId, !config.enabled);
+};
+
+// 催工配置按钮
+$('detail-ac-config').onclick = () => {
+  if (!currentSessionId) return;
+  showAutoContinueConfigModal(currentSessionId);
+};
+
+// 催工配置弹窗：自动同意 checkbox 联动
+$('ac-auto-agree').onchange = () => {
+  $('ac-agree-delay-row').style.display = $('ac-auto-agree').checked ? '' : 'none';
+};
+
+// 催工配置弹窗：取消
+$('ac-cancel').onclick = () => {
+  $('auto-continue-modal').classList.remove('active');
+};
+
+// 催工配置弹窗：点击遮罩关闭
+$('auto-continue-modal').onclick = (e) => {
+  if (e.target === $('auto-continue-modal')) {
+    $('auto-continue-modal').classList.remove('active');
+  }
+};
+
+// 催工配置弹窗：保存
+$('ac-save').onclick = async () => {
+  if (!currentSessionId) return;
+  const message = $('ac-message').value.trim();
+  if (!message) { $('ac-message').focus(); return; }
+  const intervalMinutes = parseInt($('ac-interval').value, 10);
+  if (isNaN(intervalMinutes) || intervalMinutes < 1) { $('ac-interval').focus(); return; }
+  const agreeDelay = parseInt($('ac-agree-delay').value, 10);
+
+  const config = {
+    enabled: true,
+    message,
+    intervalMs: intervalMinutes * 60000,
+    autoAgree: $('ac-auto-agree').checked,
+    autoAgreeDelaySec: isNaN(agreeDelay) ? 5 : agreeDelay,
+  };
+
+  await saveAutoContinueConfig(currentSessionId, config);
+  $('auto-continue-modal').classList.remove('active');
+  updateDetailAutoContinueUI(config);
 };
 
 // 发送消息 — 点击发送按钮
@@ -387,7 +751,7 @@ setInterval(() => {
     const textToSend = cleaned || pendingText;
     pendingText = '';
     if (textToSend) {
-      wsSend({ type: 'input', data: textToSend });
+      sendInputWithHexEnter(textToSend);
     }
     // 单独用 hex 发送回车
     wsSendHex('0d');
@@ -408,7 +772,7 @@ function sendMessage() {
 
   // 文本部分：纯文本发送
   if (text) {
-    wsSend({ type: 'input', data: text });
+    sendInputWithHexEnter(text);
   }
   // 回车部分：单独用 hex 发送，确保终端收到真正的 CR
   wsSendHex('0d');
@@ -521,7 +885,7 @@ document.querySelectorAll('.key-btn').forEach(btn => {
                       .replace(/\\r/g, '\r')
                       .replace(/\\t/g, '\t')
                       .replace(/\\n/g, '\n');
-    wsSend({ type: 'input', data: parsed });
+    sendInputWithHexEnter(parsed);
   });
 });
 
@@ -542,7 +906,12 @@ $('delete-btn').onclick = async () => {
 
 // ========== 新建会话 ==========
 
-$('new-session-btn').onclick = () => {
+$('new-session-btn').onclick = async () => {
+  await refreshRecentCwdOptions();
+  const select = $('new-cwd');
+  const options = select?.querySelectorAll('option');
+  const first = options?.length > 1 ? options[1].value : '';
+  if (!select.value.trim() && first) select.value = first;
   $('new-session-modal').classList.add('active');
 };
 

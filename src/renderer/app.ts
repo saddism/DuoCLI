@@ -14,22 +14,26 @@ interface AIProviderInfo {
 }
 
 let selectedAiProviderId: string | null = null;
+let remoteServerInfo: { lanUrl: string; token: string; port: number } | null = null;
 
 declare global {
   interface Window {
     duocli: {
       setWindowTitle: (title: string) => void;
-      createPty: (cwd: string, presetCommand: string, themeId: string) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string }>;
+      createPty: (cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string }>;
       writePty: (id: string, data: string) => void;
       resizePty: (id: string, cols: number, rows: number) => void;
       destroyPty: (id: string) => void;
       renamePty: (id: string, title: string) => void;
       getSessions: () => Promise<Array<{ id: string; title: string; themeId: string; cwd: string; displayName: string }>>;
       selectFolder: (currentPath?: string) => Promise<string | null>;
+      fileTreeListDir: (dirPath: string) => Promise<Array<{ name: string; path: string; isDir: boolean }>>;
+      remoteAddRecentCwd: (cwd: string) => Promise<boolean>;
       onPtyData: (cb: (id: string, data: string) => void) => void;
       onTitleUpdate: (cb: (id: string, title: string) => void) => void;
       onPtyExit: (cb: (id: string) => void) => void;
       onRemoteCreated: (cb: (sessionInfo: { id: string; title: string; themeId: string; cwd: string; displayName: string }) => void) => void;
+      onRemoteServerInfo: (cb: (info: { lanUrl: string; token: string; port: number }) => void) => void;
       // 快照 API
       snapshotCheckRepo: (cwd: string) => Promise<boolean>;
       snapshotCreate: (cwd: string, message?: string) => Promise<string | null>;
@@ -43,6 +47,7 @@ declare global {
       snapshotSummarize: (cwd: string, commitId: string) => Promise<string>;
       onSnapshotCreated: (cb: (commitId: string) => void) => void;
       clipboardSaveImage: () => Promise<string | null>;
+      clipboardGetFilePath: () => Promise<string | null>;
       // 文件监听 API
       filewatcherStart: (cwd: string) => Promise<void>;
       filewatcherStop: () => Promise<void>;
@@ -59,6 +64,10 @@ declare global {
       aiSelect: (providerId: string) => Promise<boolean>;
       aiSetModel: (providerId: string, model: string) => Promise<boolean>;
       aiGetSelected: () => Promise<{ providerId: string | null; model: string | null }>;
+      getCliProvider: (presetCommand: string) => Promise<string | null>;
+      // Claude 供应商配置
+      claudeProvidersList: () => Promise<Array<{ id: string; name: string; baseUrl: string; apiKey: string }>>;
+      claudeProvidersSave: (providers: Array<{ id: string; name: string; baseUrl: string; apiKey: string }>) => Promise<boolean>;
       // 会话历史 API
       sessionHistoryInit: (sessionId: string, title: string) => Promise<string>;
       sessionHistoryAppend: (sessionId: string, data: string) => void;
@@ -69,6 +78,13 @@ declare global {
       sessionHistoryRead: (filename: string) => Promise<string>;
       sessionHistoryDelete: (filename: string) => Promise<void>;
       sessionHistorySummarize: (filename: string) => Promise<string>;
+      // 文件操作
+      openFile: (filePath: string) => Promise<void>;
+      readDirectory: (dirPath: string) => Promise<Array<{ name: string; isDirectory: boolean; isFile: boolean }>>;
+      // 催工配置中转
+      onGetAutoContinueConfig: (cb: (sessionId: string) => void) => void;
+      sendAutoContinueConfig: (sessionId: string, config: any) => void;
+      onSetAutoContinueConfig: (cb: (sessionId: string, config: any) => void) => void;
     };
   }
 }
@@ -84,8 +100,217 @@ const sessionUpdateTimes: Map<string, number> = new Map();
 const sessionCwds: Map<string, string> = new Map();
 // 会话显示名称（如 Claude全自动、Codex 等）
 const sessionDisplayNames: Map<string, string> = new Map();
+// 会话实际使用的模型提供商（如 MiniMax、GLM、Anthropic 等）
+const sessionProviders: Map<string, string> = new Map();
+
+// 自动继续配置
+const sessionAutoContinue: Map<string, { enabled: boolean; message: string; intervalMs: number; lastSendTime: number; autoAgree: boolean; autoAgreeDelaySec: number; sendDelaySec: number }> = new Map();
+const AUTO_CONTINUE_DEFAULT_MESSAGE = '继续';
+const AUTO_CONTINUE_DEFAULT_INTERVAL = 10 * 60 * 1000; // 10 分钟
+const AUTO_AGREE_DEFAULT_DELAY_SEC = 5; // 自动同意默认延后 5 秒
+const AUTO_CONTINUE_SEND_DELAY_SEC = 2; // 发送回车前默认延迟 2 秒
+const AUTO_CONTINUE_STORAGE_KEY = 'duocli_auto_continue';
+
+// 持久化催工配置到 localStorage
+function saveAutoContinueToStorage(): void {
+  const data: Record<string, any> = {};
+  sessionAutoContinue.forEach((config, sessionId) => {
+    // lastSendTime 是运行时状态，不持久化
+    data[sessionId] = {
+      enabled: config.enabled,
+      message: config.message,
+      intervalMs: config.intervalMs,
+      autoAgree: config.autoAgree,
+      autoAgreeDelaySec: config.autoAgreeDelaySec,
+      sendDelaySec: config.sendDelaySec,
+    };
+  });
+  localStorage.setItem(AUTO_CONTINUE_STORAGE_KEY, JSON.stringify(data));
+}
+
+// 从 localStorage 恢复催工配置
+function loadAutoContinueFromStorage(): void {
+  try {
+    const raw = localStorage.getItem(AUTO_CONTINUE_STORAGE_KEY);
+    if (!raw) return;
+    const data = JSON.parse(raw) as Record<string, any>;
+    for (const [sessionId, config] of Object.entries(data)) {
+      sessionAutoContinue.set(sessionId, {
+        enabled: config.enabled ?? false,
+        message: config.message ?? AUTO_CONTINUE_DEFAULT_MESSAGE,
+        intervalMs: config.intervalMs ?? AUTO_CONTINUE_DEFAULT_INTERVAL,
+        lastSendTime: Date.now(),
+        autoAgree: config.autoAgree ?? true,
+        autoAgreeDelaySec: config.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC,
+        sendDelaySec: config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC,
+      });
+    }
+  } catch {}
+}
+
+// 启动时恢复催工配置并启动定时器
+loadAutoContinueFromStorage();
+// 检查是否有启用的配置，如果有则启动定时器
+const hasEnabledConfig = Array.from(sessionAutoContinue.values()).some(c => c.enabled);
+if (hasEnabledConfig) initAutoContinueTimer();
+
+// 自动继续定时器
+let autoContinueTimer: ReturnType<typeof setInterval> | null = null;
+
+// 写入 PTY 并重置自动继续计时器
+function writePtyWithAutoReset(id: string, data: string): void {
+  window.duocli.writePty(id, data);
+  // 重置该会话的自动继续计时器
+  const config = sessionAutoContinue.get(id);
+  if (config && config.enabled) {
+    config.lastSendTime = Date.now();
+  }
+}
+
+// 初始化自动继续定时器
+function initAutoContinueTimer(): void {
+  if (autoContinueTimer) {
+    clearInterval(autoContinueTimer);
+  }
+  autoContinueTimer = setInterval(() => {
+    const now = Date.now();
+    sessionAutoContinue.forEach((config, sessionId) => {
+      if (!config.enabled) return;
+      // 检查是否超时
+      if (now - config.lastSendTime >= config.intervalMs) {
+        // 发送自动继续消息（多行文本中的换行替换为回车符）
+        const message = (config.message || AUTO_CONTINUE_DEFAULT_MESSAGE).replace(/\n/g, '\r');
+        const sendDelay = (config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC) * 1000;
+        console.log(`[AutoContinue] 准备发送消息到会话 ${sessionId}（回车延迟 ${sendDelay}ms）`);
+        window.duocli.writePty(sessionId, message);
+        // 延迟发送回车，避免长文本未写入完成就提交
+        setTimeout(() => {
+          window.duocli.writePty(sessionId, String.fromCharCode(0x0d));
+          console.log(`[AutoContinue] 已发送回车`);
+        }, sendDelay);
+        config.lastSendTime = now;
+      }
+    });
+  }, 1000); // 每秒检查一次
+}
+
+// 切换自动继续开关
+function toggleAutoContinue(sessionId: string, enabled: boolean): void {
+  let config = sessionAutoContinue.get(sessionId);
+  if (!config) {
+    config = {
+      enabled: false,
+      message: AUTO_CONTINUE_DEFAULT_MESSAGE,
+      intervalMs: AUTO_CONTINUE_DEFAULT_INTERVAL,
+      lastSendTime: Date.now(),
+      autoAgree: true,
+      autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
+      sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
+    };
+    sessionAutoContinue.set(sessionId, config);
+  }
+  config.enabled = enabled;
+  config.lastSendTime = Date.now();
+  saveAutoContinueToStorage();
+
+  // 启动定时器（如果尚未启动）
+  initAutoContinueTimer();
+
+  // 重新渲染会话列表以更新开关状态
+  renderSessionList();
+}
+
+// 显示自动继续配置对话框
+function showAutoContinueConfigDialog(sessionId: string): void {
+  const config = sessionAutoContinue.get(sessionId) || {
+    enabled: false,
+    message: AUTO_CONTINUE_DEFAULT_MESSAGE,
+    intervalMs: AUTO_CONTINUE_DEFAULT_INTERVAL,
+    lastSendTime: Date.now(),
+    autoAgree: true,
+    autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
+    sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
+  };
+
+  const currentMessage = config.message || AUTO_CONTINUE_DEFAULT_MESSAGE;
+  const currentInterval = config.intervalMs || AUTO_CONTINUE_DEFAULT_INTERVAL;
+  const currentIntervalMinutes = Math.round(currentInterval / 60000);
+  const currentAutoAgree = config.autoAgree ?? true;
+  const currentAutoAgreeDelay = config.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC;
+  const currentSendDelay = config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC;
+
+  const overlay = document.getElementById('auto-continue-overlay')!;
+  const messageInput = document.getElementById('auto-continue-message') as HTMLTextAreaElement;
+  const intervalInput = document.getElementById('auto-continue-interval') as HTMLInputElement;
+  const autoAgreeCheckbox = document.getElementById('auto-continue-auto-agree') as HTMLInputElement;
+  const autoAgreeDelayInput = document.getElementById('auto-continue-agree-delay') as HTMLInputElement;
+  const autoAgreeDelayRow = document.getElementById('auto-agree-delay-row')!;
+  const sendDelayInput = document.getElementById('auto-continue-send-delay') as HTMLInputElement;
+  const saveBtn = document.getElementById('auto-continue-save')!;
+  const cancelBtn = document.getElementById('auto-continue-cancel')!;
+  const closeBtn = document.getElementById('auto-continue-dialog-close')!;
+
+  messageInput.value = currentMessage;
+  intervalInput.value = String(currentIntervalMinutes);
+  autoAgreeCheckbox.checked = currentAutoAgree;
+  autoAgreeDelayInput.value = String(currentAutoAgreeDelay);
+  autoAgreeDelayRow.style.display = currentAutoAgree ? '' : 'none';
+  sendDelayInput.value = String(currentSendDelay);
+
+  autoAgreeCheckbox.onchange = () => {
+    autoAgreeDelayRow.style.display = autoAgreeCheckbox.checked ? '' : 'none';
+  };
+
+  overlay.classList.add('active');
+  messageInput.focus();
+
+  function close(): void {
+    overlay.classList.remove('active');
+    saveBtn.removeEventListener('click', onSave);
+    cancelBtn.removeEventListener('click', close);
+    closeBtn.removeEventListener('click', close);
+    autoAgreeCheckbox.onchange = null;
+  }
+
+  function onSave(): void {
+    const message = messageInput.value.trim();
+    if (!message) { messageInput.focus(); return; }
+    const intervalMinutes = parseInt(intervalInput.value, 10);
+    if (isNaN(intervalMinutes) || intervalMinutes < 1) { intervalInput.focus(); return; }
+
+    const agreeDelay = parseInt(autoAgreeDelayInput.value, 10);
+    if (autoAgreeCheckbox.checked && (isNaN(agreeDelay) || agreeDelay < 0)) { autoAgreeDelayInput.focus(); return; }
+
+    const sendDelay = parseInt(sendDelayInput.value, 10);
+    if (isNaN(sendDelay) || sendDelay < 0) { sendDelayInput.focus(); return; }
+
+    config.message = message;
+    config.intervalMs = intervalMinutes * 60000;
+    config.lastSendTime = Date.now();
+    config.autoAgree = autoAgreeCheckbox.checked;
+    config.autoAgreeDelaySec = isNaN(agreeDelay) ? AUTO_AGREE_DEFAULT_DELAY_SEC : agreeDelay;
+    config.sendDelaySec = sendDelay;
+    sessionAutoContinue.set(sessionId, config);
+
+    if (!config.enabled) {
+      config.enabled = true;
+      initAutoContinueTimer();
+    }
+
+    saveAutoContinueToStorage();
+    close();
+    renderSessionList();
+  }
+
+  saveBtn.addEventListener('click', onSave);
+  cancelBtn.addEventListener('click', close);
+  closeBtn.addEventListener('click', close);
+}
+
 // 归档：终端进程仍在运行，只是从活跃列表隐藏
 const archivedSessions: Map<string, { title: string; themeId: string; updateTime: number; cwd: string; displayName: string }> = new Map();
+// 当前正在编辑标题的会话 ID
+let editingTitleId: string | null = null;
 
 // ========== 自定义预设 ==========
 
@@ -94,6 +319,254 @@ interface CustomPreset {
   name: string;
   command: string;
   autoFlag: string;
+}
+
+interface FileTreeItem {
+  name: string;
+  path: string;
+  isDir: boolean;
+}
+
+// ========== Claude 供应商配置 ==========
+
+interface ClaudeProvider {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+}
+
+const CLAUDE_PROVIDER_KEY = 'duocli_claude_provider'; // 记住上次选择的供应商 id
+let claudeProviders: ClaudeProvider[] = [];
+let selectedClaudeProviderId: string | null = localStorage.getItem(CLAUDE_PROVIDER_KEY);
+
+async function loadClaudeProviders(): Promise<void> {
+  claudeProviders = await window.duocli.claudeProvidersList();
+}
+
+async function saveClaudeProviders(): Promise<void> {
+  await window.duocli.claudeProvidersSave(claudeProviders);
+}
+
+function getSelectedClaudeProviderEnv(): Record<string, string> | undefined {
+  if (!selectedClaudeProviderId) return undefined;
+  const p = claudeProviders.find(x => x.id === selectedClaudeProviderId);
+  if (!p) return undefined;
+  const env: Record<string, string> = {};
+  if (p.baseUrl) env.ANTHROPIC_BASE_URL = p.baseUrl;
+  if (p.apiKey) {
+    env.ANTHROPIC_API_KEY = p.apiKey;
+    env.ANTHROPIC_AUTH_TOKEN = p.apiKey;
+  }
+  return Object.keys(env).length > 0 ? env : undefined;
+}
+
+// 判断当前选中的预设是否是 Claude 系列
+function isClaudePreset(preset: string): boolean {
+  return preset.startsWith('claude');
+}
+
+// 渲染供应商下拉框
+function renderClaudeProviderSelect(): void {
+  claudeProviderSelect.innerHTML = '';
+  if (claudeProviders.length === 0) {
+    const el = document.createElement('option');
+    el.value = '';
+    el.textContent = '未配置供应商（点击齿轮添加）';
+    claudeProviderSelect.appendChild(el);
+    return;
+  }
+  for (const p of claudeProviders) {
+    const el = document.createElement('option');
+    el.value = p.id;
+    el.textContent = p.name;
+    claudeProviderSelect.appendChild(el);
+  }
+  // 恢复上次选择
+  if (selectedClaudeProviderId) {
+    claudeProviderSelect.value = selectedClaudeProviderId;
+  }
+  // 如果上次的不存在了，选第一个
+  if (claudeProviderSelect.selectedIndex === -1 && claudeProviders.length > 0) {
+    claudeProviderSelect.value = claudeProviders[0].id;
+    selectedClaudeProviderId = claudeProviders[0].id;
+    localStorage.setItem(CLAUDE_PROVIDER_KEY, selectedClaudeProviderId);
+  }
+}
+
+// 根据预设显示/隐藏供应商行
+function updateClaudeProviderVisibility(): void {
+  const show = isClaudePreset(presetSelect.value) && claudeProviders.length > 0;
+  claudeProviderRow.style.display = show ? '' : 'none';
+}
+
+// 供应商管理弹窗
+function showClaudeProviderManageDialog(): void {
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  const dialog = document.createElement('div');
+  dialog.className = 'confirm-dialog';
+  dialog.style.minWidth = '400px';
+
+  function render() {
+    dialog.innerHTML = '<h3>管理 Claude 供应商</h3>';
+
+    const listEl = document.createElement('div');
+    listEl.className = 'preset-manage-list';
+
+    if (claudeProviders.length === 0) {
+      listEl.innerHTML = '<div class="preset-manage-empty">暂无供应商，点击下方按钮添加</div>';
+    } else {
+      for (const p of claudeProviders) {
+        const item = document.createElement('div');
+        item.className = 'preset-manage-item';
+
+        const info = document.createElement('div');
+        info.className = 'preset-manage-item-info';
+        const nameEl = document.createElement('div');
+        nameEl.className = 'preset-manage-item-name';
+        nameEl.textContent = p.name;
+        const urlEl = document.createElement('div');
+        urlEl.className = 'preset-manage-item-cmd';
+        urlEl.textContent = p.baseUrl || '(Anthropic 原生)';
+        info.appendChild(nameEl);
+        info.appendChild(urlEl);
+
+        const actions = document.createElement('div');
+        actions.className = 'preset-manage-item-actions';
+
+        const editBtn = document.createElement('button');
+        editBtn.textContent = '编辑';
+        editBtn.addEventListener('click', async () => {
+          const edited = await showClaudeProviderEditDialog(p);
+          if (edited) {
+            const idx = claudeProviders.findIndex(x => x.id === p.id);
+            if (idx !== -1) claudeProviders[idx] = edited;
+            await saveClaudeProviders();
+            renderClaudeProviderSelect();
+            updateClaudeProviderVisibility();
+            render();
+          }
+        });
+
+        const delBtn = document.createElement('button');
+        delBtn.className = 'danger';
+        delBtn.textContent = '删除';
+        delBtn.addEventListener('click', async () => {
+          claudeProviders = claudeProviders.filter(x => x.id !== p.id);
+          await saveClaudeProviders();
+          renderClaudeProviderSelect();
+          updateClaudeProviderVisibility();
+          render();
+        });
+
+        actions.appendChild(editBtn);
+        actions.appendChild(delBtn);
+        item.appendChild(info);
+        item.appendChild(actions);
+        listEl.appendChild(item);
+      }
+    }
+
+    dialog.appendChild(listEl);
+
+    const btns = document.createElement('div');
+    btns.className = 'confirm-buttons';
+    btns.style.marginTop = '16px';
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'btn-close-confirm';
+    addBtn.style.background = 'var(--accent)';
+    addBtn.textContent = '+ 添加供应商';
+    addBtn.addEventListener('click', async () => {
+      const created = await showClaudeProviderEditDialog();
+      if (created) {
+        claudeProviders.push(created);
+        await saveClaudeProviders();
+        renderClaudeProviderSelect();
+        updateClaudeProviderVisibility();
+        render();
+      }
+    });
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'btn-cancel';
+    closeBtn.textContent = '关闭';
+    closeBtn.addEventListener('click', () => overlay.remove());
+
+    btns.appendChild(addBtn);
+    btns.appendChild(closeBtn);
+    dialog.appendChild(btns);
+  }
+
+  render();
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+}
+
+// 供应商编辑/新建弹窗
+function showClaudeProviderEditDialog(provider?: ClaudeProvider): Promise<ClaudeProvider | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    const dialog = document.createElement('div');
+    dialog.className = 'confirm-dialog';
+
+    const isEdit = !!provider;
+    dialog.innerHTML = `
+      <h3>${isEdit ? '编辑' : '添加'}供应商</h3>
+      <div class="preset-form">
+        <div class="preset-form-field">
+          <label>名称</label>
+          <input type="text" id="cp-name" placeholder="如 MiniMax、NewCLI 等" value="${provider?.name || ''}" />
+        </div>
+        <div class="preset-form-field">
+          <label>Base URL</label>
+          <input type="text" id="cp-url" placeholder="如 https://api.minimaxi.com/anthropic" value="${provider?.baseUrl || ''}" />
+        </div>
+        <div class="preset-form-field">
+          <label>API Key</label>
+          <input type="password" id="cp-key" placeholder="留空则使用系统已有的 Key" value="${provider?.apiKey || ''}" />
+        </div>
+      </div>
+      <div class="confirm-buttons" style="margin-top:16px">
+        <button class="btn-cancel">取消</button>
+        <button class="btn-close-confirm" style="background:var(--accent)">保存</button>
+      </div>`;
+
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const nameInput = dialog.querySelector('#cp-name') as HTMLInputElement;
+    const urlInput = dialog.querySelector('#cp-url') as HTMLInputElement;
+    const keyInput = dialog.querySelector('#cp-key') as HTMLInputElement;
+    nameInput.focus();
+
+    const cleanup = (result: ClaudeProvider | null) => { overlay.remove(); resolve(result); };
+
+    dialog.querySelector('.btn-cancel')!.addEventListener('click', () => cleanup(null));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(null); });
+
+    dialog.querySelector('.btn-close-confirm')!.addEventListener('click', () => {
+      const name = nameInput.value.trim();
+      if (!name) {
+        nameInput.style.borderColor = 'var(--danger)';
+        return;
+      }
+      const id = provider?.id || `cp-${Date.now()}`;
+      cleanup({ id, name, baseUrl: urlInput.value.trim(), apiKey: keyInput.value.trim() });
+    });
+
+    // Enter/Escape
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Enter') dialog.querySelector<HTMLButtonElement>('.btn-close-confirm')!.click();
+      if (e.key === 'Escape') cleanup(null);
+    };
+    nameInput.addEventListener('keydown', handleKey);
+    urlInput.addEventListener('keydown', handleKey);
+    keyInput.addEventListener('keydown', handleKey);
+  });
 }
 
 const CUSTOM_PRESETS_KEY = 'duocli_custom_presets';
@@ -113,7 +586,7 @@ const BUILTIN_OPTIONS: Array<{ value: string; label: string }> = [
   { value: 'claude', label: 'Claude' },
   { value: 'claude --dangerously-skip-permissions', label: 'Claude (全自动)' },
   { value: 'codex', label: 'Codex' },
-  { value: 'codex --full-auto', label: 'Codex (全自动)' },
+  { value: 'codex -c sandbox_mode=\"danger-full-access\" -c approval=\"never\" -c network=\"enabled\"', label: 'Codex (全自动)' },
   { value: 'kimi', label: 'Kimi' },
   { value: 'kimi --yolo', label: 'Kimi (全自动)' },
   { value: 'opencode', label: 'OpenCode' },
@@ -121,6 +594,19 @@ const BUILTIN_OPTIONS: Array<{ value: string; label: string }> = [
   { value: 'gemini', label: 'Gemini' },
   { value: 'gemini --yolo', label: 'Gemini (全自动)' },
 ];
+
+// 渲染远程服务器连接信息
+function renderRemoteServerInfo(): void {
+  if (!remoteServerInfo) {
+    remoteServerInfoEl.style.display = 'none';
+    return;
+  }
+  remoteServerInfoEl.style.display = 'block';
+  const urlEl = remoteServerInfoEl.querySelector('.remote-info-url')!;
+  const tokenEl = remoteServerInfoEl.querySelector('.remote-info-token')!;
+  urlEl.textContent = remoteServerInfo.lanUrl;
+  tokenEl.textContent = `Token: ${remoteServerInfo.token}`;
+}
 
 function renderPresetSelect(): void {
   const prev = presetSelect.value;
@@ -336,6 +822,16 @@ function addRecentCwd(cwd: string): void {
   list.unshift(cwd);
   if (list.length > MAX_RECENT_CWDS) list.length = MAX_RECENT_CWDS;
   localStorage.setItem(RECENT_CWD_KEY, JSON.stringify(list));
+  // 同步到主进程远程服务配置，供手机端新建会话时复用
+  window.duocli.remoteAddRecentCwd(cwd).catch(() => { /* ignore */ });
+}
+
+function syncRecentCwdsToRemote(): void {
+  const list = getRecentCwds();
+  // 按“旧 -> 新”顺序回放，保证远程端最终顺序与桌面端一致
+  list.slice().reverse().forEach((cwd) => {
+    window.duocli.remoteAddRecentCwd(cwd).catch(() => { /* ignore */ });
+  });
 }
 
 // DOM 元素
@@ -347,10 +843,24 @@ const cwdRecentDropdown = document.getElementById('cwd-recent-dropdown')!;
 const presetSelect = document.getElementById('preset-select') as HTMLSelectElement;
 const presetAddBtn = document.getElementById('preset-add-btn')!;
 const presetManageBtn = document.getElementById('preset-manage-btn')!;
+const claudeProviderRow = document.getElementById('claude-provider-row')!;
+const claudeProviderSelect = document.getElementById('claude-provider-select') as HTMLSelectElement;
+const claudeProviderManageBtn = document.getElementById('claude-provider-manage-btn')!;
 const themeSelect = document.getElementById('theme-select')!;
 const themeDisplay = document.getElementById('theme-display')!;
 const themeDropdown = document.getElementById('theme-dropdown')!;
 const toolbarNewBtn = document.getElementById('toolbar-new-btn')!;
+const remoteServerInfoEl = document.getElementById('remote-server-info')!;
+const newSessionOverlay = document.getElementById('new-session-overlay')!;
+const newSessionCloseBtn = document.getElementById('new-session-close')!;
+const newSessionCancelBtn = document.getElementById('new-session-cancel')!;
+const newSessionCreateBtn = document.getElementById('new-session-create')!;
+const fileTreeList = document.getElementById('file-tree-list')!;
+const fileTreeRefreshBtn = document.getElementById('file-tree-refresh-btn')!;
+const fileTreePath = document.getElementById('file-tree-path')!;
+const fileTreePanel = document.getElementById('file-tree-panel')!;
+const fileTreeToggle = document.getElementById('file-tree-toggle')!;
+const fileTreeResizer = document.getElementById('file-tree-resizer')!;
 const terminalArea = document.getElementById('terminal-area')!;
 const terminalContent = document.getElementById('terminal-content')!;
 const emptyState = document.getElementById('empty-state')!;
@@ -359,7 +869,9 @@ const archivedHeader = document.getElementById('archived-header')!;
 const archivedToggle = document.getElementById('archived-toggle')!;
 const archivedList = document.getElementById('archived-list')!;
 const archivedCount = document.getElementById('archived-count')!;
-const sessionTitleText = document.getElementById('session-title-text')!;
+const sidebar = document.getElementById('sidebar')!;
+const sidebarToggle = document.getElementById('sidebar-toggle')!;
+const sidebarResizer = document.getElementById('sidebar-resizer')!;
 
 // 历史对话 DOM
 const historyHeader = document.getElementById('history-header')!;
@@ -396,6 +908,9 @@ const aiProviderList = document.getElementById('ai-provider-list')!;
 let globalRecentFiles: string[] = [];
 const MAX_RECENT_FILES = 5;
 let currentEditorName: string | null = null;
+let fileTreeRootCwd: string | null = null;
+const fileTreeExpandedDirs: Set<string> = new Set();
+const fileTreeChildrenCache: Map<string, FileTreeItem[]> = new Map();
 
 // 未读消息状态（绿点：AI 完成工作，等待输入）
 const sessionUnread: Set<string> = new Set();
@@ -422,11 +937,38 @@ const termManager = new TerminalManager(terminalContent, (id, cols, rows) => {
 if (savedCwd) {
   cwdInput.value = savedCwd;
 }
+syncRecentCwdsToRemote();
 // 初始化 preset select（含自定义预设），然后恢复上次选中
 renderPresetSelect();
 if (lastPreset) {
   presetSelect.value = lastPreset;
 }
+
+// 初始化 Claude 供应商
+loadClaudeProviders().then(() => {
+  renderClaudeProviderSelect();
+  updateClaudeProviderVisibility();
+});
+
+// 预设切换时更新供应商行可见性
+presetSelect.addEventListener('change', () => {
+  updateClaudeProviderVisibility();
+});
+
+// 供应商选择变化时记住
+claudeProviderSelect.addEventListener('change', () => {
+  selectedClaudeProviderId = claudeProviderSelect.value || null;
+  if (selectedClaudeProviderId) {
+    localStorage.setItem(CLAUDE_PROVIDER_KEY, selectedClaudeProviderId);
+  } else {
+    localStorage.removeItem(CLAUDE_PROVIDER_KEY);
+  }
+});
+
+// 供应商管理按钮
+claudeProviderManageBtn.addEventListener('click', () => {
+  showClaudeProviderManageDialog();
+});
 
 // 自定义配色下拉组件
 const themeColorMap: Record<string, string> = {
@@ -589,9 +1131,10 @@ function updateSessionTitleBar(): void {
   const activeId = termManager.getActiveId();
   if (activeId) {
     const cwd = sessionCwds.get(activeId) || '';
-    // 左上角标题条：显示当前终端工作目录
-    sessionTitleText.textContent = cwd || 'DuoCLI';
-    sessionTitleText.title = cwd || '';
+    // 左侧目录树顶部：显示最右侧目录名
+    const cwdDisplay = cwd ? cwd.split('/').filter(Boolean).pop() : '';
+    fileTreePath.textContent = cwdDisplay || '目录';
+    fileTreePath.title = cwd || '';
     // macOS 系统窗口标题：保留完整信息
     const title = sessionTitles.get(activeId) || '';
     const displayName = sessionDisplayNames.get(activeId) || '';
@@ -600,10 +1143,168 @@ function updateSessionTitleBar(): void {
     if (title && title !== '新会话') parts.push(title);
     window.duocli.setWindowTitle(parts.join('-'));
   } else {
-    sessionTitleText.textContent = '';
-    sessionTitleText.title = '';
+    fileTreePath.textContent = '目录';
+    fileTreePath.title = '';
     window.duocli.setWindowTitle('DuoCLI');
   }
+}
+
+function getActiveSessionId(): string | null {
+  return termManager.getActiveId();
+}
+
+function getActiveSessionCwd(): string {
+  const activeId = getActiveSessionId();
+  if (activeId) return sessionCwds.get(activeId) || currentCwd;
+  return currentCwd;
+}
+
+function quotePathForShell(filePath: string): string {
+  // Windows/cmd 用双引号；类 Unix shell 用单引号
+  if (/^[a-zA-Z]:\\/.test(filePath)) return `"${filePath.replace(/"/g, '\\"')}"`;
+  return `'${filePath.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function insertPathToActiveTerminal(filePath: string): void {
+  const activeId = getActiveSessionId();
+  if (!activeId) return;
+  writePtyWithAutoReset(activeId, quotePathForShell(filePath) + ' ');
+}
+
+function showTreeContextMenu(e: MouseEvent, itemPath: string, isDir: boolean): void {
+  // 移除已有菜单
+  document.querySelectorAll('.term-context-menu').forEach(m => m.remove());
+
+  const menu = document.createElement('div');
+  menu.className = 'term-context-menu';
+
+  const items: Array<{ label: string; action: () => void }> = [];
+
+  if (isDir) {
+    items.push(
+      { label: '复制绝对路径', action: () => { navigator.clipboard.writeText(itemPath); } },
+      { label: '在 Finder 中打开', action: () => window.duocli.openFolder(itemPath) },
+      { label: '插入路径到终端', action: () => insertPathToActiveTerminal(itemPath) },
+    );
+  } else {
+    items.push(
+      { label: '复制绝对路径', action: () => { navigator.clipboard.writeText(itemPath); } },
+      { label: '用默认应用打开', action: () => window.duocli.openFile(itemPath) },
+      { label: '用编辑器打开', action: () => window.duocli.filewatcherOpen(itemPath) },
+      { label: '插入路径到终端', action: () => insertPathToActiveTerminal(itemPath) },
+    );
+  }
+
+  for (const it of items) {
+    const el = document.createElement('div');
+    el.className = 'term-context-item';
+    el.textContent = it.label;
+    el.addEventListener('click', () => { menu.remove(); it.action(); });
+    menu.appendChild(el);
+  }
+
+  menu.style.left = `${e.clientX}px`;
+  menu.style.top = `${e.clientY}px`;
+  document.body.appendChild(menu);
+
+  const dismiss = (ev: Event) => {
+    if (!menu.contains(ev.target as Node)) { menu.remove(); document.removeEventListener('mousedown', dismiss); }
+  };
+  setTimeout(() => document.addEventListener('mousedown', dismiss), 0);
+}
+
+async function loadDirItems(dirPath: string): Promise<FileTreeItem[]> {
+  if (fileTreeChildrenCache.has(dirPath)) return fileTreeChildrenCache.get(dirPath)!;
+  const items = await window.duocli.fileTreeListDir(dirPath);
+  fileTreeChildrenCache.set(dirPath, items);
+  return items;
+}
+
+async function renderFileTree(): Promise<void> {
+  const rootCwd = getActiveSessionCwd();
+  if (!rootCwd) {
+    fileTreeList.innerHTML = '<div class="file-tree-empty">选择会话后显示当前目录</div>';
+    return;
+  }
+
+  if (fileTreeRootCwd !== rootCwd) {
+    fileTreeRootCwd = rootCwd;
+    fileTreeChildrenCache.clear();
+    fileTreeExpandedDirs.clear();
+    fileTreeExpandedDirs.add(rootCwd);
+  }
+
+  fileTreeList.innerHTML = '';
+  const rootItems = await loadDirItems(rootCwd);
+
+  const appendRows = async (items: FileTreeItem[], level: number): Promise<void> => {
+    for (const item of items) {
+      const row = document.createElement('div');
+      row.className = `file-tree-row ${item.isDir ? 'dir' : 'file'}`;
+      row.style.paddingLeft = `${6 + level * 14}px`;
+      if (item.isDir && fileTreeExpandedDirs.has(item.path)) row.classList.add('active-dir');
+
+      const arrow = document.createElement('span');
+      arrow.className = 'file-tree-arrow';
+      if (item.isDir) arrow.textContent = fileTreeExpandedDirs.has(item.path) ? '▼' : '▶';
+      row.appendChild(arrow);
+
+      const name = document.createElement('span');
+      name.className = 'file-tree-name';
+      name.textContent = item.name;
+      name.title = item.path;
+      row.appendChild(name);
+
+      // 目录行：添加"在 Finder 中打开"图标按钮
+      if (item.isDir) {
+        const openFolderBtn = document.createElement('span');
+        openFolderBtn.className = 'file-tree-open-folder';
+        openFolderBtn.textContent = '\u{1F4C2}';
+        openFolderBtn.title = '在 Finder 中打开';
+        openFolderBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          window.duocli.openFolder(item.path);
+        });
+        row.appendChild(openFolderBtn);
+      }
+
+      row.addEventListener('click', async () => {
+        if (item.isDir) {
+          if (fileTreeExpandedDirs.has(item.path)) fileTreeExpandedDirs.delete(item.path);
+          else fileTreeExpandedDirs.add(item.path);
+          await renderFileTree();
+        } else {
+          window.duocli.openFile(item.path);
+        }
+      });
+
+      // 右键菜单：文件和目录都支持
+      row.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showTreeContextMenu(e as MouseEvent, item.path, item.isDir);
+      });
+
+      fileTreeList.appendChild(row);
+
+      if (item.isDir && fileTreeExpandedDirs.has(item.path)) {
+        const children = await loadDirItems(item.path);
+        await appendRows(children, level + 1);
+      }
+    }
+  };
+
+  await appendRows(rootItems, 0);
+  if (!fileTreeList.children.length) {
+    fileTreeList.innerHTML = '<div class="file-tree-empty">目录为空</div>';
+  }
+}
+
+async function refreshFileTree(force = false): Promise<void> {
+  if (force) {
+    fileTreeChildrenCache.clear();
+  }
+  await renderFileTree();
 }
 
 // 确认弹窗
@@ -634,11 +1335,17 @@ function showConfirmDialog(title: string): Promise<'close' | 'archive' | 'cancel
 // ========== 渲染 ==========
 
 function startTitleEdit(id: string, titleSpan: HTMLElement): void {
+  // 如果正在编辑其他会话，先取消
+  if (editingTitleId && editingTitleId !== id) {
+    renderSessionList();
+  }
+  editingTitleId = id;
   const current = sessionTitles.get(id) || '';
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'session-title-input';
   input.value = current;
+  input.dataset.sessionId = id;
   titleSpan.replaceWith(input);
   input.focus();
   input.select();
@@ -646,6 +1353,7 @@ function startTitleEdit(id: string, titleSpan: HTMLElement): void {
   const commit = () => {
     if (committed) return;
     committed = true;
+    editingTitleId = null;
     const val = input.value.trim();
     if (val && val !== current) {
       sessionTitles.set(id, val);
@@ -658,16 +1366,26 @@ function startTitleEdit(id: string, titleSpan: HTMLElement): void {
   input.addEventListener('blur', commit);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') input.blur();
-    if (e.key === 'Escape') { input.value = current; input.blur(); }
+    if (e.key === 'Escape') { editingTitleId = null; input.value = current; input.blur(); }
   });
 }
 
 function renderSessionList(): void {
   const activeId = termManager.getActiveId();
+  // 如果有正在编辑的标题，检查 input 是否还在 DOM 中
+  if (editingTitleId) {
+    const existingInput = sessionList.querySelector(`input[data-session-id="${editingTitleId}"]`) as HTMLInputElement | null;
+    if (existingInput && document.activeElement === existingInput) {
+      // 正在编辑中，跳过渲染以保留编辑状态
+      return;
+    }
+    // input 不在 DOM 中或已失去焦点，清除编辑状态
+    editingTitleId = null;
+  }
   sessionList.innerHTML = '';
 
-  // pinned 优先，再按创建顺序倒序
-  const allIds = Array.from(sessionTitles.keys()).reverse();
+  // pinned 优先，按创建顺序排列（新建在下方）
+  const allIds = Array.from(sessionTitles.keys());
   const sortedIds = [
     ...allIds.filter(id => pinnedSessions.has(id)),
     ...allIds.filter(id => !pinnedSessions.has(id)),
@@ -710,10 +1428,10 @@ function renderSessionList(): void {
 
       const dot = document.createElement('span');
       dot.className = 'session-color-dot';
-      if (sessionUnread.has(id)) {
-        dot.style.backgroundColor = '#73c991';
-      } else if (sessionBusy.has(id)) {
+      if (sessionBusy.has(id)) {
         dot.style.backgroundColor = '#e5a100';
+      } else if (sessionUnread.has(id)) {
+        dot.style.backgroundColor = '#73c991';
       } else {
         dot.style.backgroundColor = '#666';
       }
@@ -732,7 +1450,13 @@ function renderSessionList(): void {
       const titleSpan = document.createElement('span');
       titleSpan.className = 'session-title';
       titleSpan.textContent = title;
-      titleSpan.addEventListener('dblclick', (e) => {
+
+      // 铅笔图标按钮，点击修改名称
+      const editBtn = document.createElement('button');
+      editBtn.className = 'session-edit-btn';
+      editBtn.textContent = '✏️';
+      editBtn.title = '修改名称';
+      editBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         startTitleEdit(id, titleSpan);
       });
@@ -754,21 +1478,66 @@ function renderSessionList(): void {
         metaRow.appendChild(nameSpan);
       }
 
-      const infoWrap = document.createElement('div');
-      infoWrap.className = 'session-info';
-      infoWrap.appendChild(titleSpan);
-      infoWrap.appendChild(metaRow);
+      // 显示实际使用的模型提供商（如 MiniMax、GLM、Anthropic 等）
+      const provider = sessionProviders.get(id);
+      if (provider) {
+        const providerSpan = document.createElement('span');
+        providerSpan.className = 'session-provider-tag';
+        providerSpan.textContent = provider;
+        providerSpan.title = '实际使用的模型提供商';
+        metaRow.appendChild(providerSpan);
+      }
+
+      // 第一行：dot + 置顶 + 标题 + 编辑 + 关闭按钮
+      const topRow = document.createElement('div');
+      topRow.className = 'session-item-top';
 
       const closeBtn = document.createElement('button');
       closeBtn.className = 'session-close';
       closeBtn.textContent = '\u00d7';
       closeBtn.addEventListener('click', (e) => { e.stopPropagation(); handleCloseClick(id); });
 
+      const titleRow = document.createElement('div');
+      titleRow.className = 'session-title-row';
+      titleRow.appendChild(titleSpan);
+      titleRow.appendChild(editBtn);
+      topRow.appendChild(dot);
+      topRow.appendChild(pinBtn);
+      topRow.appendChild(titleRow);
+      topRow.appendChild(closeBtn);
+
+      // 第二行：时间/标签 + 催工 + 扳手
+      const autoContinueConfig = sessionAutoContinue.get(id);
+      const autoContinueEnabled = autoContinueConfig?.enabled ?? false;
+
+      const autoContinueLabel = document.createElement('span');
+      autoContinueLabel.className = 'session-auto-continue-label' + (autoContinueEnabled ? ' enabled' : '');
+      autoContinueLabel.textContent = '催';
+      autoContinueLabel.title = autoContinueEnabled ? '自动继续已开启，点击关闭' : '自动继续已关闭，点击开启';
+      autoContinueLabel.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleAutoContinue(id, !autoContinueEnabled);
+      });
+
+      const autoContinueConfigBtn = document.createElement('button');
+      autoContinueConfigBtn.className = 'session-auto-continue-config-btn';
+      autoContinueConfigBtn.textContent = '\uD83D\uDD27';
+      autoContinueConfigBtn.title = '配置自动继续';
+      autoContinueConfigBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showAutoContinueConfigDialog(id);
+      });
+
+      const bottomRow = document.createElement('div');
+      bottomRow.className = 'session-item-bottom';
+      bottomRow.appendChild(metaRow);
+      bottomRow.appendChild(autoContinueLabel);
+      bottomRow.appendChild(autoContinueConfigBtn);
+
+      // 组装
       item.addEventListener('click', () => switchSession(id));
-      item.appendChild(dot);
-      item.appendChild(pinBtn);
-      item.appendChild(infoWrap);
-      item.appendChild(closeBtn);
+      item.appendChild(topRow);
+      item.appendChild(bottomRow);
       sessionList.appendChild(item);
     }
   }
@@ -815,13 +1584,16 @@ function renderArchivedList(): void {
 
 // ========== 核心操作 ==========
 
-async function createSession(): Promise<void> {
-  if (!currentCwd) { alert('请先选择工作目录'); return; }
+async function createSession(): Promise<boolean> {
+  if (!currentCwd) { alert('请先选择工作目录'); return false; }
+  addRecentCwd(currentCwd);
   const preset = presetSelect.value;
   const themeId = resolveThemeId(currentThemeId, currentCwd);
   lastPreset = preset;
   localStorage.setItem('duocli_preset', preset);
-  const result = await window.duocli.createPty(currentCwd, preset, themeId);
+  // Claude 系列：注入供应商环境变量
+  const providerEnv = isClaudePreset(preset) ? getSelectedClaudeProviderEnv() : undefined;
+  const result = await window.duocli.createPty(currentCwd, preset, themeId, providerEnv);
   sessionTitles.set(result.id, result.title);
   sessionThemes.set(result.id, result.themeId);
   sessionUpdateTimes.set(result.id, Date.now());
@@ -836,31 +1608,42 @@ async function createSession(): Promise<void> {
     const displayName = isAuto ? customPreset.name + '全自动' : customPreset.name;
     sessionDisplayNames.set(result.id, displayName);
   }
+  // 获取实际使用的模型提供商
+  if (isClaudePreset(preset) && selectedClaudeProviderId) {
+    const cp = claudeProviders.find(x => x.id === selectedClaudeProviderId);
+    if (cp) sessionProviders.set(result.id, cp.name);
+  } else {
+    const provider = await window.duocli.getCliProvider(preset);
+    if (provider) sessionProviders.set(result.id, provider);
+  }
   // 初始化会话历史记录
   window.duocli.sessionHistoryInit(result.id, result.title);
   const flushTimer = setInterval(() => {
     window.duocli.sessionHistoryFlush(result.id);
   }, 2000);
   historyFlushTimers.set(result.id, flushTimer);
-  termManager.create(result.id, result.themeId, currentCwd, (data) => { window.duocli.writePty(result.id, data); });
+  termManager.create(result.id, result.themeId, currentCwd, (data) => { writePtyWithAutoReset(result.id, data); });
   updateEmptyState();
   renderSessionList();
   updateSessionTitleBar();
+  void renderFileTree();
   setTimeout(() => {
     const dims = termManager.getActiveDimensions();
     if (dims) window.duocli.resizePty(result.id, dims.cols, dims.rows);
   }, 100);
+  return true;
 }
 
 function switchSession(id: string): void {
   const prev = termManager.getActiveId();
   termManager.switchTo(id);
-  // 只清除"等待输入"（绿点），不清除"工作中"（黄点）
-  // 用户查看了就不算未读，但工作中状态应由数据流驱动
+  // 用户切换到该会话 → 清除所有状态指示灯（黄/绿→灰）
   const hadUnread = sessionUnread.delete(id);
+  const hadBusy = sessionBusy.delete(id);
   // 切换到不同会话才重渲染列表，避免重建 DOM 导致 dblclick 无法触发
-  if (prev !== id || hadUnread) renderSessionList();
+  if (prev !== id || hadUnread || hadBusy) renderSessionList();
   updateSessionTitleBar();
+  void renderFileTree();
   renderFileStatusbar();
   const dims = termManager.getActiveDimensions();
   if (dims) window.duocli.resizePty(id, dims.cols, dims.rows);
@@ -891,11 +1674,15 @@ function archiveSession(id: string): void {
   sessionUpdateTimes.delete(id);
   sessionCwds.delete(id);
   sessionDisplayNames.delete(id);
+  sessionProviders.delete(id);
+  sessionAutoContinue.delete(id);
+  saveAutoContinueToStorage();
   // 隐藏终端但不销毁
   termManager.hide(id);
   updateEmptyState();
   renderSessionList();
   renderArchivedList();
+  void renderFileTree();
 }
 
 // 从归档恢复到活跃列表
@@ -918,6 +1705,7 @@ function restoreSession(id: string): void {
   renderSessionList();
   renderArchivedList();
   renderFileStatusbar();
+  void renderFileTree();
   const dims = termManager.getActiveDimensions();
   if (dims) window.duocli.resizePty(id, dims.cols, dims.rows);
 }
@@ -942,18 +1730,29 @@ function destroySession(id: string): void {
   pinnedSessions.delete(id);
   sessionCwds.delete(id);
   sessionDisplayNames.delete(id);
+  sessionProviders.delete(id);
+  sessionAutoContinue.delete(id);
+  saveAutoContinueToStorage();
   termManager.destroy(id);
   updateEmptyState();
   renderSessionList();
   renderArchivedList();
   updateSessionTitleBar();
+  void renderFileTree();
   // 刷新历史对话列表
   if (!historyList.classList.contains('collapsed')) refreshHistory();
 }
 
 async function browseCwd(): Promise<void> {
   const folder = await window.duocli.selectFolder(currentCwd || undefined);
-  if (folder) { currentCwd = folder; cwdInput.value = folder; localStorage.setItem('duocli_cwd', folder); addRecentCwd(folder); startFileWatcher(folder); }
+  if (folder) {
+    currentCwd = folder;
+    cwdInput.value = folder;
+    localStorage.setItem('duocli_cwd', folder);
+    addRecentCwd(folder);
+    startFileWatcher(folder);
+    void renderFileTree();
+  }
 }
 
 // ========== 文件监听 ==========
@@ -1579,6 +2378,7 @@ function renderRecentCwdDropdown(): void {
       localStorage.setItem('duocli_cwd', path);
       addRecentCwd(path);
       startFileWatcher(path);
+      void renderFileTree();
       cwdRecentDropdown.classList.remove('open');
     });
     cwdRecentDropdown.appendChild(item);
@@ -1600,9 +2400,220 @@ document.addEventListener('click', () => {
   cwdRecentDropdown.classList.remove('open');
 });
 cwdRecentDropdown.addEventListener('click', (e) => { e.stopPropagation(); });
-cwdInput.addEventListener('change', () => { const v = cwdInput.value.trim(); if (v) { currentCwd = v; localStorage.setItem('duocli_cwd', v); addRecentCwd(v); startFileWatcher(v); } });
+cwdInput.addEventListener('change', () => {
+  const v = cwdInput.value.trim();
+  if (v) {
+    currentCwd = v;
+    localStorage.setItem('duocli_cwd', v);
+    addRecentCwd(v);
+    startFileWatcher(v);
+    void renderFileTree();
+  }
+});
 cwdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') cwdInput.blur(); });
-toolbarNewBtn.addEventListener('click', () => { createSession(); });
+
+// ========== 面板收起/展开与拖拽功能 ==========
+
+// 左侧目录树收起/展开
+let fileTreeCollapsed = false;
+let fileTreeLastWidth = 220;
+
+fileTreeToggle.addEventListener('click', () => {
+  fileTreeCollapsed = !fileTreeCollapsed;
+  if (fileTreeCollapsed) {
+    fileTreeLastWidth = fileTreePanel.offsetWidth;
+    fileTreePanel.classList.add('collapsed');
+    fileTreeToggle.classList.add('collapsed');
+    fileTreeToggle.textContent = '\u25B6';
+  } else {
+    fileTreePanel.style.width = fileTreeLastWidth + 'px';
+    fileTreePanel.classList.remove('collapsed');
+    fileTreeToggle.classList.remove('collapsed');
+    fileTreeToggle.textContent = '\u25C4';
+  }
+  localStorage.setItem('duocli_filetree_collapsed', String(fileTreeCollapsed));
+});
+
+// 右侧边栏收起/展开
+let sidebarCollapsed = false;
+let sidebarLastWidth = 260;
+
+sidebarToggle.addEventListener('click', () => {
+  sidebarCollapsed = !sidebarCollapsed;
+  if (sidebarCollapsed) {
+    sidebarLastWidth = sidebar.offsetWidth;
+    sidebar.classList.add('collapsed');
+    sidebarToggle.classList.add('collapsed');
+    sidebarToggle.textContent = '\u25C0';
+  } else {
+    sidebar.style.width = sidebarLastWidth + 'px';
+    sidebar.classList.remove('collapsed');
+    sidebarToggle.classList.remove('collapsed');
+    sidebarToggle.textContent = '\u25B6';
+  }
+  localStorage.setItem('duocli_sidebar_collapsed', String(sidebarCollapsed));
+});
+
+// 拖拽调整宽度
+interface DragState {
+  isDragging: boolean;
+  panel: HTMLElement | null;
+  startX: number;
+  startWidth: number;
+  minWidth: number;
+  maxWidth: number;
+}
+
+const dragState: DragState = {
+  isDragging: false,
+  panel: null,
+  startX: 0,
+  startWidth: 0,
+  minWidth: 0,
+  maxWidth: 0
+};
+
+// 左侧目录树拖拽
+fileTreeResizer.addEventListener('mousedown', (e) => {
+  if (fileTreeCollapsed) return;
+  e.preventDefault();
+  dragState.isDragging = true;
+  dragState.panel = fileTreePanel;
+  dragState.startX = e.clientX;
+  dragState.startWidth = fileTreePanel.offsetWidth;
+  dragState.minWidth = 160;
+  dragState.maxWidth = 500;
+  fileTreeResizer.classList.add('active');
+});
+
+// 右侧边栏拖拽
+sidebarResizer.addEventListener('mousedown', (e) => {
+  if (sidebarCollapsed) return;
+  e.preventDefault();
+  dragState.isDragging = true;
+  dragState.panel = sidebar;
+  dragState.startX = e.clientX;
+  dragState.startWidth = sidebar.offsetWidth;
+  dragState.minWidth = 180;
+  dragState.maxWidth = 500;
+  sidebarResizer.classList.add('active');
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (!dragState.isDragging || !dragState.panel) return;
+  const deltaX = e.clientX - dragState.startX;
+  let newWidth;
+  if (dragState.panel === fileTreePanel) {
+    newWidth = dragState.startWidth + deltaX;
+  } else {
+    newWidth = dragState.startWidth - deltaX;
+  }
+  newWidth = Math.max(dragState.minWidth, Math.min(dragState.maxWidth, newWidth));
+  dragState.panel.style.width = newWidth + 'px';
+});
+
+document.addEventListener('mouseup', () => {
+  if (dragState.isDragging) {
+    dragState.isDragging = false;
+    fileTreeResizer.classList.remove('active');
+    sidebarResizer.classList.remove('active');
+    if (dragState.panel === fileTreePanel) {
+      localStorage.setItem('duocli_filetree_width', String(fileTreePanel.offsetWidth));
+    } else if (dragState.panel === sidebar) {
+      localStorage.setItem('duocli_sidebar_width', String(sidebar.offsetWidth));
+    }
+    dragState.panel = null;
+  }
+});
+
+// 恢复保存的面板状态
+(function restorePanelStates() {
+  const savedFileTreeWidth = localStorage.getItem('duocli_filetree_width');
+  if (savedFileTreeWidth) {
+    fileTreePanel.style.width = savedFileTreeWidth + 'px';
+    fileTreeLastWidth = parseInt(savedFileTreeWidth);
+  }
+  const savedSidebarWidth = localStorage.getItem('duocli_sidebar_width');
+  if (savedSidebarWidth) {
+    sidebar.style.width = savedSidebarWidth + 'px';
+    sidebarLastWidth = parseInt(savedSidebarWidth);
+  }
+  const savedFileTreeCollapsed = localStorage.getItem('duocli_filetree_collapsed');
+  if (savedFileTreeCollapsed === 'true') {
+    fileTreeCollapsed = true;
+    fileTreePanel.classList.add('collapsed');
+    fileTreeToggle.classList.add('collapsed');
+    fileTreeToggle.textContent = '\u25B6';
+  }
+  const savedSidebarCollapsed = localStorage.getItem('duocli_sidebar_collapsed');
+  if (savedSidebarCollapsed === 'true') {
+    sidebarCollapsed = true;
+    sidebar.classList.add('collapsed');
+    sidebarToggle.classList.add('collapsed');
+    sidebarToggle.textContent = '\u25C0';
+  }
+})();
+
+fileTreeRefreshBtn.addEventListener('click', () => { void refreshFileTree(true); });
+
+// 桌面端拖拽文件到终端区域：自动粘贴文件路径
+// 在 document 层面监听，确保拖拽到 xterm 内部也能捕获
+document.addEventListener('dragover', (e) => {
+  if (!e.dataTransfer) return;
+  // 只有当数据来自外部文件时才处理
+  if (e.dataTransfer.types.includes('Files')) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    terminalArea.classList.add('drag-over');
+  }
+});
+
+document.addEventListener('dragleave', (e) => {
+  if (e.target === document && !terminalArea.contains(e.relatedTarget as Node)) {
+    terminalArea.classList.remove('drag-over');
+  }
+});
+
+document.addEventListener('drop', (e) => {
+  e.preventDefault();
+  terminalArea.classList.remove('drag-over');
+  // 只有当数据来自外部文件时才处理
+  const files = Array.from(e.dataTransfer?.files || []);
+  if (!files.length) return;
+  const activeId = getActiveSessionId();
+  if (!activeId) {
+    alert('请先选择一个终端会话');
+    return;
+  }
+  const payload = files.map((f) => quotePathForShell(f.path)).join(' ') + ' ';
+  writePtyWithAutoReset(activeId, payload);
+});
+
+function openNewSessionDialog(): void {
+  cwdInput.value = currentCwd || '';
+  presetSelect.value = lastPreset || presetSelect.value || '';
+  setThemeValue(currentThemeId);
+  updateClaudeProviderVisibility();
+  newSessionOverlay.classList.add('active');
+  setTimeout(() => cwdInput.focus(), 0);
+}
+
+function closeNewSessionDialog(): void {
+  newSessionOverlay.classList.remove('active');
+  cwdRecentDropdown.classList.remove('open');
+  themeSelect.classList.remove('open');
+}
+
+toolbarNewBtn.addEventListener('click', () => { openNewSessionDialog(); });
+newSessionCloseBtn.addEventListener('click', () => { closeNewSessionDialog(); });
+newSessionCancelBtn.addEventListener('click', () => { closeNewSessionDialog(); });
+newSessionOverlay.addEventListener('click', (e) => {
+  if (e.target === newSessionOverlay) closeNewSessionDialog();
+});
+newSessionCreateBtn.addEventListener('click', async () => {
+  const ok = await createSession();
+  if (ok) closeNewSessionDialog();
+});
 
 // 自定义预设按钮
 presetAddBtn.addEventListener('click', async () => {
@@ -1674,44 +2685,81 @@ window.duocli.onPtyData((id, data) => {
   // 所有会话都追踪状态（工作中/等待输入），确保切换查看后状态不丢失
   const activeId = termManager.getActiveId();
   if (sessionTitles.has(id) || archivedSessions.has(id)) {
-    // 标记为工作中（黄点）
-    if (!sessionUnread.has(id) && !sessionBusy.has(id)) {
-      sessionBusy.add(id);
-      if (id !== activeId) renderSessionList();
-    }
+    // 有新输出就优先显示"工作中"（黄点），并清掉旧的"待处理"（绿点）
+    const prevBusy = sessionBusy.has(id);
+    const prevUnread = sessionUnread.has(id);
+    sessionBusy.add(id);
+    sessionUnread.delete(id);
+    if (!prevBusy || prevUnread) renderSessionList();
 
     // 累积最近数据用于提示符检测（保留最后 500 字符）
     const prev = recentDataBuffer.get(id) || '';
     recentDataBuffer.set(id, (prev + data).slice(-500));
 
     // 去掉 ANSI 转义后检测 AI CLI 提示符
+    // 改进：只匹配真正的提示符，排除 HTML 标签等误判
     const plain = recentDataBuffer.get(id)!.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
-    const hasPrompt = /[❯›\$>]\s*$/.test(plain.trimEnd());
+    // 催工开启时，自动确认 CLI 各类确认提示（proceed / make this edit / 等）
+    const acConfig = sessionAutoContinue.get(id);
+    if (acConfig?.enabled && (acConfig.autoAgree ?? true) && /Do you want to .*\?/.test(plain)) {
+      // 数选项行数（格式: "  1. xxx"、"  2. xxx"...）
+      const optionCount = (plain.match(/^\s+\d+\.\s/gm) || []).length;
+      // 3个选项: 1=Yes, 2=Yes永久, 3=No → 选2
+      // 2个选项: 1=Yes, 2=No → 选1
+      const choice = optionCount >= 3 ? '2' : '1';
+      const delayMs = (acConfig.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC) * 1000;
+      setTimeout(() => {
+        window.duocli.writePty(id, choice);
+        window.duocli.writePty(id, String.fromCharCode(0x0d));
+        console.log(`[AutoConfirm] 会话 ${id} 检测到${optionCount}个选项，选择 ${choice}，延后 ${delayMs}ms`);
+      }, delayMs);
+      // 清除 buffer 避免重复触发
+      recentDataBuffer.delete(id);
+    }
+
+    // 提示符检测：按行拆分，检查最后几行是否包含提示符
+    // 支持常见 CLI 提示符：❯ › ▷ $ > % ➜ 以及 [path]$ 等模式
+    const lines = plain.split('\n').map(l => l.trimEnd()).filter(l => l.length > 0);
+    const lastLines = lines.slice(-3).join('\n');
+    // 排除 Claude Code 工作中状态：xxx… (xxx) 等 spinner 模式
+    const cliWorking = /\w+…\s*\(/.test(lastLines);
+    // 宽松匹配：最后几行中任意一行以提示符字符结尾
+    const promptLike = /(^|[\s\n])(❯|›|▷|\$|>|%|➜)\s*$/.test(lastLines)
+      && !/>\s*[a-zA-Z]/.test(lastLines); // 排除 HTML 标签
+    // 也匹配 [user@host path]$ 或 user@host:path$ 等 shell 提示符
+    const shellPrompt = /[\]#$%>❯›]\s*$/.test(lastLines);
+    const hasPrompt = (promptLike || shellPrompt) && !cliWorking;
 
     if (hasPrompt) {
-      // 检测到提示符 → 从工作中转为等待输入（黄→绿）
+      // 检测到提示符 → 从工作中转为等待输入（黄→绿/灰）
       clearTimeout(unreadTimers.get(id));
       unreadTimers.delete(id);
       recentDataBuffer.delete(id);
-      sessionBusy.delete(id);
-      // 当前活跃会话不标绿点（用户正在看着）
+      const wasBusy = sessionBusy.delete(id);
+      const hadUnread = sessionUnread.has(id);
+      // 当前活跃会话直接变灰（用户正在看着）；非活跃会话标记为待处理（绿点）
       if (id !== activeId && !sessionUnread.has(id)) {
         sessionUnread.add(id);
       }
-      if (id !== activeId) renderSessionList();
+      const nowUnread = sessionUnread.has(id);
+      if (wasBusy || hadUnread !== nowUnread) renderSessionList();
     } else {
-      // 未检测到提示符 → 重置静默计时器（5 秒无新数据后转为等待输入）
+      // 未检测到提示符：用静默超时兜底（15秒无新输出 → 黄→绿/灰）
+      // 避免提示符匹配不到时永远卡在黄灯
       clearTimeout(unreadTimers.get(id));
       unreadTimers.set(id, setTimeout(() => {
         unreadTimers.delete(id);
         recentDataBuffer.delete(id);
-        sessionBusy.delete(id);
-        const currentActiveId = termManager.getActiveId();
-        if (id !== currentActiveId && !sessionUnread.has(id)) {
-          sessionUnread.add(id);
+        // 超时兜底：如果仍然是黄灯状态，转为绿灯或灰灯
+        if (sessionBusy.has(id)) {
+          sessionBusy.delete(id);
+          const currentActiveId = termManager.getActiveId();
+          if (id !== currentActiveId) {
+            sessionUnread.add(id);
+          }
+          renderSessionList();
         }
-        renderSessionList();
-      }, 5000));
+      }, 15000));
     }
   }
 });
@@ -1752,11 +2800,13 @@ window.duocli.onPtyExit((id) => {
   pinnedSessions.delete(id);
   sessionCwds.delete(id);
   sessionDisplayNames.delete(id);
+  sessionProviders.delete(id);
   termManager.destroy(id);
   updateEmptyState();
   renderSessionList();
   renderArchivedList();
   updateSessionTitleBar();
+  void renderFileTree();
   if (!historyList.classList.contains('collapsed')) refreshHistory();
 });
 
@@ -1774,14 +2824,48 @@ window.duocli.onRemoteCreated((info) => {
   }, 2000);
   historyFlushTimers.set(info.id, flushTimer);
   // 创建 xterm 实例（桌面端也能看到和操作）
-  termManager.create(info.id, info.themeId, info.cwd, (data) => { window.duocli.writePty(info.id, data); });
+  termManager.create(info.id, info.themeId, info.cwd, (data) => { writePtyWithAutoReset(info.id, data); });
   updateEmptyState();
   renderSessionList();
   updateSessionTitleBar();
+  void renderFileTree();
   setTimeout(() => {
     const dims = termManager.getActiveDimensions();
     if (dims) window.duocli.resizePty(info.id, dims.cols, dims.rows);
   }, 100);
+});
+
+// 远程服务器启动成功，保存连接信息并更新 UI
+window.duocli.onRemoteServerInfo((info) => {
+  console.log('[Renderer] Received remote server info:', info);
+  remoteServerInfo = info;
+  renderRemoteServerInfo();
+});
+
+// 催工配置：手机端通过 main 进程读取桌面端配置
+window.duocli.onGetAutoContinueConfig((sessionId) => {
+  const config = sessionAutoContinue.get(sessionId);
+  window.duocli.sendAutoContinueConfig(sessionId, config || null);
+});
+
+// 催工配置：手机端通过 main 进程写入桌面端配置
+window.duocli.onSetAutoContinueConfig((sessionId, config) => {
+  if (!config) return;
+  const existing = sessionAutoContinue.get(sessionId) || {
+    enabled: false,
+    message: AUTO_CONTINUE_DEFAULT_MESSAGE,
+    intervalMs: AUTO_CONTINUE_DEFAULT_INTERVAL,
+    lastSendTime: Date.now(),
+    autoAgree: true,
+    autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
+    sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
+  };
+  Object.assign(existing, config);
+  existing.lastSendTime = Date.now();
+  sessionAutoContinue.set(sessionId, existing);
+  saveAutoContinueToStorage();
+  if (existing.enabled) initAutoContinueTimer();
+  renderSessionList();
 });
 
 // 监听快照自动创建事件
@@ -1857,6 +2941,7 @@ function renderFileStatusbar(): void {
 if (currentCwd) {
   startFileWatcher(currentCwd);
 }
+void renderFileTree();
 
 // 启动时加载已保存的编辑器偏好
 window.duocli.filewatcherGetEditor().then((editorPath) => {

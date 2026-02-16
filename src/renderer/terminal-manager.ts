@@ -302,6 +302,8 @@ export class TerminalManager {
   private terminalArea: HTMLElement;
   private resizeObserver: ResizeObserver;
   private onResize: ((id: string, cols: number, rows: number) => void) | null = null;
+  private lastFitSize: { w: number; h: number } = { w: 0, h: 0 };
+  private fitCheckTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(terminalArea: HTMLElement, onResize?: (id: string, cols: number, rows: number) => void) {
     this.terminalArea = terminalArea;
@@ -316,6 +318,11 @@ export class TerminalManager {
     window.addEventListener('focus', () => {
       this.fitActive();
     });
+
+    // 定时检查容器尺寸变化（兜底：ResizeObserver 可能漏掉某些布局变化）
+    this.fitCheckTimer = setInterval(() => {
+      this.fitIfSizeChanged();
+    }, 3000);
   }
 
   create(id: string, themeId: string, cwd: string, onData: (data: string) => void): void {
@@ -372,19 +379,33 @@ export class TerminalManager {
       });
     });
 
-    // 拦截粘贴事件，检测剪贴板图片
+    // 拦截粘贴事件，检测剪贴板图片或文件
     container.addEventListener('paste', async (e: ClipboardEvent) => {
       if (!e.clipboardData) return;
       const hasImage = Array.from(e.clipboardData.items).some(
         (item) => item.type.startsWith('image/')
       );
-      if (!hasImage) return;
-      e.preventDefault();
-      e.stopPropagation();
+      // 优先处理图片
+      if (hasImage) {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          const filePath = await (window as any).duocli.clipboardSaveImage();
+          if (filePath) {
+            onData(filePath);
+          }
+        } catch { /* 静默失败 */ }
+        return;
+      }
+      // 尝试处理文件（从剪贴板获取文件路径）
       try {
-        const filePath = await (window as any).duocli.clipboardSaveImage();
+        const filePath = await (window as any).duocli.clipboardGetFilePath();
         if (filePath) {
-          onData(filePath);
+          e.preventDefault();
+          e.stopPropagation();
+          // 对路径进行 shell 转义
+          const escapedPath = filePath.includes("'") ? `"${filePath.replace(/"/g, '\\"')}"` : `'${filePath}'`;
+          onData(escapedPath + ' ');
         }
       } catch { /* 静默失败 */ }
     }, true);
@@ -410,6 +431,20 @@ export class TerminalManager {
     };
     terminal.onScroll(() => checkScroll());
     terminal.onWriteParsed(() => checkScroll());
+
+    // 有些情况下滚轮往下滚会停在接近底部但不贴底，向下滚时自动吸附到最新输出
+    const viewport = terminal.element?.querySelector('.xterm-viewport') as HTMLElement | null;
+    viewport?.addEventListener('wheel', (e: WheelEvent) => {
+      if (e.deltaY <= 0) return;
+      const buf = terminal.buffer.active;
+      const distanceToBottom = buf.baseY - buf.viewportY;
+      if (distanceToBottom <= 12) {
+        requestAnimationFrame(() => {
+          terminal.scrollToBottom();
+          scrollBtn.style.display = 'none';
+        });
+      }
+    }, { passive: true });
 
     this.instances.set(id, { id, terminal, fitAddon, container, themeId });
     this.switchTo(id);
@@ -487,10 +522,24 @@ export class TerminalManager {
     const inst = this.instances.get(this.activeId);
     if (inst) {
       inst.fitAddon.fit();
+      // 记录当前容器尺寸，供定时检查使用
+      const rect = inst.container.getBoundingClientRect();
+      this.lastFitSize = { w: rect.width, h: rect.height };
       if (this.onResize) {
         const { cols, rows } = inst.terminal;
         this.onResize(inst.id, cols, rows);
       }
+    }
+  }
+
+  // 定时兜底：检查容器尺寸是否变化，变了就重新 fit
+  private fitIfSizeChanged(): void {
+    if (!this.activeId) return;
+    const inst = this.instances.get(this.activeId);
+    if (!inst) return;
+    const rect = inst.container.getBoundingClientRect();
+    if (Math.abs(rect.width - this.lastFitSize.w) > 1 || Math.abs(rect.height - this.lastFitSize.h) > 1) {
+      this.fitActive();
     }
   }
 

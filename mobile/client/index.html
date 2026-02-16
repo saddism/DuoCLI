@@ -50,23 +50,30 @@
         <span id="detail-name"></span>
         <span id="detail-status" class="status-dot"></span>
       </div>
+      <span id="detail-ac-label" class="ac-label">催</span>
+      <button id="detail-ac-config" class="icon-btn-sm" title="催工配置">🔧</button>
       <button id="delete-btn" class="icon-btn danger" title="终止会话">✕</button>
     </header>
 
     <!-- xterm.js 终端 -->
-    <div id="terminal-container"></div>
+    <div id="terminal-container">
+      <div id="terminal-loading" class="terminal-loading">
+        <div class="loading-spinner"></div>
+        <span>终端连接中…</span>
+      </div>
+    </div>
 
     <!-- 快捷键栏 -->
     <div id="shortcut-bar">
+      <button class="key-btn" data-key="\x1b">Esc</button>
       <button class="key-btn" data-key="\x1b[A">↑</button>
       <button class="key-btn" data-key="\x1b[B">↓</button>
       <button class="key-btn" data-key="\x1b[D">←</button>
       <button class="key-btn" data-key="\x1b[C">→</button>
       <button class="key-btn" data-key="\x7f">⌫</button>
       <button class="key-btn" data-key="\r">↵</button>
-      <button class="key-btn" data-key="\t">Tab</button>
       <button class="key-btn" data-key="\x03">^C</button>
-      <button class="key-btn" data-key="y\r">y</button>
+      <button class="key-btn" data-key="y\r">Y</button>
     </div>
 
     <!-- 输入区域 -->
@@ -83,14 +90,16 @@
     <div class="modal-content">
       <h3>新建会话</h3>
       <label>工作目录</label>
-      <input type="text" id="new-cwd" placeholder="~" value="">
+      <select id="new-cwd">
+        <option value="">~ (默认)</option>
+      </select>
       <label>预设命令</label>
       <select id="new-preset">
         <option value="">纯终端 (shell)</option>
         <option value="claude" selected>Claude Code</option>
         <option value="claude --dangerously-skip-permissions">Claude 全自动</option>
         <option value="codex">Codex</option>
-        <option value="codex --full-auto">Codex 全自动</option>
+        <option value="codex -c sandbox_mode=&quot;danger-full-access&quot; -c approval=&quot;never&quot; -c network=&quot;enabled&quot;">Codex 全自动</option>
         <option value="gemini">Gemini</option>
         <option value="gemini --yolo">Gemini 全自动</option>
         <option value="kimi">Kimi</option>
@@ -99,6 +108,31 @@
       <div class="modal-actions">
         <button id="modal-cancel" class="btn-secondary">取消</button>
         <button id="modal-create" class="btn-primary">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 催工配置弹窗 -->
+  <div id="auto-continue-modal" class="modal">
+    <div class="modal-content">
+      <h3>催工配置</h3>
+      <label>自动发送的内容</label>
+      <input type="text" id="ac-message" placeholder="请输入自动发送的内容" />
+      <label>间隔时间（分钟）</label>
+      <input type="number" id="ac-interval" min="1" placeholder="分钟" />
+      <div style="margin-top: 14px;">
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0;">
+          <input type="checkbox" id="ac-auto-agree" checked style="width: auto;" />
+          开启自动同意（权限提示自动确认）
+        </label>
+      </div>
+      <div id="ac-agree-delay-row">
+        <label>自动同意延后时间（秒）</label>
+        <input type="number" id="ac-agree-delay" min="0" value="5" placeholder="秒" />
+      </div>
+      <div class="modal-actions">
+        <button id="ac-cancel" class="btn-secondary">取消</button>
+        <button id="ac-save" class="btn-primary">保存</button>
       </div>
     </div>
   </div>

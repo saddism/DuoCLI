@@ -8,6 +8,83 @@ import { WebSocketServer, WebSocket } from 'ws';
 import webpush from 'web-push';
 import { PtyManager, getDisplayName } from './pty-manager';
 
+// 根据 preset 命令获取实际使用的模型提供商（与 index.ts 保持一致）
+function getCliProvider(presetCommand: string): string | null {
+  const home = os.homedir();
+
+  if (presetCommand.startsWith('claude')) {
+    const settingsPath = path.join(home, '.claude', 'settings.json');
+    try {
+      if (fs.existsSync(settingsPath)) {
+        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        const env = settings.env || {};
+        const baseUrl = env.ANTHROPIC_BASE_URL || '';
+
+        if (baseUrl.includes('minimaxi')) return 'MiniMax';
+        if (baseUrl.includes('deepseek')) return 'DeepSeek';
+        if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) return 'GLM';
+        if (baseUrl.includes('cloudflare')) return 'Cloudflare';
+        if (baseUrl.includes('anthropic') || !baseUrl) return 'Anthropic';
+
+        if (baseUrl) {
+          try {
+            const url = new URL(baseUrl);
+            return url.hostname.replace(/^api\./, '').split('.')[0].toUpperCase();
+          } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
+
+    const rcFiles = [path.join(home, '.zshrc'), path.join(home, '.bashrc')];
+    for (const rcFile of rcFiles) {
+      if (!fs.existsSync(rcFile)) continue;
+      const content = fs.readFileSync(rcFile, 'utf-8');
+      const vars = parseShellExports(content);
+      const baseUrl = vars.get('ANTHROPIC_BASE_URL') || '';
+      if (baseUrl.includes('minimaxi')) return 'MiniMax';
+      if (baseUrl.includes('deepseek')) return 'DeepSeek';
+      if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) return 'GLM';
+    }
+
+    return 'Anthropic';
+  }
+
+  if (presetCommand.startsWith('codex')) {
+    return 'OpenAI';
+  }
+
+  if (presetCommand.startsWith('kimi')) {
+    return 'Moonshot';
+  }
+
+  if (presetCommand.startsWith('gemini')) {
+    return 'Google';
+  }
+
+  if (presetCommand.startsWith('opencode')) {
+    return 'OpenCode';
+  }
+
+  if (presetCommand.startsWith('agent') || presetCommand.includes('cursor')) {
+    return 'Cursor';
+  }
+
+  return null;
+}
+
+function parseShellExports(content: string): Map<string, string> {
+  const vars = new Map<string, string>();
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#')) continue;
+    const match = trimmed.match(/^export\s+([A-Z_][A-Z0-9_]*)=["']?([^"'\n]+?)["']?\s*$/);
+    if (match) {
+      vars.set(match[1], match[2]);
+    }
+  }
+  return vars;
+}
+
 const PORT = parseInt(process.env.DUOCLI_REMOTE_PORT || '9800');
 
 // 获取本机局域网 IP
@@ -33,12 +110,23 @@ interface RemoteConfig {
   vapidPublic: string;
   vapidPrivate: string;
   pushSubscriptions: webpush.PushSubscription[];
+  recentCwds: string[];
 }
 
 function loadOrCreateConfig(): RemoteConfig {
   if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
   if (fs.existsSync(CONFIG_FILE)) {
-    try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); } catch {}
+    try {
+      const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')) as Partial<RemoteConfig>;
+      const fallbackKeys = webpush.generateVAPIDKeys();
+      return {
+        token: raw.token || crypto.randomBytes(32).toString('hex'),
+        vapidPublic: raw.vapidPublic || fallbackKeys.publicKey,
+        vapidPrivate: raw.vapidPrivate || fallbackKeys.privateKey,
+        pushSubscriptions: Array.isArray(raw.pushSubscriptions) ? raw.pushSubscriptions : [],
+        recentCwds: Array.isArray(raw.recentCwds) ? raw.recentCwds.filter(Boolean).slice(0, 20) : [],
+      };
+    } catch {}
   }
   const vapidKeys = webpush.generateVAPIDKeys();
   const config: RemoteConfig = {
@@ -46,9 +134,23 @@ function loadOrCreateConfig(): RemoteConfig {
     vapidPublic: vapidKeys.publicKey,
     vapidPrivate: vapidKeys.privateKey,
     pushSubscriptions: [],
+    recentCwds: [],
   };
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
   return config;
+}
+
+const MAX_RECENT_CWDS = 20;
+
+function normalizeCwd(cwd: string): string {
+  return (cwd || '').trim().replace(/\/+$/, '');
+}
+
+function addRecentCwdInConfig(config: RemoteConfig, cwd: string): void {
+  const normalized = normalizeCwd(cwd);
+  if (!normalized) return;
+  const next = [normalized, ...config.recentCwds.filter(x => x !== normalized)];
+  config.recentCwds = next.slice(0, MAX_RECENT_CWDS);
 }
 
 /**
@@ -56,14 +158,18 @@ function loadOrCreateConfig(): RemoteConfig {
  * @param ptyManager 桌面端的终端管理器实例
  * @param onRemoteCreate 手机端创建会话后的回调，通知桌面端 renderer 刷新
  * @param onRemoteDestroy 手机端销毁会话后的回调
+ * @param onServerStarted 服务器启动后的回调，用于返回连接信息（IP、端口、Token）
  */
 export function startRemoteServer(
   ptyManager: PtyManager,
   onRemoteCreate?: (sessionInfo: any) => void,
   onRemoteDestroy?: (id: string) => void,
+  onServerStarted?: (info: { lanUrl: string; token: string; port: number }) => void,
 ): void {
   const config = loadOrCreateConfig();
   const LOCAL_IP = getLocalIP();
+
+  console.log('[RemoteServer] Starting server, IP:', LOCAL_IP, 'PORT:', PORT);
 
   webpush.setVapidDetails('mailto:duocli@localhost', config.vapidPublic, config.vapidPrivate);
 
@@ -110,11 +216,9 @@ export function startRemoteServer(
           if (!wsClients.has(data.sessionId)) wsClients.set(data.sessionId, new Set());
           wsClients.get(data.sessionId)!.add(ws);
 
-          // 回放历史 buffer
+          // 回放历史 buffer（始终发送 replay，即使 rawBuffer 为空，让客户端知道订阅已生效）
           const session = ptyManager.getSession(data.sessionId);
-          if (session && session.rawBuffer) {
-            ws.send(JSON.stringify({ type: 'replay', data: session.rawBuffer }));
-          }
+          ws.send(JSON.stringify({ type: 'replay', data: session?.rawBuffer || '' }));
         }
 
         if (data.type === 'input' && subscribedSession) {
@@ -189,10 +293,23 @@ export function startRemoteServer(
       cwd: s.cwd,
       presetCommand: s.presetCommand,
       displayName: getDisplayName(s.presetCommand),
-      status: 'running', // 桌面端没有 idle/exited 状态追踪，简化处理
-      createdAt: Date.now(), // PtySession 没有 createdAt，用当前时间占位
+      provider: (s as any).provider || getCliProvider(s.presetCommand),
+      status: (s.ptyProcess as any).exitState ? 'exited' : 'running',
+      createdAt: (s as any).createdAt || Date.now(),
     }));
     res.json(sessions);
+  });
+
+  // 最近工作目录（桌面端同步 + 运行中会话 cwd 去重合并）
+  app.get('/api/recent-cwds', (_req, res) => {
+    const fromSessions = ptyManager.getAllSessions().map(s => normalizeCwd(s.cwd)).filter(Boolean);
+    const merged = [...fromSessions, ...config.recentCwds];
+    const uniq: string[] = [];
+    for (const p of merged) {
+      if (p && !uniq.includes(p)) uniq.push(p);
+      if (uniq.length >= MAX_RECENT_CWDS) break;
+    }
+    res.json({ items: uniq });
   });
 
   // 创建会话 — 通过 ptyManager 创建，通知桌面端
@@ -208,6 +325,8 @@ export function startRemoteServer(
         cwd: session.cwd,
         displayName: getDisplayName(session.presetCommand),
       };
+      addRecentCwdInConfig(config, session.cwd);
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
       onRemoteCreate?.(info);
       res.json(info);
     } catch (e: any) {
@@ -254,6 +373,24 @@ export function startRemoteServer(
     res.json({ ok: true });
   });
 
+  // ========== 催工配置 API ==========
+
+  // 读取催工配置（从桌面端 renderer）
+  app.get('/api/sessions/:id/auto-continue', async (req, res) => {
+    const getConfig = (global as any).__getAutoContinueConfig;
+    if (!getConfig) { res.json(null); return; }
+    const config = await getConfig(req.params.id);
+    res.json(config);
+  });
+
+  // 写入催工配置（同步到桌面端 renderer）
+  app.put('/api/sessions/:id/auto-continue', (req, res) => {
+    const setConfig = (global as any).__setAutoContinueConfig;
+    if (!setConfig) { res.status(500).json({ error: '桌面端未就绪' }); return; }
+    setConfig(req.params.id, req.body);
+    res.json({ ok: true });
+  });
+
   // SSE 事件流
   app.get('/api/events', (req, res) => {
     res.writeHead(200, {
@@ -268,7 +405,8 @@ export function startRemoteServer(
         cwd: s.cwd,
         presetCommand: s.presetCommand,
         displayName: getDisplayName(s.presetCommand),
-        status: 'running',
+        provider: (s as any).provider || getCliProvider(s.presetCommand),
+        status: (s.ptyProcess as any).exitState ? 'exited' : 'running',
       }));
       res.write(`event: sessions\ndata: ${JSON.stringify(sessions)}\n\n`);
     };
@@ -294,16 +432,17 @@ export function startRemoteServer(
 
   // ========== 启动 ==========
 
+  server.on('error', (err: any) => {
+    console.error('[RemoteServer] Server error:', err.code, err.message);
+  });
+
   server.listen(PORT, '0.0.0.0', () => {
     const lanUrl = `http://${LOCAL_IP}:${PORT}`;
-    console.log('');
-    console.log('╔══════════════════════════════════════════════════╗');
-    console.log('║        DuoCLI 远程访问服务已启动                  ║');
-    console.log('╠══════════════════════════════════════════════════╣');
-    console.log(`║  局域网: ${lanUrl}`);
-    console.log(`║  Token:  ${config.token}`);
-    console.log('╚══════════════════════════════════════════════════╝');
-    console.log('');
+    console.log('[RemoteServer] Server started, URL:', lanUrl);
+    // 通过回调返回连接信息，不再输出到终端
+    if (onServerStarted) {
+      onServerStarted({ lanUrl, token: config.token, port: PORT });
+    }
   });
 }
 
@@ -315,4 +454,16 @@ export function pushRawDataToRemote(id: string, data: string): void {
 /** 发送推送通知 */
 export function sendRemotePush(title: string, body: string, sessionId: string): void {
   (startRemoteServer as any)._sendPush?.(title, body, sessionId);
+}
+
+/** 桌面端同步最近目录到远程配置（供手机端新建会话下拉使用） */
+export function addRemoteRecentCwd(cwd: string): void {
+  const normalized = normalizeCwd(cwd);
+  if (!normalized) return;
+  const config = loadOrCreateConfig();
+  const prev = config.recentCwds.join('\n');
+  addRecentCwdInConfig(config, normalized);
+  if (config.recentCwds.join('\n') !== prev) {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  }
 }

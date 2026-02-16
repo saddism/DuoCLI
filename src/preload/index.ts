@@ -5,16 +5,16 @@ contextBridge.exposeInMainWorld('duocli', {
   setWindowTitle: (title: string) => ipcRenderer.send('window:set-title', title),
 
   // 创建终端
-  createPty: (cwd: string, presetCommand: string, themeId: string) =>
-    ipcRenderer.invoke('pty:create', cwd, presetCommand, themeId),
+  createPty: (cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) =>
+    ipcRenderer.invoke('pty:create', cwd, presetCommand, themeId, providerEnv),
 
-  // 写入数据
+  // 写入数据 (改成 invoke 等待完成)
   writePty: (id: string, data: string) =>
-    ipcRenderer.send('pty:write', id, data),
+    ipcRenderer.invoke('pty:write', id, data),
 
-  // 调整大小
+  // 调整大小 (改成 invoke 等待完成)
   resizePty: (id: string, cols: number, rows: number) =>
-    ipcRenderer.send('pty:resize', id, cols, rows),
+    ipcRenderer.invoke('pty:resize', id, cols, rows),
 
   // 销毁终端
   destroyPty: (id: string) =>
@@ -29,6 +29,10 @@ contextBridge.exposeInMainWorld('duocli', {
 
   // 选择文件夹
   selectFolder: (currentPath?: string) => ipcRenderer.invoke('dialog:select-folder', currentPath),
+  // 读取目录树（用于左侧文件树）
+  fileTreeListDir: (dirPath: string) => ipcRenderer.invoke('file-tree:list-dir', dirPath),
+  // 同步最近目录到手机端远程服务
+  remoteAddRecentCwd: (cwd: string) => ipcRenderer.invoke('remote:add-recent-cwd', cwd),
 
   // 监听事件
   onPtyData: (cb: (id: string, data: string) => void) =>
@@ -42,6 +46,10 @@ contextBridge.exposeInMainWorld('duocli', {
 
   onRemoteCreated: (cb: (sessionInfo: any) => void) =>
     ipcRenderer.on('pty:remote-created', (_e, info) => cb(info)),
+
+  // 远程服务器连接信息
+  onRemoteServerInfo: (cb: (info: { lanUrl: string; token: string; port: number }) => void) =>
+    ipcRenderer.on('remote:server-info', (_e, info) => cb(info)),
 
   // 快照 API
   snapshotCheckRepo: (cwd: string) => ipcRenderer.invoke('snapshot:check-repo', cwd),
@@ -59,6 +67,8 @@ contextBridge.exposeInMainWorld('duocli', {
 
   // 剪贴板图片
   clipboardSaveImage: () => ipcRenderer.invoke('clipboard:save-image'),
+  // 剪贴板文件路径
+  clipboardGetFilePath: () => ipcRenderer.invoke('clipboard:get-file-path'),
 
   // 文件监听
   filewatcherStart: (cwd: string) => ipcRenderer.invoke('filewatcher:start', cwd),
@@ -72,6 +82,12 @@ contextBridge.exposeInMainWorld('duocli', {
   // 在 Finder 中打开目录
   openFolder: (folderPath: string) => ipcRenderer.invoke('shell:open-folder', folderPath),
 
+  // 读取目录内容
+  readDirectory: (dirPath: string) => ipcRenderer.invoke('fs:read-directory', dirPath),
+
+  // 用默认应用打开文件
+  openFile: (filePath: string) => ipcRenderer.invoke('shell:open-file', filePath),
+
   // 打开外部链接
   openUrl: (url: string) => ipcRenderer.invoke('shell:open-url', url),
 
@@ -82,6 +98,12 @@ contextBridge.exposeInMainWorld('duocli', {
   aiSelect: (providerId: string) => ipcRenderer.invoke('ai:select', providerId),
   aiSetModel: (providerId: string, model: string) => ipcRenderer.invoke('ai:set-model', providerId, model),
   aiGetSelected: () => ipcRenderer.invoke('ai:get-selected'),
+  // 获取 CLI 实际使用的模型提供商
+  getCliProvider: (presetCommand: string) => ipcRenderer.invoke('cli:get-provider', presetCommand),
+
+  // Claude 供应商配置
+  claudeProvidersList: () => ipcRenderer.invoke('claude-providers:list'),
+  claudeProvidersSave: (providers: any[]) => ipcRenderer.invoke('claude-providers:save', providers),
 
   // 会话历史 API
   sessionHistoryInit: (sessionId: string, title: string) => ipcRenderer.invoke('session-history:init', sessionId, title),
@@ -93,4 +115,12 @@ contextBridge.exposeInMainWorld('duocli', {
   sessionHistoryRead: (filename: string) => ipcRenderer.invoke('session-history:read', filename),
   sessionHistoryDelete: (filename: string) => ipcRenderer.invoke('session-history:delete', filename),
   sessionHistorySummarize: (filename: string) => ipcRenderer.invoke('session-history:summarize', filename),
+
+  // 催工配置：供 main 进程从 renderer 读写
+  onGetAutoContinueConfig: (cb: (sessionId: string) => void) =>
+    ipcRenderer.on('auto-continue:get', (_e, sessionId) => cb(sessionId)),
+  sendAutoContinueConfig: (sessionId: string, config: any) =>
+    ipcRenderer.send('auto-continue:config-reply', sessionId, config),
+  onSetAutoContinueConfig: (cb: (sessionId: string, config: any) => void) =>
+    ipcRenderer.on('auto-continue:set', (_e, sessionId, config) => cb(sessionId, config)),
 });

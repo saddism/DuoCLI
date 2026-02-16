@@ -6,7 +6,12 @@ import { PtyManager, getDisplayName } from './pty-manager';
 import { SnapshotManager } from './snapshot-manager';
 import { AIConfigManager } from './ai-config';
 import { setAIConfig, aiDiffSummary, aiSummarize, aiSessionSummarize } from './ollama';
-import { startRemoteServer, pushRawDataToRemote, sendRemotePush } from './remote-server';
+import { startRemoteServer, pushRawDataToRemote, sendRemotePush, addRemoteRecentCwd } from './remote-server';
+
+// macOS: 去掉 Dock 图标和启动终端窗口，以辅助应用模式运行
+if (process.platform === 'darwin') {
+  app.setActivationPolicy('accessory');
+}
 
 // 文件监听器
 let fileWatcher: fs.FSWatcher | null = null;
@@ -23,6 +28,18 @@ const MAX_HISTORY_FILES = 50;
 const historyBuffers: Map<string, string> = new Map();
 // sessionId → 文件路径映射
 const historyFilePaths: Map<string, string> = new Map();
+const sessionOutputTail: Map<string, string> = new Map();
+const sessionLastInputAt: Map<string, number> = new Map();
+const sessionArmedForNotify: Set<string> = new Set();
+const sessionLastNotifyAt: Map<string, number> = new Map();
+const sessionUserClosed: Set<string> = new Set();
+
+const NOTIFY_COOLDOWN_MS = 15_000;
+const WAITING_INPUT_DELAY_MS = 8_000;
+const IMESSAGE_TARGET = (process.env.DUOCLI_IMESSAGE_TO || '').trim();
+const IMESSAGE_SERVICE = ((process.env.DUOCLI_IMESSAGE_SERVICE || 'iMessage').trim().toLowerCase() === 'sms')
+  ? 'SMS'
+  : 'iMessage';
 
 function ensureHistoryDir(): void {
   if (!fs.existsSync(SESSION_HISTORY_DIR)) {
@@ -88,16 +105,139 @@ function loadEditorPreference(): string | null {
   } catch { return null; }
 }
 
+// ========== CLI 模型提供商检测 ==========
+
+// 根据 preset 命令获取实际使用的模型提供商
+function getCliProvider(presetCommand: string): string | null {
+  const home = os.homedir();
+
+  // 判断是哪个 CLI
+  if (presetCommand.startsWith('claude')) {
+    // 读取 Claude 配置
+    const settingsPath = path.join(home, '.claude', 'settings.json');
+    try {
+      if (fs.existsSync(settingsPath)) {
+        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        const env = settings.env || {};
+        const baseUrl = env.ANTHROPIC_BASE_URL || '';
+
+        // 根据 baseUrl 判断模型提供商
+        if (baseUrl.includes('minimaxi')) return 'MiniMax';
+        if (baseUrl.includes('deepseek')) return 'DeepSeek';
+        if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) return 'GLM';
+        if (baseUrl.includes('cloudflare')) return 'Cloudflare';
+        if (baseUrl.includes('anthropic') || !baseUrl) return 'Anthropic';
+
+        // 如果有自定义 baseUrl，尝试提取域名
+        if (baseUrl) {
+          try {
+            const url = new URL(baseUrl);
+            return url.hostname.replace(/^api\./, '').split('.')[0].toUpperCase();
+          } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
+
+    // 尝试从 shell 环境变量读取
+    try {
+      const rcFiles = [path.join(home, '.zshrc'), path.join(home, '.bashrc')];
+      for (const rcFile of rcFiles) {
+        if (!fs.existsSync(rcFile)) continue;
+        const content = fs.readFileSync(rcFile, 'utf-8');
+        const vars = parseShellExports(content);
+        const baseUrl = vars.get('ANTHROPIC_BASE_URL') || '';
+        if (baseUrl.includes('minimaxi')) return 'MiniMax';
+        if (baseUrl.includes('deepseek')) return 'DeepSeek';
+        if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) return 'GLM';
+      }
+    } catch { /* ignore */ }
+
+    return 'Anthropic';
+  }
+
+  if (presetCommand.startsWith('codex')) {
+    // Codex 使用 OpenAI 兼容 API
+    return 'OpenAI';
+  }
+
+  if (presetCommand.startsWith('kimi')) {
+    // Kimi 使用月之暗面 API
+    return 'Moonshot';
+  }
+
+  if (presetCommand.startsWith('gemini')) {
+    return 'Google';
+  }
+
+  if (presetCommand.startsWith('opencode')) {
+    // OpenCode 可能使用多种后端
+    const cfgPath = path.join(home, '.config', 'opencode', 'opencode.json');
+    try {
+      if (fs.existsSync(cfgPath)) {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        const provider = cfg.provider || {};
+        if (provider.anthropic) return 'Anthropic';
+        if (provider.openai) return 'OpenAI';
+        if (provider.google) return 'Google';
+      }
+    } catch { /* ignore */ }
+    return 'OpenCode';
+  }
+
+  if (presetCommand.startsWith('agent') || presetCommand.includes('cursor')) {
+    // Cursor agent
+    return 'Cursor';
+  }
+
+  // 默认返回空
+  return null;
+}
+
+// 解析 shell 导出语句
+function parseShellExports(content: string): Map<string, string> {
+  const vars = new Map<string, string>();
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#')) continue;
+    const match = trimmed.match(/^export\s+([A-Z_][A-Z0-9_]*)=["']?([^"'\n]+?)["']?\s*$/);
+    if (match) {
+      vars.set(match[1], match[2]);
+    }
+  }
+  return vars;
+}
+
 let mainWindow: BrowserWindow | null = null;
 let ptyManager: PtyManager;
 const snapshotManager = new SnapshotManager();
 const aiConfigManager = new AIConfigManager();
 
 function createWindow(): void {
-  const iconPath = path.join(__dirname, '../../build/icon.png');
-  // macOS Dock 图标需要通过 dock.setIcon 设置（BrowserWindow.icon 在 macOS 上不影响 Dock）
-  if (process.platform === 'darwin' && app.dock) {
-    app.dock.setIcon(iconPath);
+  // 项目路径含中文/特殊字符时 nativeImage.createFromPath 可能失败，
+  // 先复制图标到临时目录再加载；优先用 png（兼容性更好）
+  const os = require('os');
+  const iconCandidates = [
+    path.join(__dirname, '../../build/icon.png'),
+    path.join(__dirname, '../../build/icon.icns'),
+    path.join(__dirname, '../../icon.png'),
+  ];
+  let appIcon: Electron.NativeImage | undefined;
+  for (const iconPath of iconCandidates) {
+    try {
+      if (!fs.existsSync(iconPath)) continue;
+      const tmpIcon = path.join(os.tmpdir(), 'duocli-icon' + path.extname(iconPath));
+      fs.copyFileSync(iconPath, tmpIcon);
+      const icon = nativeImage.createFromPath(tmpIcon);
+      if (!icon.isEmpty()) {
+        appIcon = icon;
+        break;
+      }
+    } catch (_e) {
+      // 继续尝试下一个候选
+    }
+  }
+  if (appIcon && process.platform === 'darwin' && app.dock) {
+    app.dock.setIcon(appIcon);
   }
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -105,7 +245,7 @@ function createWindow(): void {
     minWidth: 800,
     minHeight: 500,
     title: 'DuoCLI',
-    icon: iconPath,
+    icon: appIcon,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -143,10 +283,81 @@ function safeSend(channel: string, ...args: unknown[]): void {
   }
 }
 
+function stripAnsi(text: string): string {
+  return text
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, '');
+}
+
+function appleScriptQuote(text: string): string {
+  return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ')}"`;
+}
+
+function sendIMessageNotification(message: string): void {
+  if (process.platform !== 'darwin' || !IMESSAGE_TARGET) return;
+  const scriptLines = [
+    'tell application "Messages"',
+    `set targetService to 1st service whose service type = ${IMESSAGE_SERVICE}`,
+    `set targetBuddy to buddy ${appleScriptQuote(IMESSAGE_TARGET)} of targetService`,
+    `send ${appleScriptQuote(message)} to targetBuddy`,
+    'end tell',
+  ];
+  const args = scriptLines.flatMap((line) => ['-e', line]);
+  const p = spawn('osascript', args, { stdio: 'ignore', detached: true });
+  p.on('error', () => { /* ignore */ });
+  p.unref();
+}
+
+function sendUserNotification(id: string, title: string, body: string): void {
+  sendRemotePush(title, body, id);
+  sendIMessageNotification(`[DuoCLI] ${title}：${body}`);
+}
+
+function maybeNotifyAttention(id: string, data: string): void {
+  const now = Date.now();
+  const lastNotify = sessionLastNotifyAt.get(id) || 0;
+  if (now - lastNotify < NOTIFY_COOLDOWN_MS) return;
+
+  const plain = stripAnsi(data);
+  if (!plain) return;
+
+  const tail = ((sessionOutputTail.get(id) || '') + plain).slice(-1200);
+  sessionOutputTail.set(id, tail);
+
+  const promptLike = /(?:^|\n)\s*(?:[$#>❯›▷➜]|(?:\[[^\]]+\]))\s*$/.test(tail);
+  const cliWorking = /\w+…\s*\(/.test(tail);
+  const hasPrompt = promptLike && !cliWorking;
+  const needDecision = /(是否|请选择|请确认|需要你|输入\s*(?:y|n|yes|no)|\[(?:y\/n|yes\/no)\]|continue\?|press enter|按回车|确认继续)/i.test(tail);
+  const taskDone = /(任务已完成|已完成|完成了|done\b|completed\b|finished\b|all set\b|success(?:fully)?\b)/i.test(tail);
+  const lastInputAt = sessionLastInputAt.get(id) || 0;
+  const waitedLongEnough = now - lastInputAt >= WAITING_INPUT_DELAY_MS;
+
+  const session = ptyManager.getSession(id);
+  const title = session?.title || session?.presetCommand || '终端';
+
+  if (hasPrompt && needDecision) {
+    sendUserNotification(id, '需要你决策', title);
+    sessionLastNotifyAt.set(id, now);
+    sessionArmedForNotify.delete(id);
+    return;
+  }
+
+  if (!sessionArmedForNotify.has(id) || !hasPrompt || !waitedLongEnough) return;
+
+  if (taskDone) {
+    sendUserNotification(id, '任务已完成', title);
+  } else {
+    sendUserNotification(id, '会话等待输入', title);
+  }
+  sessionLastNotifyAt.set(id, now);
+  sessionArmedForNotify.delete(id);
+}
+
 function setupPtyManager(): void {
   ptyManager = new PtyManager({
     onData: (id, data) => {
       safeSend('pty:data', id, data);
+      maybeNotifyAttention(id, data);
     },
     onRawData: (id, data) => {
       pushRawDataToRemote(id, data);
@@ -155,14 +366,23 @@ function setupPtyManager(): void {
       safeSend('pty:title-update', id, title);
     },
     onExit: (id) => {
-      // 推送通知到手机端
-      const session = ptyManager.getSession(id);
-      const title = session?.title || '终端';
-      sendRemotePush('会话已结束', title, id);
+      // 用户主动关闭的会话不发通知
+      if (!sessionUserClosed.has(id)) {
+        const session = ptyManager.getSession(id);
+        const title = session?.title || '终端';
+        sendUserNotification(id, '会话已结束', title);
+      }
+      sessionUserClosed.delete(id);
+      sessionOutputTail.delete(id);
+      sessionLastInputAt.delete(id);
+      sessionArmedForNotify.delete(id);
+      sessionLastNotifyAt.delete(id);
 
       safeSend('pty:exit', id);
     },
     onPasteInput: (id, cwd) => {
+      sessionLastInputAt.set(id, Date.now());
+      sessionArmedForNotify.add(id);
       snapshotManager.createSnapshot(cwd, '快照中...').then(async (commitId) => {
         if (commitId) {
           safeSend('snapshot:created', commitId);
@@ -190,29 +410,55 @@ function registerIPC(): void {
   });
 
   // 创建终端
-  ipcMain.handle('pty:create', (_e, cwd: string, presetCommand: string, themeId: string) => {
-    const session = ptyManager.create(cwd, presetCommand, themeId);
+  ipcMain.handle('pty:create', (_e, cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) => {
+    const session = ptyManager.create(cwd, presetCommand, themeId, providerEnv);
+    // 如果有 providerEnv，根据 baseUrl 推断 provider 名称
+    let provider: string | null = null;
+    if (providerEnv && providerEnv.ANTHROPIC_BASE_URL) {
+      const baseUrl = providerEnv.ANTHROPIC_BASE_URL;
+      if (baseUrl.includes('minimaxi')) provider = 'MiniMax';
+      else if (baseUrl.includes('deepseek')) provider = 'DeepSeek';
+      else if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) provider = 'GLM';
+      else if (baseUrl.includes('anthropic') && !baseUrl.includes('minimaxi')) provider = 'Anthropic';
+      else {
+        // 尝试从域名提取
+        try {
+          const url = new URL(baseUrl);
+          provider = url.hostname.replace(/^(api|code)\./, '').split('.')[0];
+          // 首字母大写
+          provider = provider.charAt(0).toUpperCase() + provider.slice(1);
+        } catch { provider = 'Custom'; }
+      }
+    } else {
+      provider = getCliProvider(presetCommand);
+    }
+    (session as any).provider = provider;
     return {
       id: session.id,
       title: session.title,
       themeId: session.themeId,
       cwd: session.cwd,
       displayName: getDisplayName(session.presetCommand),
+      provider,
     };
   });
 
   // 写入数据
-  ipcMain.on('pty:write', (_e, id: string, data: string) => {
+  ipcMain.handle('pty:write', (_e, id: string, data: string) => {
+    console.log(`[Main] pty:write 收到, id=${id}, data="${data}"`);
     ptyManager.write(id, data);
+    return true;
   });
 
   // 调整大小
-  ipcMain.on('pty:resize', (_e, id: string, cols: number, rows: number) => {
+  ipcMain.handle('pty:resize', (_e, id: string, cols: number, rows: number) => {
     ptyManager.resize(id, cols, rows);
+    return true;
   });
 
   // 销毁终端
   ipcMain.on('pty:destroy', (_e, id: string) => {
+    sessionUserClosed.add(id);
     ptyManager.destroy(id);
   });
 
@@ -241,6 +487,39 @@ function registerIPC(): void {
     });
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
+  });
+
+  // 读取目录（左侧文件树）
+  ipcMain.handle('file-tree:list-dir', (_e, dirPath: string) => {
+    try {
+      const abs = path.resolve(String(dirPath || ''));
+      const st = fs.statSync(abs);
+      if (!st.isDirectory()) return [];
+
+      const names = fs.readdirSync(abs);
+      const items = names
+        .filter((name) => name !== '.DS_Store')
+        .map((name) => {
+          const fullPath = path.join(abs, name);
+          let isDir = false;
+          try { isDir = fs.statSync(fullPath).isDirectory(); } catch { /* ignore */ }
+          return { name, path: fullPath, isDir };
+        })
+        .sort((a, b) => {
+          if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+          return a.name.localeCompare(b.name, 'zh-CN');
+        })
+        .slice(0, 500);
+
+      return items;
+    } catch {
+      return [];
+    }
+  });
+
+  ipcMain.handle('remote:add-recent-cwd', (_e, cwd: string) => {
+    try { addRemoteRecentCwd(cwd); } catch { /* ignore */ }
+    return true;
   });
 
   // ========== 快照 IPC ==========
@@ -303,7 +582,58 @@ function registerIPC(): void {
     return filePath;
   });
 
+  // ========== 剪贴板文件 IPC ==========
+  ipcMain.handle('clipboard:get-file-path', async () => {
+    // 尝试读取文件 URL
+    const formats = clipboard.availableFormats();
+    if (formats.includes('public.file-url')) {
+      const buffer = clipboard.readBuffer('public.file-url');
+      const url = buffer.toString('utf8');
+      // file-url 格式: file://localhost/path/to/file 或 file:///path/to/file
+      const match = url.match(/file:\/\/\/?(.+)$/);
+      if (match && match[1]) {
+        return decodeURIComponent(match[1]);
+      }
+    }
+    return null;
+  });
+
   // ========== 文件监听 IPC ==========
+
+  // 常见源代码文件扩展名白名单
+  const SOURCE_FILE_EXTENSIONS = [
+    // TypeScript/JavaScript
+    '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+    // Vue/Uni-app
+    '.vue', '.uvue', '.nvue',
+    // JSON/YAML
+    '.json', '.yaml', '.yml', '.toml',
+    // Python
+    '.py', '.pyw',
+    // Java/Kotlin
+    '.java', '.kt', '.kts',
+    // Swift/Objective-C
+    '.swift', '.m', '.h',
+    // Go
+    '.go',
+    // Rust
+    '.rs',
+    // HTML/CSS
+    '.html', '.htm', '.css', '.scss', '.sass', '.less',
+    // Markdown/文档
+    '.md', '.mdx', '.txt',
+    // Shell
+    '.sh', '.bash', '.zsh', '.fish',
+    // SQL
+    '.sql',
+    // 其他常见源码
+    '.xml', '.xaml', '.gradle', '.properties',
+  ];
+
+  function isSourceFile(filename: string): boolean {
+    const ext = filename.substring(filename.lastIndexOf('.')).toLowerCase();
+    return SOURCE_FILE_EXTENSIONS.includes(ext);
+  }
 
   ipcMain.handle('filewatcher:start', (_e, cwd: string) => {
     // 停掉旧的
@@ -328,6 +658,8 @@ function registerIPC(): void {
         // 忽略编译产物和临时文件
         if (/\.(map|d\.ts|tsbuildinfo|pyc|o|a|dylib|so|class|tmp|temp|swp|swo|bak|log)$/i.test(filename)) return;
         if (/~$/.test(filename)) return;
+        // 只显示源代码文件（白名单过滤）
+        if (!isSourceFile(filename)) return;
         mainWindow?.webContents.send('filewatcher:change', filename, eventType);
       });
     } catch { /* 监听失败静默忽略 */ }
@@ -390,6 +722,26 @@ function registerIPC(): void {
   // 在 Finder 中打开目录
   ipcMain.handle('shell:open-folder', (_e, folderPath: string) => {
     shell.showItemInFolder(folderPath);
+  });
+
+  // 读取目录内容
+  ipcMain.handle('fs:read-directory', async (_e, dirPath: string) => {
+    try {
+      const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+      return entries.map(entry => ({
+        name: entry.name,
+        isDirectory: entry.isDirectory(),
+        isFile: entry.isFile(),
+      }));
+    } catch (error) {
+      console.error('读取目录失败:', error);
+      return [];
+    }
+  });
+
+  // 用默认应用打开文件
+  ipcMain.handle('shell:open-file', (_e, filePath: string) => {
+    shell.openPath(filePath);
   });
 
   // 打开外部链接
@@ -463,6 +815,63 @@ function registerIPC(): void {
   ipcMain.handle('ai:get-selected', () => {
     return loadAiPreferenceData();
   });
+
+  // 获取 CLI 实际使用的模型提供商
+  ipcMain.handle('cli:get-provider', (_e, presetCommand: string) => {
+    return getCliProvider(presetCommand);
+  });
+
+  // ========== Claude 供应商配置 ==========
+  const CLAUDE_PROVIDERS_PATH = path.join(app.getPath('userData'), 'claude-providers.json');
+
+  ipcMain.handle('claude-providers:list', () => {
+    try {
+      if (fs.existsSync(CLAUDE_PROVIDERS_PATH)) {
+        return JSON.parse(fs.readFileSync(CLAUDE_PROVIDERS_PATH, 'utf-8'));
+      }
+    } catch { /* ignore */ }
+    return [];
+  });
+
+  ipcMain.handle('claude-providers:save', (_e, providers: any[]) => {
+    fs.writeFileSync(CLAUDE_PROVIDERS_PATH, JSON.stringify(providers, null, 2), 'utf-8');
+    return true;
+  });
+
+  // ========== 催工配置中转 IPC ==========
+  // main 进程作为中转：remote-server API → renderer 的 sessionAutoContinue
+
+  // 存放 pending 的 get 请求回调
+  const autoContinuePendingGets = new Map<string, (config: any) => void>();
+
+  // renderer 回复配置
+  ipcMain.on('auto-continue:config-reply', (_e, sessionId: string, config: any) => {
+    const resolve = autoContinuePendingGets.get(sessionId);
+    if (resolve) {
+      autoContinuePendingGets.delete(sessionId);
+      resolve(config);
+    }
+  });
+
+  // 供 remote-server 调用：读取催工配置
+  (global as any).__getAutoContinueConfig = (sessionId: string): Promise<any> => {
+    return new Promise((resolve) => {
+      autoContinuePendingGets.set(sessionId, resolve);
+      safeSend('auto-continue:get', sessionId);
+      // 超时兜底
+      setTimeout(() => {
+        if (autoContinuePendingGets.has(sessionId)) {
+          autoContinuePendingGets.delete(sessionId);
+          resolve(null);
+        }
+      }, 2000);
+    });
+  };
+
+  // 供 remote-server 调用：写入催工配置
+  (global as any).__setAutoContinueConfig = (sessionId: string, config: any): void => {
+    safeSend('auto-continue:set', sessionId, config);
+  };
 
   // ========== 会话历史 IPC ==========
 
@@ -565,6 +974,9 @@ app.whenReady().then(async () => {
   }, (id) => {
     // 手机端销毁了会话，通知桌面端 renderer
     safeSend('pty:exit', id);
+  }, (info) => {
+    // 服务器启动后，把连接信息发送给渲染进程显示
+    safeSend('remote:server-info', info);
   });
 
   // 自动扫描并选择 AI 服务

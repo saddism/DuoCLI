@@ -1,6 +1,6 @@
 # DuoCLI — 手机电脑实时同步的 AI 编程终端 | Use Claude Code on Your Phone, Sync with Desktop in Real-time
 
-> 躺在床上写代码，蹲在马桶上 debug，洗着澡还能看 AI 跑任务  
+> 躺在床上写代码，蹲在马桶上 debug，洗着澡还能看 AI 跑任务
 > Code from your bed, debug from the bathroom, monitor AI tasks while showering
 
 <p align="center">
@@ -67,7 +67,8 @@ AI 编程助手跑一个任务经常要好几分钟。以前你只能干坐在�
 - **真正的双向同步** — 不是投屏，是共享同一个 PTY 进程。手机上按 `Ctrl+C`，电脑上的进程也会中断
 - **断线自动重连** — WiFi 切换、手机锁屏后重新打开，2 秒内自动恢复连接，终端历史完整保留
 - **手机端完整功能** — 创建/切换/删除会话、上传文件（最大 50MB）、快捷键栏（方向键、Tab、Ctrl+C 等）
-- **Web Push 通知** — AI 任务完成时手机收到推送，不用一直盯着屏幕
+- **Web Push 通知** — 检测到「任务完成 / 需要你决策 / 会话结束」时，手机收到推送
+- **iMessage 通知（可选）** — macOS 可同步发 iMessage 给你，离开浏览器也能收到提醒
 - **iOS 深度适配** — 全屏模式、键盘自适应、触摸滚动，原生 App 般的体验
 - **PWA 离线支持** — 添加到主屏幕后像原生 App 一样使用，静态资源自动缓存
 
@@ -77,6 +78,16 @@ AI 编程助手跑一个任务经常要好几分钟。以前你只能干坐在�
 2. 手机浏览器打开该地址
 3. 输入 Token 登录（Token 在电脑端首次启动时自动生成，存储在 `~/.duocli-mobile/config.json`）
 4. 开始使用 — 手机上看到的就是电脑上的终端，打字、滚动、切换会话，一切实时同步
+
+#### 可选：开启 iMessage 通知（macOS）
+
+```bash
+DUOCLI_IMESSAGE_TO="你的手机号或邮箱" npm start
+# 可选：DUOCLI_IMESSAGE_SERVICE=SMS
+```
+
+- 未设置 `DUOCLI_IMESSAGE_TO` 时，仅使用 Web Push。
+- 触发场景：任务完成、需要你决策、会话结束。
 
 ### 截图
 
@@ -142,6 +153,8 @@ npm run build:linux # Linux
 - 局域网 WebSocket 双向同步，手机和电脑共享同一个终端进程
 - 手机端支持创建/切换/删除会话、上传文件、快捷键操作
 - Web Push 通知，AI 任务完成时手机推送提醒
+- 支持通知触发：任务完成、需要决策、会话结束
+- macOS 可选 iMessage 通知（通过环境变量启用）
 - PWA 支持，添加到主屏幕后像原生 App 使用
 - Token 认证，保障安全性
 - 断线自动重连，历史缓冲区完整回放
@@ -153,7 +166,27 @@ npm run build:linux # Linux
 - 支持普通模式和全自动模式（Claude `--dangerously-skip-permissions`、Codex `--full-auto`、Gemini/Kimi `--yolo`）
 - 会话列表实时显示标题、最后活跃时间和工作目录
 - 会话置顶、归档/恢复、手动重命名、未读标记
+- 三色状态指示灯：🟡 工作中 → 🟢 等待输入 → ⚪ 已读，状态自动流转
 - 关闭应用时自动检测运行中的终端并弹出确认提示
+
+#### 催工模式（Auto-Continue）
+
+让 AI 不停歇地干活。配置一段催工文本，DuoCLI 按设定间隔自动发送给终端，让 Claude Code 等 AI 助手持续工作不停顿。
+
+- **多行催工文本** — 支持复杂的多行指令，不只是简单的 "continue"
+- **可配置发送延迟** — 文字写入后等待指定秒数再发送回车，避免长文本粘贴失败
+- **自动同意权限提示** — 检测到 CLI 的 "Do you want to..." 确认弹窗时自动选择 Yes，可配置延迟
+- **每会话独立配置** — 每个终端会话有自己的催工设置，互不干扰
+- **配置持久化** — 催工文本和参数自动保存，重启不丢失
+- **手机端远程控制** — 手机上也能开关催工、修改配置
+
+#### Claude 供应商管理
+
+一个 Claude Code，多个 API 后端。DuoCLI 让你在创建终端时选择不同的模型供应商，无需手动改配置文件。
+
+- 支持 Anthropic 官方、MiniMax、DeepSeek、GLM（智谱）等兼容 API
+- 自定义供应商：填入 Base URL 和 API Key 即可
+- 会话列表显示当前供应商标签，一眼区分
 
 #### AI 智能标题
 
@@ -167,12 +200,21 @@ npm run build:linux # Linux
 - 逐文件 diff 查看、撤销变更、时间机器还原
 - AI 自动生成快照变更总结
 
+#### 目录树与文件操作
+
+- 左侧目录树实时显示工作目录结构，支持展开/折叠
+- 右键菜单：复制绝对路径、在 Finder 中打开、用编辑器打开、插入路径到终端
+- 目录行悬浮 📂 按钮，一键在 Finder 中打开
+- 底部状态栏实时显示最近修改的文件
+
 #### 其他
 
 - 终端输出中的文件路径自动识别为可点击链接，点击用编辑器打开
-- 实时监听工作目录文件变化，底部状态栏显示最近修改
 - 会话历史自动保存为 TXT，支持全文查看、复制和 AI 总结
-- 内置 6 套配色方案：VS Code Dark、Monokai、Dracula、Solarized Dark、One Dark、Nord
+- 内置 6 套配色方案 + 自动配色：VS Code Dark、Monokai、Dracula、Solarized Dark、One Dark、Nord
+- 自定义 CLI 预设管理，保存常用的命令行组合
+- 终端尺寸智能自适应，窗口缩放、面板拖拽后自动重新计算行列数
+- 剪贴板图片/文件粘贴，直接将图片路径或文件路径插入终端
 
 ### 使用方法
 
@@ -253,7 +295,8 @@ AI coding assistants often take several minutes to run a task. Previously, you'd
 - **True bidirectional sync** — Not screen mirroring, but sharing the same PTY process. Press `Ctrl+C` on your phone, the process on your computer also interrupts
 - **Auto-reconnect** — WiFi switching, phone screen lock, reopen within 2 seconds to automatically restore connection with complete terminal history
 - **Full mobile functionality** — Create/switch/delete sessions, upload files (up to 50MB), shortcut bar (arrow keys, Tab, Ctrl+C, etc.)
-- **Web Push notifications** — Phone receives push notifications when AI tasks complete, no need to keep staring at the screen
+- **Web Push notifications** — Phone receives push when "task complete / decision needed / session ended" is detected
+- **iMessage notifications (optional)** — macOS can send iMessage alerts, so you get notified even outside the browser
 - **Deep iOS optimization** — Full-screen mode, keyboard adaptation, touch scrolling, native app-like experience
 - **PWA offline support** — Add to home screen for native app-like usage, static resources automatically cached
 
@@ -263,6 +306,16 @@ AI coding assistants often take several minutes to run a task. Previously, you'd
 2. Open the address in your mobile browser
 3. Enter the Token to log in (Token is auto-generated on first desktop launch, stored in `~/.duocli-mobile/config.json`)
 4. Start using — what you see on your phone is your computer's terminal; typing, scrolling, switching sessions, everything syncs in real-time
+
+#### Optional: Enable iMessage Notifications (macOS)
+
+```bash
+DUOCLI_IMESSAGE_TO="your-phone-or-email" npm start
+# Optional: DUOCLI_IMESSAGE_SERVICE=SMS
+```
+
+- Without `DUOCLI_IMESSAGE_TO`, only Web Push is used.
+- Triggers: task complete, decision needed, session ended.
 
 ### Screenshots
 
@@ -328,6 +381,8 @@ npm run build:linux # Linux
 - LAN WebSocket bidirectional sync — phone and computer share the same terminal process
 - Mobile support for creating/switching/deleting sessions, uploading files, shortcut operations
 - Web Push notifications — phone push alerts when AI tasks complete
+- Notification triggers: task complete, decision needed, session ended
+- Optional iMessage notifications on macOS (via environment variable)
 - PWA support — add to home screen for native app-like usage
 - Token authentication for security
 - Auto-reconnect with complete history buffer replay
@@ -339,7 +394,27 @@ npm run build:linux # Linux
 - Support for normal and fully automatic modes (Claude `--dangerously-skip-permissions`, Codex `--full-auto`, Gemini/Kimi `--yolo`)
 - Session list displays title, last active time, and working directory in real-time
 - Pin sessions, archive/restore, manual rename, unread indicators
+- Three-color status indicator: 🟡 Working → 🟢 Awaiting input → ⚪ Read, auto-transitions
 - Auto-detect running terminals and prompt for confirmation when closing the app
+
+#### Auto-Continue Mode
+
+Keep your AI working non-stop. Configure a prompt message and DuoCLI will automatically send it to the terminal at set intervals, keeping Claude Code and other AI assistants working continuously.
+
+- **Multi-line prompt text** — Support complex multi-line instructions, not just a simple "continue"
+- **Configurable send delay** — Wait specified seconds after text input before sending Enter, preventing long text paste failures
+- **Auto-approve permission prompts** — Automatically selects Yes when CLI shows "Do you want to..." confirmation dialogs, with configurable delay
+- **Per-session configuration** — Each terminal session has its own auto-continue settings, independent of others
+- **Persistent configuration** — Auto-continue text and parameters are saved automatically, survive restarts
+- **Remote control from mobile** — Toggle auto-continue and modify settings from your phone
+
+#### Claude Provider Management
+
+One Claude Code, multiple API backends. DuoCLI lets you select different model providers when creating terminals, no need to manually edit config files.
+
+- Supports Anthropic official, MiniMax, DeepSeek, GLM (Zhipu), and other compatible APIs
+- Custom providers: just enter Base URL and API Key
+- Session list shows current provider tag at a glance
 
 #### AI Smart Titles
 
@@ -353,12 +428,21 @@ npm run build:linux # Linux
 - Per-file diff viewing, undo changes, time machine restore
 - AI auto-generates snapshot change summaries
 
+#### File Tree & File Operations
+
+- Left sidebar file tree displays working directory structure in real-time, with expand/collapse
+- Context menu: copy absolute path, open in Finder, open in editor, insert path into terminal
+- Hover 📂 button on directories to open in Finder instantly
+- Bottom status bar shows recently modified files in real-time
+
 #### Others
 
 - File paths in terminal output automatically recognized as clickable links, open in editor on click
-- Real-time monitoring of working directory file changes, status bar shows recent modifications
 - Session history auto-saved as TXT, supports full-text viewing, copying, and AI summarization
-- 6 built-in color schemes: VS Code Dark, Monokai, Dracula, Solarized Dark, One Dark, Nord
+- 6 built-in color schemes + auto-color: VS Code Dark, Monokai, Dracula, Solarized Dark, One Dark, Nord
+- Custom CLI preset management, save frequently used command combinations
+- Smart terminal resizing — auto-recalculates rows and columns after window resize or panel drag
+- Clipboard image/file paste — directly insert image paths or file paths into the terminal
 
 ### How to Use
 
@@ -425,14 +509,6 @@ src/
 - **Service Worker** — PWA offline support | PWA 离线支持
 - **TypeScript** — Full project type safety | 全项目类型安全
 - **esbuild** — Renderer process bundling | 渲染进程打包
-
-## Known Issues | 已知问题
-
-- 左侧终端有时鼠标滚动无法到达最底部，需要按一下方向键 `↓` 回到最新输出  
-  The left terminal sometimes can't scroll to the bottom with mouse; press the `↓` arrow key to return to the latest output
-
-- 右侧会话列表的状态指示灯有时显示不准确  
-  The status indicator in the right session list sometimes displays inaccurately
 
 ## License | 许可证
 

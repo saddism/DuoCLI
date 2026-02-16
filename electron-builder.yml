@@ -6,7 +6,7 @@ mac:
     - target: dmg
       arch:
         - arm64
-  icon: build/icon.png
+  icon: build/icon.icns
 files:
   - dist/**/*
   - node_modules/**/*

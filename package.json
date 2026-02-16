@@ -62,6 +62,7 @@
     "ws": "^8.19.0"
   },
   "build": {
+    "npmRebuild": false,
     "appId": "com.duocli.app",
     "productName": "DuoCLI",
     "directories": {

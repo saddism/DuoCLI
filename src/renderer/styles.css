@@ -5,6 +5,7 @@
 }
 
 :root {
+  --file-tree-width: 220px;
   --sidebar-width: 260px;
   --toolbar-height: 44px;
   --bg-primary: #1e1e1e;
@@ -17,6 +18,54 @@
   --hover-bg: #2a2d2e;
   --active-bg: #37373d;
   --danger: #f44747;
+}
+
+/* 面板收起/展开按钮 */
+.panel-toggle {
+  width: 16px;
+  background: var(--bg-toolbar);
+  border: none;
+  color: var(--text-secondary);
+  font-size: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.panel-toggle:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}
+
+.panel-toggle.collapsed {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* 拖拽条 */
+.resizer {
+  width: 4px;
+  background: transparent;
+  cursor: col-resize;
+  flex-shrink: 0;
+  transition: background 0.1s;
+}
+
+.resizer:hover,
+.resizer.active {
+  background: var(--accent);
+}
+
+#file-tree-resizer {
+  border-right: 1px solid var(--border-color);
+}
+
+#sidebar-resizer {
+  border-left: 1px solid var(--border-color);
 }
 
 html, body {
@@ -35,8 +84,9 @@ html, body {
   border-bottom: 1px solid var(--border-color);
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   padding: 0 12px;
-  gap: 10px;
+  gap: 8px;
   -webkit-app-region: drag;
   overflow: visible;
 }
@@ -243,9 +293,96 @@ html, body {
 }
 
 #toolbar-new-btn {
-  width: calc(var(--sidebar-width) - 1px - 12px - 10px);
+  width: 100%;
   text-align: center;
   flex-shrink: 0;
+}
+
+/* 新建终端弹窗 */
+.new-session-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.new-session-overlay.active {
+  display: flex;
+}
+
+.new-session-dialog {
+  width: min(760px, calc(100vw - 40px));
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.new-session-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.new-session-header h3 {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.new-session-close {
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.new-session-close:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}
+
+.new-session-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.new-session-body > label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.new-session-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.new-session-row-sub {
+  margin-top: 4px;
+}
+
+.new-session-row-sub label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+  display: block;
+}
+
+.new-session-row #cwd-wrapper,
+.new-session-row .toolbar-select,
+.new-session-row .custom-select {
+  flex: 1;
+  min-width: 0;
 }
 
 .toolbar-icon-btn {
@@ -273,7 +410,126 @@ html, body {
 /* 主体布局 */
 #main {
   display: flex;
-  height: calc(100% - var(--toolbar-height));
+  height: 100%;
+}
+
+/* 左侧目录树 */
+#file-tree-panel {
+  width: var(--file-tree-width);
+  background: #212224;
+  display: flex;
+  flex-direction: column;
+  min-width: 160px;
+  max-width: 500px;
+  transition: width 0.2s ease, opacity 0.2s ease;
+}
+
+#file-tree-panel.collapsed {
+  width: 0 !important;
+  min-width: 0 !important;
+  overflow: hidden;
+  opacity: 0;
+}
+
+#file-tree-header {
+  height: 34px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px 0 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+#file-tree-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+#file-tree-refresh-btn {
+  width: 22px;
+  height: 22px;
+  font-size: 12px;
+}
+
+#file-tree-list {
+  flex: 1;
+  overflow: auto;
+  padding: 6px 4px;
+}
+
+.file-tree-empty {
+  padding: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.file-tree-row {
+  height: 24px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.file-tree-row:hover {
+  background: var(--hover-bg);
+}
+
+.file-tree-row.active-dir {
+  background: #2a3340;
+}
+
+.file-tree-arrow {
+  width: 12px;
+  color: var(--text-secondary);
+  text-align: center;
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.file-tree-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.file-tree-row.dir .file-tree-name {
+  color: #d8c38a;
+}
+
+.file-tree-row.file .file-tree-name {
+  color: var(--text-primary);
+}
+
+/* 目录行"在 Finder 中打开"按钮 */
+.file-tree-open-folder {
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0;
+  flex-shrink: 0;
+  padding: 0 2px;
+  transition: opacity 0.15s;
+}
+
+.file-tree-row:hover .file-tree-open-folder {
+  opacity: 0.6;
+}
+
+.file-tree-open-folder:hover {
+  opacity: 1 !important;
 }
 
 /* 终端区域 */
@@ -285,30 +541,10 @@ html, body {
   background: var(--bg-primary);
 }
 
-/* 会话标题栏 */
-#session-title-bar {
-  height: 28px;
-  background: var(--bg-toolbar);
-  border-bottom: 1px solid var(--border-color);
-  display: flex;
-  align-items: center;
-  padding: 0 12px;
-  flex-shrink: 0;
+#terminal-area.drag-over {
+  box-shadow: inset 0 0 0 2px rgba(0, 120, 212, 0.9);
 }
 
-#session-title-bar:empty,
-#session-title-bar:not(:has(#session-title-text:not(:empty))) {
-  display: none;
-}
-
-#session-title-text {
-  font-size: 12px;
-  color: var(--text-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 500;
-}
 
 #terminal-content {
   flex: 1;
@@ -337,7 +573,7 @@ html, body {
 }
 
 .terminal-container .xterm-screen {
-  height: 100%;
+  /* 不设 height: 100%，让 FitAddon 根据容器实际尺寸计算行数 */
 }
 
 .scroll-bottom-btn {
@@ -370,10 +606,52 @@ html, body {
 #sidebar {
   width: var(--sidebar-width);
   background: var(--bg-sidebar);
-  border-left: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  min-width: 180px;
+  max-width: 500px;
+  transition: width 0.2s ease, opacity 0.2s ease;
+}
+
+#sidebar.collapsed {
+  width: 0 !important;
+  min-width: 0 !important;
+  overflow: hidden;
+  opacity: 0;
+}
+
+#sidebar-topbar {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+/* 远程服务器连接信息 */
+.remote-server-info {
+  padding: 8px 10px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.remote-info-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--text-primary);
+}
+
+.remote-info-url {
+  font-family: monospace;
+  color: var(--accent-color);
+  word-break: break-all;
+}
+
+.remote-info-token {
+  margin-top: 2px;
+  font-family: monospace;
+  opacity: 0.8;
 }
 
 /* 侧边栏 Tab 切换 */
@@ -423,14 +701,32 @@ html, body {
   padding: 4px 0;
 }
 
+/* 会话项：垂直排列标题行和操作行 */
 .session-item {
   display: flex;
-  align-items: center;
-  padding: 8px 12px;
+  flex-direction: column;
+  padding: 6px 10px;
   cursor: pointer;
-  gap: 8px;
+  gap: 4px;
   border-left: 3px solid transparent;
   background: var(--group-color, transparent);
+}
+
+/* 标题行：置顶按钮 + 标题 + 铅笔 + 催工开关 */
+.session-item-top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* 操作行：时间 + 关闭按钮 */
+.session-item-bottom {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .session-item:hover {
@@ -438,13 +734,13 @@ html, body {
 }
 
 .session-item.active {
-  background: var(--active-bg);
-  border-left-color: var(--accent);
+  background: #1a3a5c;
+  border-left-color: transparent;
 }
 
 .session-color-dot {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   flex-shrink: 0;
 }
@@ -457,6 +753,15 @@ html, body {
   gap: 2px;
 }
 
+/* 标题行：标题和编辑按钮在同一行 */
+.session-title-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
 .session-title {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -464,10 +769,26 @@ html, body {
   font-size: 13px;
 }
 
+.session-edit-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 1px 2px;
+  opacity: 0.5;
+  transition: opacity 0.2s;
+  flex-shrink: 0;
+}
+
+.session-edit-btn:hover {
+  opacity: 1;
+}
+
 .session-meta-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .session-time {
@@ -484,6 +805,19 @@ html, body {
   font-weight: 500;
   color: var(--cli-tag-color, var(--accent));
   background: var(--cli-tag-bg, transparent);
+}
+
+/* 模型提供商标签（显示在 CLI 标签右侧） */
+.session-provider-tag {
+  font-size: 9px;
+  white-space: nowrap;
+  padding: 0 4px;
+  border-radius: 3px;
+  line-height: 1.6;
+  font-weight: 500;
+  color: #aaa;
+  background: rgba(255, 255, 255, 0.08);
+  margin-left: 4px;
 }
 
 .session-cwd {
@@ -522,10 +856,110 @@ html, body {
   color: #fff;
 }
 
+/* 自动继续 Toggle 开关 */
+.session-auto-continue-toggle {
+  position: relative;
+  display: inline-flex;
+  width: 32px;
+  height: 16px;
+  flex-shrink: 0;
+  align-self: center;
+  cursor: pointer;
+}
+
+.session-auto-continue-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.session-auto-continue-toggle .toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #4a4a4a;
+  transition: 0.2s;
+  border-radius: 18px;
+}
+
+.session-auto-continue-toggle .toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 12px;
+  width: 12px;
+  left: 2px;
+  bottom: 2px;
+  background-color: white;
+  transition: 0.2s;
+  border-radius: 50%;
+}
+
+.session-auto-continue-toggle input:checked + .toggle-slider {
+  background-color: #4caf50;
+}
+
+.session-auto-continue-toggle input:checked + .toggle-slider:before {
+  transform: translateX(16px);
+}
+
+.session-auto-continue-toggle:hover .toggle-slider {
+  background-color: #5a5a5a;
+}
+
+.session-auto-continue-toggle input:checked:hover + .toggle-slider {
+  background-color: #66bb6a;
+}
+
+/* 自动继续文字标签 */
+.session-auto-continue-label {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  cursor: pointer;
+  background: #555;
+  color: #aaa;
+  flex-shrink: 0;
+  align-self: center;
+  transition: background 0.2s, color 0.2s;
+}
+
+.session-auto-continue-label.enabled {
+  background: #4caf50;
+  color: #fff;
+}
+
+.session-auto-continue-label:hover {
+  background: #666;
+}
+
+.session-auto-continue-label.enabled:hover {
+  background: #66bb6a;
+}
+
+/* 配置按钮 */
+.session-auto-continue-config-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px;
+  opacity: 0.5;
+  transition: opacity 0.2s;
+  flex-shrink: 0;
+  align-self: center;
+}
+
+.session-auto-continue-config-btn:hover {
+  opacity: 1;
+}
+
 /* Pin 置顶按钮 */
 .session-pin {
-  width: 20px;
-  height: 20px;
+  width: 18px;
+  height: 18px;
   border: none;
   background: transparent;
   color: var(--text-secondary);
@@ -736,8 +1170,8 @@ html, body {
 
 /* 分组内会话项 active 状态覆盖背景 */
 .session-item.active {
-  background: var(--active-bg);
-  border-left-color: var(--accent);
+  background: #1a3a5c;
+  border-left-color: transparent;
 }
 
 .session-item:hover {
