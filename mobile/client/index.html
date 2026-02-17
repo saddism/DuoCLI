@@ -51,7 +51,6 @@
         <span id="detail-status" class="status-dot"></span>
       </div>
       <span id="detail-ac-label" class="ac-label">催</span>
-      <button id="detail-ac-config" class="icon-btn-sm" title="催工配置">🔧</button>
       <button id="delete-btn" class="icon-btn danger" title="终止会话">✕</button>
     </header>
 
@@ -72,6 +71,7 @@
       <button class="key-btn" data-key="\x1b[C">→</button>
       <button class="key-btn" data-key="\x7f">⌫</button>
       <button class="key-btn" data-key="\r">↵</button>
+      <button class="key-btn" data-key="\x09">Tab</button>
       <button class="key-btn" data-key="\x03">^C</button>
       <button class="key-btn" data-key="y\r">Y</button>
     </div>
@@ -115,7 +115,10 @@
   <!-- 催工配置弹窗 -->
   <div id="auto-continue-modal" class="modal">
     <div class="modal-content">
-      <h3>催工配置</h3>
+      <div class="modal-header">
+        <h3>催工配置</h3>
+        <button id="ac-cancel" class="modal-close">✕</button>
+      </div>
       <label>自动发送的内容</label>
       <input type="text" id="ac-message" placeholder="请输入自动发送的内容" />
       <label>间隔时间（分钟）</label>
@@ -131,8 +134,8 @@
         <input type="number" id="ac-agree-delay" min="0" value="5" placeholder="秒" />
       </div>
       <div class="modal-actions">
-        <button id="ac-cancel" class="btn-secondary">取消</button>
-        <button id="ac-save" class="btn-primary">保存</button>
+        <button id="ac-stop" class="btn-danger" style="display:none;">关闭催工</button>
+        <button id="ac-save" class="btn-primary">保存并开启</button>
       </div>
     </div>
   </div>

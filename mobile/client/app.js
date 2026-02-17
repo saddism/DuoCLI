@@ -21,6 +21,19 @@ let scrollToBottomTimer = null;
 
 function $(id) { return document.getElementById(id); }
 
+// 截断长路径，优先显示最右侧目录名，如 /a/b/c/d → …/c/d
+function shortenPath(p, maxLen = 30) {
+  if (p.length <= maxLen) return p;
+  const parts = p.split('/').filter(Boolean);
+  let result = parts[parts.length - 1] || p;
+  for (let i = parts.length - 2; i >= 0; i--) {
+    const next = parts[i] + '/' + result;
+    if (next.length + 1 > maxLen) break; // +1 for leading …/
+    result = next;
+  }
+  return '…/' + result;
+}
+
 // CLI 标签颜色映射 [文字色, 背景色]，与桌面端保持一致
 const CLI_TAG_COLORS = {
   'Claude':       ['#d4a574', '#3d2e1e'],
@@ -164,6 +177,16 @@ async function showAutoContinueConfigModal(sessionId) {
   $('ac-auto-agree').checked = config.autoAgree !== false;
   $('ac-agree-delay').value = String(config.autoAgreeDelaySec ?? 5);
   $('ac-agree-delay-row').style.display = $('ac-auto-agree').checked ? '' : 'none';
+
+  // 根据当前状态设置按钮
+  if (config.enabled) {
+    $('ac-save').textContent = '保存';
+    $('ac-stop').style.display = '';
+  } else {
+    $('ac-save').textContent = '保存并开启';
+    $('ac-stop').style.display = 'none';
+  }
+
   modal.classList.add('active');
 }
 
@@ -174,6 +197,13 @@ function updateDetailAutoContinueUI(config) {
     label.textContent = '催';
     label.className = 'ac-label' + (enabled ? ' enabled' : '');
   }
+}
+
+// 判断终端是否滚动到底部附近（容差 2 行）
+function isAtBottom() {
+  if (!term) return true;
+  const buf = term.buffer.active;
+  return buf.viewportY >= buf.baseY - 2;
 }
 
 function getLineTextByTouchY(clientY) {
@@ -263,7 +293,7 @@ async function refreshRecentCwdOptions() {
     for (const p of items) {
       const opt = document.createElement('option');
       opt.value = p;
-      opt.textContent = p;
+      opt.textContent = shortenPath(p);
       select.appendChild(opt);
     }
   } catch {
@@ -298,7 +328,7 @@ function renderSessionList(sessions) {
         </div>
         <div class="session-meta">
           <span class="session-time">${formatTime(s.createdAt)}</span>
-          <span class="session-cwd">${escHtml(s.cwd)}</span>
+          <span class="session-cwd">${escHtml(s.cwd.split('/').pop() || s.cwd)}</span>
         </div>
       </div>
       <div class="session-arrow">›</div>
@@ -441,6 +471,8 @@ function createTerminal() {
         screen.addEventListener('touchstart', (e) => {
           if (e.touches.length === 1) {
             touchLastY = e.touches[0].clientY;
+            // 标记用户正在手动滚动
+            isUserScrolling = true;
           }
         }, { passive: true });
 
@@ -455,20 +487,40 @@ function createTerminal() {
             }
           }
         }, { passive: true });
+
+        screen.addEventListener('touchend', () => {
+          // 触摸结束后检查是否在底部，如果在底部则恢复自动滚动
+          setTimeout(() => {
+            if (term && isAtBottom()) {
+              isUserScrolling = false;
+            }
+          }, 150);
+        }, { passive: true });
       }
 
-      // 检测用户手动滚动状态：触摸时标记为用户滚动，滚动结束后恢复
+      // 用户手动滚动期间，阻止 xterm 内部 write() 自动滚到底部
+      // 通过拦截 viewport 的 scrollTop 赋值实现
       if (viewport) {
-        let scrollTimeout = null;
-        const onUserScroll = () => {
-          isUserScrolling = true;
-          if (scrollTimeout) clearTimeout(scrollTimeout);
-          scrollTimeout = setTimeout(() => {
-            isUserScrolling = false;
-          }, 1000); // 停止滚动 1 秒后恢复自动滚动
-        };
-        viewport.addEventListener('touchstart', onUserScroll, { passive: true });
-        viewport.addEventListener('touchmove', onUserScroll, { passive: true });
+        let savedScrollTop = null;
+        const origScrollTopDesc = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollTop') ||
+                                   Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+        if (origScrollTopDesc && origScrollTopDesc.set) {
+          const origSet = origScrollTopDesc.set;
+          const origGet = origScrollTopDesc.get;
+          Object.defineProperty(viewport, 'scrollTop', {
+            get() {
+              return origGet.call(this);
+            },
+            set(val) {
+              if (isUserScrolling) {
+                // 用户滚动中，忽略 xterm 内部的 scrollTop 设置
+                return;
+              }
+              origSet.call(this, val);
+            },
+            configurable: true,
+          });
+        }
       }
 
       if (!container.dataset.copyBound) {
@@ -511,6 +563,11 @@ function createTerminal() {
         container.addEventListener('touchend', cancelCopyPress, { passive: true });
         container.addEventListener('touchcancel', cancelCopyPress, { passive: true });
         container.dataset.copyBound = '1';
+      }
+
+      // 绑定 canvas context lost 监听（黑屏修复）
+      if (typeof bindCanvasContextLost === 'function') {
+        setTimeout(bindCanvasContextLost, 100);
       }
 
       resolve(term);
@@ -567,6 +624,7 @@ function connectWebSocket(sessionId) {
 
   let replayReceived = false;
   let replayRetryTimer = null;
+  let replayRetryCount = 0;
 
   ws.onmessage = (event) => {
     try {
@@ -586,14 +644,19 @@ function connectWebSocket(sessionId) {
               term.scrollToBottom();
             }
           });
-        }
-        // 如果 replay 为空（新建会话时 pty 刚启动），延迟重新订阅以获取最新 buffer
-        if (!msg.data && !replayRetryTimer) {
-          replayRetryTimer = setTimeout(() => {
-            if (ws && ws.readyState === WebSocket.OPEN && currentSessionId === sessionId) {
-              wsSend({ type: 'subscribe', sessionId });
-            }
-          }, 800);
+        } else {
+          // replay 为空（新建会话，pty 刚启动）：也隐藏 loading，连接已成功
+          hideTerminalLoading();
+          // 延迟重新订阅以获取最新 buffer，最多重试 3 次
+          if (!replayRetryTimer && replayRetryCount < 3) {
+            replayRetryCount++;
+            replayRetryTimer = setTimeout(() => {
+              replayRetryTimer = null;
+              if (ws && ws.readyState === WebSocket.OPEN && currentSessionId === sessionId) {
+                wsSend({ type: 'subscribe', sessionId });
+              }
+            }, 800);
+          }
         }
       } else if (msg.type === 'output') {
         hideTerminalLoading();
@@ -675,6 +738,25 @@ async function openSession(id) {
   getAutoContinueConfig(id).then(config => updateDetailAutoContinueUI(config));
 }
 
+// 点击标题编辑
+$('detail-name').onclick = async () => {
+  if (!currentSessionId) return;
+  const current = $('detail-name').textContent || '';
+  const newTitle = prompt('修改标题', current);
+  if (newTitle === null || newTitle.trim() === '' || newTitle.trim() === current) return;
+  try {
+    const res = await api(`/api/sessions/${currentSessionId}/title`, {
+      method: 'PUT',
+      body: JSON.stringify({ title: newTitle.trim() }),
+    });
+    if (res.ok) {
+      $('detail-name').textContent = newTitle.trim();
+    }
+  } catch (e) {
+    console.error('修改标题失败', e);
+  }
+};
+
 // 返回按钮
 $('back-btn').onclick = () => {
   currentSessionId = null;
@@ -683,15 +765,8 @@ $('back-btn').onclick = () => {
   refreshSessions();
 };
 
-// 催工开关：点击标签切换
-$('detail-ac-label').onclick = async () => {
-  if (!currentSessionId) return;
-  const config = await getAutoContinueConfig(currentSessionId) || {};
-  await toggleAutoContinue(currentSessionId, !config.enabled);
-};
-
-// 催工配置按钮
-$('detail-ac-config').onclick = () => {
+// 催工：点击标签直接弹配置弹窗
+$('detail-ac-label').onclick = () => {
   if (!currentSessionId) return;
   showAutoContinueConfigModal(currentSessionId);
 };
@@ -713,7 +788,14 @@ $('auto-continue-modal').onclick = (e) => {
   }
 };
 
-// 催工配置弹窗：保存
+// 催工配置弹窗：关闭催工
+$('ac-stop').onclick = async () => {
+  if (!currentSessionId) return;
+  await toggleAutoContinue(currentSessionId, false);
+  $('auto-continue-modal').classList.remove('active');
+};
+
+// 催工配置弹窗：保存并开启
 $('ac-save').onclick = async () => {
   if (!currentSessionId) return;
   const message = $('ac-message').value.trim();
@@ -857,6 +939,12 @@ $('file-input').onchange = async (e) => {
       if (data.ok) {
         // 在终端显示上传成功提示
         if (term) term.write(`\r\n\x1b[32m✓ 已上传: ${file.name} (${formatSize(data.size)})\x1b[0m\r\n`);
+        // 把文件路径填入输入框，方便用户直接发送给 AI
+        if (data.path) {
+          const input = $('msg-input');
+          const prev = input.value.trim();
+          input.value = prev ? prev + ' ' + data.path : data.path;
+        }
       } else {
         if (term) term.write(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${data.error}\x1b[0m\r\n`);
       }
@@ -980,6 +1068,104 @@ function urlBase64ToUint8Array(base64String) {
     outputArray[i] = rawData.charCodeAt(i);
   }
   return outputArray;
+}
+
+// ========== iOS PWA 黑屏修复 ==========
+// iOS standalone 模式下切换输入法/app 后 canvas 上下文被系统回收，
+// term.refresh() 无法恢复，必须销毁终端重建 + 重连 WebSocket 拿 replay
+
+let repaintDebounce = null;
+let isRecreating = false;
+
+async function forceTerminalRecreate() {
+  // 只在会话详情页且有当前会话时才重建
+  if (!currentSessionId || !$('detail-page').classList.contains('active')) return;
+  if (isRecreating) return;
+  isRecreating = true;
+  console.log('[黑屏修复] 重建终端, session=', currentSessionId);
+  const sid = currentSessionId;
+  try {
+    await createTerminal();
+    connectWebSocket(sid);
+  } finally {
+    isRecreating = false;
+  }
+}
+
+function scheduleRepaint() {
+  if (repaintDebounce) return; // 防抖，避免多个事件重复触发
+  repaintDebounce = setTimeout(() => {
+    repaintDebounce = null;
+    forceTerminalRecreate();
+  }, 300);
+}
+
+// 检测终端 canvas 是否黑屏（WebGL 上下文丢失）
+function isCanvasContextLost() {
+  if (!term) return false;
+  const container = $('terminal-container');
+  if (!container) return false;
+  const canvas = container.querySelector('canvas');
+  if (!canvas) return false;
+  // 检查 WebGL 上下文
+  const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+  if (gl && gl.isContextLost()) return true;
+  // 兜底：检查 canvas 尺寸是否为 0（被系统回收后可能出现）
+  if (canvas.width === 0 || canvas.height === 0) return true;
+  return false;
+}
+
+// 页面从后台恢复可见时重建终端
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    scheduleRepaint();
+  }
+});
+
+// iOS Safari/PWA 的 BFCache 恢复
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) {
+    scheduleRepaint();
+  }
+});
+
+// focus 事件兜底：语音输入法跳转回来时可能不触发 visibilitychange
+// 只在 canvas 上下文确实丢失时才重建，避免正常打字时频繁触发
+window.addEventListener('focus', () => {
+  if (!currentSessionId || !$('detail-page').classList.contains('active')) return;
+  // 延迟检测，等 iOS 完成页面恢复
+  setTimeout(() => {
+    if (isCanvasContextLost()) {
+      console.log('[黑屏修复] focus 检测到 canvas 上下文丢失');
+      scheduleRepaint();
+    }
+  }, 200);
+});
+
+// 监听 canvas 的 WebGL context lost 事件（最精准的检测）
+function bindCanvasContextLost() {
+  const container = $('terminal-container');
+  if (!container) return;
+  const canvas = container.querySelector('canvas');
+  if (!canvas || canvas.dataset.ctxBound) return;
+  canvas.addEventListener('webglcontextlost', (e) => {
+    console.log('[黑屏修复] webglcontextlost 事件触发');
+    e.preventDefault(); // 允许上下文恢复
+    // 上下文丢失后，等页面恢复可见时重建
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        document.removeEventListener('visibilitychange', onVisible);
+        scheduleRepaint();
+      }
+    };
+    // 如果当前已经可见（语音输入法场景），直接重建
+    if (document.visibilityState === 'visible') {
+      scheduleRepaint();
+    } else {
+      document.addEventListener('visibilitychange', onVisible);
+    }
+  });
+  canvas.dataset.ctxBound = '1';
 }
 
 // ========== 初始化 ==========

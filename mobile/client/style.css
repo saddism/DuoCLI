@@ -209,6 +209,7 @@ header h2 {
 
 .status-dot.running { background: var(--yellow); }
 .status-dot.idle { background: var(--green); }
+.status-dot.inactive { background: var(--text2); }
 .status-dot.exited { background: var(--text2); }
 
 .session-info {
@@ -310,6 +311,8 @@ header h2 {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  cursor: pointer;
+  border-bottom: 1px dashed var(--text2);
 }
 
 .detail-title .status-dot {
@@ -552,6 +555,37 @@ header h2 {
   padding-bottom: calc(24px + var(--safe-bottom));
 }
 
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.modal-header h3 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.modal-close {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: var(--bg3);
+  color: var(--text2);
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.modal-close:active {
+  opacity: 0.7;
+}
+
 .modal-content h3 {
   font-size: 18px;
   margin-bottom: 20px;
@@ -602,7 +636,7 @@ header h2 {
   margin-top: 24px;
 }
 
-.btn-secondary, .btn-primary {
+.btn-secondary, .btn-primary, .btn-danger {
   flex: 1;
   padding: 14px;
   border: none;
@@ -619,6 +653,11 @@ header h2 {
 
 .btn-primary {
   background: var(--accent);
+  color: white;
+}
+
+.btn-danger {
+  background: #e94560;
   color: white;
 }
 

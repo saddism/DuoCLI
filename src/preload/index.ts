@@ -116,6 +116,10 @@ contextBridge.exposeInMainWorld('duocli', {
   sessionHistoryDelete: (filename: string) => ipcRenderer.invoke('session-history:delete', filename),
   sessionHistorySummarize: (filename: string) => ipcRenderer.invoke('session-history:summarize', filename),
 
+  // 会话状态同步：renderer → main（供手机端读取）
+  syncSessionStatus: (statuses: Record<string, string>) =>
+    ipcRenderer.send('session:sync-status', statuses),
+
   // 催工配置：供 main 进程从 renderer 读写
   onGetAutoContinueConfig: (cb: (sessionId: string) => void) =>
     ipcRenderer.on('auto-continue:get', (_e, sessionId) => cb(sessionId)),

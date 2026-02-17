@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>我花了三天，解决了"AI在等我回车，但我在马桶上"的世纪难题</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            background: #ffffff;
+            color: #333333;
+            line-height: 1.8;
+            font-size: 16px;
+        }
+        
+        .container {
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 32px 24px;
+        }
+        
+        /* 标题区域 */
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            padding: 24px 0;
+            border-bottom: 1px solid #e8e8e8;
+        }
+        
+        h1 {
+            font-size: 26px;
+            font-weight: 700;
+            color: #1a1a1a;
+            margin-bottom: 20px;
+            line-height: 1.5;
+        }
+        
+        .subtitle {
+            font-size: 14px;
+            color: #666;
+            font-style: italic;
+            padding: 16px 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #e74c3c;
+        }
+        
+        /* 分隔线 */
+        .divider {
+            text-align: center;
+            margin: 36px 0;
+            color: #ccc;
+            font-size: 14px;
+            letter-spacing: 6px;
+        }
+        
+        /* 章节标题 */
+        h2 {
+            font-size: 20px;
+            color: #e74c3c;
+            margin: 40px 0 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #fee;
+            font-weight: 600;
+        }
+        
+        h3 {
+            font-size: 17px;
+            color: #2c3e50;
+            margin: 28px 0 14px;
+            font-weight: 600;
+        }
+        
+        /* 段落 */
+        p {
+            margin-bottom: 18px;
+            text-align: justify;
+            line-height: 1.9;
+        }
+        
+        /* 引用块 */
+        blockquote {
+            margin: 24px 0;
+            padding: 18px 22px;
+            background: #fff8f8;
+            border-left: 4px solid #e74c3c;
+            border-radius: 0 8px 8px 0;
+            font-style: italic;
+            color: #555;
+        }
+        
+        blockquote p {
+            margin: 0;
+        }
+        
+        /* 代码 */
+        code {
+            background: #f4f4f4;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-family: "SF Mono", Monaco, Inconsolata, "Fira Code", "Courier New", monospace;
+            font-size: 14px;
+            color: #c0392b;
+        }
+        
+        .code-block {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 18px 22px;
+            border-radius: 8px;
+            margin: 20px 0;
+            font-family: "SF Mono", Monaco, Inconsolata, "Fira Code", "Courier New", monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            overflow-x: auto;
+        }
+        
+        /* 表格 */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 24px 0;
+            font-size: 14px;
+            background: #fff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        th {
+            background: #fff5f5;
+            color: #c0392b;
+            padding: 14px 12px;
+            text-align: left;
+            font-weight: 600;
+            border-bottom: 2px solid #ffe0e0;
+        }
+        
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        
+        tr:last-child td {
+            border-bottom: none;
+        }
+        
+        tr:nth-child(even) {
+            background: #fafafa;
+        }
+        
+        /* 列表 */
+        ul, ol {
+            margin: 18px 0;
+            padding-left: 28px;
+        }
+        
+        li {
+            margin-bottom: 10px;
+            line-height: 1.8;
+        }
+        
+        /* 强调 */
+        .highlight {
+            color: #e74c3c;
+            font-weight: 600;
+        }
+        
+        .warning {
+            background: #fff8e1;
+            border-left: 4px solid #ffc107;
+            padding: 16px 20px;
+            border-radius: 0 8px 8px 0;
+            margin: 20px 0;
+            color: #5d4037;
+        }
+        
+        /* 场景卡片 */
+        .scene-card {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 22px;
+            margin: 20px 0;
+            border: 1px solid #e8e8e8;
+        }
+        
+        .scene-card h4 {
+            color: #2980b9;
+            font-size: 16px;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+        
+        .scene-card h4::before {
+            content: "▸ ";
+            color: #e74c3c;
+        }
+        
+        .scene-card p {
+            margin-bottom: 10px;
+        }
+        
+        .scene-card p:last-child {
+            margin-bottom: 0;
+        }
+        
+        /* GitHub 按钮 */
+        .github-btn {
+            display: inline-block;
+            background: #e74c3c;
+            color: #fff;
+            padding: 12px 28px;
+            border-radius: 24px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 15px;
+            margin: 8px 0;
+            transition: all 0.2s;
+        }
+        
+        .github-btn:hover {
+            background: #c0392b;
+        }
+        
+        /* P.S. 区域 */
+        .ps {
+            margin-top: 40px;
+            padding: 28px;
+            background: #f8f9fa;
+            border-radius: 12px;
+            border: 1px dashed #ddd;
+            font-style: italic;
+            color: #666;
+        }
+        
+        .ps p {
+            margin-bottom: 10px;
+        }
+        
+        .ps p:last-child {
+            margin-bottom: 0;
+            color: #e74c3c;
+            font-weight: 500;
+        }
+        
+        /* 移动端适配 */
+        @media (max-width: 600px) {
+            .container {
+                padding: 20px 16px;
+            }
+            
+            h1 {
+                font-size: 21px;
+            }
+            
+            h2 {
+                font-size: 18px;
+            }
+            
+            table {
+                font-size: 12px;
+            }
+            
+            th, td {
+                padding: 10px 8px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 标题 -->
+        <div class="header">
+            <h1>我花了三天，解决了"AI在等我回车，但我在马桶上"的世纪难题</h1>
+            <div class="subtitle">
+                小声 BB：Token 日结，用不完作废，但AI每天在等我上厕所时浪费的token，够写一个操作系统了。
+            </div>
+        </div>
+        
+        <div class="divider">• • •</div>
+        
+        <!-- 第一部分 -->
+        <h2>一、一个荒诞的日常</h2>
+        
+        <p>上周五晚上 11 点，Claude Code 正在帮我迁移数据库。</p>
+        
+        <div class="code-block">
+"发现 47 张表需要调整索引，是否继续？"<br>
+(y/n，回车确认)
+        </div>
+        
+        <p>我看着屏幕上的提示，肚子突然一阵绞痛。</p>
+        
+        <blockquote>
+            <p><strong>去，还是不去？</strong></p>
+        </blockquote>
+        
+        <p>这是一个哲学问题。去吧，万一错过这个确认，AI 就要傻等 5 分钟。5 分钟是什么概念？按照 Claude 的速度，足够读完半个 Linux 内核源码了。</p>
+        
+        <p>不去吧……我真的快憋不住了。</p>
+        
+        <p>最后我跑了。冲刺到厕所，速战速决，冲回电脑前——<span class="highlight">耗时 3 分 47 秒</span>。</p>
+        
+        <p>AI 果然在等我。屏幕还是那个 <code>(y/n)</code>，光标静静闪烁，像一个被放了鸽子的约会对象。</p>
+        
+        <p>我按下 <code>y</code>，它才继续干活。</p>
+        
+        <div class="warning">
+            <strong>那一刻我突然意识到一个问题：我每天给 AI 买了那么多 token，最贵的部分不是它在思考，而是它在等我上厕所。</strong>
+        </div>
+        
+        <!-- 第二部分 -->
+        <h2>二、深度绑定：AI 时代的新型人质危机</h2>
+        
+        <p>你有没有算过一笔账？</p>
+        
+        <p>假设你用 Claude Code Pro，一个月 100 美元，token 日结，用不完作废。看起来挺充裕对吧？</p>
+        
+        <p>但实际情况是：</p>
+        
+        <ul>
+            <li>AI 跑 5 分钟，停下来问 "继续吗？"</li>
+            <li>你去倒水，1 分钟，回来看到它在等</li>
+            <li>你去哄孩子，10 分钟，回来看到它在等</li>
+            <li>你去蹲坑，5 分钟，回来看到它在等</li>
+            <li>你去做饭、吃饭、洗碗，40 分钟，回来……<strong>它还在等</strong></li>
+        </ul>
+        
+        <blockquote>
+            <p>AI 没有休息，但它也没有在工作。它在等你按回车。</p>
+        </blockquote>
+        
+        <p>最可怕的是，你根本不知道它什么时候在等你。你以为它在努力重构代码，其实它在屏幕前捧着"请按回车"的牌子，而你一无所知。</p>
+        
+        <p>这种 <span class="highlight">"被电脑拴住"</span> 的感觉，比 996 还难受。996 至少你知道自己在工作，而这种状态是：<strong>你明明在干别的，但精神被一根线扯着，不敢走远。</strong></p>
+        
+        <p>我想过各种办法。</p>
+        
+        <!-- 第三部分 -->
+        <h2>三、与尴尬作斗争的半年</h2>
+        
+        <h3>尝试一：远程桌面</h3>
+        
+        <p>我装了 TeamViewer、RustDesk、向日葵。</p>
+        
+        <p>结果呢？</p>
+        
+        <p><strong>字小到需要放大镜。</strong> 终端里的代码，在 6 寸手机屏幕上就是一片蚂蚁。我 zoom in，一行字占满屏幕；zoom out，不知道自己在看哪。</p>
+        
+        <p><strong>卡成 PPT。</strong> 远程桌面要传整个屏幕画面，我家 WiFi 穿墙能力又差。我在卧室躺着，AI 在书房输出了一屏日志，我手机上 5 秒后才刷出来——<strong>有时差</strong>。</p>
+        
+        <p>最尴尬的一次，我在被窝里试图回一个 <code>y</code>，输入法弹不出来，等我终于按了发送，发现 AI 已经超时退出了。</p>
+        
+        <p>我像个傻子一样在被窝里戳屏幕，而 AI 早已下班。</p>
+        
+        <h3>尝试二：抱笔记本到处走</h3>
+        
+        <p>既然手机不行，那我用笔记本总行了吧？</p>
+        
+        <p>理论上可以。直到我发现：</p>
+        
+        <ul>
+            <li><strong>上厕所抱笔记本</strong>，姿势极其扭曲，膝盖要夹住机身，还要悬空打字</li>
+            <li><strong>做饭时抱笔记本</strong>，油烟熏屏幕，油渍键盘，被老婆骂了三次</li>
+            <li><strong>带娃时抱笔记本</strong>，女儿一把合上盖子，我的终端没了，AI 的上下文断了</li>
+        </ul>
+        
+        <p>有一次我真的抱着笔记本去了厕所，结果——<strong>没地方放</strong>。马桶盖、水箱、垃圾桶盖，我都试过。最后我蹲在马桶上，笔记本放在腿上，姿势像某种古老的祭祀仪式。</p>
+        
+        <p>而且，我的笔记本续航只有 3 小时，插电的地方可不会跟着我去厕所。</p>
+        
+        <h3>尝试三：用 Siri/快捷指令</h3>
+        
+        <p>我想，能不能语音控制？</p>
+        
+        <div class="code-block">
+"嘿 Siri，告诉电脑按 y"
+        </div>
+        
+        <p>然后我要先解锁手机，打开快捷指令，等它连接到我的 Mac，再执行一个 AppleScript……整个流程 30 秒。</p>
+        
+        <p>AI 等 30 秒，黄花菜都凉了。而且我只能发简单的指令，看不到 AI 的输出，<strong>跟盲人摸象差不多</strong>。</p>
+        
+        <h3>尝试四：手机 SSH</h3>
+        
+        <p>这个最接近我想要的效果。</p>
+        
+        <p>但问题是，<strong>SSH 进去是一个新会话</strong>，不是我已经开好的 Claude Code。我要重新进目录，重新加载上下文，重新等 AI 分析一遍代码库。</p>
+        
+        <p>10 分钟的等待，就为了回一个 <code>y</code>。</p>
+        
+        <p>而且手机屏幕太小，终端体验极差。我试过在手机上用 Termius 跑 Claude Code，输入框和输出混在一起，<strong>我感觉自己在用一个 1980 年代的终端</strong>。</p>
+        
+        <!-- 第四部分 -->
+        <h2>四、半年来累计的尴尬</h2>
+        
+        <p>让我统计一下这半年的"斗争史"：</p>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th>场景</th>
+                    <th>尝试方案</th>
+                    <th>结果</th>
+                    <th>浪费 Token</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>蹲坑</td>
+                    <td>远程桌面</td>
+                    <td>卡死，超时退出</td>
+                    <td>~50k</td>
+                </tr>
+                <tr>
+                    <td>做饭</td>
+                    <td>抱笔记本</td>
+                    <td>油渍键盘，被老婆骂</td>
+                    <td>~30k</td>
+                </tr>
+                <tr>
+                    <td>哄娃</td>
+                    <td>手机 SSH</td>
+                    <td>新会话，重载上下文</td>
+                    <td>~80k</td>
+                </tr>
+                <tr>
+                    <td>睡前</td>
+                    <td>Siri 指令</td>
+                    <td>连接失败</td>
+                    <td>~20k</td>
+                </tr>
+                <tr>
+                    <td>逛街</td>
+                    <td>纯靠记忆猜进度</td>
+                    <td>根本不知道 AI 在等</td>
+                    <td>~100k</td>
+                </tr>
+            </tbody>
+        </table>
+        
+        <div class="warning">
+            <strong>半年下来，我大概浪费了 300 万 token。按照 Pro 的价格，差不多 20 美元。</strong><br><br>
+            这 20 美元没买到任何价值，只是买到了我在马桶上的焦虑。
+        </div>
+        
+        <p>我想通了：<span class="highlight">AI 解放了生产力，但没有解放我。</span> 我还是被绑在电脑前，只是以前绑着写代码，现在绑着按回车。</p>
+        
+        <!-- 第五部分 -->
+        <h2>五、一个大胆的设想</h2>
+        
+        <p>那天晚上，我坐在马桶上（是的，又是马桶），突然想：</p>
+        
+        <blockquote>
+            <p>为什么不能直接在手机上看到电脑的终端？不是远程桌面，不是 SSH 新会话，而是——<strong>我就在手机上操控电脑已经开好的那个终端。</strong></p>
+        </blockquote>
+        
+        <p>我在手机上按 "y"，电脑上的 Claude 立刻收到；  
+        AI 在电脑上输出日志，我手机上实时滚动；  
+        我在手机上按 Ctrl+C，电脑上的进程立刻中断。</p>
+        
+        <p><strong>同一个 PTY 进程，双向实时同步。</strong></p>
+        
+        <p>说白了，我想要的是：<span class="highlight">我的手机就是电脑的键盘和屏幕，走到哪带到哪。</span></p>
+        
+        <p>这让我想到一个更远的未来：</p>
+        
+        <p>十年前我们用电脑聊 QQ，觉得理所当然。现在谁不是躺着刷手机？当我们用手机看视频、看文档、甚至剪视频都成为常态的时候，<strong>"编程必须坐在电脑前"这件事，难道不奇怪吗？</strong></p>
+        
+        <p>我想象未来的某个下午，我和朋友在山里徒步，手机震了一下，Claude 问我："重构完成，要跑测试吗？"</p>
+        
+        <p>我回："跑。"</p>
+        
+        <p>然后锁屏，继续爬山。</p>
+        
+        <div class="scene-card">
+            <h4>Ambient Programming（氛围编程）</h4>
+            <p>编程不再是"去电脑桌前工作"，而是像空气一样，在你生活的缝隙里自然流动。</p>
+        </div>
+        
+        <!-- 第六部分 -->
+        <h2>六、三天，从想法到实现</h2>
+        
+        <p>说干就干。</p>
+        
+        <p><strong>第一天</strong>，我完成了桌面端。多会话管理、AI 标题生成、Git 快照回滚……用 Electron + node-pty，这些问题在我脑子里存了很久，终于落地了。</p>
+        
+        <p><strong>第二天晚上</strong>，我在洗澡。</p>
+        
+        <p>对，洗澡。我把手机端的需求丢给 Opus 4.6，水还没冲完，它告诉我基本能跑了。WebSocket 双向同步、xterm.js 虚拟终端渲染、PWA 离线缓存……</p>
+        
+        <blockquote>
+            <p>一个 AI 在云端写代码，一个我在浴室洗头发，我们都很高效。</p>
+        </blockquote>
+        
+        <p><strong>第三天</strong>，我精调了移动端体验。iOS 全屏适配、键盘自适应、触摸滚动优化、断线重连……我想让它用起来像原生 App 一样舒服。</p>
+        
+        <p>然后昨晚，我搞了个私货：<strong>公网访问版本</strong>。</p>
+        
+        <p>什么意思？就是我不需要在家里的 WiFi 里，<strong>我在地铁上、在公司、在咖啡馆，手机都能连上家里的电脑终端。</strong> 不过这个版本暂时只给我自己用（涉及一些安全考量），没法开源。</p>
+        
+        <p>但开源版本已经很好用了：<strong>只要手机和电脑连同一个 WiFi，你拿着手机满屋跑，终端永远跟着你。</strong></p>
+        
+        <!-- 第七部分 -->
+        <h2>七、几个真实的使用场景</h2>
+        
+        <div class="scene-card">
+            <h4>场景一：带娃时刻</h4>
+            <p>女儿让我陪她拼乐高，Claude 正在迁移数据库。以前我得跟她商量："爸爸先工作 10 分钟。"</p>
+            <p>现在我说："好呀，爸爸陪你。"</p>
+            <p>手机揣兜里，震了就掏出来看一眼，打两行字，继续拼城堡。她知道爸爸"在看"，我也知道 AI "在干活"。两不耽误。</p>
+        </div>
+        
+        <div class="scene-card">
+            <h4>场景二：蹲坑自由（重点）</h4>
+            <p>这个我必须单独拿出来说。</p>
+            <p>现在我上厕所，手机就放在水箱上，AI 输出我盯着，该回车就回车，该 Ctrl+C 就 Ctrl+C。<strong>物理上解放了，精神上也解放了。</strong></p>
+            <p>再也没有那种"腿麻了也不敢起身"的焦虑了。</p>
+        </div>
+        
+        <div class="scene-card">
+            <h4>场景三：睡前灵感</h4>
+            <p>半夜 12 点，突然想到一个边界 case 没处理。以前要么爬起来开电脑，要么记下来明天再弄——明天肯定忘了。</p>
+            <p>现在摸出床头柜的手机，直接在当前终端里操作。5 分钟搞定，倒头就睡。</p>
+        </div>
+        
+        <div class="scene-card">
+            <h4>场景四：沙发上躺着</h4>
+            <p>这个最爽。</p>
+            <p>让 Claude 重构一个大模块，我去沙发上躺着。手机放胸口，AI 的输出在我脸上滚动，像看弹幕一样。等它问"继续吗"，我随手一点，继续躺着。</p>
+            <p><strong>这才是雇主和 AI 的正确关系：我雇你干活，不是我陪你坐牢。</strong></p>
+        </div>
+        
+        <!-- 第八部分 -->
+        <h2>八、它是什么</h2>
+        
+        <p>这个项目叫 <strong>DuoCLI</strong>，一个为 AI 编程时代设计的终端管理器。</p>
+        
+        <p>核心功能很简单：</p>
+        
+        <ul>
+            <li>电脑上开多个 AI 终端（Claude、Codex、Gemini、Kimi……）</li>
+            <li>手机浏览器连上电脑，<strong>看到的就是同一个终端</strong></li>
+            <li><strong>双向实时同步</strong>：手机输入 = 电脑输入，完全等价</li>
+            <li>断线自动重连，历史记录完整保留</li>
+            <li>Web Push 推送，AI 完成任务时手机会震一下</li>
+        </ul>
+        
+        <p>它不是远程桌面（不卡），不是 SSH（不用重开会话），而是 <strong>共享同一个 PTY 进程</strong>。</p>
+        
+        <p>开源，免费，MIT 协议。</p>
+        
+        <p style="text-align: center; margin: 32px 0;">
+            <a href="https://github.com/saddism/DuoCLI" class="github-btn" target="_blank">⭐ GitHub: saddism/DuoCLI</a>
+        </p>
+        
+        <!-- 第九部分 -->
+        <h2>九、写在最后</h2>
+        
+        <p>有人问我："手机上打字那么慢，能写代码吗？"</p>
+        
+        <p>我说：<strong>不是让你在手机上写代码，而是让你在手机上"在场"。</strong></p>
+        
+        <ul>
+            <li>AI 问"确认吗"，你回"y"；</li>
+            <li>AI 报错，你看一眼决定继续还是停下；</li>
+            <li>AI 跑完任务，你收到推送知道可以接着下指令了。</li>
+        </ul>
+        
+        <p>这些不需要键盘，只需要你在。</p>
+        
+        <p>也许十年后，我们会回想 2025 年，觉得"必须用电脑编程"这件事很复古，就像现在看"去网吧登 QQ"一样。</p>
+        
+        <p>而 DuoCLI，就是朝那个方向迈出的一小步。</p>
+        
+        <p>试试看吧。去沙发上躺着，去马桶上蹲着，去床上瘫着——<span class="highlight">让 AI 干活，你享受生活。别再让 token 等你上厕所了。</span></p>
+        
+        <!-- P.S. -->
+        <div class="ps">
+            <p>P.S. 我在写这篇文章的时候，电脑正在客厅帮我跑测试。手机震了一下，我划开看了一眼："测试通过"。</p>
+            <p>我笑了笑，继续躺着。</p>
+            <p>而这台手机，距离我的电脑，隔了三堵墙。</p>
+        </div>
+        
+    </div>
+</body>
+</html>

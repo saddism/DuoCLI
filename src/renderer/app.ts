@@ -178,15 +178,41 @@ function initAutoContinueTimer(): void {
       if (!config.enabled) return;
       // 检查是否超时
       if (now - config.lastSendTime >= config.intervalMs) {
-        // 发送自动继续消息（多行文本中的换行替换为回车符）
-        const message = (config.message || AUTO_CONTINUE_DEFAULT_MESSAGE).replace(/\n/g, '\r');
+        // 发送自动继续消息
+        const message = config.message || AUTO_CONTINUE_DEFAULT_MESSAGE;
         const sendDelay = (config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC) * 1000;
         console.log(`[AutoContinue] 准备发送消息到会话 ${sessionId}（回车延迟 ${sendDelay}ms）`);
         window.duocli.writePty(sessionId, message);
         // 延迟发送回车，避免长文本未写入完成就提交
+        // 发送多种换行符组合，最大化兼容性
         setTimeout(() => {
-          window.duocli.writePty(sessionId, String.fromCharCode(0x0d));
-          console.log(`[AutoContinue] 已发送回车`);
+          // 尝试多种换行符组合，最大化兼容性
+          // 1. \r (CR, 0x0D) - 经典 Unix Enter
+          // 2. \n (LF, 0x0A) - 另一种换行
+          // 3. \r\n (CRLF) - Windows/网络标准
+          // 4. Ctrl+M (0x0D) - 和 \r 相同但明确
+          // 5. Ctrl+J (0x0A) - 和 \n 相同但明确
+          // 6. Alt+Enter 变体 - 某些终端有效
+          const enterKeys = [
+            '\r',           // CR - 经典 Enter
+            '\n',           // LF
+            '\r\n',         // CRLF
+            '\x0d',         // CR 十六进制
+            '\x0a',         // LF 十六进制
+            '\x1b\n',       // Alt+Enter
+            '\x1b\r',       // Alt+Enter 变体
+          ];
+          let idx = 0;
+          const sendNext = () => {
+            if (idx < enterKeys.length) {
+              window.duocli.writePty(sessionId, enterKeys[idx]);
+              idx++;
+              setTimeout(sendNext, 15);
+            } else {
+              console.log(`[AutoContinue] 已发送 ${enterKeys.length} 种回车`);
+            }
+          };
+          sendNext();
         }, sendDelay);
         config.lastSendTime = now;
       }
@@ -247,6 +273,7 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   const autoAgreeDelayRow = document.getElementById('auto-agree-delay-row')!;
   const sendDelayInput = document.getElementById('auto-continue-send-delay') as HTMLInputElement;
   const saveBtn = document.getElementById('auto-continue-save')!;
+  const stopBtn = document.getElementById('auto-continue-stop')!;
   const cancelBtn = document.getElementById('auto-continue-cancel')!;
   const closeBtn = document.getElementById('auto-continue-dialog-close')!;
 
@@ -256,6 +283,15 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   autoAgreeDelayInput.value = String(currentAutoAgreeDelay);
   autoAgreeDelayRow.style.display = currentAutoAgree ? '' : 'none';
   sendDelayInput.value = String(currentSendDelay);
+
+  // 根据当前状态设置按钮文字和显示
+  if (config.enabled) {
+    saveBtn.textContent = '保存';
+    stopBtn.style.display = '';
+  } else {
+    saveBtn.textContent = '保存并开启';
+    stopBtn.style.display = 'none';
+  }
 
   autoAgreeCheckbox.onchange = () => {
     autoAgreeDelayRow.style.display = autoAgreeCheckbox.checked ? '' : 'none';
@@ -267,6 +303,7 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   function close(): void {
     overlay.classList.remove('active');
     saveBtn.removeEventListener('click', onSave);
+    stopBtn.removeEventListener('click', onStop);
     cancelBtn.removeEventListener('click', close);
     closeBtn.removeEventListener('click', close);
     autoAgreeCheckbox.onchange = null;
@@ -302,7 +339,18 @@ function showAutoContinueConfigDialog(sessionId: string): void {
     renderSessionList();
   }
 
+  function onStop(): void {
+    config.enabled = false;
+    config.lastSendTime = Date.now();
+    sessionAutoContinue.set(sessionId, config);
+    saveAutoContinueToStorage();
+    initAutoContinueTimer();
+    close();
+    renderSessionList();
+  }
+
   saveBtn.addEventListener('click', onSave);
+  stopBtn.addEventListener('click', onStop);
   cancelBtn.addEventListener('click', close);
   closeBtn.addEventListener('click', close);
 }
@@ -925,6 +973,21 @@ const sessionTitleLocked: Set<string> = new Set();
 // 置顶会话
 const pinnedSessions: Set<string> = new Set();
 
+// 同步会话状态到 main 进程（供手机端 remote-server 读取）
+function syncSessionStatusToMain(): void {
+  const statuses: Record<string, string> = {};
+  for (const id of sessionTitles.keys()) {
+    if (sessionBusy.has(id)) {
+      statuses[id] = 'running';   // 黄灯：AI 正在工作
+    } else if (sessionUnread.has(id)) {
+      statuses[id] = 'idle';      // 绿灯：等待输入
+    } else {
+      statuses[id] = 'inactive';  // 灰灯：已查看
+    }
+  }
+  window.duocli.syncSessionStatus(statuses);
+}
+
 // 会话历史 buffer 刷盘
 const historyFlushTimers: Map<string, ReturnType<typeof setInterval>> = new Map();
 
@@ -1372,6 +1435,10 @@ function startTitleEdit(id: string, titleSpan: HTMLElement): void {
 
 function renderSessionList(): void {
   const activeId = termManager.getActiveId();
+
+  // 同步会话状态到 main 进程（供手机端读取）
+  syncSessionStatusToMain();
+
   // 如果有正在编辑的标题，检查 input 是否还在 DOM 中
   if (editingTitleId) {
     const existingInput = sessionList.querySelector(`input[data-session-id="${editingTitleId}"]`) as HTMLInputElement | null;
@@ -1506,24 +1573,15 @@ function renderSessionList(): void {
       topRow.appendChild(titleRow);
       topRow.appendChild(closeBtn);
 
-      // 第二行：时间/标签 + 催工 + 扳手
+      // 第二行：时间/标签 + 催工按钮（点击弹配置弹窗）
       const autoContinueConfig = sessionAutoContinue.get(id);
       const autoContinueEnabled = autoContinueConfig?.enabled ?? false;
 
       const autoContinueLabel = document.createElement('span');
       autoContinueLabel.className = 'session-auto-continue-label' + (autoContinueEnabled ? ' enabled' : '');
       autoContinueLabel.textContent = '催';
-      autoContinueLabel.title = autoContinueEnabled ? '自动继续已开启，点击关闭' : '自动继续已关闭，点击开启';
+      autoContinueLabel.title = autoContinueEnabled ? '催工已开启，点击配置' : '点击配置催工';
       autoContinueLabel.addEventListener('click', (e) => {
-        e.stopPropagation();
-        toggleAutoContinue(id, !autoContinueEnabled);
-      });
-
-      const autoContinueConfigBtn = document.createElement('button');
-      autoContinueConfigBtn.className = 'session-auto-continue-config-btn';
-      autoContinueConfigBtn.textContent = '\uD83D\uDD27';
-      autoContinueConfigBtn.title = '配置自动继续';
-      autoContinueConfigBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         showAutoContinueConfigDialog(id);
       });
@@ -1532,7 +1590,6 @@ function renderSessionList(): void {
       bottomRow.className = 'session-item-bottom';
       bottomRow.appendChild(metaRow);
       bottomRow.appendChild(autoContinueLabel);
-      bottomRow.appendChild(autoContinueConfigBtn);
 
       // 组装
       item.addEventListener('click', () => switchSession(id));

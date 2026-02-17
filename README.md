@@ -30,6 +30,14 @@
 
 **手机和电脑共享同一个终端。** 连上同一个 WiFi，手机上打的每一个字电脑上实时出现，电脑上 Claude Code 的每一行输出手机上同步滚动。不是远程桌面，不是屏幕投射——是真正的同一个终端会话，双向实时同步。
 
+### 最近更新（2026-02-17）
+
+- **手机端会话状态和桌面端完全同步**：黄灯工作中、绿灯待确认、灰灯已读/不活跃
+- **手机端支持直接改会话标题**：点击详情页标题即可重命名
+- **催工配置交互升级**：`催` 按钮直接打开配置，支持“保存并开启 / 关闭催工”
+- **iOS PWA 黑屏修复**：输入法切换/后台恢复后自动重建终端并回放历史
+- **移动端细节优化**：新增 Tab 快捷键、最近目录短路径显示、上传后自动回填文件路径到输入框
+
 ### 为什么需要 DuoCLI
 
 **离开电脑 ≠ 停止编程**
@@ -248,6 +256,14 @@ A multi-terminal manager designed for the AI coding era. Built on Electron, craf
 ### Core Selling Point
 
 **Your phone and computer share the same terminal.** Connect to the same WiFi, and every keystroke on your phone appears on your computer in real-time. Every line of output from Claude Code on your computer scrolls simultaneously on your phone. Not remote desktop, not screen mirroring — it's a true shared terminal session with bidirectional real-time sync.
+
+### Latest Updates (2026-02-17)
+
+- **Mobile session status now matches desktop semantics**: yellow = running, green = awaiting input, gray = inactive/read
+- **Rename sessions directly on mobile**: tap the session title in detail view
+- **Auto-Continue UX refreshed**: tap `催` to open config, with “Save & Enable / Stop” actions
+- **iOS PWA black-screen fix**: auto-recreate terminal and replay buffer after app/input-method resume
+- **Mobile usability polish**: added Tab key, shortened recent-path labels, auto-fill uploaded file path into input box
 
 ### Why You Need DuoCLI
 

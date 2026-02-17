@@ -873,6 +873,13 @@ function registerIPC(): void {
     safeSend('auto-continue:set', sessionId, config);
   };
 
+  // 供 remote-server 调用：读取会话状态（busy/unread/idle）
+  // renderer 通过 IPC 同步状态到这里
+  (global as any).__sessionStatuses = {} as Record<string, string>;
+  ipcMain.on('session:sync-status', (_e, statuses: Record<string, string>) => {
+    (global as any).__sessionStatuses = statuses;
+  });
+
   // ========== 会话历史 IPC ==========
 
   ipcMain.handle('session-history:init', (_e, sessionId: string, title: string) => {

@@ -285,6 +285,13 @@ export function startRemoteServer(
     res.json({ ok: true });
   });
 
+  // 获取会话的 UI 状态（busy/unread/idle），由 renderer 同步到 main
+  function getSessionStatus(id: string, ptyProcess: any): string {
+    if (ptyProcess.exitState) return 'exited';
+    const statuses = (global as any).__sessionStatuses || {};
+    return statuses[id] || 'idle';
+  }
+
   // 会话列表 — 直接读 ptyManager
   app.get('/api/sessions', (_req, res) => {
     const sessions = ptyManager.getAllSessions().map(s => ({
@@ -294,7 +301,7 @@ export function startRemoteServer(
       presetCommand: s.presetCommand,
       displayName: getDisplayName(s.presetCommand),
       provider: (s as any).provider || getCliProvider(s.presetCommand),
-      status: (s.ptyProcess as any).exitState ? 'exited' : 'running',
+      status: getSessionStatus(s.id, s.ptyProcess),
       createdAt: (s as any).createdAt || Date.now(),
     }));
     res.json(sessions);
@@ -366,6 +373,19 @@ export function startRemoteServer(
     }
   });
 
+  // 重命名会话标题
+  app.put('/api/sessions/:id/title', (req, res) => {
+    const { title } = req.body;
+    if (typeof title !== 'string' || !title.trim()) {
+      res.status(400).json({ error: '缺少 title' });
+      return;
+    }
+    const session = ptyManager.getSession(req.params.id);
+    if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
+    ptyManager.rename(req.params.id, title.trim());
+    res.json({ ok: true });
+  });
+
   // 删除会话
   app.delete('/api/sessions/:id', (req, res) => {
     ptyManager.destroy(req.params.id);
@@ -406,7 +426,7 @@ export function startRemoteServer(
         presetCommand: s.presetCommand,
         displayName: getDisplayName(s.presetCommand),
         provider: (s as any).provider || getCliProvider(s.presetCommand),
-        status: (s.ptyProcess as any).exitState ? 'exited' : 'running',
+        status: getSessionStatus(s.id, s.ptyProcess),
       }));
       res.write(`event: sessions\ndata: ${JSON.stringify(sessions)}\n\n`);
     };
