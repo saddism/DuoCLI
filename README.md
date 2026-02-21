@@ -30,13 +30,14 @@
 
 **手机和电脑共享同一个终端。** 连上同一个 WiFi，手机上打的每一个字电脑上实时出现，电脑上 Claude Code 的每一行输出手机上同步滚动。不是远程桌面，不是屏幕投射——是真正的同一个终端会话，双向实时同步。
 
-### 最近更新（2026-02-17）
+### 最近更新（2026-02-21）
 
+- **Android 远程调试神器** — 远程开发时看不到手机界面？现在可以直接在手机端查看 Android 设备实时截图、点击操控、输入文字（支持中文），彻底解决远程调试无法看到 UI 的痛点
+- **全屏控制模式** — 截图全屏展示，点击即操控，支持自动刷新（3/5/10/30秒），远程调试体验接近真机
+- **远程文字输入** — 通过 ADBKeyboard 向 Android 设备输入中英文，无需触碰手机
+- **自定义 ADB 命令** — 直接在手机端执行任意 adb shell 命令，部署应用、查看日志一气呵成
 - **手机端会话状态和桌面端完全同步**：黄灯工作中、绿灯待确认、灰灯已读/不活跃
 - **手机端支持直接改会话标题**：点击详情页标题即可重命名
-- **催工配置交互升级**：`催` 按钮直接打开配置，支持“保存并开启 / 关闭催工”
-- **iOS PWA 黑屏修复**：输入法切换/后台恢复后自动重建终端并回放历史
-- **移动端细节优化**：新增 Tab 快捷键、最近目录短路径显示、上传后自动回填文件路径到输入框
 
 ### 为什么需要 DuoCLI
 
@@ -57,6 +58,38 @@ AI 编程助手跑一个任务经常要好几分钟。以前你只能干坐在�
 - **回滚困难** — AI 改了一堆代码，效果不对想回退，但已经搞不清改了哪些文件
 - **对话丢失** — 终端关了就没了，之前 AI 说了什么、改了什么，全部消失
 - **重复配置** — 每个 AI 工具都要单独配 API Key，明明机器上已经有了
+
+### Android 远程调试
+
+> **远程开发最大的痛点：看不到手机界面。**
+>
+> 你在异地用 SSH 连着开发机，Claude Code 帮你写好了代码，`adb install` 也成功了——但你根本不知道 App 跑起来长什么样，UI 对不对，有没有崩溃。以前你只能干等，或者让别人帮你看，或者放弃远程回到电脑旁边。
+>
+> **现在不需要了。**
+
+DuoCLI 内置 Android 远程调试功能，通过手机端 PWA 直接操控连接在开发机上的 Android 设备：
+
+- **实时截图** — 一键获取 Android 设备当前画面，全屏展示，比例完整
+- **点击操控** — 点击截图的任意位置，对应坐标实时发送到手机，点完自动刷新截图
+- **自动刷新** — 设置 3/5/10/30 秒间隔自动截图，像看直播一样监控 App 运行状态
+- **文字输入** — 支持中英文输入，通过 ADBKeyboard 精准发送到 Android 设备
+- **自定义命令** — 执行任意 `adb shell` 命令：安装 APK、查看进程、清除数据、触发 deeplink……
+
+```
+你在外地 → 手机打开 DuoCLI → 点击"手机设备" → 看到 Android 实时画面 → 点击操控 → 部署验证
+```
+
+**典型场景：**
+- Claude Code 帮你改了 UI，`adb install` 后直接在手机上看效果，不用回到电脑旁
+- 远程调试崩溃：截图看到错误弹窗，执行 `adb logcat` 命令查日志
+- 自动化测试：让 AI 写脚本，你在手机上实时看执行过程
+
+#### 使用方式
+
+1. 开发机连接 Android 设备（USB 或 WiFi ADB）
+2. 手机端打开 DuoCLI，点击右上角 📱 进入设备页
+3. 选择设备 → 点 📷 获取截图 → 点 ⛶ 进入全屏控制模式
+4. 开启 🖱 远程控制后，点击截图即可操控手机
 
 ### 手机同步功能
 
@@ -257,13 +290,14 @@ A multi-terminal manager designed for the AI coding era. Built on Electron, craf
 
 **Your phone and computer share the same terminal.** Connect to the same WiFi, and every keystroke on your phone appears on your computer in real-time. Every line of output from Claude Code on your computer scrolls simultaneously on your phone. Not remote desktop, not screen mirroring — it's a true shared terminal session with bidirectional real-time sync.
 
-### Latest Updates (2026-02-17)
+### Latest Updates (2026-02-21)
 
+- **Android Remote Debugging** — Can't see your phone's UI during remote development? Now you can view real-time Android screenshots, tap to control, and type text (including Chinese) directly from your phone — solving the #1 pain point of remote mobile development
+- **Fullscreen Control Mode** — Screenshots displayed fullscreen, tap to control, auto-refresh (3/5/10/30s), remote debugging experience close to hands-on
+- **Remote Text Input** — Send Chinese and English text to Android devices via ADBKeyboard, no need to touch the phone
+- **Custom ADB Commands** — Execute any `adb shell` command from your phone: deploy APKs, check logs, all in one flow
 - **Mobile session status now matches desktop semantics**: yellow = running, green = awaiting input, gray = inactive/read
 - **Rename sessions directly on mobile**: tap the session title in detail view
-- **Auto-Continue UX refreshed**: tap `催` to open config, with “Save & Enable / Stop” actions
-- **iOS PWA black-screen fix**: auto-recreate terminal and replay buffer after app/input-method resume
-- **Mobile usability polish**: added Tab key, shortened recent-path labels, auto-fill uploaded file path into input box
 
 ### Why You Need DuoCLI
 
@@ -284,6 +318,38 @@ AI coding assistants often take several minutes to run a task. Previously, you'd
 - **Rollback difficulty** — AI changed a bunch of code, effects aren't right and you want to revert, but can't figure out what files were changed
 - **Conversation loss** — Terminal closes and it's gone. What the AI said and changed before, all disappears
 - **Repeated configuration** — Every AI tool needs its own API Key configuration, even though your machine already has them
+
+### Android Remote Debugging
+
+> **The biggest pain point of remote development: you can't see the phone's UI.**
+>
+> You're SSH'd into a dev machine from another location. Claude Code wrote the code, `adb install` succeeded — but you have no idea what the app looks like, whether the UI is correct, or if it crashed. Previously you'd have to wait, ask someone else to check, or give up and go back to your desk.
+>
+> **Not anymore.**
+
+DuoCLI has built-in Android remote debugging. Control Android devices connected to your dev machine directly from the mobile PWA:
+
+- **Live screenshots** — Capture the current Android screen instantly, displayed fullscreen with correct aspect ratio
+- **Tap to control** — Tap anywhere on the screenshot, coordinates are sent to the device in real-time, screenshot auto-refreshes after each tap
+- **Auto-refresh** — Set 3/5/10/30 second intervals for automatic screenshots, monitor your app like a live stream
+- **Text input** — Chinese and English input via ADBKeyboard, sent precisely to the Android device
+- **Custom commands** — Run any `adb shell` command: install APKs, inspect processes, clear data, trigger deeplinks…
+
+```
+You're away → Open DuoCLI on phone → Tap "Device" → See Android live → Tap to control → Deploy & verify
+```
+
+**Typical scenarios:**
+- Claude Code updated your UI, `adb install` done — check the result on your phone without going back to your desk
+- Remote crash debugging: screenshot shows the error dialog, run `adb logcat` to get logs
+- Automated testing: let AI write scripts, watch execution in real-time from your phone
+
+#### How to Use
+
+1. Connect Android device to dev machine (USB or WiFi ADB)
+2. Open DuoCLI on your phone, tap 📱 in the top-right to enter Device page
+3. Select device → tap 📷 for screenshot → tap ⛶ for fullscreen control mode
+4. Enable 🖱 remote control, then tap the screenshot to control the device
 
 ### Mobile Sync Features
 

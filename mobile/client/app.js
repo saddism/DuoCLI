@@ -261,10 +261,202 @@ $('token-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('login-btn').click();
 });
 
+// ========== 设备页 ==========
+
+let remoteTapEnabled = false;
+let screenshotObjectUrl = null;
+
+function initDevicePage() {
+  $('device-console-btn').onclick = () => {
+    showPage('device-page');
+    refreshAndroidDevices();
+    showCopyToast('📷 截图查看手机画面 · 🖱 开启后可点击操控');
+  };
+  let autoRefreshTimer = null;
+  $('device-back-btn').onclick = () => showPage('main-page');
+  $('fullscreen-back-btn').onclick = () => {
+    if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+    $('fullscreen-auto-btn').textContent = '自动刷新';
+    $('fullscreen-overlay').style.display = 'none';
+  };
+  $('fullscreen-auto-btn').onclick = () => {
+    if (autoRefreshTimer) {
+      clearInterval(autoRefreshTimer);
+      autoRefreshTimer = null;
+      $('fullscreen-auto-btn').textContent = '自动刷新';
+    } else {
+      const secs = parseInt($('fullscreen-interval').value);
+      const doRefresh = async () => {
+        await refreshAndroidScreenshot();
+        $('fullscreen-preview').src = $('device-preview').src;
+      };
+      doRefresh();
+      autoRefreshTimer = setInterval(doRefresh, secs * 1000);
+      $('fullscreen-auto-btn').textContent = '停止刷新';
+    }
+  };
+  const sendTextToDevice = async () => {
+    const text = $('fullscreen-text-input').value;
+    if (!text) return;
+    const deviceId = $('device-select').value;
+    if (!deviceId) { showCopyToast('请先选择设备'); return; }
+    $('fullscreen-text-input').value = '';
+    $('input-text-modal').classList.remove('active');
+    showCopyToast('⚠️ 请确保手机上已点击输入框');
+    await new Promise(r => setTimeout(r, 800));
+    await fetch(`${API}/api/android/input-text`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ deviceId, text }),
+    }).catch(() => {});
+    showCopyToast('已发送');
+  };
+  $('fullscreen-text-btn').onclick = () => {
+    $('fullscreen-text-input').value = '';
+    $('input-text-modal').classList.add('active');
+    setTimeout(() => $('fullscreen-text-input').focus(), 100);
+  };
+  $('input-text-close').onclick = () => $('input-text-modal').classList.remove('active');
+  $('fullscreen-text-send').onclick = sendTextToDevice;
+  $('fullscreen-text-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendTextToDevice(); });
+  $('device-fullscreen-btn').onclick = () => {
+    const src = $('device-preview').src;
+    if (!src) { showCopyToast('请先获取截图'); return; }
+    $('fullscreen-preview').src = src;
+    $('fullscreen-overlay').style.display = 'flex';
+    showCopyToast('点击屏幕可远程操控 · ⌨️ 输入文字 · 📷 刷新截图');
+  };
+  $('device-shell-btn').onclick = () => {
+    $('shell-output').style.display = 'none';
+    $('shell-input').value = '';
+    $('shell-modal').classList.add('active');
+  };
+  $('shell-modal-close').onclick = () => $('shell-modal').classList.remove('active');
+  $('shell-run-btn').onclick = async () => {
+    const command = $('shell-input').value.trim();
+    const deviceId = $('device-select').value;
+    if (!command) return;
+    if (!deviceId) { showCopyToast('请先选择设备'); return; }
+    $('shell-run-btn').textContent = '执行中...';
+    $('shell-run-btn').disabled = true;
+    try {
+      const res = await fetch(`${API}/api/android/shell`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ deviceId, command }),
+      });
+      const data = await res.json();
+      const out = $('shell-output');
+      out.textContent = data.output || data.error || '（无输出）';
+      out.style.display = 'block';
+    } catch (e) {
+      showCopyToast('执行失败: ' + e.message);
+    } finally {
+      $('shell-run-btn').textContent = '执行';
+      $('shell-run-btn').disabled = false;
+    }
+  };
+  $('fullscreen-preview').onclick = async (e) => {
+    const img = e.currentTarget;
+    const rect = img.getBoundingClientRect();
+    const x = Math.round((e.clientX - rect.left) * img.naturalWidth / rect.width);
+    const y = Math.round((e.clientY - rect.top) * img.naturalHeight / rect.height);
+    const deviceId = $('device-select').value;
+    if (!deviceId) return;
+    await fetch(`${API}/api/android/tap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ deviceId, x, y }),
+    }).catch(() => {});
+    setTimeout(async () => {
+      await refreshAndroidScreenshot();
+      $('fullscreen-preview').src = $('device-preview').src;
+    }, 800);
+  };
+  $('device-refresh-btn').onclick = refreshAndroidDevices;
+  $('device-shot-btn').onclick = () => {
+    showCopyToast('正在刷新截图...');
+    refreshAndroidScreenshot();
+  };
+  $('device-tap-toggle').onclick = () => {
+    remoteTapEnabled = !remoteTapEnabled;
+    $('device-tap-toggle').style.opacity = remoteTapEnabled ? '1' : '0.4';
+    $('device-preview').style.cursor = remoteTapEnabled ? 'crosshair' : 'default';
+    showCopyToast(remoteTapEnabled ? '🖱 远程控制已开启，点击截图操控手机' : '🖱 远程控制已关闭');
+  };
+  $('device-preview').onclick = async (e) => {
+    if (!remoteTapEnabled) {
+      // 非控制模式：进入全屏
+      const overlay = $('fullscreen-overlay');
+      $('fullscreen-preview').src = $('device-preview').src;
+      overlay.style.display = 'flex';
+      return;
+    }
+    const img = e.currentTarget;
+    const rect = img.getBoundingClientRect();
+    const x = Math.round((e.clientX - rect.left) * img.naturalWidth / rect.width);
+    const y = Math.round((e.clientY - rect.top) * img.naturalHeight / rect.height);
+    const deviceId = $('device-select').value;
+    if (!deviceId) return;
+    await fetch(`${API}/api/android/tap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ deviceId, x, y }),
+    }).catch(() => {});
+    setTimeout(() => refreshAndroidScreenshot(), 800);
+  };
+  $('device-select').onchange = () => {
+    const id = $('device-select').value;
+    if (id) localStorage.setItem('duocli_android_device', id);
+  };
+}
+
+function setDeviceHint(msg) {
+  showCopyToast(msg);
+}
+
+async function refreshAndroidDevices() {
+  setDeviceHint('正在加载设备...');
+  try {
+    const data = await api('/api/android/devices');
+    const sel = $('device-select');
+    const saved = localStorage.getItem('duocli_android_device');
+    sel.innerHTML = data.devices.length
+      ? data.devices.map(d => `<option value="${d.id}"${d.id === saved ? ' selected' : ''}>${d.id} ${d.info}</option>`).join('')
+      : '<option value="">未找到设备</option>';
+    setDeviceHint(data.devices.length ? '' : '未找到已连接的 Android 设备');
+  } catch (e) {
+    setDeviceHint('获取设备失败: ' + (e.message || e));
+  }
+}
+
+async function refreshAndroidScreenshot() {
+  const deviceId = $('device-select').value;
+  if (!deviceId) { setDeviceHint('请先选择设备'); return; }
+  setDeviceHint('正在获取截图...');
+  try {
+    const res = await fetch(`${API}/api/android/screenshot?deviceId=${encodeURIComponent(deviceId)}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    if (screenshotObjectUrl) URL.revokeObjectURL(screenshotObjectUrl);
+    screenshotObjectUrl = URL.createObjectURL(blob);
+    const img = $('device-preview');
+    img.src = screenshotObjectUrl;
+    img.style.display = 'block';
+    $('device-preview-empty').style.display = 'none';
+    setDeviceHint('截图更新于 ' + new Date().toLocaleTimeString());
+  } catch (e) {
+    setDeviceHint('截图失败: ' + (e.message || e));
+  }
+}
+
 // ========== 主页面 ==========
 
 async function enterMain() {
   showPage('main-page');
+  initDevicePage();
   await refreshSessions();
   await refreshRecentCwdOptions();
   startSSE();

@@ -32,6 +32,7 @@
         <h2>DuoCLI</h2>
       </div>
       <div class="header-right">
+        <button id="device-console-btn" class="icon-btn" title="手机设备">📱</button>
         <button id="new-session-btn" class="icon-btn" title="新建会话">＋</button>
       </div>
     </header>
@@ -140,7 +141,71 @@
     </div>
   </div>
 
-  <script src="xterm.js"></script>
+  <!-- 设备页 -->
+  <div id="device-page" class="page">
+    <header>
+      <button id="device-back-btn" class="icon-btn">←</button>
+      <select id="device-select" class="device-select-header">
+        <option value="">正在加载设备...</option>
+      </select>
+      <button id="device-refresh-btn" class="icon-btn" title="刷新设备列表">🔄</button>
+      <button id="device-shot-btn" class="icon-btn" title="刷新截图">📷</button>
+      <button id="device-fullscreen-btn" class="icon-btn" title="全屏">⛶</button>
+      <button id="device-shell-btn" class="icon-btn" title="执行命令">⌨️</button>
+      <button id="device-tap-toggle" class="icon-btn" title="远程点击" style="opacity:0.4;">🖱</button>
+    </header>
+    <div class="device-page-body">
+      <div class="device-preview-wrap">
+        <img id="device-preview" alt="设备截图" style="display:none;max-width:100%;max-height:100%;object-fit:contain;" />
+        <div id="device-preview-empty" class="device-preview-empty">点击 📷 获取手机截图</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 全屏截图 overlay -->
+  <div id="fullscreen-overlay" style="display:none;position:fixed;inset:0;z-index:200;background:#000;flex-direction:column;">
+    <button id="fullscreen-back-btn" style="position:absolute;top:calc(12px + env(safe-area-inset-top,0px));left:12px;z-index:201;width:40px;height:40px;border:none;border-radius:10px;background:rgba(0,0,0,0.5);color:#fff;font-size:20px;cursor:pointer;">←</button>
+    <button id="fullscreen-text-btn" style="position:absolute;bottom:calc(12px + env(safe-area-inset-bottom,0px));right:12px;z-index:201;width:44px;height:44px;border:none;border-radius:50%;background:rgba(0,0,0,0.5);color:#fff;font-size:22px;cursor:pointer;">⌨️</button>
+    <div style="position:absolute;top:calc(12px + env(safe-area-inset-top,0px));right:12px;z-index:201;display:flex;align-items:center;gap:6px;">
+      <select id="fullscreen-interval" style="padding:4px 8px;border-radius:8px;border:none;background:rgba(0,0,0,0.5);color:#fff;font-size:13px;outline:none;">
+        <option value="3">3秒</option>
+        <option value="5" selected>5秒</option>
+        <option value="10">10秒</option>
+        <option value="30">30秒</option>
+      </select>
+      <button id="fullscreen-auto-btn" style="padding:4px 10px;border:none;border-radius:8px;background:rgba(0,0,0,0.5);color:#fff;font-size:13px;cursor:pointer;">自动刷新</button>
+    </div>
+    <img id="fullscreen-preview" style="width:100%;height:100%;object-fit:contain;" />
+  </div>
+
+  <!-- Shell 命令弹窗 -->
+  <div id="shell-modal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>执行命令</h3>
+        <button id="shell-modal-close" class="modal-close">✕</button>
+      </div>
+      <input type="text" id="shell-input" placeholder="输入 adb shell 命令，如 pm list packages" autocomplete="off" />
+      <div class="modal-actions">
+        <button id="shell-run-btn" class="btn-primary">执行</button>
+      </div>
+      <pre id="shell-output" style="margin-top:14px;max-height:200px;overflow:auto;background:#111426;color:#cfd7ff;padding:10px;border-radius:10px;font-size:12px;white-space:pre-wrap;word-break:break-word;display:none;"></pre>
+    </div>
+  </div>
+
+  <!-- 输入文字弹窗 -->
+  <div id="input-text-modal" class="modal" style="z-index:300;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>输入文字到手机</h3>
+        <button id="input-text-close" class="modal-close">✕</button>
+      </div>
+      <input type="text" id="fullscreen-text-input" placeholder="输入文字..." autocomplete="off" />
+      <div class="modal-actions">
+        <button id="fullscreen-text-send" class="btn-primary">发送</button>
+      </div>
+    </div>
+  </div>
   <script src="addon-fit.js"></script>
   <script src="app.js"></script>
 </body>

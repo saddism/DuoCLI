@@ -4,6 +4,12 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import os from 'os';
+import { execFileSync, execSync } from 'child_process';
+
+function resolveAdb(): string {
+  try { return execSync('which adb', { encoding: 'utf8' }).trim(); } catch { return 'adb'; }
+}
+const ADB = resolveAdb();
 import { WebSocketServer, WebSocket } from 'ws';
 import webpush from 'web-push';
 import { PtyManager, getDisplayName } from './pty-manager';
@@ -391,6 +397,76 @@ export function startRemoteServer(
     ptyManager.destroy(req.params.id);
     onRemoteDestroy?.(req.params.id);
     res.json({ ok: true });
+  });
+
+  // ========== Android 设备 API ==========
+
+  app.get('/api/android/devices', (_req, res) => {
+    try {
+      const out = execFileSync(ADB, ['devices', '-l'], { encoding: 'utf8' });
+      const devices = out.split('\n').slice(1).filter(l => l.trim() && !l.startsWith('*')).map(l => {
+        const [id, ...rest] = l.trim().split(/\s+/);
+        return { id, info: rest.join(' ') };
+      });
+      res.json({ devices });
+    } catch (e: any) {
+      res.status(500).json({ error: '获取设备失败: ' + (e.message || e) });
+    }
+  });
+
+  app.get('/api/android/screenshot', (req, res) => {
+    try {
+      const deviceId = typeof req.query.deviceId === 'string' ? req.query.deviceId.trim() : '';
+      const args: string[] = [];
+      if (deviceId) args.push('-s', deviceId);
+      args.push('exec-out', 'screencap', '-p');
+      const png = execFileSync(ADB, args, { maxBuffer: 8 * 1024 * 1024 });
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(png);
+    } catch (e: any) {
+      res.status(500).json({ error: '截图失败: ' + (e.message || e) });
+    }
+  });
+
+  app.post('/api/android/tap', (req, res) => {
+    try {
+      const deviceId = typeof req.body.deviceId === 'string' ? req.body.deviceId.trim() : '';
+      const x = Math.round(Number(req.body.x));
+      const y = Math.round(Number(req.body.y));
+      if (!deviceId || isNaN(x) || isNaN(y)) { res.status(400).json({ error: '参数错误' }); return; }
+      execFileSync(ADB, ['-s', deviceId, 'shell', 'input', 'tap', String(x), String(y)]);
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ error: '点击失败: ' + (e.message || e) });
+    }
+  });
+
+  app.post('/api/android/shell', (req, res) => {
+    try {
+      const deviceId = typeof req.body.deviceId === 'string' ? req.body.deviceId.trim() : '';
+      const command = typeof req.body.command === 'string' ? req.body.command.trim() : '';
+      if (!deviceId || !command) { res.status(400).json({ error: '参数错误' }); return; }
+      const out = execSync(`${ADB} -s ${deviceId} shell ${command}`, { encoding: 'utf8', timeout: 30000 });
+      res.json({ output: out });
+    } catch (e: any) {
+      res.json({ output: e.stdout || e.message || String(e) });
+    }
+  });
+
+  app.post('/api/android/input-text', (req, res) => {
+    try {
+      const deviceId = typeof req.body.deviceId === 'string' ? req.body.deviceId.trim() : '';
+      const text = typeof req.body.text === 'string' ? req.body.text : '';
+      if (!deviceId || !text) { res.status(400).json({ error: '参数错误' }); return; }
+      // 切到 ADBKeyboard 发送文字，再切回搜狗
+      execFileSync(ADB, ['-s', deviceId, 'shell', 'ime', 'set', 'com.android.adbkeyboard/.AdbIME']);
+      execFileSync(ADB, ['-s', deviceId, 'shell', 'am', 'broadcast', '-a', 'ADB_INPUT_TEXT', '--es', 'msg', text]);
+      execFileSync(ADB, ['-s', deviceId, 'shell', 'ime', 'set', 'com.sohu.inputmethod.sogouoem/.SogouIME']);
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message || String(e) });
+    }
   });
 
   // ========== 催工配置 API ==========

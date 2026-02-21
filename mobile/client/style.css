@@ -152,6 +152,12 @@ header h2 {
   font-weight: 700;
 }
 
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .icon-btn {
   width: 40px;
   height: 40px;
@@ -705,4 +711,83 @@ header h2 {
 ::-webkit-scrollbar-thumb {
   background: var(--border);
   border-radius: 2px;
+}
+
+/* ========== 设备页 ========== */
+
+#device-page header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 12px;
+  padding-top: calc(12px + var(--safe-top));
+  min-height: 56px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.device-page-body {
+  flex: 1;
+  overflow: hidden;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.device-select-header {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  min-width: 0;
+}
+
+.device-hint {
+  color: var(--text2);
+  font-size: 11px;
+  line-height: 1.2;
+  flex-shrink: 0;
+}
+
+.mini-btn {
+  padding: 6px 10px;
+  font-size: 12px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+.device-preview-wrap {
+  flex: 1;
+  background: #0f1326;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+}
+
+.device-preview-empty {
+  color: var(--text2);
+  font-size: 12px;
+  padding: 20px;
+  text-align: center;
+}
+
+.device-log-output {
+  margin: 0;
+  max-height: 100px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #111426;
+  color: #cfd7ff;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
