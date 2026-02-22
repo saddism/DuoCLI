@@ -918,15 +918,14 @@ async function openSession(id) {
   currentSessionId = id;
   showPage('detail-page');
 
-  // 更新标题
-  try {
-    const sessions = await api('/api/sessions');
+  // 更新标题（不阻塞 WebSocket 连接）
+  api('/api/sessions').then(sessions => {
     const s = sessions.find(x => x.id === id);
-    if (s) {
+    if (s && currentSessionId === id) {
       $('detail-name').textContent = s.title || s.presetCommand || '终端';
       $('detail-status').className = `status-dot ${s.status}`;
     }
-  } catch {}
+  }).catch(() => {});
 
   // 创建终端并连接 WebSocket（等终端 ready 后再连，避免 replay 数据丢失）
   console.log('[openSession] creating terminal...');
