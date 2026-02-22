@@ -20,7 +20,7 @@ declare global {
   interface Window {
     duocli: {
       setWindowTitle: (title: string) => void;
-      createPty: (cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string }>;
+      createPty: (cwd: string, presetCommand: string, themeId: string) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string }>;
       writePty: (id: string, data: string) => void;
       resizePty: (id: string, cols: number, rows: number) => void;
       destroyPty: (id: string) => void;
@@ -66,8 +66,8 @@ declare global {
       aiGetSelected: () => Promise<{ providerId: string | null; model: string | null }>;
       getCliProvider: (presetCommand: string) => Promise<string | null>;
       // Claude 供应商配置
-      claudeProvidersList: () => Promise<Array<{ id: string; name: string; baseUrl: string; apiKey: string }>>;
-      claudeProvidersSave: (providers: Array<{ id: string; name: string; baseUrl: string; apiKey: string }>) => Promise<boolean>;
+      claudeProvidersList: () => Promise<Array<{ id: string; name: string; baseUrl: string; apiKey: string; model?: string }>>;
+      claudeProvidersSave: (providers: Array<{ id: string; name: string; baseUrl: string; apiKey: string; model?: string }>) => Promise<boolean>;
       // 会话历史 API
       sessionHistoryInit: (sessionId: string, title: string) => Promise<string>;
       sessionHistoryAppend: (sessionId: string, data: string) => void;
@@ -81,6 +81,8 @@ declare global {
       // 文件操作
       openFile: (filePath: string) => Promise<void>;
       readDirectory: (dirPath: string) => Promise<Array<{ name: string; isDirectory: boolean; isFile: boolean }>>;
+      // 会话状态同步
+      syncSessionStatus: (statuses: Record<string, string>) => void;
       // 催工配置中转
       onGetAutoContinueConfig: (cb: (sessionId: string) => void) => void;
       sendAutoContinueConfig: (sessionId: string, config: any) => void;
@@ -102,6 +104,8 @@ const sessionCwds: Map<string, string> = new Map();
 const sessionDisplayNames: Map<string, string> = new Map();
 // 会话实际使用的模型提供商（如 MiniMax、GLM、Anthropic 等）
 const sessionProviders: Map<string, string> = new Map();
+// 每个会话使用的自定义供应商 ID（用于切换终端时恢复选择）
+const sessionClaudeProviderIds: Map<string, string> = new Map();
 
 // 自动继续配置
 const sessionAutoContinue: Map<string, { enabled: boolean; message: string; intervalMs: number; lastSendTime: number; autoAgree: boolean; autoAgreeDelaySec: number; sendDelaySec: number }> = new Map();
@@ -110,6 +114,10 @@ const AUTO_CONTINUE_DEFAULT_INTERVAL = 10 * 60 * 1000; // 10 分钟
 const AUTO_AGREE_DEFAULT_DELAY_SEC = 5; // 自动同意默认延后 5 秒
 const AUTO_CONTINUE_SEND_DELAY_SEC = 2; // 发送回车前默认延迟 2 秒
 const AUTO_CONTINUE_STORAGE_KEY = 'duocli_auto_continue';
+
+function hasSessionInUI(sessionId: string): boolean {
+  return sessionTitles.has(sessionId) || archivedSessions.has(sessionId);
+}
 
 // 持久化催工配置到 localStorage
 function saveAutoContinueToStorage(): void {
@@ -150,6 +158,9 @@ function loadAutoContinueFromStorage(): void {
 
 // 启动时恢复催工配置并启动定时器
 loadAutoContinueFromStorage();
+// 冷启动时先清理历史会话残留，避免旧 term-id 误命中新会话
+sessionAutoContinue.clear();
+saveAutoContinueToStorage();
 // 检查是否有启用的配置，如果有则启动定时器
 const hasEnabledConfig = Array.from(sessionAutoContinue.values()).some(c => c.enabled);
 if (hasEnabledConfig) initAutoContinueTimer();
@@ -174,8 +185,13 @@ function initAutoContinueTimer(): void {
   }
   autoContinueTimer = setInterval(() => {
     const now = Date.now();
+    const staleSessionIds: string[] = [];
     sessionAutoContinue.forEach((config, sessionId) => {
       if (!config.enabled) return;
+      if (!hasSessionInUI(sessionId)) {
+        staleSessionIds.push(sessionId);
+        return;
+      }
       // 检查是否超时
       if (now - config.lastSendTime >= config.intervalMs) {
         // 发送自动继续消息
@@ -217,6 +233,11 @@ function initAutoContinueTimer(): void {
         config.lastSendTime = now;
       }
     });
+    if (staleSessionIds.length > 0) {
+      staleSessionIds.forEach((id) => sessionAutoContinue.delete(id));
+      saveAutoContinueToStorage();
+      renderSessionList();
+    }
   }, 1000); // 每秒检查一次
 }
 
@@ -373,248 +394,6 @@ interface FileTreeItem {
   name: string;
   path: string;
   isDir: boolean;
-}
-
-// ========== Claude 供应商配置 ==========
-
-interface ClaudeProvider {
-  id: string;
-  name: string;
-  baseUrl: string;
-  apiKey: string;
-}
-
-const CLAUDE_PROVIDER_KEY = 'duocli_claude_provider'; // 记住上次选择的供应商 id
-let claudeProviders: ClaudeProvider[] = [];
-let selectedClaudeProviderId: string | null = localStorage.getItem(CLAUDE_PROVIDER_KEY);
-
-async function loadClaudeProviders(): Promise<void> {
-  claudeProviders = await window.duocli.claudeProvidersList();
-}
-
-async function saveClaudeProviders(): Promise<void> {
-  await window.duocli.claudeProvidersSave(claudeProviders);
-}
-
-function getSelectedClaudeProviderEnv(): Record<string, string> | undefined {
-  if (!selectedClaudeProviderId) return undefined;
-  const p = claudeProviders.find(x => x.id === selectedClaudeProviderId);
-  if (!p) return undefined;
-  const env: Record<string, string> = {};
-  if (p.baseUrl) env.ANTHROPIC_BASE_URL = p.baseUrl;
-  if (p.apiKey) {
-    env.ANTHROPIC_API_KEY = p.apiKey;
-    env.ANTHROPIC_AUTH_TOKEN = p.apiKey;
-  }
-  return Object.keys(env).length > 0 ? env : undefined;
-}
-
-// 判断当前选中的预设是否是 Claude 系列
-function isClaudePreset(preset: string): boolean {
-  return preset.startsWith('claude');
-}
-
-// 渲染供应商下拉框
-function renderClaudeProviderSelect(): void {
-  claudeProviderSelect.innerHTML = '';
-  if (claudeProviders.length === 0) {
-    const el = document.createElement('option');
-    el.value = '';
-    el.textContent = '未配置供应商（点击齿轮添加）';
-    claudeProviderSelect.appendChild(el);
-    return;
-  }
-  for (const p of claudeProviders) {
-    const el = document.createElement('option');
-    el.value = p.id;
-    el.textContent = p.name;
-    claudeProviderSelect.appendChild(el);
-  }
-  // 恢复上次选择
-  if (selectedClaudeProviderId) {
-    claudeProviderSelect.value = selectedClaudeProviderId;
-  }
-  // 如果上次的不存在了，选第一个
-  if (claudeProviderSelect.selectedIndex === -1 && claudeProviders.length > 0) {
-    claudeProviderSelect.value = claudeProviders[0].id;
-    selectedClaudeProviderId = claudeProviders[0].id;
-    localStorage.setItem(CLAUDE_PROVIDER_KEY, selectedClaudeProviderId);
-  }
-}
-
-// 根据预设显示/隐藏供应商行
-function updateClaudeProviderVisibility(): void {
-  const show = isClaudePreset(presetSelect.value) && claudeProviders.length > 0;
-  claudeProviderRow.style.display = show ? '' : 'none';
-}
-
-// 供应商管理弹窗
-function showClaudeProviderManageDialog(): void {
-  const overlay = document.createElement('div');
-  overlay.className = 'confirm-overlay';
-  const dialog = document.createElement('div');
-  dialog.className = 'confirm-dialog';
-  dialog.style.minWidth = '400px';
-
-  function render() {
-    dialog.innerHTML = '<h3>管理 Claude 供应商</h3>';
-
-    const listEl = document.createElement('div');
-    listEl.className = 'preset-manage-list';
-
-    if (claudeProviders.length === 0) {
-      listEl.innerHTML = '<div class="preset-manage-empty">暂无供应商，点击下方按钮添加</div>';
-    } else {
-      for (const p of claudeProviders) {
-        const item = document.createElement('div');
-        item.className = 'preset-manage-item';
-
-        const info = document.createElement('div');
-        info.className = 'preset-manage-item-info';
-        const nameEl = document.createElement('div');
-        nameEl.className = 'preset-manage-item-name';
-        nameEl.textContent = p.name;
-        const urlEl = document.createElement('div');
-        urlEl.className = 'preset-manage-item-cmd';
-        urlEl.textContent = p.baseUrl || '(Anthropic 原生)';
-        info.appendChild(nameEl);
-        info.appendChild(urlEl);
-
-        const actions = document.createElement('div');
-        actions.className = 'preset-manage-item-actions';
-
-        const editBtn = document.createElement('button');
-        editBtn.textContent = '编辑';
-        editBtn.addEventListener('click', async () => {
-          const edited = await showClaudeProviderEditDialog(p);
-          if (edited) {
-            const idx = claudeProviders.findIndex(x => x.id === p.id);
-            if (idx !== -1) claudeProviders[idx] = edited;
-            await saveClaudeProviders();
-            renderClaudeProviderSelect();
-            updateClaudeProviderVisibility();
-            render();
-          }
-        });
-
-        const delBtn = document.createElement('button');
-        delBtn.className = 'danger';
-        delBtn.textContent = '删除';
-        delBtn.addEventListener('click', async () => {
-          claudeProviders = claudeProviders.filter(x => x.id !== p.id);
-          await saveClaudeProviders();
-          renderClaudeProviderSelect();
-          updateClaudeProviderVisibility();
-          render();
-        });
-
-        actions.appendChild(editBtn);
-        actions.appendChild(delBtn);
-        item.appendChild(info);
-        item.appendChild(actions);
-        listEl.appendChild(item);
-      }
-    }
-
-    dialog.appendChild(listEl);
-
-    const btns = document.createElement('div');
-    btns.className = 'confirm-buttons';
-    btns.style.marginTop = '16px';
-
-    const addBtn = document.createElement('button');
-    addBtn.className = 'btn-close-confirm';
-    addBtn.style.background = 'var(--accent)';
-    addBtn.textContent = '+ 添加供应商';
-    addBtn.addEventListener('click', async () => {
-      const created = await showClaudeProviderEditDialog();
-      if (created) {
-        claudeProviders.push(created);
-        await saveClaudeProviders();
-        renderClaudeProviderSelect();
-        updateClaudeProviderVisibility();
-        render();
-      }
-    });
-
-    const closeBtn = document.createElement('button');
-    closeBtn.className = 'btn-cancel';
-    closeBtn.textContent = '关闭';
-    closeBtn.addEventListener('click', () => overlay.remove());
-
-    btns.appendChild(addBtn);
-    btns.appendChild(closeBtn);
-    dialog.appendChild(btns);
-  }
-
-  render();
-  overlay.appendChild(dialog);
-  document.body.appendChild(overlay);
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-}
-
-// 供应商编辑/新建弹窗
-function showClaudeProviderEditDialog(provider?: ClaudeProvider): Promise<ClaudeProvider | null> {
-  return new Promise((resolve) => {
-    const overlay = document.createElement('div');
-    overlay.className = 'confirm-overlay';
-    const dialog = document.createElement('div');
-    dialog.className = 'confirm-dialog';
-
-    const isEdit = !!provider;
-    dialog.innerHTML = `
-      <h3>${isEdit ? '编辑' : '添加'}供应商</h3>
-      <div class="preset-form">
-        <div class="preset-form-field">
-          <label>名称</label>
-          <input type="text" id="cp-name" placeholder="如 MiniMax、NewCLI 等" value="${provider?.name || ''}" />
-        </div>
-        <div class="preset-form-field">
-          <label>Base URL</label>
-          <input type="text" id="cp-url" placeholder="如 https://api.minimaxi.com/anthropic" value="${provider?.baseUrl || ''}" />
-        </div>
-        <div class="preset-form-field">
-          <label>API Key</label>
-          <input type="password" id="cp-key" placeholder="留空则使用系统已有的 Key" value="${provider?.apiKey || ''}" />
-        </div>
-      </div>
-      <div class="confirm-buttons" style="margin-top:16px">
-        <button class="btn-cancel">取消</button>
-        <button class="btn-close-confirm" style="background:var(--accent)">保存</button>
-      </div>`;
-
-    overlay.appendChild(dialog);
-    document.body.appendChild(overlay);
-
-    const nameInput = dialog.querySelector('#cp-name') as HTMLInputElement;
-    const urlInput = dialog.querySelector('#cp-url') as HTMLInputElement;
-    const keyInput = dialog.querySelector('#cp-key') as HTMLInputElement;
-    nameInput.focus();
-
-    const cleanup = (result: ClaudeProvider | null) => { overlay.remove(); resolve(result); };
-
-    dialog.querySelector('.btn-cancel')!.addEventListener('click', () => cleanup(null));
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(null); });
-
-    dialog.querySelector('.btn-close-confirm')!.addEventListener('click', () => {
-      const name = nameInput.value.trim();
-      if (!name) {
-        nameInput.style.borderColor = 'var(--danger)';
-        return;
-      }
-      const id = provider?.id || `cp-${Date.now()}`;
-      cleanup({ id, name, baseUrl: urlInput.value.trim(), apiKey: keyInput.value.trim() });
-    });
-
-    // Enter/Escape
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Enter') dialog.querySelector<HTMLButtonElement>('.btn-close-confirm')!.click();
-      if (e.key === 'Escape') cleanup(null);
-    };
-    nameInput.addEventListener('keydown', handleKey);
-    urlInput.addEventListener('keydown', handleKey);
-    keyInput.addEventListener('keydown', handleKey);
-  });
 }
 
 const CUSTOM_PRESETS_KEY = 'duocli_custom_presets';
@@ -891,9 +670,6 @@ const cwdRecentDropdown = document.getElementById('cwd-recent-dropdown')!;
 const presetSelect = document.getElementById('preset-select') as HTMLSelectElement;
 const presetAddBtn = document.getElementById('preset-add-btn')!;
 const presetManageBtn = document.getElementById('preset-manage-btn')!;
-const claudeProviderRow = document.getElementById('claude-provider-row')!;
-const claudeProviderSelect = document.getElementById('claude-provider-select') as HTMLSelectElement;
-const claudeProviderManageBtn = document.getElementById('claude-provider-manage-btn')!;
 const themeSelect = document.getElementById('theme-select')!;
 const themeDisplay = document.getElementById('theme-display')!;
 const themeDropdown = document.getElementById('theme-dropdown')!;
@@ -905,6 +681,7 @@ const newSessionCancelBtn = document.getElementById('new-session-cancel')!;
 const newSessionCreateBtn = document.getElementById('new-session-create')!;
 const fileTreeList = document.getElementById('file-tree-list')!;
 const fileTreeRefreshBtn = document.getElementById('file-tree-refresh-btn')!;
+const fileTreeOpenBtn = document.getElementById('file-tree-open-btn')!;
 const fileTreePath = document.getElementById('file-tree-path')!;
 const fileTreePanel = document.getElementById('file-tree-panel')!;
 const fileTreeToggle = document.getElementById('file-tree-toggle')!;
@@ -1006,32 +783,6 @@ renderPresetSelect();
 if (lastPreset) {
   presetSelect.value = lastPreset;
 }
-
-// 初始化 Claude 供应商
-loadClaudeProviders().then(() => {
-  renderClaudeProviderSelect();
-  updateClaudeProviderVisibility();
-});
-
-// 预设切换时更新供应商行可见性
-presetSelect.addEventListener('change', () => {
-  updateClaudeProviderVisibility();
-});
-
-// 供应商选择变化时记住
-claudeProviderSelect.addEventListener('change', () => {
-  selectedClaudeProviderId = claudeProviderSelect.value || null;
-  if (selectedClaudeProviderId) {
-    localStorage.setItem(CLAUDE_PROVIDER_KEY, selectedClaudeProviderId);
-  } else {
-    localStorage.removeItem(CLAUDE_PROVIDER_KEY);
-  }
-});
-
-// 供应商管理按钮
-claudeProviderManageBtn.addEventListener('click', () => {
-  showClaudeProviderManageDialog();
-});
 
 // 自定义配色下拉组件
 const themeColorMap: Record<string, string> = {
@@ -1298,6 +1049,41 @@ async function renderFileTree(): Promise<void> {
   }
 
   fileTreeList.innerHTML = '';
+
+  // 先渲染根目录行
+  const rootRow = document.createElement('div');
+  rootRow.className = 'file-tree-row dir active-dir';
+  rootRow.style.paddingLeft = '6px';
+
+  const rootArrow = document.createElement('span');
+  rootArrow.className = 'file-tree-arrow';
+  rootArrow.textContent = '▼';
+  rootRow.appendChild(rootArrow);
+
+  const rootName = document.createElement('span');
+  rootName.className = 'file-tree-name';
+  rootName.textContent = rootCwd.split(/[/\\]/).pop() || rootCwd;
+  rootName.title = rootCwd;
+  rootRow.appendChild(rootName);
+
+  const rootOpenBtn = document.createElement('span');
+  rootOpenBtn.className = 'file-tree-open-folder';
+  rootOpenBtn.textContent = '\u{1F4C2}';
+  rootOpenBtn.title = '在 Finder 中打开';
+  rootOpenBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    window.duocli.openFolder(rootCwd);
+  });
+  rootRow.appendChild(rootOpenBtn);
+
+  rootRow.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    showTreeContextMenu(e as MouseEvent, rootCwd, true);
+  });
+
+  fileTreeList.appendChild(rootRow);
+
   const rootItems = await loadDirItems(rootCwd);
 
   const appendRows = async (items: FileTreeItem[], level: number): Promise<void> => {
@@ -1333,9 +1119,16 @@ async function renderFileTree(): Promise<void> {
 
       row.addEventListener('click', async () => {
         if (item.isDir) {
-          if (fileTreeExpandedDirs.has(item.path)) fileTreeExpandedDirs.delete(item.path);
+          const wasExpanded = fileTreeExpandedDirs.has(item.path);
+          if (wasExpanded) fileTreeExpandedDirs.delete(item.path);
           else fileTreeExpandedDirs.add(item.path);
           await renderFileTree();
+          // 展开后滚动到该目录位置
+          if (!wasExpanded) {
+            requestAnimationFrame(() => {
+              row.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            });
+          }
         } else {
           window.duocli.openFile(item.path);
         }
@@ -1477,10 +1270,20 @@ function renderSessionList(): void {
     groupName.className = 'session-group-name';
     groupName.textContent = cwdShortName(cwd);
     groupName.title = cwd;
+    // 添加按钮：点击在该目录下创建新终端
+    const groupAddBtn = document.createElement('button');
+    groupAddBtn.className = 'session-group-add-btn';
+    groupAddBtn.textContent = '+';
+    groupAddBtn.title = '在此目录下创建新终端';
+    groupAddBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openNewSessionDialog(cwd);
+    });
     const groupCount = document.createElement('span');
     groupCount.className = 'session-group-count';
     groupCount.textContent = String(ids.length);
     groupHeader.appendChild(groupName);
+    groupHeader.appendChild(groupAddBtn);
     groupHeader.appendChild(groupCount);
     sessionList.appendChild(groupHeader);
 
@@ -1648,9 +1451,7 @@ async function createSession(): Promise<boolean> {
   const themeId = resolveThemeId(currentThemeId, currentCwd);
   lastPreset = preset;
   localStorage.setItem('duocli_preset', preset);
-  // Claude 系列：注入供应商环境变量
-  const providerEnv = isClaudePreset(preset) ? getSelectedClaudeProviderEnv() : undefined;
-  const result = await window.duocli.createPty(currentCwd, preset, themeId, providerEnv);
+  const result = await window.duocli.createPty(currentCwd, preset, themeId);
   sessionTitles.set(result.id, result.title);
   sessionThemes.set(result.id, result.themeId);
   sessionUpdateTimes.set(result.id, Date.now());
@@ -1664,14 +1465,6 @@ async function createSession(): Promise<boolean> {
     const isAuto = customPreset.autoFlag && preset === customPreset.command + ' ' + customPreset.autoFlag;
     const displayName = isAuto ? customPreset.name + '全自动' : customPreset.name;
     sessionDisplayNames.set(result.id, displayName);
-  }
-  // 获取实际使用的模型提供商
-  if (isClaudePreset(preset) && selectedClaudeProviderId) {
-    const cp = claudeProviders.find(x => x.id === selectedClaudeProviderId);
-    if (cp) sessionProviders.set(result.id, cp.name);
-  } else {
-    const provider = await window.duocli.getCliProvider(preset);
-    if (provider) sessionProviders.set(result.id, provider);
   }
   // 初始化会话历史记录
   window.duocli.sessionHistoryInit(result.id, result.title);
@@ -1694,6 +1487,7 @@ async function createSession(): Promise<boolean> {
 function switchSession(id: string): void {
   const prev = termManager.getActiveId();
   termManager.switchTo(id);
+
   // 用户切换到该会话 → 清除所有状态指示灯（黄/绿→灰）
   const hadUnread = sessionUnread.delete(id);
   const hadBusy = sessionBusy.delete(id);
@@ -2613,6 +2407,37 @@ document.addEventListener('mouseup', () => {
 
 fileTreeRefreshBtn.addEventListener('click', () => { void refreshFileTree(true); });
 
+// 打开目录按钮
+fileTreeOpenBtn.addEventListener('click', () => {
+  const activeId = termManager.getActiveId();
+  if (activeId) {
+    const cwd = sessionCwds.get(activeId);
+    if (cwd) {
+      window.duocli.openFolder(cwd);
+    }
+  }
+});
+
+// 目录自动刷新 - 每30秒刷新一次
+let fileTreeAutoRefreshTimer: ReturnType<typeof setInterval> | null = null;
+function startFileTreeAutoRefresh(): void {
+  if (fileTreeAutoRefreshTimer) return;
+  fileTreeAutoRefreshTimer = setInterval(() => {
+    const activeId = termManager.getActiveId();
+    if (activeId) {
+      void refreshFileTree(true);
+    }
+  }, 30000);
+}
+function stopFileTreeAutoRefresh(): void {
+  if (fileTreeAutoRefreshTimer) {
+    clearInterval(fileTreeAutoRefreshTimer);
+    fileTreeAutoRefreshTimer = null;
+  }
+}
+// 启动自动刷新
+startFileTreeAutoRefresh();
+
 // 桌面端拖拽文件到终端区域：自动粘贴文件路径
 // 在 document 层面监听，确保拖拽到 xterm 内部也能捕获
 document.addEventListener('dragover', (e) => {
@@ -2646,11 +2471,10 @@ document.addEventListener('drop', (e) => {
   writePtyWithAutoReset(activeId, payload);
 });
 
-function openNewSessionDialog(): void {
-  cwdInput.value = currentCwd || '';
+function openNewSessionDialog(cwd?: string): void {
+  cwdInput.value = cwd || currentCwd || '';
   presetSelect.value = lastPreset || presetSelect.value || '';
   setThemeValue(currentThemeId);
-  updateClaudeProviderVisibility();
   newSessionOverlay.classList.add('active');
   setTimeout(() => cwdInput.focus(), 0);
 }
@@ -2775,15 +2599,12 @@ window.duocli.onPtyData((id, data) => {
     }
 
     // 提示符检测：按行拆分，检查最后几行是否包含提示符
-    // 支持常见 CLI 提示符：❯ › ▷ $ > % ➜ 以及 [path]$ 等模式
     const lines = plain.split('\n').map(l => l.trimEnd()).filter(l => l.length > 0);
     const lastLines = lines.slice(-3).join('\n');
     // 排除 Claude Code 工作中状态：xxx… (xxx) 等 spinner 模式
     const cliWorking = /\w+…\s*\(/.test(lastLines);
-    // 宽松匹配：最后几行中任意一行以提示符字符结尾
-    const promptLike = /(^|[\s\n])(❯|›|▷|\$|>|%|➜)\s*$/.test(lastLines)
-      && !/>\s*[a-zA-Z]/.test(lastLines); // 排除 HTML 标签
-    // 也匹配 [user@host path]$ 或 user@host:path$ 等 shell 提示符
+    // Shell 提示符
+    const promptLike = /(^|[\s\n])(❯|›|▷|\$|>|%|➜)\s*$/.test(lastLines) && !/>\s*[a-zA-Z]/.test(lastLines);
     const shellPrompt = /[\]#$%>❯›]\s*$/.test(lastLines);
     const hasPrompt = (promptLike || shellPrompt) && !cliWorking;
 
@@ -2816,7 +2637,7 @@ window.duocli.onPtyData((id, data) => {
           }
           renderSessionList();
         }
-      }, 15000));
+      }, 3000));
     }
   }
 });
@@ -2858,6 +2679,8 @@ window.duocli.onPtyExit((id) => {
   sessionCwds.delete(id);
   sessionDisplayNames.delete(id);
   sessionProviders.delete(id);
+  sessionAutoContinue.delete(id);
+  saveAutoContinueToStorage();
   termManager.destroy(id);
   updateEmptyState();
   renderSessionList();
@@ -2907,7 +2730,7 @@ window.duocli.onGetAutoContinueConfig((sessionId) => {
 
 // 催工配置：手机端通过 main 进程写入桌面端配置
 window.duocli.onSetAutoContinueConfig((sessionId, config) => {
-  if (!config) return;
+  if (!config || !hasSessionInUI(sessionId)) return;
   const existing = sessionAutoContinue.get(sessionId) || {
     enabled: false,
     message: AUTO_CONTINUE_DEFAULT_MESSAGE,

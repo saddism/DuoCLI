@@ -8,9 +8,9 @@ import { AIConfigManager } from './ai-config';
 import { setAIConfig, aiDiffSummary, aiSummarize, aiSessionSummarize } from './ollama';
 import { startRemoteServer, pushRawDataToRemote, sendRemotePush, addRemoteRecentCwd } from './remote-server';
 
-// macOS: 去掉 Dock 图标和启动终端窗口，以辅助应用模式运行
+// macOS: 设置为普通应用模式，显示在 Dock 和 Command+Tab 切换器中
 if (process.platform === 'darwin') {
-  app.setActivationPolicy('accessory');
+  app.setActivationPolicy('regular');
 }
 
 // 文件监听器
@@ -279,7 +279,11 @@ function createWindow(): void {
 
 function safeSend(channel: string, ...args: unknown[]): void {
   if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
-    mainWindow.webContents.send(channel, ...args);
+    try {
+      mainWindow.webContents.send(channel, ...args);
+    } catch {
+      // render frame disposed during GPU crash/restart
+    }
   }
 }
 
@@ -460,6 +464,11 @@ function registerIPC(): void {
   ipcMain.on('pty:destroy', (_e, id: string) => {
     sessionUserClosed.add(id);
     ptyManager.destroy(id);
+    sessionOutputTail.delete(id);
+    sessionLastInputAt.delete(id);
+    sessionArmedForNotify.delete(id);
+    sessionLastNotifyAt.delete(id);
+    sessionUserClosed.delete(id);
   });
 
   // 重命名终端
@@ -824,13 +833,83 @@ function registerIPC(): void {
   // ========== Claude 供应商配置 ==========
   const CLAUDE_PROVIDERS_PATH = path.join(app.getPath('userData'), 'claude-providers.json');
 
+  // 自动从 ~/.claude/settings.json 检测 MiniMax 等自定义供应商
+  function detectClaudeProvidersFromSettings(): any[] {
+    const home = os.homedir();
+    const settingsPath = path.join(home, '.claude', 'settings.json');
+    const detected: any[] = [];
+
+    try {
+      if (fs.existsSync(settingsPath)) {
+        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        const env = settings.env || {};
+        const baseUrl = env.ANTHROPIC_BASE_URL || '';
+        const apiKey = env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || '';
+        const model = env.ANTHROPIC_MODEL || env.ANTHROPIC_DEFAULT_SONNET_MODEL || '';
+
+        // 如果有自定义 baseUrl 且不是默认的 Anthropic，则自动添加为供应商
+        if (baseUrl && !baseUrl.includes('api.anthropic.com')) {
+          let name = 'Custom';
+          let id = 'custom';
+
+          if (baseUrl.includes('minimaxi')) {
+            name = 'MiniMax';
+            id = 'minimax';
+          } else if (baseUrl.includes('deepseek')) {
+            name = 'DeepSeek';
+            id = 'deepseek';
+          } else if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) {
+            name = 'GLM (智谱清言)';
+            id = 'glm';
+          } else if (baseUrl.includes('moonshot')) {
+            name = 'Kimi (月之暗面)';
+            id = 'kimi';
+          } else if (baseUrl.includes('qwen') || baseUrl.includes('dashscope')) {
+            name = 'QWEN (通义千问)';
+            id = 'qwen';
+          } else {
+            // 从域名提取名称
+            try {
+              const url = new URL(baseUrl);
+              const host = url.hostname.replace(/^(api|code)\./, '');
+              name = host.split('.')[0].charAt(0).toUpperCase() + host.split('.')[0].slice(1);
+              id = name.toLowerCase();
+            } catch { /* ignore */ }
+          }
+
+          detected.push({
+            id,
+            name,
+            baseUrl,
+            apiKey,
+            model: model || '',
+          });
+        }
+      }
+    } catch { /* ignore */ }
+
+    return detected;
+  }
+
   ipcMain.handle('claude-providers:list', () => {
     try {
       if (fs.existsSync(CLAUDE_PROVIDERS_PATH)) {
-        return JSON.parse(fs.readFileSync(CLAUDE_PROVIDERS_PATH, 'utf-8'));
+        const saved = JSON.parse(fs.readFileSync(CLAUDE_PROVIDERS_PATH, 'utf-8'));
+        // 合并自动检测到的供应商（已保存的优先）
+        const detected = detectClaudeProvidersFromSettings();
+        const savedIds = new Set(saved.map((p: any) => p.id));
+
+        // 添加未保存的检测到的供应商
+        for (const p of detected) {
+          if (!savedIds.has(p.id)) {
+            saved.push(p);
+          }
+        }
+        return saved;
       }
     } catch { /* ignore */ }
-    return [];
+    // 没有保存的配置时，返回自动检测到的供应商
+    return detectClaudeProvidersFromSettings();
   });
 
   ipcMain.handle('claude-providers:save', (_e, providers: any[]) => {

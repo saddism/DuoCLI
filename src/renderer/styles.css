@@ -421,6 +421,7 @@ html, body {
   flex-direction: column;
   min-width: 160px;
   max-width: 500px;
+  min-height: 0;
   transition: width 0.2s ease, opacity 0.2s ease;
 }
 
@@ -493,7 +494,7 @@ html, body {
   width: 12px;
   color: var(--text-secondary);
   text-align: center;
-  font-size: 10px;
+  font-size: 11px;
   flex-shrink: 0;
 }
 
@@ -503,7 +504,7 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .file-tree-row.dir .file-tree-name {
@@ -1158,6 +1159,26 @@ html, body {
   white-space: nowrap;
   font-weight: 600;
   letter-spacing: 0.3px;
+}
+
+.session-group-add-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.2s, color 0.2s;
+}
+
+.session-group-header:hover .session-group-add-btn {
+  opacity: 1;
+}
+
+.session-group-add-btn:hover {
+  color: var(--accent-color);
 }
 
 .session-group-count {
@@ -1943,6 +1964,20 @@ html, body {
 .preset-form-field input::placeholder {
   color: var(--text-secondary);
   opacity: 0.6;
+}
+
+.preset-form-field select {
+  padding: 6px 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  outline: none;
+}
+
+.preset-form-field select:focus {
+  border-color: var(--accent);
 }
 
 .preset-manage-list {

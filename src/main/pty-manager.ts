@@ -18,6 +18,7 @@ export interface PtySession {
   presetCommand: string;
   themeId: string;
   provider: string | null;    // 实际使用的模型提供商 (如 MiniMax, GLM 等)
+  disposables: pty.IDisposable[];
 }
 
 interface PtyManagerEvents {
@@ -62,7 +63,25 @@ export class PtyManager {
       ? (process.env.COMSPEC || 'cmd.exe')
       : (process.env.SHELL || '/bin/zsh');
 
-    const env = { ...process.env, ...(envOverrides || {}) } as { [key: string]: string };
+    // 先复制 process.env，过滤掉 undefined 值，然后应用覆盖（空字符串用于清除）
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) {
+        env[key] = value;
+      }
+    }
+    if (envOverrides) {
+      for (const [key, value] of Object.entries(envOverrides)) {
+        if (value === '') {
+          // 空字符串表示清除该变量
+          delete env[key];
+        } else {
+          env[key] = value;
+        }
+      }
+      // 调试日志
+      console.log('[PtyManager] 设置的环境变量:', JSON.stringify(envOverrides));
+    }
 
     const ptyProcess = pty.spawn(shell, [], {
       name: 'xterm-256color',
@@ -86,9 +105,10 @@ export class PtyManager {
       presetCommand,
       themeId,
       provider: null,
+      disposables: [],
     };
 
-    ptyProcess.onData((data: string) => {
+    session.disposables.push(ptyProcess.onData((data: string) => {
       session.buffer += data;
       // 限制buffer大小，避免内存膨胀
       if (session.buffer.length > 5000) {
@@ -96,17 +116,17 @@ export class PtyManager {
       }
       // rawBuffer 用于远程终端回放（保留更多）
       session.rawBuffer += data;
-      if (session.rawBuffer.length > 200000) {
-        session.rawBuffer = session.rawBuffer.slice(-200000);
+      if (session.rawBuffer.length > 50000) {
+        session.rawBuffer = session.rawBuffer.slice(-50000);
       }
       this.events.onData(id, data);
       this.events.onRawData?.(id, data);
-    });
+    }));
 
-    ptyProcess.onExit(() => {
+    session.disposables.push(ptyProcess.onExit(() => {
       this.events.onExit(id);
       this.sessions.delete(id);
-    });
+    }));
 
     this.sessions.set(id, session);
 
@@ -141,8 +161,8 @@ export class PtyManager {
     // 检测回车键，计数命令
     if (data === '\r') {
       session.commandCount++;
-      // 标题未成功生成时持续重试（前10次命令内）
-      if (!session.titleGenerated && session.commandCount <= 10) {
+      // 前3轮命令自动生成标题
+      if (!session.titleGenerated && session.commandCount <= 3) {
         this.triggerSummarize(id);
       }
       // 每次执行命令时触发快照
@@ -164,6 +184,8 @@ export class PtyManager {
   destroy(id: string): void {
     const session = this.sessions.get(id);
     if (!session) return;
+    session.disposables.forEach(d => d.dispose());
+    session.disposables = [];
     session.ptyProcess.kill();
     this.sessions.delete(id);
   }

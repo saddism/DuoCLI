@@ -214,7 +214,7 @@ class FilePathLinkProvider implements ILinkProvider {
       if (fp.includes('node_modules')) continue;
       const ext = fp.split('.').pop()?.toLowerCase() || '';
       const isDir = fp.endsWith('/');
-      if (!isDir && !SOURCE_EXTS.has(ext)) continue;
+      if (!isDir && !fp.startsWith('/') && !SOURCE_EXTS.has(ext)) continue;
       matched.push({ filePath: fp, display: fp, index: match.index });
     }
 
@@ -334,7 +334,6 @@ export class TerminalManager {
       cursorBlink: true,
       allowProposedApi: true,
       scrollback: 10000,
-      scrollOnOutput: true,
     });
 
     const fitAddon = new FitAddon();
@@ -448,6 +447,17 @@ export class TerminalManager {
 
     this.instances.set(id, { id, terminal, fitAddon, container, themeId });
     this.switchTo(id);
+
+    // 创建终端后确保滚动到正确位置
+    setTimeout(() => {
+      // 强制重置 viewport 滚动位置
+      const viewportEl = terminal.element?.querySelector('.xterm-viewport') as HTMLElement | null;
+      if (viewportEl) {
+        viewportEl.scrollTop = 0;
+      }
+      // 确保 buffer 视图在顶部
+      terminal.scrollToTop();
+    }, 100);
   }
 
   switchTo(id: string): void {
@@ -468,7 +478,33 @@ export class TerminalManager {
         this.onResize(target.id, cols, rows);
       }
       target.terminal.focus();
+      // 切换终端后重新计算滚动位置
+      this.recalcScroll(target.id);
     }, 50);
+  }
+
+  // 重新计算并修正滚动位置
+  private recalcScroll(id: string): void {
+    const inst = this.instances.get(id);
+    if (!inst) return;
+    const { terminal } = inst;
+    // 强制重置 viewport 滚动
+    const viewportEl = terminal.element?.querySelector('.xterm-viewport') as HTMLElement | null;
+    if (viewportEl) {
+      // 检查是否应该滚动到底部（当 buffer 内容很少时）
+      const buf = terminal.buffer.active;
+      const hasEnoughContent = buf.baseY > 0;
+      if (!hasEnoughContent) {
+        // 内容很少，滚动到顶部
+        viewportEl.scrollTop = 0;
+        terminal.scrollToTop();
+      } else {
+        // 内容很多，确保滚动到底部
+        requestAnimationFrame(() => {
+          terminal.scrollToBottom();
+        });
+      }
+    }
   }
 
   // 隐藏终端（归档用，不销毁）

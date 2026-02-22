@@ -818,6 +818,14 @@ function connectWebSocket(sessionId) {
   let replayRetryTimer = null;
   let replayRetryCount = 0;
 
+  // 8秒内未收到 replay，显示重连提示
+  const connectTimeoutTimer = setTimeout(() => {
+    if (!replayReceived && term) {
+      hideTerminalLoading();
+      term.write('\r\n\x1b[33m⚠ 连接超时，正在重连...\x1b[0m\r\n');
+    }
+  }, 8000);
+
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
@@ -825,6 +833,7 @@ function connectWebSocket(sessionId) {
 
       if (msg.type === 'replay') {
         replayReceived = true;
+        clearTimeout(connectTimeoutTimer);
         console.log('[ws] replay received, data length=', (msg.data || '').length);
         // 先彻底清空，再写入 replay 内容，避免残留
         term.reset();

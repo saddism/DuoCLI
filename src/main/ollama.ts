@@ -70,17 +70,23 @@ export async function aiSummarize(buffer: string): Promise<string> {
 
   aiLog(`当前配置: ${JSON.stringify(currentConfig)}`);
 
+  // 标题生成强制用 Haiku（便宜模型）
+  const titleConfig: AIClientConfig = {
+    ...currentConfig,
+    model: currentConfig.apiFormat === 'anthropic' ? 'claude-3-5-haiku-20241022' : currentConfig.model,
+  };
+
   try {
     let result: string;
-    switch (currentConfig.apiFormat) {
+    switch (titleConfig.apiFormat) {
       case 'anthropic':
-        result = await anthropicCall(`终端内容：\n${text}`, currentConfig);
+        result = await anthropicCall(`用户输入：\n${text}`, titleConfig);
         break;
       case 'openai':
-        result = await openaiCall(`终端内容：\n${text}`, currentConfig);
+        result = await openaiCall(`用户输入：\n${text}`, titleConfig);
         break;
       case 'gemini':
-        result = await geminiCall(`终端内容：\n${text}`, currentConfig);
+        result = await geminiCall(`用户输入：\n${text}`, titleConfig);
         break;
       case 'ollama':
         result = await ollamaCall(text);
