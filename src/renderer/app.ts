@@ -1226,6 +1226,47 @@ function startTitleEdit(id: string, titleSpan: HTMLElement): void {
   });
 }
 
+function showSessionContextMenu(e: MouseEvent, targetId: string): void {
+  document.querySelectorAll('.term-context-menu').forEach(m => m.remove());
+
+  const menu = document.createElement('div');
+  menu.className = 'term-context-menu';
+
+  const items: Array<{ label: string; action: () => void }> = [
+    {
+      label: '关闭其他终端',
+      action: () => {
+        const allIds = Array.from(sessionTitles.keys()).filter(id => id !== targetId);
+        for (const id of allIds) destroySession(id);
+      },
+    },
+    {
+      label: '关闭所有终端',
+      action: () => {
+        const allIds = Array.from(sessionTitles.keys());
+        for (const id of allIds) destroySession(id);
+      },
+    },
+  ];
+
+  for (const it of items) {
+    const el = document.createElement('div');
+    el.className = 'term-context-item';
+    el.textContent = it.label;
+    el.addEventListener('click', () => { menu.remove(); it.action(); });
+    menu.appendChild(el);
+  }
+
+  menu.style.left = `${e.clientX}px`;
+  menu.style.top = `${e.clientY}px`;
+  document.body.appendChild(menu);
+
+  const dismiss = (ev: Event) => {
+    if (!menu.contains(ev.target as Node)) { menu.remove(); document.removeEventListener('mousedown', dismiss); }
+  };
+  setTimeout(() => document.addEventListener('mousedown', dismiss), 0);
+}
+
 function renderSessionList(): void {
   const activeId = termManager.getActiveId();
 
@@ -1244,11 +1285,13 @@ function renderSessionList(): void {
   }
   sessionList.innerHTML = '';
 
-  // pinned 优先，按创建顺序排列（新建在下方）
+  // pinned 优先，其余按最近活跃时间降序（最近使用的排最上面）
   const allIds = Array.from(sessionTitles.keys());
+  const byRecent = (a: string, b: string) =>
+    (sessionUpdateTimes.get(b) || 0) - (sessionUpdateTimes.get(a) || 0);
   const sortedIds = [
-    ...allIds.filter(id => pinnedSessions.has(id)),
-    ...allIds.filter(id => !pinnedSessions.has(id)),
+    ...allIds.filter(id => pinnedSessions.has(id)).sort(byRecent),
+    ...allIds.filter(id => !pinnedSessions.has(id)).sort(byRecent),
   ];
 
   // 按 cwd 分组（保持排序顺序）
@@ -1393,6 +1436,13 @@ function renderSessionList(): void {
       bottomRow.className = 'session-item-bottom';
       bottomRow.appendChild(metaRow);
       bottomRow.appendChild(autoContinueLabel);
+
+      // 右键菜单
+      item.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showSessionContextMenu(e, id);
+      });
 
       // 组装
       item.addEventListener('click', () => switchSession(id));
