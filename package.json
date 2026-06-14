@@ -32,6 +32,7 @@
     "electron",
     "multi-terminal",
     "codex-cli",
+    "copilot-cli",
     "gemini-cli",
     "xterm",
     "pwa",

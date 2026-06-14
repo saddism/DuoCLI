@@ -593,6 +593,7 @@ const BUILTIN_OPTIONS: Array<{ value: string; label: string }> = [
   { value: '', label: '空终端' },
   { value: 'claude --dangerously-skip-permissions', label: 'Claude (全自动)' },
   { value: 'codex -c sandbox_mode="danger-full-access" -c approval="never" -c network="enabled"', label: 'Codex (全自动)' },
+  { value: 'copilot --allow-all --autopilot', label: 'Copilot (全自动)' },
   { value: 'devin --permission-mode bypass', label: 'Devin (全自动)' },
   { value: 'opencode', label: 'OpenCode' },
   { value: 'kiro-cli chat --trust-all-tools', label: 'Kiro (全自动)' },
@@ -1011,6 +1012,8 @@ const CLI_TAG_COLORS: Record<string, [string, string]> = {
   'Claude全自动':  ['#e5a100', '#3d3010'],
   'Codex':        ['#73c991', '#1e3328'],
   'Codex全自动':   ['#56d4a0', '#1a3d2e'],
+  'Copilot':      ['#7ee787', '#17361f'],
+  'Copilot全自动': ['#3fb950', '#12351f'],
 };
 
 function getCliTagColors(displayName: string): [string, string] {

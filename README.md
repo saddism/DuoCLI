@@ -1,12 +1,12 @@
 # DuoCLI
 
-CLI proxy for **Claude Code** – expose a local HTTP endpoint that any Cascade-compatible IDE can talk to.
+Desktop and mobile-synced terminal for AI coding CLIs, including Claude Code, Codex, GitHub Copilot CLI, Devin, OpenCode, Kiro, and custom commands.
 
 ## Features
 
 - 🌊 **Streaming SSE proxy** – Local HTTP endpoint for IDE integration
 - 💬 **Interactive chat** – `duo chat` for quick terminal conversations
-- 🔍 **Auto-detection** – Automatically finds Claude Code CLI
+- 🔍 **Built-in AI CLI presets** – Start Claude Code, Codex, GitHub Copilot CLI, Devin, OpenCode, Kiro, or custom commands
 - ⚙️ **Persistent config** – `duo config` to set defaults
 
 ## Quick Start
@@ -20,6 +20,9 @@ duo chat
 
 # Start proxy server for IDE integration
 duo serve --port 8787
+
+# GitHub Copilot CLI preset used by the desktop and mobile UI
+copilot --allow-all --autopilot
 ```
 
 ## Configuration
@@ -43,7 +46,7 @@ IDE (Cascade-compatible)
 └──────┬───────┘
        │
        ▼
-   Claude Code
+   Claude Code / Codex / GitHub Copilot CLI / custom CLI
 ```
 
 ## Development

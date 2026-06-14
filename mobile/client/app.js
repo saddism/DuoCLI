@@ -52,6 +52,7 @@ const chatHelpers = globalThis.DuoChatHelpers || {
   getResumeAgentLabel(agent) {
     if (agent === 'codex') return 'Codex';
     if (agent === 'claude') return 'Claude Code';
+    if (agent === 'copilot') return 'GitHub Copilot';
     return 'Agent';
   },
 };
@@ -168,6 +169,7 @@ function shortenPath(p, maxLen = 30) {
 const CLI_TAG_COLORS = {
   'Claude全自动':  ['#e5a100', '#3d3010'],
   'Codex全自动':   ['#56d4a0', '#1a3d2e'],
+  'Copilot全自动': ['#3fb950', '#12351f'],
 };
 
 function getCliTagColors(name) {
@@ -2003,6 +2005,7 @@ const BUILTIN_OPTIONS = [
   { value: '', label: '纯终端 (shell)' },
   { value: 'claude --dangerously-skip-permissions', label: 'Claude 全自动' },
   { value: 'codex -c sandbox_mode="danger-full-access" -c approval="never" -c network="enabled"', label: 'Codex 全自动' },
+  { value: 'copilot --allow-all --autopilot', label: 'Copilot 全自动' },
 ];
 
 let customPresetNextId = 1;

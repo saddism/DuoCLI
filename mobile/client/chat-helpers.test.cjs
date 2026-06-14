@@ -47,5 +47,6 @@ test('ensureApiSuccess throws backend error message on non-2xx responses', () =>
 test('getResumeAgentLabel renders native resume session agents', () => {
   assert.equal(getResumeAgentLabel('claude'), 'Claude Code');
   assert.equal(getResumeAgentLabel('codex'), 'Codex');
+  assert.equal(getResumeAgentLabel('copilot'), 'GitHub Copilot');
   assert.equal(getResumeAgentLabel('unknown'), 'Agent');
 });

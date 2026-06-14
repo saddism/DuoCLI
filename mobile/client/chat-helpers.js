@@ -44,6 +44,7 @@
   function getResumeAgentLabel(agent) {
     if (agent === 'codex') return 'Codex';
     if (agent === 'claude') return 'Claude Code';
+    if (agent === 'copilot') return 'GitHub Copilot';
     return 'Agent';
   }
 

@@ -235,6 +235,10 @@ function getCliProvider(presetCommand: string): string | null {
     return 'OpenAI';
   }
 
+  if (presetCommand.startsWith('copilot')) {
+    return 'GitHub Copilot';
+  }
+
   if (presetCommand.startsWith('kimi')) {
     // Kimi 使用月之暗面 API
     return 'Moonshot';

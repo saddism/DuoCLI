@@ -51,6 +51,7 @@ const PRESET_DISPLAY_NAMES: Record<string, string> = {
   'claude --dangerously-skip-permissions': 'Claude全自动',
   'codex --full-auto': 'Codex全自动',
   'codex -c sandbox_mode="danger-full-access" -c approval="never" -c network="enabled"': 'Codex全自动',
+  'copilot --allow-all --autopilot': 'Copilot全自动',
   'devin --permission-mode bypass': 'Devin全自动',
   'opencode': 'OpenCode',
   'kiro-cli chat --trust-all-tools': 'Kiro全自动',
@@ -81,6 +82,8 @@ function parseResumeCommand(text: string): { command: string; sessionId: string 
     { re: /\b(kiro[\w-]*)\s+--resume-id\s+([\w-]+)/i, build: m => `${m[1]} --resume-id ${m[2]}` },
     // Codex: "codex resume <id>"
     { re: /\b(codex)\s+resume\s+([\w-]+)/i, build: m => `${m[1]} resume ${m[2]}` },
+    // GitHub Copilot CLI: "copilot --resume <id>"
+    { re: /\b(copilot)\s+--resume(?:=|\s+)([\w-]+)/i, build: m => `${m[1]} --resume ${m[2]}` },
     // OpenCode: "opencode -s <ses_id>"
     { re: /\b(opencode)\s+-s\s+(\w+)/i, build: m => `${m[1]} -s ${m[2]}` },
     // Devin: "devin -r <session_name>"
