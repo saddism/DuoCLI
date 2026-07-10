@@ -377,6 +377,46 @@ function markUserScrolling() {
   }, 800);
 }
 
+// 触摸滚动：本版 xterm 用 SmoothScrollableElement（虚拟滚动条），
+// 直接写 viewport.scrollTop 无效，必须走官方 term.scrollLines()。
+// 用像素累积把手指位移换算成整行滚动，保证顺滑。
+let _scrollAccum = 0;
+function resetScrollAccum() { _scrollAccum = 0; }
+function terminalRowHeight() {
+  const vp = document.querySelector('#terminal-container .xterm-viewport');
+  if (vp && term && term.rows > 0) return vp.clientHeight / term.rows;
+  return 18;
+}
+function scrollTerminalByPixels(deltaY) {
+  if (!term) return false;
+  _scrollAccum += deltaY;
+  const rh = terminalRowHeight();
+  const lines = Math.trunc(_scrollAccum / rh);
+  if (lines === 0) return false;
+  _scrollAccum -= lines * rh;
+  const before = term.buffer.active.viewportY;
+  term.scrollLines(lines);
+  markUserScrolling();
+  return term.buffer.active.viewportY !== before;
+}
+
+let terminalResizeObserver = null;
+let terminalResizeFrame = null;
+let terminalTouchCleanup = null;
+let lastTerminalSize = '';
+function scheduleTerminalResize() {
+  if (terminalResizeFrame !== null) return;
+  terminalResizeFrame = requestAnimationFrame(() => {
+    terminalResizeFrame = null;
+    const container = $('terminal-container');
+    if (!term || !fitAddon || !container || container.clientWidth < 1 || container.clientHeight < 1) return;
+    const size = `${container.clientWidth}x${container.clientHeight}`;
+    if (size === lastTerminalSize) return;
+    lastTerminalSize = size;
+    handleResize();
+  });
+}
+
 function getLineTextByTouchY(clientY) {
   if (!term) return '';
   const container = $('terminal-container');
@@ -1078,7 +1118,12 @@ function createTerminal() {
   });
 
   // 窗口大小变化 → resize
-  window.addEventListener('resize', handleResize);
+  window.addEventListener('resize', scheduleTerminalResize);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', scheduleTerminalResize);
+  if (typeof ResizeObserver !== 'undefined') {
+    terminalResizeObserver = new ResizeObserver(scheduleTerminalResize);
+    terminalResizeObserver.observe(container);
+  }
 
   // 返回 Promise，确保终端完全 ready 后再做后续操作（如连接 WebSocket）
   // 双重 rAF 确保页面切换后 DOM 布局完成，避免 fit 算出 0 列 0 行
@@ -1091,11 +1136,8 @@ function createTerminal() {
         xtermTextarea.setAttribute('readonly', 'readonly');
       }
 
-      // 移动端触摸滚动：xterm.js 的 .xterm-screen 覆盖在 .xterm-viewport 上层，
-      // 手指实际触摸到的是 screen，所以监听必须挂在 screen（或同时挂 viewport 兜底），
-      // 然后直接操作 viewport.scrollTop，让 xterm 内部 onScroll 同步渲染。
-      const screen = container.querySelector('.xterm-screen');
-      const viewport = container.querySelector('.xterm-viewport');
+      // xterm 的 canvas 会遮住内部 viewport，直接依赖浏览器滚动在手机上不稳定。
+      // 在容器捕获阶段把手势交给 xterm 的公开滚动 API。
       term.onScroll(() => {
         markUserScrolling();
       });
@@ -1106,84 +1148,34 @@ function createTerminal() {
         if (e.touches.length !== 1) { touchActive = false; return; }
         touchLastY = e.touches[0].clientY;
         touchActive = true;
+        resetScrollAccum();
       };
       const onTouchMove = (e) => {
-        if (!touchActive || !viewport || e.touches.length !== 1) return;
+        if (!touchActive || e.touches.length !== 1) return;
         const currentY = e.touches[0].clientY;
         const deltaY = touchLastY - currentY;
+        touchLastY = currentY;
         if (deltaY === 0) return;
-        const before = viewport.scrollTop;
-        const max = viewport.scrollHeight - viewport.clientHeight;
-        const next = Math.max(0, Math.min(max, before + deltaY));
-        if (next !== before) {
-          viewport.scrollTop = next;
-          touchLastY = currentY;
-          markUserScrolling();
-          // 仅在确实滚动时阻止页面滚动，到顶/到底时让浏览器接管（避免卡死）
-          if (e.cancelable) e.preventDefault();
-        } else {
-          // 到达边界，更新基准点避免反向滑动需要先抵消累计量
-          touchLastY = currentY;
-        }
+        scrollTerminalByPixels(deltaY);
+        // 页面本身不可滚动，始终拦截可避免浏览器在第一小段位移后接管手势。
+        if (e.cancelable) e.preventDefault();
       };
       const onTouchEnd = () => {
         touchActive = false;
         if (term && isAtBottom()) isUserScrolling = false;
       };
 
-      // screen 必须监听（用户手指实际接触的层），viewport 也监听以兜底滚动条区域
-      [screen, viewport].forEach((el) => {
-        if (!el) return;
-        el.addEventListener('touchstart', onTouchStart, { passive: true });
-        el.addEventListener('touchmove', onTouchMove, { passive: false });
-        el.addEventListener('touchend', onTouchEnd, { passive: true });
-        el.addEventListener('touchcancel', onTouchEnd, { passive: true });
-      });
-
-      // 兜底：部分设备/版本 .xterm-screen 内层 canvas 会吃掉触摸事件，
-      // 在最外层 container 上再挂一份滚动逻辑，同样操作 viewport.scrollTop 做像素级滚动。
-      // 命中内层 screen/viewport 时跳过，避免和上面那套一起触发导致滑动距离翻倍
-      if (!container.dataset.scrollFallbackBound) {
-        container.dataset.scrollFallbackBound = '1';
-        let fbLastY = 0;
-        let fbActive = false;
-        const isHandledByInner = (e) => {
-          const t = e.target;
-          if (!t || !t.closest) return false;
-          return !!(t.closest('.xterm-screen') || t.closest('.xterm-viewport'));
-        };
-        container.addEventListener('touchstart', (e) => {
-          if (isHandledByInner(e)) { fbActive = false; return; }
-          if (e.touches.length !== 1) { fbActive = false; return; }
-          fbLastY = e.touches[0].clientY;
-          fbActive = true;
-        }, { passive: true });
-        container.addEventListener('touchmove', (e) => {
-          if (!fbActive || !term || e.touches.length !== 1) return;
-          if (isHandledByInner(e)) return;
-          if (!viewport) return;
-          const currentY = e.touches[0].clientY;
-          const deltaY = fbLastY - currentY;
-          if (deltaY === 0) return;
-          const before = viewport.scrollTop;
-          const max = viewport.scrollHeight - viewport.clientHeight;
-          const next = Math.max(0, Math.min(max, before + deltaY));
-          if (next !== before) {
-            viewport.scrollTop = next;
-            fbLastY = currentY;
-            markUserScrolling();
-            if (e.cancelable) e.preventDefault();
-          } else {
-            fbLastY = currentY;
-          }
-        }, { passive: false });
-        const fbEnd = () => {
-          fbActive = false;
-          if (term && isAtBottom()) isUserScrolling = false;
-        };
-        container.addEventListener('touchend', fbEnd, { passive: true });
-        container.addEventListener('touchcancel', fbEnd, { passive: true });
-      }
+      container.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
+      container.addEventListener('touchmove', onTouchMove, { passive: false, capture: true });
+      container.addEventListener('touchend', onTouchEnd, { passive: true, capture: true });
+      container.addEventListener('touchcancel', onTouchEnd, { passive: true, capture: true });
+      terminalTouchCleanup = () => {
+        container.removeEventListener('touchstart', onTouchStart, true);
+        container.removeEventListener('touchmove', onTouchMove, true);
+        container.removeEventListener('touchend', onTouchEnd, true);
+        container.removeEventListener('touchcancel', onTouchEnd, true);
+        terminalTouchCleanup = null;
+      };
 
       if (!container.dataset.copyBound) {
         // 长按复制：优先复制已选中文本；未选择时复制当前按住行
@@ -1252,7 +1244,18 @@ function handleResize() {
 }
 
 function closeTerminal() {
-  window.removeEventListener('resize', handleResize);
+  if (terminalTouchCleanup) terminalTouchCleanup();
+  window.removeEventListener('resize', scheduleTerminalResize);
+  if (window.visualViewport) window.visualViewport.removeEventListener('resize', scheduleTerminalResize);
+  if (terminalResizeObserver) {
+    terminalResizeObserver.disconnect();
+    terminalResizeObserver = null;
+  }
+  if (terminalResizeFrame !== null) {
+    cancelAnimationFrame(terminalResizeFrame);
+    terminalResizeFrame = null;
+  }
+  lastTerminalSize = '';
   closeWebSocket();
   // 重置 spinner 拦截状态
   resetSpinnerState();
@@ -1267,86 +1270,15 @@ function closeTerminal() {
 
 // 手机端列数少（40-50），CLI spinner（如 ⠋⠙⠹ braille 动画或逐字变色）
 // 用 \r 覆盖同一行，但内容超宽 wrap 后 \r 无法清除上方残留行，导致重复多行。
-// 此模块在 term.write 前拦截 spinner 帧，替换为截断的静态文本。
+// 此模块在 term.write 前丢弃 spinner 帧，避免窄屏换行后留下重复文本。
 
 const spinnerState = {
-  active: false,          // 当前是否处于 spinner 拦截模式
-  consecutiveCRFrames: 0, // 连续只含 \r 不含 \n 的帧计数
-  spinnerLine: '',        // 当前拦截到的 spinner 纯文本
-  cooldownUntil: 0,       // 冷却期截止时间（避免 spinner 结束后误拦截）
-  lastRefreshTime: 0,     // 上次刷新终端显示的时间戳（限频用）
+  active: false,
 };
 
 /** 重置 spinner 拦截状态（退出 spinner 模式或关闭终端时调用） */
-function resetSpinnerState(cooldownMs) {
+function resetSpinnerState() {
   spinnerState.active = false;
-  spinnerState.consecutiveCRFrames = 0;
-  spinnerState.spinnerLine = '';
-  spinnerState.cooldownUntil = cooldownMs ? Date.now() + cooldownMs : 0;
-  spinnerState.lastRefreshTime = 0;
-}
-
-/** 去除 ANSI escape sequences，返回纯文本 */
-function stripAnsi(str) {
-  return str
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '') // CSI 序列 (含 ? 私有参数, 如 \x1b[?25l)
-    .replace(/\x1b\][^\x07]*\x07/g, '')        // OSC + BEL
-    .replace(/\x1b\][^\x1b]*\x1b\\/g, '')      // OSC + ST
-    .replace(/\x1b\([B0UK]/g, '')               // 字符集指定
-    .replace(/\x1b[()][B0UK]/g, '');           // 字符集指定 (另一形式)
-}
-
-/** 从 spinner 原始数据中提取纯文本 */
-function extractSpinnerText(rawData) {
-  let text = rawData;
-  text = text.replace(/^\r+/, '');  // 去掉开头的 \r
-  text = stripAnsi(text);
-  text = text.trimEnd();
-  return text;
-}
-
-/** 将 braille spinner 等动画字符替换为简化的省略号 */
-function simplifySpinnerText(text) {
-  // Braille spinner 字符
-  text = text.replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷]+/g, '…');
-  // 旋转线 spinner（至少 3 个连续字符才匹配，避免误伤 |- 或 -- 等短组合）
-  text = text.replace(/[|/\\-]{3,}/g, '…');
-  // 合并连续省略号
-  text = text.replace(/…{2,}/g, '…');
-  return text;
-}
-
-/**
- * 判断 output 帧类型
- * 返回: 'spinner' | 'spinner-final' | 'normal'
- */
-function classifyOutputFrame(data) {
-  if (!data || data.length === 0) return 'normal';
-
-  const hasCR = data.includes('\r');
-  const hasNewline = data.includes('\n');
-
-  // 含 \n 不含 \r：正常输出
-  if (hasNewline && !hasCR) return 'normal';
-
-  // 含 \n 且含 \r：
-  //   - spinner 模式下：视为 spinner 最终帧
-  //   - 非 spinner 模式：正常输出
-  if (hasNewline && hasCR) {
-    if (spinnerState.active) return 'spinner-final';
-    return 'normal';
-  }
-
-  // 只含 \r 不含 \n：spinner 的典型特征
-  if (hasCR) {
-    const strippedLen = stripAnsi(data).length;
-    // 内容太长（> 300）不太可能是典型 spinner，保守放行
-    if (strippedLen > 300) return 'normal';
-    return 'spinner';
-  }
-
-  // 没有 \r 也没有 \n：正常输出分片
-  return 'normal';
 }
 
 /**
@@ -1354,77 +1286,15 @@ function classifyOutputFrame(data) {
  * 返回应写入 term 的数据；返回 null 表示丢弃该帧
  */
 function interceptSpinnerData(rawData) {
-  const classification = classifyOutputFrame(rawData);
-  const now = Date.now();
-
-  // 冷却期内非 spinner 帧直接放行
-  if (spinnerState.cooldownUntil > now && classification !== 'spinner') {
+  // 服务端会合并多个 PTY 分片，因此不能把整个 WebSocket 包按“有无换行”分类。
+  // 移除每段 CR 覆盖帧，保留正常 CRLF 行与其后的真实输出。
+  const filtered = rawData.replace(/\r(?!\n)[^\r\n]*/g, '');
+  if (filtered === rawData) {
+    if (spinnerState.active) resetSpinnerState();
     return rawData;
   }
-
-  // --- normal：如果正在 spinner 模式则退出，否则直接放行 ---
-  if (classification === 'normal') {
-    if (spinnerState.active) {
-      // spinner 模式结束，清行退出
-      resetSpinnerState(300);
-      // 先清掉之前写到终端的 spinner 行
-      return '\r\x1b[K' + rawData;
-    }
-    return rawData;
-  }
-
-  // --- spinner-final：spinner 结束帧 ---
-  if (classification === 'spinner-final') {
-    if (spinnerState.active) {
-      resetSpinnerState(300);
-      // 清行后写最终内容
-      return '\r\x1b[K' + rawData;
-    }
-    return rawData;
-  }
-
-  // --- spinner：含 \r 不含 \n 的帧 ---
-  if (classification === 'spinner') {
-    spinnerState.consecutiveCRFrames++;
-
-    // 连续 2 帧 \r-only 才激活拦截（避免单次 \r 误触）
-    if (!spinnerState.active && spinnerState.consecutiveCRFrames < 2) {
-      return rawData; // 还在确认阶段，先正常输出
-    }
-
-    // 激活 spinner 模式
-    if (!spinnerState.active) {
-      spinnerState.active = true;
-      spinnerState.spinnerLine = '';
-    }
-
-    // 提取并简化文本
-    const newText = simplifySpinnerText(extractSpinnerText(rawData));
-
-    // 内容没变化就不刷新
-    if (newText === spinnerState.spinnerLine) {
-      return null;
-    }
-    spinnerState.spinnerLine = newText;
-
-    // 200ms 限频，避免高频渲染
-    if (spinnerState.lastRefreshTime && now - spinnerState.lastRefreshTime < 200) {
-      return null;
-    }
-    spinnerState.lastRefreshTime = now;
-
-    // 截断到终端列宽 - 4，防止再次 wrap
-    const maxLen = (term ? term.cols : 40) - 4;
-    let display = newText;
-    if (display.length > maxLen) {
-      display = display.substring(0, maxLen) + '…';
-    }
-
-    // \r 回到行首，\x1b[K 清除整行，然后写简化文本
-    return '\r\x1b[K' + display;
-  }
-
-  return rawData;
+  spinnerState.active = true;
+  return filtered || null;
 }
 
 // ========== WebSocket ==========
@@ -1825,10 +1695,7 @@ if (window.visualViewport) {
       if (shortcutBar) shortcutBar.style.paddingBottom = '';
     }
 
-    // 重新 fit 终端
-    if (fitAddon && term) {
-      requestAnimationFrame(() => fitAddon.fit());
-    }
+    scheduleTerminalResize();
   }
 
   vv.addEventListener('resize', adjustForKeyboard);

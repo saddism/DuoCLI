@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { execSync, spawn } from 'child_process';
-import { requestTitleFromConfiguredAI, TitleAIConfig } from './title-ai';
+import { requestTitleFromConfiguredAI, cleanGeneratedTitle, TitleAIConfig } from './title-ai';
 
 export interface PtySession {
   id: string;
@@ -16,6 +16,10 @@ export interface PtySession {
   title: string;
   titleLocked: boolean;
   titleGenerated: boolean;
+  // —— 「智能起名」用户输入行缓冲（只用用户敲下的内容起名，绝不掺 CLI 输出）——
+  currentLine: string;            // 当前正在输入、尚未回车的行缓冲
+  accumulatedInputs: string[];    // 已发送的各段用户输入（起名唯一料源）
+  titleSegmentCount: number;      // 已触发起名的段数（回车计数，封顶 TITLE_SEGMENT_CAP）
   summarizeScheduled: boolean;
   summarizeTimer: NodeJS.Timeout | null;
   cwd: string;
@@ -56,6 +60,89 @@ const PRESET_DISPLAY_NAMES: Record<string, string> = {
   'kiro-cli chat --trust-all-tools': 'Kiro全自动',
 };
 
+// 终端会话标题「智能起名」：起名材料累加到第 N 段（用户每次回车发送算一段）后锁定，不再自动改名
+const TITLE_SEGMENT_CAP = 3;
+
+/**
+ * 把用户击键的原始字节流解析成「行缓冲」状态，供起名使用（旁路观察，绝不影响命令转发）。
+ * 只采集用户真正敲下的可见输入：可打印字符累积、退格按字符删尾、回车分段；
+ * 方向键/功能键/ESC 序列/控制键一律忽略。
+ * 返回：更新后的行缓冲、本次新完成的所有段、以及本次是否有可见输入。
+ */
+function processUserInputData(currentLine: string, data: string): {
+  line: string;
+  segments: string[];
+  hadInput: boolean;
+} {
+  let line = currentLine;
+  const segments: string[] = [];
+  let hadInput = false;
+
+  // 逐字符处理，让批量粘贴、IME 确认和普通击键遵循同一套回车/ESC 规则。
+  for (let i = 0; i < data.length; i++) {
+    const ch = data[i];
+    const code = data.charCodeAt(i);
+
+    if (ch === '\r' || ch === '\n') {
+      const trimmed = line.trim();
+      if (trimmed.length > 0) segments.push(trimmed);
+      line = '';
+    } else if (code === 0x7f || code === 0x08) {
+      // 退格 DEL/BS：按字符删尾（Array.from 防止切坏多字节中文）
+      const chars = Array.from(line);
+      chars.pop();
+      line = chars.join('');
+    } else if (code === 0x1b) {
+      // ESC 序列（方向键/功能键/粘贴标记等）：吞掉整个序列，避免残留 [A 之类污染缓冲
+      i = skipEscapeSequence(data, i);
+    } else if (code >= 0x20) {
+      line += ch;
+      hadInput = true;
+    }
+    // 其它控制字符（0x00-0x1f，Ctrl/Tab 等）忽略
+  }
+
+  return { line, segments, hadInput };
+}
+
+/**
+ * 从 ESC 序列起始位置 i，返回该序列最后一个字节的位置（含），供循环跳过整个序列。
+ * 覆盖 CSI(ESC [)、OSC(ESC ])、SS3(ESC O) 与单字符 ESC 序列。
+ */
+function skipEscapeSequence(data: string, i: number): number {
+  // data[i] === 0x1b (ESC)
+  if (i + 1 >= data.length) return i;  // 孤立 ESC
+  const next = data.charCodeAt(i + 1);
+
+  if (next === 0x5b) {
+    // CSI: ESC [ params(0x30-0x3f) intermed(0x20-0x2f) final(0x40-0x7e)
+    let j = i + 2;
+    while (j < data.length) {
+      const c = data.charCodeAt(j);
+      if (c >= 0x40 && c <= 0x7e) return j;        // final byte
+      if (c >= 0x20 && c <= 0x3f) { j++; continue; }
+      return j;                                    // 异常字节，停止
+    }
+    return data.length - 1;
+  }
+  if (next === 0x5d) {
+    // OSC: ESC ] ... BEL(0x07) 或 ST(ESC \)
+    let j = i + 2;
+    while (j < data.length) {
+      if (data.charCodeAt(j) === 0x07) return j;
+      if (data.charCodeAt(j) === 0x1b && j + 1 < data.length && data.charCodeAt(j + 1) === 0x5c) return j + 1;
+      j++;
+    }
+    return data.length - 1;
+  }
+  if (next === 0x4f) {
+    // SS3: ESC O <final>
+    return Math.min(i + 2, data.length - 1);
+  }
+  // 单字符 ESC 序列：ESC <byte>
+  return i + 1;
+}
+
 function stripTerminalControlSequences(text: string): string {
   return text
     // OSC: ESC ] ... BEL / ESC \
@@ -75,8 +162,9 @@ function parseResumeCommand(text: string): { command: string; sessionId: string 
   const patterns: Array<{ re: RegExp; build: (m: RegExpMatchArray) => string }> = [
     // Cursor Agent: "agent --resume=<uuid>"
     { re: /\b(agent)\s+--resume=([\w-]+)/i, build: m => `${m[1]} --resume=${m[2]}` },
-    // Claude Code: "claude --resume <uuid>"
-    { re: /\b(claude)\s+--resume\s+([\w-]+)/i, build: m => `${m[1]} --resume ${m[2]}` },
+    // Claude Code: "claude --resume <uuid>" —— id 必须是 UUID，
+    // 否则会把 Claude 自己打印的提示文案（如 "claude --resume to ..."）误抓成会话 id
+    { re: /\b(claude)\s+--resume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i, build: m => `${m[1]} --resume ${m[2]}` },
     // Kiro: "kiro-cli --resume-id <uuid>"
     { re: /\b(kiro[\w-]*)\s+--resume-id\s+([\w-]+)/i, build: m => `${m[1]} --resume-id ${m[2]}` },
     // Codex: "codex resume <id>"
@@ -223,6 +311,9 @@ export class PtyManager {
       title: '新会话',
       titleLocked: false,
       titleGenerated: false,
+      currentLine: '',
+      accumulatedInputs: [],
+      titleSegmentCount: 0,
       summarizeScheduled: false,
       summarizeTimer: null,
       cwd,
@@ -277,19 +368,6 @@ export class PtyManager {
             // 不设 titleGenerated — OSC 可能只是 shell 启动信息，等用户有输入后再确认
             this.events.onTitleUpdate(id, session.title);
           }
-        }
-      }
-
-      // 累积阈值首次触发：不依赖回车检测（TUI 下回车经常不是裸 \r）
-      // 800 字节通常等价于一屏内容，足够 AI 判断用户意图
-      if (!session.titleGenerated && !session.titleLocked && session.buffer.length >= 800) {
-        if (!session.summarizeScheduled) {
-          session.summarizeScheduled = true;
-          // 800ms 去抖：等输出稍微稳定，避免抓到半行
-          session.summarizeTimer = setTimeout(() => {
-            session.summarizeTimer = null;
-            void this.triggerSummarize(id);
-          }, 800);
         }
       }
 
@@ -436,30 +514,19 @@ export class PtyManager {
     // 用户手动输入 → 重置自动切号计数（用户接管了）
     session.switchAttempts = 0;
 
-    // 检测粘贴输入（语音输入法通过粘贴方式输入，一次性写入多个字符）
-    if (data.length > 5 && data !== '\r') {
-      const cleaned = data.replace(/[\r\n]/g, ' ').trim();
-      if (cleaned.length > 0) {
-        session.userInputs.push(cleaned);
-        // 只保留最近20条
-        if (session.userInputs.length > 20) {
-          session.userInputs = session.userInputs.slice(-20);
-        }
-        this.events.onPasteInput?.(id, session.cwd);
-      }
-    }
+    // 「智能起名」：旁路观察用户击键，维护行缓冲（绝不影响下面的命令转发）
+    const parsed = processUserInputData(session.currentLine, data);
+    session.currentLine = parsed.line;
 
-    // 检测回车键，计数命令；TUI 下 \r 可能不出现，纯属补充信号
-    if (data === '\r') {
-      session.commandCount++;
-      // 前3轮命令自动生成标题（与 buffer 阈值触发互为兜底）
-      // 如果标题还没最终确认（titleGenerated=false），即使用户输入前已调度过，
-      // 也要重新调度——因为现在有了用户输入，生成结果会更准确
-      if (!session.titleGenerated && !session.titleLocked && session.commandCount <= 3) {
-        // 清除之前的调度，重新安排
+    // 每检测到一次回车分段 → 累加进 accumulatedInputs，并在封顶前安排起名（覆盖式更新）
+    if (parsed.segments.length > 0) {
+      session.accumulatedInputs.push(...parsed.segments);
+      if (!session.titleGenerated && !session.titleLocked
+          && session.titleSegmentCount < TITLE_SEGMENT_CAP) {
+        session.titleSegmentCount = Math.min(TITLE_SEGMENT_CAP, session.titleSegmentCount + parsed.segments.length);
+        // 防抖 800ms：合并连续回车，最后一次为准
         if (session.summarizeTimer) {
           clearTimeout(session.summarizeTimer);
-          session.summarizeTimer = null;
         }
         session.summarizeScheduled = true;
         session.summarizeTimer = setTimeout(() => {
@@ -467,9 +534,14 @@ export class PtyManager {
           void this.triggerSummarize(id);
         }, 800);
       }
+    }
+
+    // 用户有可见输入（逐字/粘贴）或回车 → 通知功能 arm（index.ts 消费 onPasteInput）
+    if (parsed.hadInput || parsed.segments.length > 0 || data === '\r') {
       this.events.onPasteInput?.(id, session.cwd);
     }
 
+    // C1 硬约束：对所有输入照常转发给 CLI，起名逻辑是纯旁路
     session.ptyProcess.write(data);
   }
 
@@ -540,7 +612,10 @@ export class PtyManager {
     if (result) {
       session.resumeId = result.sessionId;
       session.resumeCommand = result.command;
+      return;
     }
+    // 不从 ~/.claude/projects 猜测“最新”会话：同一工作目录可同时运行多个 Claude，
+    // 无法证明文件属于当前 PTY 时宁可不保存恢复记录，也不能恢复到错误会话。
   }
 
   getCwd(id: string): string {
@@ -575,57 +650,52 @@ export class PtyManager {
     if (!session) return;
     if (session.titleLocked || session.titleGenerated) return;
 
-    const cleanBuffer = stripTerminalControlSequences(session.buffer).trim();
-    const lastUserInput = session.userInputs.length > 0
-      ? session.userInputs[session.userInputs.length - 1]
-      : '';
-    const hasUserInput = session.userInputs.length > 0 || session.commandCount > 0;
-
-    // 素材太少则不浪费 API 调用，等下一轮触发
-    if (cleanBuffer.length < 20 && lastUserInput.length < 4) {
+    // 起名唯一料源：用户先后发送的各段输入。绝不掺 CLI 输出 / 终端输出。
+    const inputs = session.accumulatedInputs;
+    if (inputs.length === 0) {
       session.summarizeScheduled = false;
       return;
     }
+    const inputsText = inputs.join('\n');
+    // 是否已达封顶段：达到后本次起名即锁死，后续不再自动改名
+    const atCap = session.titleSegmentCount >= TITLE_SEGMENT_CAP
+               || inputs.length >= TITLE_SEGMENT_CAP;
 
-    // 如果用户还没有实际输入，只设临时标题，不锁死 titleGenerated
-    // 这样用户输入后可以重新生成更准确的标题
     const config = this.getTitleAIConfig?.();
     if (config?.baseUrl && config.apiKey && config.model) {
       try {
         const prompt = [
-          '请根据以下终端会话内容，推断用户正在做什么任务，生成一个简短中文标题。',
-          '要求：8-15 个字，直接输出标题，不要加引号、前缀或解释。',
+          '你是终端会话标题生成助手。下面是用户先后输入并发送给命令行工具的内容，',
+          '请理解用户想做什么，生成一个简洁的中文标题（不超过 12 个字，不要标点、不要引号、不要解释）。',
           '',
-          `工作目录：${session.cwd}`,
-          `启动命令：${getDisplayName(session.presetCommand)}`,
-          lastUserInput ? `用户最近输入：${lastUserInput.slice(0, 240)}` : '',
-          `终端输出（已剥离控制符）：\n${cleanBuffer.slice(-1500)}`,
-        ].filter(Boolean).join('\n');
+          '用户输入：',
+          inputsText,
+          '',
+          '只返回标题本身。',
+        ].join('\n');
         const title = await requestTitleFromConfiguredAI(config, prompt);
         const latest = this.sessions.get(id);
         if (latest && !latest.titleLocked && title) {
-          latest.title = title.slice(0, 50);
-          // 只有用户有实际输入时才锁死标题，否则只是临时标题
-          latest.titleGenerated = hasUserInput;
+          latest.title = cleanGeneratedTitle(title).slice(0, 50);
+          // 封顶才锁死；未封顶则保持 false，允许后续段覆盖更新（R4 累加覆盖）
+          latest.titleGenerated = atCap;
           latest.summarizeScheduled = false;
           this.events.onTitleUpdate(id, latest.title);
           return;
         }
       } catch (err) {
         console.error('[PtyManager] AI 标题生成失败，走兜底:', err instanceof Error ? err.message : err);
-        // 失败兜底走下面的 buffer 首行
       }
     }
 
-    // 兜底：用 buffer 首行可读文本
+    // 兜底：用累积用户输入截断当标题（不再用 buffer / 终端输出）
     const latest = this.sessions.get(id);
     if (!latest || latest.titleLocked || latest.titleGenerated) return;
     latest.summarizeScheduled = false;
-    const fallback = lastUserInput || cleanBuffer.split('\n').map(s => s.trim()).find(s => s.length >= 3) || '';
+    const fallback = inputsText.replace(/\n/g, ' ').trim();
     if (!fallback) return;
     latest.title = fallback.length > 40 ? fallback.slice(0, 40) + '…' : fallback;
-    // 只有用户有实际输入时才锁死标题
-    latest.titleGenerated = hasUserInput;
+    latest.titleGenerated = atCap;
     this.events.onTitleUpdate(id, latest.title);
   }
 }

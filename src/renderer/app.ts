@@ -275,23 +275,12 @@ function initAutoContinueTimer(): void {
           const msg = messages[cmdIdx];
           cmdIdx++;
           window.duocli.writePty(sessionId, msg);
-          // 延迟发送回车
+          // 所有 PTY CLI 都以 CR (0x0d) 提交一条命令。
+          // 过去依次发送多种换行/转义序列，会让部分 Agent 接收到多次提交。
           setTimeout(() => {
-            const enterKeys = [
-              '\r', '\n', '\r\n', '\x0d', '\x0a', '\x1b\n', '\x1b\r',
-            ];
-            let ei = 0;
-            const sendNextEnter = () => {
-              if (ei < enterKeys.length) {
-                window.duocli.writePty(sessionId, enterKeys[ei]);
-                ei++;
-                setTimeout(sendNextEnter, 15);
-              } else {
-                // 这条命令回车完成，发送下一条命令
-                setTimeout(sendNextCommand, cmdInterval);
-              }
-            };
-            sendNextEnter();
+            window.duocli.writePty(sessionId, '\r');
+            // 这条命令回车完成，发送下一条命令
+            setTimeout(sendNextCommand, cmdInterval);
           }, sendDelay);
         };
         sendNextCommand();

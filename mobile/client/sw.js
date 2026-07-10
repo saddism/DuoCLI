@@ -1,6 +1,6 @@
 // DuoCLI Mobile - Service Worker
 
-const CACHE_NAME = 'duocli-v10';
+const CACHE_NAME = 'duocli-v13';
 const ASSETS = [
   '/',
   '/index.html',
@@ -34,6 +34,25 @@ self.addEventListener('fetch', e => {
   if (url.pathname.startsWith('/api/')) return;
   // 局域网探针：永远走网络，避免 SW 缓存导致误判 + 缓存条目无限累积
   if (url.pathname === '/ping.png') return;
+
+  // 应用外壳（HTML/JS/CSS）网络优先：联网时一次刷新即拿最新代码，断网才回退缓存。
+  // 避免 stale-while-revalidate 导致改完代码要重开两次才生效。
+  const isAppShell =
+    e.request.mode === 'navigate' ||
+    /\.(?:js|css|html)$/.test(url.pathname) ||
+    url.pathname === '/';
+  if (isAppShell) {
+    e.respondWith(
+      fetch(e.request).then(response => {
+        if (response.ok) {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(e.request, clone));
+        }
+        return response;
+      }).catch(() => caches.match(e.request))
+    );
+    return;
+  }
 
   e.respondWith(
     caches.match(e.request).then(cached => {
