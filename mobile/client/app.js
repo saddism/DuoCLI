@@ -1054,6 +1054,91 @@ function sendInputWithHexEnter(raw) {
 
 // ========== xterm.js 终端 ==========
 
+function openFilePreview(requestedPath) {
+  if (!currentSessionId) return;
+  const title = $('file-preview-title');
+  const meta = $('file-preview-meta');
+  const content = $('file-preview-content');
+  if (!title || !meta || !content) return;
+
+  title.textContent = requestedPath.split('/').pop() || requestedPath;
+  meta.textContent = '正在读取…';
+  content.textContent = '';
+  showPage('file-preview-page');
+
+  api(`/api/sessions/${encodeURIComponent(currentSessionId)}/file-preview?path=${encodeURIComponent(requestedPath)}`)
+    .then((data) => {
+      if (!currentSessionId) return;
+      title.textContent = data.name || requestedPath;
+      meta.textContent = data.path || requestedPath;
+      content.textContent = typeof data.content === 'string' ? data.content : '';
+    })
+    .catch((error) => {
+      showPage('detail-page');
+      showCopyToast(error.message || '文件预览失败');
+    });
+}
+
+function registerMobileFileLinks() {
+  if (!term || !globalThis.DuoFilePreviewHelpers) return;
+  const provider = {
+    provideLinks(y, callback) {
+      const buffer = term.buffer.active;
+      let startLineIndex = y - 1;
+      if (!buffer.getLine(startLineIndex)) { callback(undefined); return; }
+      while (startLineIndex > 0 && buffer.getLine(startLineIndex)?.isWrapped) startLineIndex--;
+
+      const lines = [];
+      let nextLineIndex = startLineIndex;
+      while (true) {
+        const line = buffer.getLine(nextLineIndex);
+        if (!line || (nextLineIndex !== startLineIndex && !line.isWrapped)) break;
+        lines.push(line);
+        nextLineIndex++;
+      }
+
+      let text = '';
+      const posLine = [];
+      const posCell = [];
+      lines.forEach((line, lineOffset) => {
+        const bufferLineIndex = startLineIndex + lineOffset;
+        for (let cellIndex = 0; cellIndex < line.length; cellIndex++) {
+          const cell = line.getCell(cellIndex);
+          const chars = cell?.getChars() || '';
+          const width = cell?.getWidth() || 1;
+          if (chars) {
+            for (let charIndex = 0; charIndex < chars.length; charIndex++) {
+              posLine.push(bufferLineIndex);
+              posCell.push(cellIndex);
+            }
+            text += chars;
+          } else if (width !== 0) {
+            posLine.push(bufferLineIndex);
+            posCell.push(cellIndex);
+            text += ' ';
+          }
+        }
+      });
+
+      const links = globalThis.DuoFilePreviewHelpers.findFilePathMatches(text).flatMap((match) => {
+        const start = match.index;
+        const end = match.index + match.length - 1;
+        if (start >= posLine.length || end >= posLine.length) return [];
+        return [{
+          range: {
+            start: { x: posCell[start] + 1, y: posLine[start] + 1 },
+            end: { x: posCell[end] + 1, y: posLine[end] + 1 },
+          },
+          text: match.filePath,
+          activate: () => openFilePreview(match.filePath),
+        }];
+      });
+      callback(links.length ? links : undefined);
+    },
+  };
+  term.registerLinkProvider(provider);
+}
+
 function createTerminal() {
   closeTerminal();
 
@@ -1111,6 +1196,7 @@ function createTerminal() {
   // 显示 loading
   if (loading) loading.classList.remove('hidden');
   term.open(container);
+  registerMobileFileLinks();
 
   // 终端键盘输入 → WebSocket
   term.onData((data) => {
@@ -1531,6 +1617,14 @@ $('back-btn').onclick = () => {
   closeTerminal();
   showPage('main-page');
   refreshSessions();
+};
+
+$('file-preview-back-btn').onclick = () => {
+  showPage('detail-page');
+  requestAnimationFrame(() => {
+    handleResize();
+    scheduleRepaint();
+  });
 };
 
 // 催工：点击标签直接弹配置弹窗

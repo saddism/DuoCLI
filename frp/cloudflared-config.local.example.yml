@@ -1,5 +1,6 @@
 tunnel: your-tunnel-name
 credentials-file: /Users/yourname/.cloudflared/your-tunnel-id.json
+protocol: http2
 
 ingress:
   - hostname: your-domain.example.com

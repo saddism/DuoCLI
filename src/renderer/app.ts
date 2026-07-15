@@ -1430,6 +1430,22 @@ function showSessionContextMenu(e: MouseEvent, targetId: string): void {
       },
     },
     {
+      label: '关闭本项目下方所有对话',
+      action: () => {
+        // 与侧栏一致：置顶优先，其余按创建时间从新到旧。
+        const byCreated = (a: string, b: string) => getSessionCreateTime(b) - getSessionCreateTime(a);
+        const projectIds = Array.from(sessionTitles.keys()).filter(id =>
+          normalizeCwd(sessionCwds.get(id) || '') === targetCwdKey
+        );
+        const displayOrder = [
+          ...projectIds.filter(id => pinnedSessions.has(id)).sort(byCreated),
+          ...projectIds.filter(id => !pinnedSessions.has(id)).sort(byCreated),
+        ];
+        const targetIndex = displayOrder.indexOf(targetId);
+        if (targetIndex >= 0) destroySessions(displayOrder.slice(targetIndex + 1));
+      },
+    },
+    {
       label: '关闭所有对话',
       action: () => {
         destroySessions(Array.from(sessionTitles.keys()));

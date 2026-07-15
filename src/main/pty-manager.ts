@@ -20,6 +20,7 @@ export interface PtySession {
   currentLine: string;            // 当前正在输入、尚未回车的行缓冲
   accumulatedInputs: string[];    // 已发送的各段用户输入（起名唯一料源）
   titleSegmentCount: number;      // 已触发起名的段数（回车计数，封顶 TITLE_SEGMENT_CAP）
+  titleInputRevision: number;     // 每次提交指令递增，用于丢弃过期的异步起名结果
   summarizeScheduled: boolean;
   summarizeTimer: NodeJS.Timeout | null;
   cwd: string;
@@ -314,6 +315,7 @@ export class PtyManager {
       currentLine: '',
       accumulatedInputs: [],
       titleSegmentCount: 0,
+      titleInputRevision: 0,
       summarizeScheduled: false,
       summarizeTimer: null,
       cwd,
@@ -521,6 +523,7 @@ export class PtyManager {
     // 每检测到一次回车分段 → 累加进 accumulatedInputs，并在封顶前安排起名（覆盖式更新）
     if (parsed.segments.length > 0) {
       session.accumulatedInputs.push(...parsed.segments);
+      session.titleInputRevision++;
       if (!session.titleGenerated && !session.titleLocked
           && session.titleSegmentCount < TITLE_SEGMENT_CAP) {
         session.titleSegmentCount = Math.min(TITLE_SEGMENT_CAP, session.titleSegmentCount + parsed.segments.length);
@@ -531,7 +534,7 @@ export class PtyManager {
         session.summarizeScheduled = true;
         session.summarizeTimer = setTimeout(() => {
           session.summarizeTimer = null;
-          void this.triggerSummarize(id);
+          void this.triggerSummarize(id, session.titleInputRevision);
         }, 800);
       }
     }
@@ -592,8 +595,13 @@ export class PtyManager {
     if (!session) return;
     session.titleLocked = false;
     session.titleGenerated = false;
+    session.titleInputRevision++;
     session.summarizeScheduled = false;
-    await this.triggerSummarize(id);
+    if (session.summarizeTimer) {
+      clearTimeout(session.summarizeTimer);
+      session.summarizeTimer = null;
+    }
+    await this.triggerSummarize(id, session.titleInputRevision);
   }
 
   getAllSessions(): PtySession[] {
@@ -645,10 +653,13 @@ export class PtyManager {
     return session.cwd;
   }
 
-  private async triggerSummarize(id: string): Promise<void> {
+  private async triggerSummarize(id: string, expectedRevision?: number): Promise<void> {
     const session = this.sessions.get(id);
     if (!session) return;
     if (session.titleLocked || session.titleGenerated) return;
+
+    const revision = session.titleInputRevision;
+    if (expectedRevision !== undefined && expectedRevision !== revision) return;
 
     // 起名唯一料源：用户先后发送的各段输入。绝不掺 CLI 输出 / 终端输出。
     const inputs = session.accumulatedInputs;
@@ -675,7 +686,8 @@ export class PtyManager {
         ].join('\n');
         const title = await requestTitleFromConfiguredAI(config, prompt);
         const latest = this.sessions.get(id);
-        if (latest && !latest.titleLocked && title) {
+        if (latest && !latest.titleLocked && !latest.titleGenerated
+            && latest.titleInputRevision === revision && title) {
           latest.title = cleanGeneratedTitle(title).slice(0, 50);
           // 封顶才锁死；未封顶则保持 false，允许后续段覆盖更新（R4 累加覆盖）
           latest.titleGenerated = atCap;
@@ -690,7 +702,8 @@ export class PtyManager {
 
     // 兜底：用累积用户输入截断当标题（不再用 buffer / 终端输出）
     const latest = this.sessions.get(id);
-    if (!latest || latest.titleLocked || latest.titleGenerated) return;
+    if (!latest || latest.titleLocked || latest.titleGenerated
+        || latest.titleInputRevision !== revision) return;
     latest.summarizeScheduled = false;
     const fallback = inputsText.replace(/\n/g, ' ').trim();
     if (!fallback) return;

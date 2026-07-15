@@ -333,7 +333,8 @@ header h2 {
   flex: 1;
   overflow: hidden;
   background: #1a1a2e;
-  touch-action: pan-y;
+  /* 终端历史由 app.js 调用 xterm.scrollLines() 处理，不能让浏览器抢走纵向手势。 */
+  touch-action: none;
   position: relative;
 }
 
@@ -423,7 +424,7 @@ header h2 {
 #terminal-container .xterm-viewport {
   overflow-y: scroll !important;
   -webkit-overflow-scrolling: touch;
-  touch-action: pan-y;
+  touch-action: none;
   /* 隐藏滚动条，只保留触摸滚动功能 */
   scrollbar-width: none !important;
   -ms-overflow-style: none;
@@ -436,7 +437,49 @@ header h2 {
 }
 
 #terminal-container .xterm-screen {
-  touch-action: pan-y;
+  touch-action: none;
+}
+
+#file-preview-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: calc(8px + var(--safe-top)) 12px 8px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+
+#file-preview-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+#file-preview-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+  -webkit-overflow-scrolling: touch;
+}
+
+#file-preview-meta {
+  margin-bottom: 10px;
+  color: var(--text2);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+#file-preview-content {
+  margin: 0;
+  color: var(--text);
+  font: 13px/1.6 'SF Mono', 'Menlo', 'Courier New', monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 2;
 }
 
 .copy-toast {

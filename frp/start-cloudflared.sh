@@ -5,6 +5,11 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+LSOF_BIN="$(command -v lsof || true)"
+if [ -z "$LSOF_BIN" ] && [ -x /usr/sbin/lsof ]; then
+    LSOF_BIN="/usr/sbin/lsof"
+fi
+
 CONFIG_FILE=""
 for candidate in "cloudflared-config.local.yml" "cloudflared-config.private.yml" "cloudflared-config.yml"; do
     if [ -f "$candidate" ]; then
@@ -30,7 +35,7 @@ fi
 
 # 检查 DuoCLI 是否已启动（端口 9800）
 echo "正在检查 DuoCLI 服务状态..."
-if ! lsof -i :9800 > /dev/null 2>&1; then
+if [ -z "$LSOF_BIN" ] || ! "$LSOF_BIN" -i :9800 > /dev/null 2>&1; then
     echo "⚠️  警告：DuoCLI 服务（端口 9800）未启动！"
     echo "请先启动 DuoCLI 桌面应用，然后再运行此脚本。"
     echo ""
@@ -63,7 +68,8 @@ echo "🧩 配置文件: $CONFIG_FILE"
 echo ""
 
 # 启动 cloudflared（后台运行，日志追加到 cloudflared.log）
-nohup cloudflared tunnel --config "$CONFIG_FILE" run >> cloudflared.log 2>&1 &
+# 当前网络环境下 QUIC 经常超时，固定走 http2/TCP 443。
+nohup cloudflared tunnel --protocol http2 --config "$CONFIG_FILE" run >> cloudflared.log 2>&1 &
 
 sleep 3
 if pgrep -f "cloudflared.*cloudflared-config" > /dev/null 2>&1; then

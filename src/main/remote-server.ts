@@ -207,9 +207,38 @@ function loadOrCreateConfig(): RemoteConfig {
 }
 
 const MAX_RECENT_CWDS = 20;
+const MAX_PREVIEW_BYTES = 1024 * 1024;
+const PREVIEW_EXTENSIONS = new Set([
+  '.md', '.markdown', '.txt', '.log', '.json', '.jsonl', '.yaml', '.yml', '.toml',
+  '.xml', '.csv', '.tsv', '.ini', '.conf', '.config', '.env', '.properties',
+  '.js', '.jsx', '.ts', '.tsx', '.vue', '.css', '.scss', '.less', '.html', '.htm',
+  '.py', '.pyw', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.cc', '.cpp', '.h',
+  '.hpp', '.sh', '.bash', '.zsh', '.fish', '.sql', '.nvue', '.wxml', '.wxss',
+]);
 
 function normalizeCwd(cwd: string): string {
   return (cwd || '').trim().replace(/\/+$/, '');
+}
+
+function isPreviewableFile(filePath: string): boolean {
+  const name = path.basename(filePath).toLowerCase();
+  return name === '.env' || PREVIEW_EXTENSIONS.has(path.extname(name));
+}
+
+function resolvePreviewPath(cwd: string, requestedPath: string): { cwdReal: string; filePath: string } | null {
+  try {
+    const cwdReal = fs.realpathSync(cwd);
+    const raw = String(requestedPath || '').trim().replace(/^['"`]|['"`]$/g, '');
+    if (!raw) return null;
+    const expanded = raw.startsWith('@/') || raw.startsWith('@')
+      ? path.join(cwdReal, raw.replace(/^@\/?/, ''))
+      : path.isAbsolute(raw) ? raw : path.resolve(cwdReal, raw);
+    const filePath = fs.realpathSync(expanded);
+    if (!filePath.startsWith(cwdReal + path.sep)) return null;
+    return { cwdReal, filePath };
+  } catch {
+    return null;
+  }
 }
 
 function addRecentCwdInConfig(config: RemoteConfig, cwd: string): void {
@@ -497,6 +526,35 @@ export function startRemoteServer(
   app.get('/api/sessions', (_req, res) => {
     const sessions = ptyManager.getAllSessions().map(s => mapSessionToApi(s));
     res.json(sessions);
+  });
+
+  // 手机端只读预览会话 cwd 内的文本文件
+  app.get('/api/sessions/:id/file-preview', (req, res) => {
+    const session = ptyManager.getSession(req.params.id);
+    if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
+    const resolved = resolvePreviewPath(session.cwd, String(req.query.path || ''));
+    if (!resolved || !isPreviewableFile(resolved.filePath)) {
+      res.status(400).json({ error: '只支持工作目录内的文本文件' }); return;
+    }
+    try {
+      const stat = fs.statSync(resolved.filePath);
+      if (!stat.isFile()) { res.status(400).json({ error: '目标不是文件' }); return; }
+      if (stat.size > MAX_PREVIEW_BYTES) {
+        res.status(413).json({ error: '文件过大，无法在手机端预览' }); return;
+      }
+      const content = fs.readFileSync(resolved.filePath);
+      if (content.includes(0)) {
+        res.status(400).json({ error: '该文件不是文本文件' }); return;
+      }
+      res.json({
+        name: path.basename(resolved.filePath),
+        path: resolved.filePath,
+        content: content.toString('utf8'),
+        size: stat.size,
+      });
+    } catch (e: any) {
+      res.status(404).json({ error: '文件读取失败: ' + (e.message || e) });
+    }
   });
 
   // 最近工作目录（桌面端同步 + 运行中会话 cwd 去重合并）

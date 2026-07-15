@@ -4,6 +4,11 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+LSOF_BIN="$(command -v lsof || true)"
+if [ -z "$LSOF_BIN" ] && [ -x /usr/sbin/lsof ]; then
+    LSOF_BIN="/usr/sbin/lsof"
+fi
+
 CONFIG_FILE=""
 for candidate in "cloudflared-config.local.yml" "cloudflared-config.private.yml" "cloudflared-config.yml"; do
     if [ -f "$candidate" ]; then
@@ -45,7 +50,7 @@ fi
 echo ""
 echo "🔗 本地服务:"
 # 检查 DuoCLI
-if lsof -i :9800 > /dev/null 2>&1; then
+if [ -n "$LSOF_BIN" ] && "$LSOF_BIN" -i :9800 > /dev/null 2>&1; then
     echo "   ✅ DuoCLI (9800): 运行中"
 else
     echo "   ❌ DuoCLI (9800): 未启动"

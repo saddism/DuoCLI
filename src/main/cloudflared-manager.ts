@@ -74,7 +74,7 @@ export class CloudflaredManager {
 
     fs.mkdirSync(path.dirname(this.logPath), { recursive: true });
     const out = fs.openSync(this.logPath, 'a');
-    const child = spawn(bin, ['tunnel', '--config', this.configPath, 'run'], {
+    const child = spawn(bin, ['tunnel', '--protocol', 'http2', '--config', this.configPath, 'run'], {
       detached: true,
       stdio: ['ignore', out, out],
     });

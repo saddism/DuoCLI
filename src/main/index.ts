@@ -784,6 +784,18 @@ function registerIPC(): void {
   });
 
   ipcMain.handle('filewatcher:open', async (_e, filePath: string) => {
+    try {
+      if (fs.statSync(filePath).isDirectory()) {
+        await shell.openPath(filePath);
+        return;
+      }
+    } catch { /* 不存在的源码路径仍交给编辑器处理 */ }
+
+    if (!isSourceFile(filePath)) {
+      await shell.openPath(filePath);
+      return;
+    }
+
     const editor = loadEditorPreference();
     if (editor) {
       if (process.platform === 'win32') {

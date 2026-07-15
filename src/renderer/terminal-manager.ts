@@ -151,16 +151,8 @@ const THEME_DOTS: Record<string, string> = {
 // 文件路径正则
 // 1. 带目录的路径: /abs/path, rel/path, @alias/path, ./rel/path
 const PATH_RE = /(?:@\/?|\.\/|\/)?(?:[\w.\-\u4e00-\u9fff]+\/)+[\w.\-\u4e00-\u9fff]*(?:\.[\w]+)?/g;
-// 2. 单文件名（无目录，有源码扩展名）
-const SINGLE_FILE_RE = /(?<![\/\w.\-])[\w.\-\u4e00-\u9fff]+\.(?:vue|ts|tsx|js|jsx|json|css|scss|less|html|md|yaml|yml|xml|svg|py|go|rs|java|kt|swift|c|cpp|h|hpp|sh|toml|conf|txt|env|config|nvue|wxml|wxss)(?![\w.\-])/g;
-
-// 常见源码扩展名
-const SOURCE_EXTS = new Set([
-  'vue', 'ts', 'tsx', 'js', 'jsx', 'json', 'css', 'scss', 'less', 'html',
-  'md', 'yaml', 'yml', 'xml', 'svg', 'py', 'go', 'rs', 'java', 'kt',
-  'swift', 'c', 'cpp', 'h', 'hpp', 'sh', 'bash', 'zsh', 'toml', 'conf',
-  'txt', 'env', 'lock', 'config', 'nvue', 'wxml', 'wxss',
-]);
+// 2. 单文件名（无目录，扩展名不限定为源码文件）
+const SINGLE_FILE_RE = /(?<![\/\w.\-])[\w.\-\u4e00-\u9fff]+\.[a-z0-9][a-z0-9_-]{0,15}(?![\w.\-])/gi;
 
 // URL 正则
 const URL_RE = /https?:\/\/[^\s<>"']+/g;
@@ -179,20 +171,25 @@ class FilePathLinkProvider implements ILinkProvider {
 
   provideLinks(y: number, callback: (links: ILink[] | undefined) => void): void {
     const buffer = this.terminal.buffer.active;
-    const line = buffer.getLine(y - 1);
+    let startLineIndex = y - 1;
+    const line = buffer.getLine(startLineIndex);
     if (!line) { callback(undefined); return; }
 
-    // 跳过续行（由起始行统一处理整个续行序列）
-    if (line.isWrapped) { callback(undefined); return; }
+    // xterm 会按鼠标所在行请求链接；续行需要先回到逻辑行的起点。
+    while (startLineIndex > 0 && buffer.getLine(startLineIndex)?.isWrapped) {
+      startLineIndex--;
+    }
 
     // 收集起始行及后续所有续行
-    const bufferLines: IBufferLine[] = [line];
-    let nextY = y;
+    const startLine = buffer.getLine(startLineIndex);
+    if (!startLine) { callback(undefined); return; }
+    const bufferLines: IBufferLine[] = [startLine];
+    let nextLineIndex = startLineIndex + 1;
     while (true) {
-      const nextLine = buffer.getLine(nextY);
+      const nextLine = buffer.getLine(nextLineIndex);
       if (nextLine && nextLine.isWrapped) {
         bufferLines.push(nextLine);
-        nextY++;
+        nextLineIndex++;
       } else {
         break;
       }
@@ -205,7 +202,7 @@ class FilePathLinkProvider implements ILinkProvider {
 
     for (let li = 0; li < bufferLines.length; li++) {
       const bl = bufferLines[li];
-      const bufLineIdx = y - 1 + li;
+      const bufLineIdx = startLineIndex + li;
       for (let i = 0; i < bl.length; i++) {
         const cell = bl.getCell(i);
         const chars = cell?.getChars() || '';
@@ -243,14 +240,11 @@ class FilePathLinkProvider implements ILinkProvider {
     // 2. 匹配带目录的路径
     PATH_RE.lastIndex = 0;
     while ((match = PATH_RE.exec(text)) !== null) {
-      let fp = match[0];
+      const fp = match[0].replace(/[.,;:!?)\]}>]+$/, '');
       if (fp.length < 4) continue;
       const before = text.substring(Math.max(0, match.index - 10), match.index);
       if (/:\/{0,2}$/.test(before) || /:\d+$/.test(before)) continue;
       if (fp.includes('node_modules')) continue;
-      const ext = fp.split('.').pop()?.toLowerCase() || '';
-      const isDir = fp.endsWith('/');
-      if (!isDir && !fp.startsWith('/') && !SOURCE_EXTS.has(ext)) continue;
       const overlaps = matched.some(r => match!.index >= r.index && match!.index < r.index + r.length);
       if (overlaps) continue;
       matched.push({ filePath: fp, display: fp, index: match.index, length: fp.length, isUrl: false });
