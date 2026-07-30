@@ -335,6 +335,7 @@ header h2 {
   background: #1a1a2e;
   /* 终端历史由 app.js 调用 xterm.scrollLines() 处理，不能让浏览器抢走纵向手势。 */
   touch-action: none;
+  overscroll-behavior: contain;
   position: relative;
 }
 
@@ -440,6 +441,26 @@ header h2 {
   touch-action: none;
 }
 
+#terminal-scroll-bottom-btn {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 16;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: rgba(22, 33, 62, 0.94);
+  color: var(--text);
+  font-size: 24px;
+  line-height: 1;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+}
+
+#terminal-scroll-bottom-btn:active {
+  background: var(--bg3);
+}
+
 #file-preview-header {
   display: flex;
   align-items: center;
@@ -542,6 +563,11 @@ header h2 {
 .key-btn:active {
   background: var(--bg3);
   border-color: var(--accent);
+}
+
+/* 防止 iOS 在可滚动容器内延迟或吞掉 touchend 事件 */
+.key-btn {
+  touch-action: manipulation;
 }
 
 /* ========== 输入区域 ========== */
@@ -689,6 +715,14 @@ header h2 {
   border-radius: 20px 20px 0 0;
   padding: 24px 20px;
   padding-bottom: calc(24px + var(--safe-bottom));
+}
+
+#auto-continue-modal .modal-content {
+  max-height: calc(100vh - env(safe-area-inset-top, 0px));
+  max-height: calc(100dvh - env(safe-area-inset-top, 0px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .modal-header {
@@ -1440,4 +1474,164 @@ header h2 {
 @keyframes net-mode-fadein {
   from { opacity: 0; transform: translateY(-4px); }
   to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ========== 媒体预览 ========== */
+.media-preview-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+}
+
+.media-img,
+.media-video,
+.media-pdf {
+  max-width: 100%;
+  max-height: 70vh;
+  object-fit: contain;
+  border-radius: 8px;
+  background: #000;
+}
+
+.media-video {
+  width: 100%;
+}
+
+.media-audio {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.media-audio-name {
+  margin-top: 10px;
+  color: var(--text2);
+  font-size: 13px;
+  text-align: center;
+  word-break: break-all;
+}
+
+.media-pdf {
+  width: 100%;
+  height: 75vh;
+  border: none;
+  background: #fff;
+}
+
+.media-error {
+  text-align: center;
+  color: var(--text2);
+  font-size: 14px;
+  padding: 24px;
+  line-height: 1.6;
+}
+
+.media-error-hint {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+#file-preview-media {
+  margin-bottom: 12px;
+}
+
+#file-preview-media:empty {
+  margin-bottom: 0;
+}
+
+/* ========== 媒体浏览页 ========== */
+#media-browse-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.media-browse-loading,
+.media-browse-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--text2);
+  font-size: 14px;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+  gap: 10px;
+}
+
+.media-cell {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  transition: transform 0.1s, border-color 0.1s;
+}
+
+.media-cell:active {
+  transform: scale(0.97);
+  border-color: var(--accent);
+}
+
+.media-thumb {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  background: #000;
+  display: block;
+}
+
+.media-thumb-icon {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 36px;
+  background: var(--bg1);
+}
+
+.media-cell-name {
+  font-size: 11px;
+  color: var(--text);
+  padding: 4px 6px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.media-cell-size {
+  font-size: 10px;
+  color: var(--text2);
+  padding: 0 6px 6px;
+}
+
+/* 媒体浏览页 header 与其他详情页一致 */
+#media-browse-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: calc(10px + env(safe-area-inset-top,0px)) 12px 10px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+}
+
+#media-browse-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
 }

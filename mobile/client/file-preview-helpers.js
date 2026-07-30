@@ -11,6 +11,24 @@
     'hpp', 'sh', 'bash', 'zsh', 'fish', 'sql', 'nvue', 'wxml', 'wxss',
   ]);
 
+  // 媒体扩展名 → kind（与后端 MEDIA_EXT_MAP 对应，用于前端分流渲染）
+  const MEDIA_EXT_KIND = {
+    jpg: 'image', jpeg: 'image', png: 'image', gif: 'image',
+    webp: 'image', bmp: 'image', svg: 'image', avif: 'image',
+    heic: 'image', heif: 'image',
+    mp4: 'video', m4v: 'video', mov: 'video', webm: 'video',
+    mp3: 'audio', m4a: 'audio', aac: 'audio', wav: 'audio',
+    ogg: 'audio', flac: 'audio',
+    pdf: 'pdf',
+  };
+
+  function getMediaKind(filePath) {
+    const name = String(filePath || '').split(/[\\/]/).pop() || '';
+    const dot = name.lastIndexOf('.');
+    if (dot <= 0) return null;
+    return MEDIA_EXT_KIND[name.slice(dot + 1).toLowerCase()] || null;
+  }
+
   const PATH_RE = /(?:@\/?|\.\/|\/)?(?:[\w.\-\u4e00-\u9fff]+\/)+[\w.\-\u4e00-\u9fff]*(?:\.[\w]+)?/g;
   const SINGLE_FILE_RE = /(?<![\/\w.\-])[\w.\-\u4e00-\u9fff]+\.[a-z0-9][a-z0-9_-]{0,15}(?![\w.\-])/gi;
   const URL_RE = /https?:\/\/[^\s<>"']+/g;
@@ -23,7 +41,9 @@
     const name = String(filePath || '').split(/[\\/]/).pop() || '';
     if (name.toLowerCase() === '.env') return true;
     const dot = name.lastIndexOf('.');
-    return dot > 0 && PREVIEW_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
+    if (dot <= 0) return false;
+    const ext = name.slice(dot + 1).toLowerCase();
+    return PREVIEW_EXTENSIONS.has(ext) || MEDIA_EXT_KIND[ext] != null;
   }
 
   function findFilePathMatches(text) {
@@ -54,5 +74,5 @@
     return matched.filter((item) => !item.isUrl).sort((a, b) => a.index - b.index);
   }
 
-  return { PREVIEW_EXTENSIONS, isPreviewableFileName, findFilePathMatches };
+  return { PREVIEW_EXTENSIONS, MEDIA_EXT_KIND, isPreviewableFileName, findFilePathMatches, getMediaKind };
 });

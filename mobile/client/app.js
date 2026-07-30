@@ -25,8 +25,12 @@ let wsConnectTimeoutTimer = null;
 let wsLastPongAt = 0;
 let copyToastTimer = null;
 let isUserScrolling = false;
-let scrollToBottomTimer = null;
-let userScrollReleaseTimer = null;
+let terminalTouchActive = false;
+let terminalScrollInteractionRevision = 0;
+let terminalOutputWriteCount = 0;
+// xterm v6 的 scrollToBottom 是平滑动画，onScroll 会在同步代码之后异步触发，
+// 用布尔标志会被竞态误判。改用时间戳窗口标记程序化滚动。
+let programmaticScrollUntil = 0;
 let sseReconnectTimer = null;
 let sseReconnectAttempt = 0;
 const WEAK_NETWORK_STORAGE_KEY = 'duocli_weak_network_mode';
@@ -55,6 +59,48 @@ const chatHelpers = globalThis.DuoChatHelpers || {
     return 'Agent';
   },
 };
+const terminalScrollHelpers = globalThis.DuoTerminalScrollHelpers || {
+  isAtBottom(viewportY, baseY) { return viewportY >= baseY - 2; },
+  shouldFollowOutput(wasAtBottom, touchActive, startInteraction, currentInteraction) {
+    return wasAtBottom && !touchActive && startInteraction === currentInteraction;
+  },
+};
+
+// 通用 spinner 拦截器（与 CLI 品牌无关：合并 \r 同行覆盖链，透传 \x1b[1A 等跨行定位码）。
+const spinnerInterceptor = globalThis.DuoSpinnerInterceptor || {
+  intercept(rawData) {
+    // 兜底：保留原始数据不做合并，比丢内容安全。
+    return rawData || null;
+  },
+  looksLikeSpinnerFrame() { return false; },
+};
+
+// spinner 高频期检测：短时间内连续多帧覆盖写入时，暂停滚动判定，
+// 避免 spinner 每帧都触发一次 scrollToBottom 造成抖动与空白。
+let spinnerActivityUntil = 0;
+let spinnerFollowTimer = 0;
+// 记录进入 spinner 期前用户是否在底部，供结束补滚判定。
+let wasAtBottomBeforeSpinner = false;
+function noteSpinnerActivity() {
+  // 从「非活跃」进入活跃时，记录此刻用户是否在底部，供结束补滚判定。
+  if (!isSpinnerActive()) {
+    wasAtBottomBeforeSpinner = !isUserScrolling && isAtBottom();
+  }
+  spinnerActivityUntil = Date.now() + 200;
+  // spinner 期间不滚；停顿 220ms 后若原本在底部且不在底部了，补一次 scrollToBottom，
+  // 把 spinner 推下去的内容拉回视口，避免「spinner 结束后停在中间」。
+  if (spinnerFollowTimer) clearTimeout(spinnerFollowTimer);
+  spinnerFollowTimer = setTimeout(() => {
+    spinnerFollowTimer = 0;
+    if (term && !isUserScrolling && wasAtBottomBeforeSpinner && !isAtBottom()) {
+      scrollTerminalToBottom();
+    }
+    wasAtBottomBeforeSpinner = false;
+  }, 220);
+}
+function isSpinnerActive() {
+  return Date.now() < spinnerActivityUntil;
+}
 
 // ========== 循环（自动继续）==========
 // 手机端只做 UI，实际配置存在桌面端，通过 API 读写
@@ -168,6 +214,13 @@ function shortenPath(p, maxLen = 30) {
 const CLI_TAG_COLORS = {
   'Claude全自动':  ['#e5a100', '#3d3010'],
   'Codex全自动':   ['#56d4a0', '#1a3d2e'],
+  'Devin全自动':   ['#7ec699', '#1e3328'],
+  'Kimi全自动':    ['#d19ae8', '#33204a'],
+  'Gemini全自动':  ['#99bbff', '#222d4a'],
+  'OpenCode':     ['#61afef', '#1e2e3d'],
+  'Qoder':        ['#e5c07b', '#3d3520'],
+  'Qoder全自动':  ['#d4a020', '#3d3520'],
+  'Kiro全自动':    ['#ff9e7a', '#4a2a1a'],
 };
 
 function getCliTagColors(name) {
@@ -332,9 +385,10 @@ async function showAutoContinueConfigModal(sessionId) {
   const msgs = Array.isArray(config.messages) ? config.messages : (config.message ? [config.message] : ['继续']);
   $('ac-message').value = msgs.join('\n');
   $('ac-interval').value = String(Math.round((config.intervalMs || 600000) / 60000));
+  $('ac-initial-delay').value = String(Math.round((config.initialDelayMs || 0) / 60000));
   $('ac-cmd-interval').value = String(Math.round((config.commandIntervalMs || 2000) / 1000));
   $('ac-send-delay').value = String(config.sendDelaySec ?? 2);
-  $('ac-max-duration').value = String(config.maxDurationMs ? Math.round(config.maxDurationMs / 60000) : 0);
+  $('ac-max-loops').value = String(config.maxLoops ?? -1);
   $('ac-auto-agree').checked = config.autoAgree !== false;
   $('ac-agree-delay').value = String(config.autoAgreeDelaySec ?? 5);
   $('ac-agree-delay-row').style.display = $('ac-auto-agree').checked ? '' : 'none';
@@ -360,21 +414,101 @@ function updateDetailAutoContinueUI(config) {
   }
 }
 
-// 判断终端是否滚动到底部附近（容差 2 行）
+// 用户只要离开最后一行就视为正在回看，避免新输出抢走阅读位置。
 function isAtBottom() {
   if (!term) return true;
   const buf = term.buffer.active;
-  return buf.viewportY >= buf.baseY - 2;
+  return terminalScrollHelpers.isAtBottom(buf.viewportY, buf.baseY);
 }
 
 function markUserScrolling() {
+  if (!term) return;
+  terminalScrollInteractionRevision++;
   isUserScrolling = !isAtBottom();
-  if (userScrollReleaseTimer) clearTimeout(userScrollReleaseTimer);
-  userScrollReleaseTimer = setTimeout(() => {
-    if (term && isAtBottom()) {
-      isUserScrolling = false;
+  if (!isUserScrolling) setTerminalUnreadOutput(false);
+}
+
+function ensureTerminalScrollButton() {
+  const container = $('terminal-container');
+  if (!container || container.querySelector('#terminal-scroll-bottom-btn')) return;
+  const button = document.createElement('button');
+  button.id = 'terminal-scroll-bottom-btn';
+  button.type = 'button';
+  button.hidden = true;
+  button.title = '跳到最新输出';
+  button.setAttribute('aria-label', '跳到最新输出');
+  button.textContent = '↓';
+  button.addEventListener('click', scrollTerminalToBottom);
+  container.appendChild(button);
+}
+
+function setTerminalUnreadOutput(hasUnread) {
+  const button = $('terminal-scroll-bottom-btn');
+  if (button) button.hidden = !hasUnread;
+}
+
+let scrollToBottomRaf = 0;
+function scrollTerminalToBottom() {
+  if (!term) return;
+  isUserScrolling = false;
+  resetScrollAccum();
+  setTerminalUnreadOutput(false);
+  if (isAtBottom()) return;
+  // 高频输出时 writeTerminalOutput 每次 write 回调都可能调到这里。
+  // xterm v6 的 scrollToBottom 是平滑动画，多次叠加会在动画过程中把 viewport
+  // 反复拉到底，渲染出中间空白帧（屏幕表现为「滚出很多空白」）。
+  // 用 rAF 把同一帧内的多次调用合并成一次。
+  if (scrollToBottomRaf) return;
+  scrollToBottomRaf = requestAnimationFrame(() => {
+    scrollToBottomRaf = 0;
+    if (!term) return;
+    if (isAtBottom()) return;
+    // 200ms 足以覆盖一次平滑滚动；过长会让 onScroll 长时间被当成程序化滚动，
+    // 吞掉用户真实触摸滚动。
+    programmaticScrollUntil = Date.now() + 200;
+    term.scrollToBottom();
+  });
+}
+
+function resetTerminalScrollState() {
+  isUserScrolling = false;
+  terminalTouchActive = false;
+  terminalScrollInteractionRevision = 0;
+  terminalOutputWriteCount = 0;
+  programmaticScrollUntil = 0;
+  spinnerActivityUntil = 0;
+  wasAtBottomBeforeSpinner = false;
+  if (spinnerFollowTimer) { clearTimeout(spinnerFollowTimer); spinnerFollowTimer = 0; }
+  if (scrollToBottomRaf) {
+    cancelAnimationFrame(scrollToBottomRaf);
+    scrollToBottomRaf = 0;
+  }
+  resetScrollAccum();
+  setTerminalUnreadOutput(false);
+}
+
+function writeTerminalOutput(data, wasAtBottom = isAtBottom()) {
+  if (!term) return;
+  const activeTerm = term;
+  const startInteraction = terminalScrollInteractionRevision;
+  terminalOutputWriteCount++;
+  activeTerm.write(data, () => {
+    if (term !== activeTerm) return;
+    terminalOutputWriteCount = Math.max(0, terminalOutputWriteCount - 1);
+    // spinner 高频期暂停滚动判定：spinner 每秒 10+ 帧 \r 覆盖，逐帧 scrollToBottom
+    // 会让 xterm 平滑动画叠加成抖动 + 空白。期间只写不滚，等带 \n 的真实输出恢复跟随。
+    if (isSpinnerActive()) return;
+    if (terminalScrollHelpers.shouldFollowOutput(
+      wasAtBottom,
+      terminalTouchActive,
+      startInteraction,
+      terminalScrollInteractionRevision,
+    )) {
+      scrollTerminalToBottom();
+    } else if (!isAtBottom()) {
+      setTerminalUnreadOutput(true);
     }
-  }, 800);
+  });
 }
 
 // 触摸滚动：本版 xterm 用 SmoothScrollableElement（虚拟滚动条），
@@ -396,8 +530,9 @@ function scrollTerminalByPixels(deltaY) {
   _scrollAccum -= lines * rh;
   const before = term.buffer.active.viewportY;
   term.scrollLines(lines);
-  markUserScrolling();
-  return term.buffer.active.viewportY !== before;
+  const moved = term.buffer.active.viewportY !== before;
+  if (moved) markUserScrolling();
+  return moved;
 }
 
 let terminalResizeObserver = null;
@@ -1059,13 +1194,27 @@ function openFilePreview(requestedPath) {
   const title = $('file-preview-title');
   const meta = $('file-preview-meta');
   const content = $('file-preview-content');
+  const mediaBox = $('file-preview-media');
   if (!title || !meta || !content) return;
 
-  title.textContent = requestedPath.split('/').pop() || requestedPath;
+  const baseName = requestedPath.split('/').pop() || requestedPath;
+  title.textContent = baseName;
   meta.textContent = '正在读取…';
   content.textContent = '';
+  content.style.display = '';
+  if (mediaBox) mediaBox.innerHTML = '';
   showPage('file-preview-page');
 
+  // 媒体文件：用 <img>/<video>/<audio>/<iframe> 直接加载（src 带 token）
+  const mediaKind = globalThis.DuoFilePreviewHelpers?.getMediaKind?.(requestedPath);
+  if (mediaKind) {
+    const mediaUrl = `${API}/api/sessions/${encodeURIComponent(currentSessionId)}/media?path=${encodeURIComponent(requestedPath)}&token=${encodeURIComponent(token)}`;
+    meta.textContent = requestedPath;
+    renderMediaPreview(mediaKind, mediaUrl, baseName, requestedPath);
+    return;
+  }
+
+  // 文本文件：走原逻辑
   api(`/api/sessions/${encodeURIComponent(currentSessionId)}/file-preview?path=${encodeURIComponent(requestedPath)}`)
     .then((data) => {
       if (!currentSessionId) return;
@@ -1077,6 +1226,58 @@ function openFilePreview(requestedPath) {
       showPage('detail-page');
       showCopyToast(error.message || '文件预览失败');
     });
+}
+
+// 按媒体类型渲染预览元素到 #file-preview-media
+function renderMediaPreview(kind, mediaUrl, name, fullPath) {
+  const mediaBox = $('file-preview-media');
+  const content = $('file-preview-content');
+  if (!mediaBox) return;
+  mediaBox.innerHTML = '';
+  content.style.display = 'none';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'media-preview-wrap';
+
+  if (kind === 'image') {
+    const img = document.createElement('img');
+    img.src = mediaUrl;
+    img.alt = name;
+    img.className = 'media-img';
+    img.onerror = () => {
+      mediaBox.innerHTML = `<div class="media-error">⚠️ 图片加载失败：${escapeHtml(name)}</div>`;
+    };
+    wrap.appendChild(img);
+  } else if (kind === 'video') {
+    const video = document.createElement('video');
+    video.src = mediaUrl;
+    video.controls = true;
+    video.playsInline = true;
+    video.preload = 'metadata';
+    video.className = 'media-video';
+    video.onerror = () => {
+      mediaBox.innerHTML = `<div class="media-error">⚠️ 视频加载失败：${escapeHtml(name)}<br><span class="media-error-hint">mov 等格式浏览器可能不支持，建议在桌面端查看</span></div>`;
+    };
+    wrap.appendChild(video);
+  } else if (kind === 'audio') {
+    const audio = document.createElement('audio');
+    audio.src = mediaUrl;
+    audio.controls = true;
+    audio.preload = 'metadata';
+    audio.className = 'media-audio';
+    wrap.appendChild(audio);
+    const hint = document.createElement('div');
+    hint.className = 'media-audio-name';
+    hint.textContent = name;
+    wrap.appendChild(hint);
+  } else if (kind === 'pdf') {
+    const iframe = document.createElement('iframe');
+    iframe.src = mediaUrl;
+    iframe.className = 'media-pdf';
+    wrap.appendChild(iframe);
+  }
+
+  mediaBox.appendChild(wrap);
 }
 
 function registerMobileFileLinks() {
@@ -1196,6 +1397,7 @@ function createTerminal() {
   // 显示 loading
   if (loading) loading.classList.remove('hidden');
   term.open(container);
+  ensureTerminalScrollButton();
   registerMobileFileLinks();
 
   // 终端键盘输入 → WebSocket
@@ -1225,15 +1427,31 @@ function createTerminal() {
       // xterm 的 canvas 会遮住内部 viewport，直接依赖浏览器滚动在手机上不稳定。
       // 在容器捕获阶段把手势交给 xterm 的公开滚动 API。
       term.onScroll(() => {
-        markUserScrolling();
+        // 输出写入也会触发 xterm 的 scroll 事件，不能误判为用户回看。
+        // xterm v6 平滑滚动期间 onScroll 会异步多次触发，落在时间戳窗口内即视为程序化滚动。
+        if (Date.now() < programmaticScrollUntil) {
+          isUserScrolling = false;
+          setTerminalUnreadOutput(false);
+          if (isAtBottom()) programmaticScrollUntil = 0;
+        } else if (terminalOutputWriteCount === 0) {
+          markUserScrolling();
+        } else if (isAtBottom()) {
+          isUserScrolling = false;
+          setTerminalUnreadOutput(false);
+        }
       });
 
       let touchLastY = 0;
       let touchActive = false;
       const onTouchStart = (e) => {
-        if (e.touches.length !== 1) { touchActive = false; return; }
+        if (e.touches.length !== 1) {
+          touchActive = false;
+          terminalTouchActive = false;
+          return;
+        }
         touchLastY = e.touches[0].clientY;
         touchActive = true;
+        terminalTouchActive = true;
         resetScrollAccum();
       };
       const onTouchMove = (e) => {
@@ -1241,14 +1459,19 @@ function createTerminal() {
         const currentY = e.touches[0].clientY;
         const deltaY = touchLastY - currentY;
         touchLastY = currentY;
-        if (deltaY === 0) return;
-        scrollTerminalByPixels(deltaY);
         // 页面本身不可滚动，始终拦截可避免浏览器在第一小段位移后接管手势。
         if (e.cancelable) e.preventDefault();
+        if (deltaY !== 0) scrollTerminalByPixels(deltaY);
       };
       const onTouchEnd = () => {
         touchActive = false;
-        if (term && isAtBottom()) isUserScrolling = false;
+        terminalTouchActive = false;
+        if (term && isAtBottom()) {
+          isUserScrolling = false;
+          setTerminalUnreadOutput(false);
+        } else if (term) {
+          isUserScrolling = true;
+        }
       };
 
       container.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
@@ -1317,13 +1540,11 @@ function createTerminal() {
 
 function handleResize() {
   if (!fitAddon || !term) return;
-  // fit() 会改变终端行列数，可能导致 viewport 意外跳到顶部。
-  // 记录 fit 前是否在底部，fit 后恢复。
-  const wasAtBottom = isAtBottom();
+  // fit() 改变 cols/rows 时，xterm 会保持视口相对位置，不需要手动 scrollToBottom。
+  // 旧版在 fit 后强制 scrollToBottom，会在输出期间与 ResizeObserver 形成自激循环：
+  // 输出 → xterm 内部 DOM 重排 → container 尺寸微变 → ResizeObserver → fit → scrollToBottom
+  // → 平滑动画期间又触发 onScroll → 反复滚到底，渲染出大片空白行。
   fitAddon.fit();
-  if (wasAtBottom) {
-    term.scrollToBottom();
-  }
   if (ws && ws.readyState === WebSocket.OPEN && term.cols > 0 && term.rows > 0) {
     wsSend({ type: 'resize', cols: term.cols, rows: term.rows });
   }
@@ -1342,6 +1563,7 @@ function closeTerminal() {
     terminalResizeFrame = null;
   }
   lastTerminalSize = '';
+  resetTerminalScrollState();
   closeWebSocket();
   // 重置 spinner 拦截状态
   resetSpinnerState();
@@ -1352,35 +1574,31 @@ function closeTerminal() {
   }
 }
 
-// ========== Spinner 拦截（手机窄屏优化） ==========
+// ========== Spinner 拦截（手机窄屏优化，通用 CLI 兼容） ==========
 
-// 手机端列数少（40-50），CLI spinner（如 ⠋⠙⠹ braille 动画或逐字变色）
-// 用 \r 覆盖同一行，但内容超宽 wrap 后 \r 无法清除上方残留行，导致重复多行。
-// 此模块在 term.write 前丢弃 spinner 帧，避免窄屏换行后留下重复文本。
+// 手机端列数少（40-50），各 CLI（Claude/Codex/Cursor/Qoder）的 spinner 用 \r
+// 反复覆盖同一行，但窄屏下内容超宽 wrap 后 \r 无法清除上方残留行 → 重复多行
+// → 视觉上「滚出空白屏」。
+//
+// 本模块调用 spinner-interceptor.js 的通用拦截器：按 \n 切段，对每段合并 \r 同行
+// 覆盖链（只保留最后一个有效 \r 之后的内容），含 \x1b[1A 等跨行定位码的段透传
+// 给 xterm 原生处理。与 CLI 品牌无关。
+//
+// 同时联动滚动：检测到 spinner 覆盖帧时进入高频节流期，期间暂停 scrollToBottom，
+// 避免 spinner 每帧都触发平滑动画叠加成抖动。
 
-const spinnerState = {
-  active: false,
-};
-
-/** 重置 spinner 拦截状态（退出 spinner 模式或关闭终端时调用） */
 function resetSpinnerState() {
-  spinnerState.active = false;
+  spinnerActivityUntil = 0;
 }
 
-/**
- * 核心：拦截处理 spinner 帧
- * 返回应写入 term 的数据；返回 null 表示丢弃该帧
- */
+/** 核心拦截：返回应写入 term 的数据；null 表示丢弃该帧 */
 function interceptSpinnerData(rawData) {
-  // 服务端会合并多个 PTY 分片，因此不能把整个 WebSocket 包按“有无换行”分类。
-  // 移除每段 CR 覆盖帧，保留正常 CRLF 行与其后的真实输出。
-  const filtered = rawData.replace(/\r(?!\n)[^\r\n]*/g, '');
-  if (filtered === rawData) {
-    if (spinnerState.active) resetSpinnerState();
-    return rawData;
+  const result = spinnerInterceptor.intercept(rawData);
+  // 检测到覆盖帧（被合并或仍含 \r 覆盖链）→ 标记 spinner 活跃期，暂停滚动判定。
+  if (result && spinnerInterceptor.looksLikeSpinnerFrame(rawData)) {
+    noteSpinnerActivity();
   }
-  spinnerState.active = true;
-  return filtered || null;
+  return result;
 }
 
 // ========== WebSocket ==========
@@ -1430,7 +1648,7 @@ function connectWebSocket(sessionId) {
   wsConnectTimeoutTimer = setTimeout(() => {
     if (!replayReceived && term) {
       hideTerminalLoading();
-      term.write('\r\n\x1b[33m⚠ 连接超时，正在重连...\x1b[0m\r\n');
+      writeTerminalOutput('\r\n\x1b[33m⚠ 连接超时，正在重连...\x1b[0m\r\n');
       showWeakNetworkPrompt('连接超时，正在重试');
     }
   }, profile.wsConnectTimeoutMs);
@@ -1452,14 +1670,11 @@ function connectWebSocket(sessionId) {
         console.log('[ws] replay received, data length=', (msg.data || '').length);
         // 先彻底清空，再写入 replay 内容，避免残留
         term.reset();
+        resetTerminalScrollState();
         if (msg.data) {
           // 有内容，隐藏 loading 并写入
           hideTerminalLoading();
-          term.write(msg.data, () => {
-            if (!isUserScrolling) {
-              term.scrollToBottom();
-            }
-          });
+          writeTerminalOutput(msg.data, true);
         } else {
           // replay 为空（新建会话，pty 刚启动）：也隐藏 loading，连接已成功
           hideTerminalLoading();
@@ -1485,14 +1700,7 @@ function connectWebSocket(sessionId) {
         }
 
         if (writeData !== null) {
-          const shouldStickToBottom = !isUserScrolling && isAtBottom();
-          term.write(writeData);
-          if (shouldStickToBottom) {
-            if (scrollToBottomTimer) clearTimeout(scrollToBottomTimer);
-            scrollToBottomTimer = setTimeout(() => {
-              term.scrollToBottom();
-            }, 50);
-          }
+          writeTerminalOutput(writeData, !isUserScrolling && isAtBottom());
         }
       }
     } catch {}
@@ -1627,6 +1835,87 @@ $('file-preview-back-btn').onclick = () => {
   });
 };
 
+// ========== 媒体浏览页 ==========
+function openMediaBrowse() {
+  if (!currentSessionId) return;
+  $('media-browse-title').textContent = '媒体';
+  const body = $('media-browse-body');
+  if (body) {
+    body.innerHTML = '<div class="media-browse-loading"><div class="loading-spinner"></div><span>加载中…</span></div>';
+  }
+  showPage('media-browse-page');
+  api(`/api/sessions/${encodeURIComponent(currentSessionId)}/media-list`)
+    .then((data) => {
+      if (!currentSessionId) return;
+      renderMediaBrowse(data.items || []);
+    })
+    .catch((err) => {
+      const b = $('media-browse-body');
+      if (b) b.innerHTML = `<div class="media-browse-empty">加载失败：${escapeHtml(err.message || String(err))}</div>`;
+    });
+}
+
+function renderMediaBrowse(items) {
+  const body = $('media-browse-body');
+  if (!body) return;
+  $('media-browse-title').textContent = `媒体 (${items.length})`;
+  if (!items.length) {
+    body.innerHTML = '<div class="media-browse-empty">当前工作目录没有可预览的媒体文件</div>';
+    return;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'media-grid';
+  const KIND_ICON = { image: '🖼️', video: '🎬', audio: '🎵', pdf: '📄' };
+  items.forEach((item) => {
+    const cell = document.createElement('div');
+    cell.className = 'media-cell';
+    const isImg = item.kind === 'image';
+    // 图片：直接用 media 接口做缩略图（带小尺寸参数会更快，但本期复用原图，浏览器自适应缩放）
+    const mediaUrl = `${API}/api/sessions/${encodeURIComponent(currentSessionId)}/media?path=${encodeURIComponent(item.path)}&token=${encodeURIComponent(token)}`;
+    if (isImg) {
+      const img = document.createElement('img');
+      img.src = mediaUrl;
+      img.loading = 'lazy';
+      img.alt = item.name;
+      img.className = 'media-thumb';
+      cell.appendChild(img);
+    } else {
+      const ic = document.createElement('div');
+      ic.className = 'media-thumb-icon';
+      ic.textContent = KIND_ICON[item.kind] || '📎';
+      cell.appendChild(ic);
+    }
+    const name = document.createElement('div');
+    name.className = 'media-cell-name';
+    name.textContent = item.name;
+    cell.appendChild(name);
+    const size = document.createElement('div');
+    size.className = 'media-cell-size';
+    size.textContent = formatSize(item.size);
+    cell.appendChild(size);
+    cell.onclick = () => openFilePreview(item.path);
+    grid.appendChild(cell);
+  });
+  body.innerHTML = '';
+  body.appendChild(grid);
+}
+
+$('media-browse-back-btn').onclick = () => {
+  showPage('detail-page');
+  requestAnimationFrame(() => {
+    handleResize();
+    scheduleRepaint();
+  });
+};
+
+$('media-browse-refresh-btn').onclick = () => {
+  openMediaBrowse();
+};
+
+$('detail-media-btn').onclick = () => {
+  openMediaBrowse();
+};
+
 // 催工：点击标签直接弹配置弹窗
 $('detail-ac-label').onclick = () => {
   if (!currentSessionId) return;
@@ -1664,18 +1953,22 @@ $('ac-save').onclick = async () => {
   if (!msgs.length) { $('ac-message').focus(); return; }
   const intervalMinutes = parseInt($('ac-interval').value, 10);
   if (isNaN(intervalMinutes) || intervalMinutes < 1) { $('ac-interval').focus(); return; }
+  const initialDelayMinutes = parseInt($('ac-initial-delay').value || '0', 10);
+  if (isNaN(initialDelayMinutes) || initialDelayMinutes < 0) { $('ac-initial-delay').focus(); return; }
   const agreeDelay = parseInt($('ac-agree-delay').value, 10);
   const cmdIntervalSec = parseInt($('ac-cmd-interval')?.value || '2', 10);
   const sendDelaySec = parseInt($('ac-send-delay')?.value || '2', 10);
-  const maxDurationMinutes = parseInt($('ac-max-duration')?.value || '0', 10);
+  const maxLoops = parseInt($('ac-max-loops')?.value || '-1', 10);
+  if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { $('ac-max-loops').focus(); return; }
 
   const config = {
     enabled: true,
     messages: msgs,
     intervalMs: intervalMinutes * 60000,
+    initialDelayMs: initialDelayMinutes * 60000,
     commandIntervalMs: (isNaN(cmdIntervalSec) || cmdIntervalSec < 0 ? 2 : cmdIntervalSec) * 1000,
     sendDelaySec: isNaN(sendDelaySec) || sendDelaySec < 0 ? 2 : sendDelaySec,
-    maxDurationMs: isNaN(maxDurationMinutes) || maxDurationMinutes < 0 ? 0 : maxDurationMinutes * 60000,
+    maxLoops,
     autoAgree: $('ac-auto-agree').checked,
     autoAgreeDelaySec: isNaN(agreeDelay) ? 5 : agreeDelay,
   };
@@ -1716,7 +2009,7 @@ setInterval(() => {
         }).catch(() => {});
       }
     }
-    if (term) term.scrollToBottom();
+    scrollTerminalToBottom();
   } else if (val) {
     pendingText = val;
   } else {
@@ -1748,7 +2041,7 @@ function sendMessage() {
     // 空消息只发回车
     wsSendHex('0d');
   }
-  if (term) term.scrollToBottom();
+  scrollTerminalToBottom();
 }
 
 // 发送 hex 编码的原始字节（用于回车、控制字符等）
@@ -1837,7 +2130,7 @@ function renderQuickCommands() {
           body: JSON.stringify({ input: cmd }),
         }).catch(() => showCopyToast('发送失败'));
       }
-      if (term) term.scrollToBottom();
+      scrollTerminalToBottom();
     };
     // 长按 → 删除
     let longTimer = null;
@@ -1901,7 +2194,7 @@ $('file-input').onchange = async (e) => {
       const data = await res.json();
       if (data.ok) {
         // 在终端显示上传成功提示
-        if (term) term.write(`\r\n\x1b[32m✓ 已上传: ${file.name} (${formatSize(data.size)})\x1b[0m\r\n`);
+        writeTerminalOutput(`\r\n\x1b[32m✓ 已上传: ${file.name} (${formatSize(data.size)})\x1b[0m\r\n`);
         // 把文件路径填入输入框，方便用户直接发送给 AI
         if (data.path) {
           const input = $('msg-input');
@@ -1909,10 +2202,10 @@ $('file-input').onchange = async (e) => {
           input.value = prev ? prev + ' ' + data.path : data.path;
         }
       } else {
-        if (term) term.write(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${data.error}\x1b[0m\r\n`);
+        writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${data.error}\x1b[0m\r\n`);
       }
     } catch (err) {
-      if (term) term.write(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${err.message}\x1b[0m\r\n`);
+      writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${err.message}\x1b[0m\r\n`);
     }
   }
 
@@ -1927,8 +2220,8 @@ function formatSize(bytes) {
 }
 
 document.querySelectorAll('.key-btn').forEach(btn => {
-  btn.addEventListener('touchstart', (e) => { e.preventDefault(); }, { passive: false });
-  btn.addEventListener('touchend', (e) => {
+  // 用 click 统一处理桌面和移动端，辅以 touch-action: manipulation 消除 300ms 延迟
+  btn.addEventListener('click', (e) => {
     e.preventDefault();
     if (!currentSessionId) return;
     const key = btn.dataset.key;
@@ -1964,6 +2257,12 @@ const BUILTIN_OPTIONS = [
   { value: '', label: '纯终端 (shell)' },
   { value: 'claude --dangerously-skip-permissions', label: 'Claude 全自动' },
   { value: 'codex -c sandbox_mode="danger-full-access" -c approval="never" -c network="enabled"', label: 'Codex 全自动' },
+  { value: 'devin --permission-mode bypass', label: 'Devin 全自动' },
+  { value: 'kimi --auto', label: 'Kimi 全自动' },
+  { value: 'gemini --yolo', label: 'Gemini 全自动' },
+  { value: 'qoder chat --dangerously-skip-permissions', label: 'Qoder 全自动' },
+  { value: 'opencode', label: 'OpenCode' },
+  { value: 'kiro-cli chat --trust-all-tools', label: 'Kiro 全自动' },
 ];
 
 let customPresetNextId = 1;

@@ -4,12 +4,27 @@ const assert = require('node:assert/strict');
 const {
   isPreviewableFileName,
   findFilePathMatches,
+  getMediaKind,
 } = require('./file-preview-helpers.js');
 
 test('preview helper accepts common text files case-insensitively', () => {
   assert.equal(isPreviewableFileName('README.MD'), true);
   assert.equal(isPreviewableFileName('logs/build.LOG'), true);
-  assert.equal(isPreviewableFileName('video.mp4'), false);
+  // mp4 现在作为媒体文件可预览
+  assert.equal(isPreviewableFileName('video.mp4'), true);
+  // 无扩展名或非可预览扩展名仍为 false
+  assert.equal(isPreviewableFileName('Makefile'), false);
+  assert.equal(isPreviewableFileName('archive.zip'), false);
+});
+
+test('media kind detection', () => {
+  assert.equal(getMediaKind('a/b.mp4'), 'video');
+  assert.equal(getMediaKind('photo.JPG'), 'image');
+  assert.equal(getMediaKind('clip.mov'), 'video');
+  assert.equal(getMediaKind('song.mp3'), 'audio');
+  assert.equal(getMediaKind('doc.pdf'), 'pdf');
+  assert.equal(getMediaKind('README.md'), null); // 文本，非媒体
+  assert.equal(getMediaKind('archive.zip'), null);
 });
 
 test('preview helper finds relative and absolute paths without trailing punctuation', () => {

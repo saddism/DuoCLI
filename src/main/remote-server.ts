@@ -77,6 +77,10 @@ function getCliProvider(presetCommand: string): string | null {
     return 'OpenCode';
   }
 
+  if (presetCommand.startsWith('qoder')) {
+    return 'Qoder';
+  }
+
   if (presetCommand.startsWith('devin')) {
     return 'Devin';
   }
@@ -554,6 +558,141 @@ export function startRemoteServer(
       });
     } catch (e: any) {
       res.status(404).json({ error: '文件读取失败: ' + (e.message || e) });
+    }
+  });
+
+  // ========== 手机端媒体文件预览（图片/视频/音频/PDF，流式 + Range） ==========
+  // 媒体扩展名 → { mime, kind }；kind 供前端分流渲染（image/video/audio/pdf）
+  const MEDIA_EXT_MAP: Record<string, { mime: string; kind: string }> = {
+    // 图片
+    '.jpg': { mime: 'image/jpeg', kind: 'image' },
+    '.jpeg': { mime: 'image/jpeg', kind: 'image' },
+    '.png': { mime: 'image/png', kind: 'image' },
+    '.gif': { mime: 'image/gif', kind: 'image' },
+    '.webp': { mime: 'image/webp', kind: 'image' },
+    '.bmp': { mime: 'image/bmp', kind: 'image' },
+    '.svg': { mime: 'image/svg+xml', kind: 'image' },
+    '.avif': { mime: 'image/avif', kind: 'image' },
+    '.heic': { mime: 'image/heic', kind: 'image' },   // 原生不可显示，下面转 JPEG
+    '.heif': { mime: 'image/heif', kind: 'image' },
+    // 视频
+    '.mp4': { mime: 'video/mp4', kind: 'video' },
+    '.m4v': { mime: 'video/mp4', kind: 'video' },
+    '.mov': { mime: 'video/quicktime', kind: 'video' },
+    '.webm': { mime: 'video/webm', kind: 'video' },
+    // 音频
+    '.mp3': { mime: 'audio/mpeg', kind: 'audio' },
+    '.m4a': { mime: 'audio/mp4', kind: 'audio' },
+    '.aac': { mime: 'audio/aac', kind: 'audio' },
+    '.wav': { mime: 'audio/wav', kind: 'audio' },
+    '.ogg': { mime: 'audio/ogg', kind: 'audio' },
+    '.flac': { mime: 'audio/flac', kind: 'audio' },
+    // 文档
+    '.pdf': { mime: 'application/pdf', kind: 'pdf' },
+  };
+  const MEDIA_EXTS = new Set(Object.keys(MEDIA_EXT_MAP));
+
+  function getMediaMeta(filePath: string) {
+    const ext = path.extname(filePath).toLowerCase();
+    return MEDIA_EXT_MAP[ext] || null;
+  }
+
+  // 列出会话 cwd 内的媒体文件（非递归，避免扫到大目录树）
+  app.get('/api/sessions/:id/media-list', (req, res) => {
+    const session = ptyManager.getSession(req.params.id);
+    if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
+    try {
+      const cwdReal = fs.realpathSync(session.cwd);
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(cwdReal, { withFileTypes: true }); }
+      catch (e: any) {
+        res.status(500).json({ error: '读取目录失败: ' + (e.message || e) }); return;
+      }
+      const items: Array<{ name: string; path: string; kind: string; mime: string; size: number; mtime: number }> = [];
+      for (const ent of entries) {
+        if (!ent.isFile()) continue;
+        const ext = path.extname(ent.name).toLowerCase();
+        if (!MEDIA_EXTS.has(ext)) continue;
+        const meta = MEDIA_EXT_MAP[ext];
+        const full = path.join(cwdReal, ent.name);
+        let stat: fs.Stats;
+        try { stat = fs.statSync(full); } catch { continue; }
+        items.push({
+          name: ent.name,
+          path: full,
+          kind: meta.kind,
+          mime: meta.mime,
+          size: stat.size,
+          mtime: stat.mtimeMs,
+        });
+      }
+      items.sort((a, b) => b.mtime - a.mtime); // 新文件在前
+      res.json({ items });
+    } catch (e: any) {
+      res.status(500).json({ error: '列出媒体失败: ' + (e.message || e) });
+    }
+  });
+
+  // 媒体文件流式输出，支持 HTTP Range（视频拖动进度条）
+  app.get('/api/sessions/:id/media', (req, res) => {
+    const session = ptyManager.getSession(req.params.id);
+    if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
+    const resolved = resolvePreviewPath(session.cwd, String(req.query.path || ''));
+    if (!resolved) { res.status(400).json({ error: '路径不在工作目录内' }); return; }
+    const meta = getMediaMeta(resolved.filePath);
+    if (!meta) { res.status(400).json({ error: '不支持的媒体类型' }); return; }
+
+    try {
+      const stat = fs.statSync(resolved.filePath);
+      if (!stat.isFile()) { res.status(400).json({ error: '目标不是文件' }); return; }
+
+      // HEIC/HEIF 浏览器原生不可显示，转 JPEG 后整体返回（不支持分片）
+      if (path.extname(resolved.filePath).toLowerCase() === '.heic' ||
+          path.extname(resolved.filePath).toLowerCase() === '.heif') {
+        sharp(resolved.filePath)
+          .jpeg({ quality: 88 })
+          .toBuffer()
+          .then((buf) => {
+            res.setHeader('Content-Type', 'image/jpeg');
+            res.setHeader('Content-Length', String(buf.length));
+            res.setHeader('Cache-Control', 'private, max-age=300');
+            res.end(buf);
+          })
+          .catch((e: any) => {
+            res.status(500).json({ error: 'HEIC 转码失败: ' + (e.message || e) });
+          });
+        return;
+      }
+
+      const total = stat.size;
+      const range = req.headers.range;
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Content-Type', meta.mime);
+      res.setHeader('Cache-Control', 'private, max-age=300');
+
+      if (!range) {
+        // 整文件
+        res.setHeader('Content-Length', String(total));
+        fs.createReadStream(resolved.filePath).pipe(res);
+        return;
+      }
+
+      // 解析 bytes=start-end
+      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      if (!m) { res.status(416).json({ error: 'Range 无效' }); return; }
+      let start = m[1] ? parseInt(m[1], 10) : 0;
+      let end = m[2] ? parseInt(m[2], 10) : total - 1;
+      if (isNaN(start) || isNaN(end)) { res.status(416).json({ error: 'Range 无效' }); return; }
+      if (start < 0 || start >= total) { res.status(416).json({ error: 'Range 越界' }); return; }
+      if (end >= total) end = total - 1;
+      if (end < start) { res.status(416).json({ error: 'Range 无效' }); return; }
+      const chunkSize = end - start + 1;
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', String(chunkSize));
+      fs.createReadStream(resolved.filePath, { start, end }).pipe(res);
+    } catch (e: any) {
+      res.status(500).json({ error: '媒体读取失败: ' + (e.message || e) });
     }
   });
 

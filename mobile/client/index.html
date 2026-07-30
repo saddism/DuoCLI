@@ -54,6 +54,7 @@
         <span id="detail-status" class="status-dot"></span>
       </div>
       <span id="detail-ac-label" class="ac-label">催</span>
+      <button id="detail-media-btn" class="icon-btn" title="浏览媒体文件">🎬</button>
       <button id="delete-btn" class="icon-btn danger" title="终止会话">✕</button>
     </header>
 
@@ -99,8 +100,19 @@
     </header>
     <main id="file-preview-body">
       <div id="file-preview-meta"></div>
+      <div id="file-preview-media"></div>
       <pre id="file-preview-content"></pre>
     </main>
+  </div>
+
+  <!-- 媒体浏览页 -->
+  <div id="media-browse-page" class="page">
+    <header id="media-browse-header">
+      <button id="media-browse-back-btn" class="icon-btn" title="返回终端">←</button>
+      <div id="media-browse-title">媒体</div>
+      <button id="media-browse-refresh-btn" class="icon-btn" title="刷新">🔄</button>
+    </header>
+    <main id="media-browse-body"></main>
   </div>
 
   <!-- Chat 详情页 -->
@@ -170,12 +182,14 @@
       <textarea id="ac-message" rows="3" placeholder="每行一条命令，按顺序发送"></textarea>
       <label>循环间隔（分钟）</label>
       <input type="number" id="ac-interval" min="1" placeholder="分钟" />
+      <label>首次循环延迟（分钟）</label>
+      <input type="number" id="ac-initial-delay" min="0" value="0" placeholder="分钟（0=立即）" />
       <label>命令间隔（秒）</label>
       <input type="number" id="ac-cmd-interval" min="0" value="2" placeholder="秒" />
       <label>发送延迟（秒）</label>
       <input type="number" id="ac-send-delay" min="0" value="2" placeholder="秒" />
-      <label>最大持续时间（分钟）</label>
-      <input type="number" id="ac-max-duration" min="0" value="0" placeholder="0 表示不限制" />
+      <label>最大循环次数</label>
+      <input type="number" id="ac-max-loops" min="-1" value="-1" placeholder="-1 表示不限制，1 表示一次" />
       <div style="margin-top: 14px;">
         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0;">
           <input type="checkbox" id="ac-auto-agree" checked style="width: auto;" />
@@ -259,6 +273,8 @@
   <script src="addon-unicode11.js"></script>
   <script src="chat-helpers.js"></script>
   <script src="file-preview-helpers.js"></script>
+  <script src="terminal-scroll-helpers.js"></script>
+  <script src="spinner-interceptor.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
