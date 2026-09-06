@@ -156,6 +156,18 @@ const THEME_DOTS: Record<string, string> = {
   'nord': '#88c0d0',
 };
 
+function openTerminalExternalUrl(url: string): void {
+  const trimmed = String(url || '').trim();
+  if (!/^https?:\/\//i.test(trimmed)) return;
+  void (window as any).duocli?.openUrl?.(trimmed);
+}
+
+const TERMINAL_LINK_HANDLER = {
+  activate(_event: MouseEvent, text: string) {
+    openTerminalExternalUrl(text);
+  },
+};
+
 // 文件路径链接检测器
 class FilePathLinkProvider implements ILinkProvider {
   private onClickCallback: (resolvedPath: string) => void;
@@ -186,7 +198,7 @@ class FilePathLinkProvider implements ILinkProvider {
             end: { x: range.end.cell + 1, y: range.end.line + 1 },
           },
           text: match.display,
-          activate: () => { (window as any).duocli?.openUrl?.(match.url); },
+          activate: () => { openTerminalExternalUrl(match.url); },
         });
       } else {
         let resolved = match.filePath;
@@ -380,6 +392,7 @@ export class TerminalManager {
       cursorBlink: true,
       allowProposedApi: true,
       scrollback: 10000,
+      linkHandler: TERMINAL_LINK_HANDLER,
     });
 
     const fitAddon = new FitAddon();
@@ -393,6 +406,19 @@ export class TerminalManager {
     terminal.open(container);
     terminal.onData((data) => onData(data));
     attachCursorKeyBindings(terminal, container, onData);
+
+    // 兜底：拦截 xterm 内部可能生成的 <a> 点击，避免在 Electron 窗口内导航
+    container.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const anchor = target.closest('a[href]');
+      if (!(anchor instanceof HTMLAnchorElement)) return;
+      const href = anchor.getAttribute('href') || '';
+      if (!/^https?:\/\//i.test(href)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      openTerminalExternalUrl(href);
+    }, true);
 
     // 注册文件路径链接检测
     const linkProvider = new FilePathLinkProvider(

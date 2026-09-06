@@ -67,13 +67,13 @@ jobs:
             artifacts/mac/*.dmg
             artifacts/win/*.exe
           body: |
-            ## DuoCLI — 在手机上用 Claude Code
+            ## DuoCLI — 轻量级 AI CLI 多终端管理器
 
-            手机电脑实时同步的 AI 编程终端。连上同一个 WiFi，手机和电脑共享同一个终端会话，双向实时同步。
+            轻量级支持 Claude Code、Codex、Zcode、Kimi、Antigravity、Cursor 等 10+ 主流 CLI 编程工具。支持手机远程开发、手机远程操控，局域网与互联网连接。
 
             **亮点功能：**
-            - 📱 手机电脑实时同步 — 手机上打的字电脑上实时出现，反过来也一样
-            - 🔄 多终端并行管理 — 同时跑 Claude Code、Codex、Gemini、Kimi
+            - 📱 手机远程开发与操控 — 共享电脑端同一会话，双向实时同步
+            - 🔄 多终端并行管理 — Claude Code、Codex、Zcode、Kimi、Antigravity、Cursor 等
             - 📸 Git 快照与回滚 — AI 改代码前自动快照，一键撤销
             - 🤖 AI 智能标题 — 自动识别终端内容生成标题
             - 🔔 Web Push 通知 — AI 跑完任务手机推送提醒

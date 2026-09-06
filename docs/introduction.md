@@ -4,7 +4,7 @@
 
 ## 一句话
 
-DuoCLI 是一个面向 AI 编程时代的多终端管理器：你在电脑端运行的同一个终端会话，可以在手机端实时查看和输入。
+DuoCLI 是轻量级 AI CLI 多终端管理器：支持 Claude Code、Codex、Zcode、Kimi、Antigravity、Cursor 等 10+ 主流 CLI 编程工具，手机远程开发、远程操控，局域网与互联网连接。
 
 ## 最新能力
 

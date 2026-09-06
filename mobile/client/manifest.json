@@ -1,7 +1,7 @@
 {
   "name": "DuoCLI",
   "short_name": "DuoCLI",
-  "description": "远程终端控制",
+  "description": "轻量级多 CLI 手机远程开发与操控，支持局域网与互联网连接",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#1a1a2e",

@@ -411,6 +411,28 @@ function restartRemoteAccessServer(): void {
   );
 }
 
+function openExternalHttpUrl(url: string): boolean {
+  try {
+    const parsed = new URL(String(url || '').trim());
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    void shell.openExternal(parsed.toString());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function attachExternalLinkHandlers(win: BrowserWindow): void {
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    openExternalHttpUrl(url);
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (event, url) => {
+    if (url === win.webContents.getURL()) return;
+    if (openExternalHttpUrl(url)) event.preventDefault();
+  });
+}
+
 function loadAppIcon(): Electron.NativeImage | undefined {
   // macOS 打包后用 .icns，开发模式用 .png
   const candidates = [
@@ -445,6 +467,7 @@ function createWindow(appIcon?: Electron.NativeImage): void {
   });
 
   mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
+  attachExternalLinkHandlers(mainWindow);
 
   mainWindow.webContents.on('before-input-event', (event, input) => {
     if (input.type === 'keyDown' && (input.meta || input.control) && input.key.toLowerCase() === 'w') {
@@ -1140,10 +1163,8 @@ function registerIPC(): void {
     shell.openPath(filePath);
   });
 
-  // 打开外部链接
-  ipcMain.handle('shell:open-url', (_e, url: string) => {
-    shell.openExternal(url);
-  });
+  // 打开外部链接（系统默认浏览器）
+  ipcMain.handle('shell:open-url', (_e, url: string) => openExternalHttpUrl(url));
 
   // ========== AI 配置 IPC ==========
 
