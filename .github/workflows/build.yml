@@ -11,6 +11,9 @@ permissions:
 jobs:
   build-mac:
     runs-on: macos-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      DUOCLI_SCRCPY_VERSION: '4.1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,6 +24,14 @@ jobs:
           python-version: '3.11'
       - run: pip install setuptools
       - run: npm install
+      - name: Prepare scrcpy server
+        shell: bash
+        run: |
+          mkdir -p vendor
+          curl --fail --location --retry 3 --silent --show-error \
+            https://github.com/Genymobile/scrcpy/releases/download/v4.1/scrcpy-server-v4.1 \
+            --output vendor/scrcpy-server
+          node -e "const fs=require('node:fs'),crypto=require('node:crypto');const expected='deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae';const actual=crypto.createHash('sha256').update(fs.readFileSync('vendor/scrcpy-server')).digest('hex');if(actual!==expected){console.error('scrcpy-server SHA-256 mismatch');process.exit(1)}"
       - run: npm run build:ts
       - run: npm run copy:html
       - run: npx electron-builder --mac --publish never
@@ -31,6 +42,9 @@ jobs:
 
   build-win:
     runs-on: windows-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      DUOCLI_SCRCPY_VERSION: '4.1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -41,6 +55,14 @@ jobs:
           python-version: '3.11'
       - run: pip install setuptools
       - run: npm install
+      - name: Prepare scrcpy server
+        shell: bash
+        run: |
+          mkdir -p vendor
+          curl --fail --location --retry 3 --silent --show-error \
+            https://github.com/Genymobile/scrcpy/releases/download/v4.1/scrcpy-server-v4.1 \
+            --output vendor/scrcpy-server
+          node -e "const fs=require('node:fs'),crypto=require('node:crypto');const expected='deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae';const actual=crypto.createHash('sha256').update(fs.readFileSync('vendor/scrcpy-server')).digest('hex');if(actual!==expected){console.error('scrcpy-server SHA-256 mismatch');process.exit(1)}"
       - run: npm run build:ts
       - run: npm run copy:html
       - run: npx electron-builder --win --publish never
