@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing tag to build and attach the release to'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -85,6 +91,7 @@ jobs:
           path: artifacts/win
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           files: |
             artifacts/mac/*.dmg
             artifacts/win/*.exe
