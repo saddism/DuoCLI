@@ -418,6 +418,7 @@ export function startRemoteServer(
     perMessageDeflate: false,
   });
   const wsClients = new Map<string, Set<WebSocket>>();
+  ptyManager.setRemoteSubscriberCheck((id) => (wsClients.get(id)?.size ?? 0) > 0);
   type RemoteWsChunk = { data: string; sequence: number };
   type RemoteWsState = {
     id: string;
@@ -573,7 +574,10 @@ export function startRemoteServer(
           // 订阅先同步回放 rawBuffer，保证手机端立刻收到 replay 并停止重连。
           const session = ptyManager.getSession(data.sessionId);
           if (session && !session.closing) {
-            sendRawReplay(ws, state, session);
+            // Once a mobile client owns the PTY geometry, reconnecting that
+            // client should restore the acknowledged mobile size as well.
+            // A desktop-owned session still lets the browser fit locally.
+            sendRawReplay(ws, state, session, session.sizeOwner === 'mobile');
           } else if (ws.readyState === WebSocket.OPEN) {
             void enqueueWsSend(ws, state, JSON.stringify({ type: 'replay', data: '', cols: 80, rows: 24, sequence: 0 })).then(() => {
               if (remoteStates.get(ws) === state) {
@@ -626,7 +630,16 @@ export function startRemoteServer(
 
     ws.on('close', () => {
       remoteStates.delete(ws);
-      if (subscribedSession) wsClients.get(subscribedSession)?.delete(ws);
+      if (subscribedSession) {
+        wsClients.get(subscribedSession)?.delete(ws);
+        if ((wsClients.get(subscribedSession)?.size ?? 0) === 0) {
+          const session = ptyManager.getSession(subscribedSession);
+          const desktop = session?.sizeBySource.desktop;
+          if (session && desktop && session.sizeOwner === 'mobile') {
+            ptyManager.resize(subscribedSession, desktop.cols, desktop.rows, 'desktop', true);
+          }
+        }
+      }
     });
   });
 

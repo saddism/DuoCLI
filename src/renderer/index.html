@@ -255,7 +255,7 @@
         </button>
         <button class="sidebar-tab" data-tab="ai-config">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-          <span>智能 AI</span>
+          <span>AI 配置</span>
         </button>
       </div>
 
@@ -267,6 +267,10 @@
       <!-- AI 配置 Tab -->
       <div id="tab-ai-config" class="tab-content">
         <div id="ai-config-form">
+          <div class="ai-config-description">
+            <strong>AI 用途</strong>
+            <span>用于整理会话历史，并根据你发送给终端的内容自动生成对话标题；不参与终端命令执行。</span>
+          </div>
           <div class="ai-form-group">
             <label class="ai-form-label">API 格式</label>
             <select id="ai-format-select" class="ai-form-input">

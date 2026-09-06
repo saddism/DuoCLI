@@ -212,6 +212,7 @@ export class PtyManager {
   private events: PtyManagerEvents;
   private getTitleAIConfig?: TitleAIConfigProvider;
   private getTerminalAutoResponseConfig?: TerminalAutoResponseConfigProvider;
+  private remoteSubscriberCheck: ((id: string) => boolean) | null = null;
 
   constructor(
     events: PtyManagerEvents,
@@ -221,6 +222,11 @@ export class PtyManager {
     this.events = events;
     this.getTitleAIConfig = getTitleAIConfig;
     this.getTerminalAutoResponseConfig = getTerminalAutoResponseConfig;
+  }
+
+  /** 远程浏览器订阅某会话时，桌面 pane 尺寸不应再驱动共享 PTY。 */
+  setRemoteSubscriberCheck(check: (id: string) => boolean): void {
+    this.remoteSubscriberCheck = check;
   }
 
   create(cwd: string, presetCommand: string, themeId: string, envOverrides?: Record<string, string>): PtySession {
@@ -566,6 +572,11 @@ export class PtyManager {
     if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 2 || rows < 1 || cols > 1000 || rows > 1000) return;
 
     session.sizeBySource[source] = { cols, rows };
+
+    // 浏览器端已订阅时，桌面分屏只影响本地 xterm 显示，不改共享 PTY 几何。
+    if (source === 'desktop' && this.remoteSubscriberCheck?.(id)) {
+      return;
+    }
 
     // 另一端正在使用时不抢尺寸：每次 resize 都会让 TUI 重绘并在滚动区留下残帧。
     // force 用于手机端刚打开会话的首次 resize，属于显式接管。

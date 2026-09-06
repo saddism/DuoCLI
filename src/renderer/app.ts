@@ -1027,7 +1027,7 @@ const paneWorkspaceRoot = document.getElementById('pane-workspace')!;
 const terminalContent = document.getElementById('terminal-content')!;
 const emptyState = document.getElementById('empty-state')!;
 const sessionList = document.getElementById('session-list')!;
-const sidebar = document.getElementById('sidebar')!;;
+const sidebar = document.getElementById('sidebar')!;
 const sidebarToggle = document.getElementById('sidebar-toggle')!;
 const sidebarResizer = document.getElementById('sidebar-resizer')!;
 
@@ -1601,6 +1601,50 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
   void loadDevices();
 }
 
+// ========== CLI 标签颜色 ==========
+
+// 已知 CLI → 固定颜色（文字色, 背景色）
+const CLI_TAG_COLORS: Record<string, [string, string]> = {
+  'Claude':       ['#d4a574', '#3d2e1e'],
+  'Claude全自动':  ['#e5a100', '#3d3010'],
+  'Codex':        ['#73c991', '#1e3328'],
+  'Codex全自动':   ['#56d4a0', '#1a3d2e'],
+  'Kimi':         ['#c678dd', '#2e1e3d'],
+  'Kimi全自动':    ['#d19ae8', '#33204a'],
+  'Gemini':       ['#82aaff', '#1e2540'],
+  'Gemini全自动':  ['#99bbff', '#222d4a'],
+  'OpenCode':     ['#61afef', '#1e2e3d'],
+  'Qoder':        ['#e5c07b', '#3d3520'],
+  'Qoder全自动':   ['#d4a020', '#3d3520'],
+  'QoderCN':      ['#e5c07b', '#3d3520'],
+  'QoderCN全自动': ['#d4a020', '#3d3520'],
+  'Cursor':       ['#56b6c2', '#1e3338'],
+  'Cursor全自动':  ['#56b6c2', '#1e3338'],
+  '反重力':       ['#c792ea', '#2e1e3d'],
+  '反重力全自动':  ['#c792ea', '#2e1e3d'],
+  'Kiro':         ['#f78c6c', '#3d2518'],
+  'Kiro全自动':    ['#ff9e7a', '#4a2a1a'],
+};
+
+function getCliTagColors(displayName: string): [string, string] {
+  // 精确匹配
+  if (CLI_TAG_COLORS[displayName]) return CLI_TAG_COLORS[displayName];
+  // 前缀匹配（自定义预设的"全自动"变体）
+  for (const key of Object.keys(CLI_TAG_COLORS)) {
+    if (displayName.startsWith(key)) return CLI_TAG_COLORS[key];
+  }
+  // 未知 CLI：用 hash 从色板中选一个
+  let h = 0;
+  for (let i = 0; i < displayName.length; i++) {
+    h = ((h << 5) - h + displayName.charCodeAt(i)) | 0;
+  }
+  const palette: Array<[string, string]> = [
+    ['#e06c75', '#3d1e22'], ['#e5c07b', '#3d3520'], ['#98c379', '#253320'],
+    ['#f78c6c', '#3d2518'], ['#c792ea', '#2e1e3d'], ['#ff5370', '#3d1825'],
+  ];
+  return palette[Math.abs(h) % palette.length];
+}
+
 paneWorkspace = new PaneWorkspace(paneWorkspaceRoot, currentCwd, {
   onContentMount: mountPaneContent,
   onContentUnmount: unmountPaneContent,
@@ -1610,7 +1654,7 @@ paneWorkspace = new PaneWorkspace(paneWorkspaceRoot, currentCwd, {
     const count = countPanes(layout.root);
     const isEmptyLayout = layout.root.type === 'pane' && layout.root.content.kind === 'empty';
     paneLayoutToolbar.hidden = count < 2;
-    paneLayoutSummary.textContent = `${count} 个窗口`;
+    paneLayoutSummary.textContent = `${count} 个可见分屏`;
     // Keep the existing welcome card as the single-pane insertion state. Once
     // real content exists, the pane workspace owns the entire terminal area.
     paneWorkspaceRoot.style.display = isEmptyLayout ? 'none' : '';
@@ -1699,50 +1743,6 @@ document.addEventListener('click', () => {
 // 启动时恢复保存的配色
 setThemeValue(currentThemeId);
 
-// ========== CLI 标签颜色 ==========
-
-// 已知 CLI → 固定颜色（文字色, 背景色）
-const CLI_TAG_COLORS: Record<string, [string, string]> = {
-  'Claude':       ['#d4a574', '#3d2e1e'],
-  'Claude全自动':  ['#e5a100', '#3d3010'],
-  'Codex':        ['#73c991', '#1e3328'],
-  'Codex全自动':   ['#56d4a0', '#1a3d2e'],
-  'Kimi':         ['#c678dd', '#2e1e3d'],
-  'Kimi全自动':    ['#d19ae8', '#33204a'],
-  'Gemini':       ['#82aaff', '#1e2540'],
-  'Gemini全自动':  ['#99bbff', '#222d4a'],
-  'OpenCode':     ['#61afef', '#1e2e3d'],
-  'Qoder':        ['#e5c07b', '#3d3520'],
-  'Qoder全自动':   ['#d4a020', '#3d3520'],
-  'QoderCN':      ['#e5c07b', '#3d3520'],
-  'QoderCN全自动': ['#d4a020', '#3d3520'],
-  'Cursor':       ['#56b6c2', '#1e3338'],
-  'Cursor全自动':  ['#56b6c2', '#1e3338'],
-  '反重力':       ['#c792ea', '#2e1e3d'],
-  '反重力全自动':  ['#c792ea', '#2e1e3d'],
-  'Kiro':         ['#f78c6c', '#3d2518'],
-  'Kiro全自动':    ['#ff9e7a', '#4a2a1a'],
-};
-
-function getCliTagColors(displayName: string): [string, string] {
-  // 精确匹配
-  if (CLI_TAG_COLORS[displayName]) return CLI_TAG_COLORS[displayName];
-  // 前缀匹配（自定义预设的"全自动"变体）
-  for (const key of Object.keys(CLI_TAG_COLORS)) {
-    if (displayName.startsWith(key)) return CLI_TAG_COLORS[key];
-  }
-  // 未知 CLI：用 hash 从色板中选一个
-  let h = 0;
-  for (let i = 0; i < displayName.length; i++) {
-    h = ((h << 5) - h + displayName.charCodeAt(i)) | 0;
-  }
-  const palette: Array<[string, string]> = [
-    ['#e06c75', '#3d1e22'], ['#e5c07b', '#3d3520'], ['#98c379', '#253320'],
-    ['#f78c6c', '#3d2518'], ['#c792ea', '#2e1e3d'], ['#ff5370', '#3d1825'],
-  ];
-  return palette[Math.abs(h) % palette.length];
-}
-
 function buildTerminalPaneContent(sessionId: string): Extract<PaneContent, { kind: 'terminal' }> {
   return {
     kind: 'terminal',
@@ -1750,6 +1750,18 @@ function buildTerminalPaneContent(sessionId: string): Extract<PaneContent, { kin
     label: sessionTitles.get(sessionId) || '终端',
     agentLabel: sessionDisplayNames.get(sessionId) || '',
   };
+}
+
+/**
+ * 普通会话切换像标签页一样复用当前焦点 Pane；只有 Pane 上的拆分按钮
+ * 才会增加可见分屏。这样活动会话数量不受可见分屏上限影响。
+ */
+function showTerminalSession(sessionId: string): void {
+  if (paneWorkspace.focusContent('terminal', sessionId)) return;
+  paneWorkspace.replaceContent(
+    paneWorkspace.getFocusedPaneId(),
+    buildTerminalPaneContent(sessionId),
+  );
 }
 
 function syncTerminalPaneHeaders(): void {
@@ -2687,8 +2699,7 @@ async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
     syncPaneLiveSessions();
     termManager.create(result.id, result.themeId, cwd, (data) => { writePtyWithAutoReset(result.id, data); });
     paneWorkspace.setWorkspace(result.cwd || cwd);
-    paneWorkspace.openContent(buildTerminalPaneContent(result.id));
-    paneWorkspace.focusContent('terminal', result.id);
+    showTerminalSession(result.id);
     termManager.followSession(result.id);
     updatePaneAccents();
 
@@ -2750,7 +2761,7 @@ async function createSession(): Promise<boolean> {
   // 初始化终端
   termManager.create(result.id, result.themeId, currentCwd, (data) => { writePtyWithAutoReset(result.id, data); });
   paneWorkspace.setWorkspace(currentCwd);
-  paneWorkspace.openContent(buildTerminalPaneContent(result.id));
+  showTerminalSession(result.id);
   updatePaneAccents();
   updateEmptyState();
   renderSessionList();
@@ -2768,8 +2779,7 @@ function switchSession(id: string): void {
   const cwd = sessionCwds.get(id) || currentCwd;
   if (cwd) paneWorkspace.setWorkspace(cwd);
   const prev = getActiveSessionId();
-  const content = buildTerminalPaneContent(id);
-  if (!paneWorkspace.focusContent('terminal', id)) paneWorkspace.openContent(content);
+  showTerminalSession(id);
 
   // 用户切换到该会话 → 清除所有状态指示灯（黄/绿→灰）
   const hadUnread = sessionUnread.delete(id);
@@ -3056,6 +3066,8 @@ function syncPanelTogglePositions(): void {
     fileTreeToggle.style.left = `${left}px`;
   }
 
+  sidebarToggle.style.top = '';
+  sidebarToggle.style.bottom = '8px';
   if (sidebarCollapsed) {
     sidebarToggle.style.right = '10px';
   } else {
@@ -3470,7 +3482,7 @@ window.duocli.onRemoteCreated((info) => {
   // 创建 xterm 实例（桌面端也能看到和操作）
   termManager.create(info.id, info.themeId, info.cwd, (data) => { writePtyWithAutoReset(info.id, data); });
   if (normalizeCwd(paneWorkspace.getWorkspaceKey()) === normalizeCwd(info.cwd || currentCwd)) {
-    paneWorkspace.openContent(buildTerminalPaneContent(info.id));
+    showTerminalSession(info.id);
   }
   updateEmptyState();
   renderSessionList();

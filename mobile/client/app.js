@@ -721,7 +721,12 @@ function restoreTerminalSnapshot(msg) {
     const revision = terminalScrollInteractionRevision;
     terminalOutputWriteCount++;
     activeTerm.reset();
-    if (Number.isInteger(msg.cols) && Number.isInteger(msg.rows) && msg.cols >= 2 && msg.rows > 0) {
+    // A resize-triggered snapshot is the acknowledgement of this browser's
+    // requested PTY geometry. Initial/reconnect replays may contain the
+    // desktop pane size, so only apply dimensions when the server marks the
+    // snapshot as preserving the remote viewport.
+    if (msg.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
+        && msg.cols >= 2 && msg.rows > 0) {
       activeTerm.resize(msg.cols, msg.rows);
     }
     activeTerm.write(msg.data || '', () => {
@@ -737,22 +742,46 @@ function restoreTerminalSnapshot(msg) {
           if (recreateViewport != null) pendingRecreateViewport = null;
         }
         scheduleMobileLinkHighlights();
+        if (msg.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
+            && msg.cols >= 2 && msg.rows > 0) {
+          // The replay confirms the remote viewport we just requested. Keep
+          // that geometry while the terminal parses the snapshot; fitting
+          // here would immediately undo the acknowledgement on narrow views.
+          lastSentCols = msg.cols;
+          lastSentRows = msg.rows;
+        } else {
+          syncTerminalToViewport();
+        }
       }
       resolve();
     });
   }));
 }
 
-// 空 replay 也携带了服务端当前的行列数。新会话还没有输出时不能调用
-// restoreTerminalSnapshot（那会清掉本地已经收到的内容），但仍要先同步几何，
-// 否则不同终端在首次 resize 后会一直用旧列数解析后续 ANSI 换行。
+// replay 里的 cols/rows 来自桌面 pane，不能用来驱动浏览器 xterm。
+// 浏览器始终按自身 viewport fit，再通过 resize 消息声明 PTY 尺寸。
+function syncTerminalToViewport() {
+  if (!fitAddon || !term) return;
+  try { fitAddon.fit(); } catch {}
+  handleResize();
+}
+
 function applyTerminalSnapshotGeometry(msg) {
-  if (!term) return;
-  if (Number.isInteger(msg?.cols) && Number.isInteger(msg?.rows)
-      && msg.cols >= 2 && msg.rows > 0
+  if (msg?.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
+      && msg.cols >= 2 && msg.rows > 0 && term
       && (term.cols !== msg.cols || term.rows !== msg.rows)) {
     term.resize(msg.cols, msg.rows);
+    lastSentCols = msg.cols;
+    lastSentRows = msg.rows;
+    return;
   }
+  if (msg?.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
+      && msg.cols >= 2 && msg.rows > 0) {
+    lastSentCols = msg.cols;
+    lastSentRows = msg.rows;
+    return;
+  }
+  syncTerminalToViewport();
 }
 
 // 触摸滚动：本版 xterm 用 SmoothScrollableElement（虚拟滚动条），

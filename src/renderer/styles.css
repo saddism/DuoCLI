@@ -82,7 +82,9 @@
 }
 
 #sidebar-toggle {
-  right: 241px;
+  top: auto;
+  bottom: 8px;
+  z-index: 25;
 }
 
 /* 拖拽条 */
@@ -2220,6 +2222,23 @@ html, body {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.ai-config-description {
+  padding: 10px 11px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.ai-config-description strong {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--text-primary);
+  font-size: 12px;
 }
 
 .ai-form-group {

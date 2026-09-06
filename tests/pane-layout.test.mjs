@@ -87,3 +87,24 @@ test('tiled layout gives three panes a full-width lower row', () => {
   assert.equal(tiled.root.first.direction, 'horizontal');
   assert.equal(tiled.root.second.type, 'pane');
 });
+
+test('replacing a focused pane keeps normal sessions independent of the four-pane limit', () => {
+  let workspace = layout.createEmptyLayout();
+  const firstId = workspace.root.id;
+  workspace = layout.setPaneContent(workspace, firstId, { kind: 'terminal', sessionId: 'one' });
+  workspace = layout.splitPane(workspace, firstId, 'vertical', { kind: 'terminal', sessionId: 'two' }, 'split-1', 'pane-two');
+  workspace = layout.splitPane(workspace, 'pane-two', 'vertical', { kind: 'terminal', sessionId: 'three' }, 'split-2', 'pane-three');
+  workspace = layout.arrangeTiled(workspace);
+  workspace = layout.splitPane(workspace, 'pane-three', 'horizontal', { kind: 'terminal', sessionId: 'four' }, 'split-3', 'pane-four');
+  workspace = layout.arrangeTiled(workspace);
+
+  const switched = layout.setPaneContent(workspace, workspace.focusedPaneId, {
+    kind: 'terminal',
+    sessionId: 'five',
+  });
+
+  assert.equal(layout.countPanes(switched.root), 4);
+  assert.deepEqual(layout.listPanes(switched.root).map((pane) => pane.content.kind === 'terminal' ? pane.content.sessionId : ''),
+    ['one', 'two', 'three', 'five']);
+  assert.ok(layout.validateLayout(switched));
+});

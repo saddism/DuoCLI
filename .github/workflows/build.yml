@@ -67,19 +67,27 @@ jobs:
             artifacts/mac/*.dmg
             artifacts/win/*.exe
           body: |
-            ## DuoCLI — 轻量级 AI CLI 多终端管理器
+            ## DuoCLI v1.2.1 — 一个窗口，随手管理常用的 AI CLI
 
-            轻量级支持 Claude Code、Codex、Zcode、Kimi、Antigravity、Cursor 等 10+ 主流 CLI 编程工具。支持手机远程开发、手机远程操控，局域网与互联网连接。
+            **不在多个终端窗口之间找 AI。** DuoCLI 把 Claude Code、Codex、Gemini、Kimi、Cursor、Kiro、QoderCN、OpenCode、Antigravity 等常用 CLI 放进一个轻量桌面工作区。
 
-            **亮点功能：**
-            - 📱 手机远程开发与操控 — 共享电脑端同一会话，双向实时同步
-            - 🔄 多终端并行管理 — Claude Code、Codex、Zcode、Kimi、Antigravity、Cursor 等
-            - 📸 Git 快照与回滚 — AI 改代码前自动快照，一键撤销
-            - 🤖 AI 智能标题 — 自动识别终端内容生成标题
-            - 🔔 Web Push 通知 — AI 跑完任务手机推送提醒
+            **这次更新：**
+            - 普通会话不再受 4 个可见分屏限制，想开几个开几个
+            - 会话切换像切换标签一样简单；只有点击拆分按钮才增加可见分屏
+            - 保留最多 4 个清晰分屏，重要任务可以并行对照
+            - 修复旧 Pane 布局导致启动中断、无法新建终端的问题
+            - AI 配置用途更清楚：整理会话历史、生成对话标题，不参与终端命令执行
+
+            **DuoCLI 的核心体验：**
+            - 🧭 一个侧边栏管理多个 CLI 和多个工作目录
+            - 🎨 标题、颜色、运行状态一眼区分
+            - 📱 手机远程查看和操控桌面端终端
+            - 🔄 关闭会话后可从列表恢复
 
             **安装说明：**
 
-            **macOS 用户：** 下载 .dmg 文件，打开后拖入 Applications。首次打开如提示"无法验证开发者"，右键点击应用 → 打开 即可。
+            **macOS 用户：** 下载 `.dmg` 文件，打开后拖入 Applications。首次打开如提示“无法验证开发者”，右键点击应用 → 打开即可。
 
-            **Windows 用户：** 下载 .exe 安装包，双击安装。如弹出 SmartScreen 警告，点击"更多信息" → "仍要运行"。
+            **Windows 用户：** 下载 `.exe` 安装包，双击安装。如弹出 SmartScreen 警告，点击“更多信息” → “仍要运行”。
+
+            完整更新说明：[v1.2.1 Release Notes](https://github.com/saddism/DuoCLI/blob/main/docs/updates/v1.2.1-release-notes.md)
