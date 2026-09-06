@@ -2,12 +2,19 @@ import { app, BrowserWindow, ipcMain, dialog, clipboard, nativeImage, shell, glo
 import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
-import { PtyManager, getDisplayName, rotateDevinInstallationId } from './pty-manager';
+import { PtyManager, getDisplayName } from './pty-manager';
 import { AIConfigManager } from './ai-config';
 import { startRemoteServer, pushRawDataToRemote, sendRemotePush, addRemoteRecentCwd } from './remote-server';
 import { CloudflaredManager } from './cloudflared-manager';
-import { ChatSessionManager } from './chat-session-manager';
-import { WindsurfProxyManager } from './windsurf-proxy-manager';
+import { RemoteSyncHealth, RemoteSyncMonitor } from './remote-sync-monitor';
+import {
+  DEFAULT_TERMINAL_AUTO_RESPONSE_CONFIG,
+  normalizeTerminalAutoResponseConfig,
+  TerminalAutoResponseConfig,
+} from './terminal-auto-response';
+import { getAvailableBuiltinPresets } from './cli-detect';
+import { buildResumeCommand, evaluateRestoreProgress, identifyCli, isResumeCommandCompatible, ResumeCapture } from './session-resume';
+import { parseAndroidDevices, runAdb } from './android-devices';
 
 // macOS: 设置为普通应用模式，显示在 Dock 和 Command+Tab 切换器中
 if (process.platform === 'darwin') {
@@ -37,6 +44,20 @@ const IMESSAGE_SERVICE = ((process.env.DUOCLI_IMESSAGE_SERVICE || 'iMessage').tr
 
 const sessionOutputTail: Map<string, string> = new Map();
 
+const DESKTOP_PREVIEW_EXTENSIONS = new Set([
+  '.md', '.markdown', '.txt', '.log', '.json', '.jsonl', '.yaml', '.yml', '.toml',
+  '.xml', '.csv', '.tsv', '.ini', '.conf', '.config', '.properties',
+  '.js', '.jsx', '.ts', '.tsx', '.vue', '.css', '.scss', '.less', '.html', '.htm',
+  '.py', '.pyw', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.cc', '.cpp', '.h',
+  '.hpp', '.sh', '.bash', '.zsh', '.fish', '.sql', '.nvue', '.wxml', '.wxss',
+]);
+const DESKTOP_MEDIA_TYPES: Record<string, string> = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+  '.pdf': 'application/pdf',
+};
+const DESKTOP_MAX_PREVIEW_BYTES = 2 * 1024 * 1024;
+
 // ========== 已关闭会话持久化 ==========
 interface ClosedSession {
   id: string;
@@ -47,82 +68,105 @@ interface ClosedSession {
   resumeCommand: string;
   displayName: string;
   closedAt: number;
+  cli?: string;
+  resumeSource?: ResumeCapture['source'];
+  state?: 'closed' | 'restoring';
+  restoreStartedAt?: number;
 }
 const CLOSED_SESSIONS_FILE = path.join(app.getPath('userData'), 'closed-sessions.json');
 const MAX_CLOSED_SESSIONS = 20;
 
-function loadClosedSessions(): ClosedSession[] {
+function loadClosedSessions(options?: { resetRestoring?: boolean }): ClosedSession[] {
   try {
     const raw = fs.readFileSync(CLOSED_SESSIONS_FILE, 'utf-8');
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Migrate records written by older DuoCLI versions whose resume command
+    // was blank (or relied on the invalid generic “preset --resume” fallback).
+    return parsed.map((value: any) => {
+      const session = value as ClosedSession;
+      if (session.resumeId && (!isResumeCommandCompatible(session.presetCommand || '', session.resumeCommand || '') || (session.resumeCommand || '').includes('undefined') || /[\r\n]/.test(session.resumeCommand || ''))) {
+        const command = buildResumeCommand(session.presetCommand || '', session.resumeId);
+        // Unknown CLIs are intentionally left non-restorable rather than
+        // carrying forward the old generic “preset --resume” guess.
+        session.resumeCommand = command;
+      }
+      session.cli = session.cli || identifyCli(session.presetCommand || '');
+      if (options?.resetRestoring) {
+        // Only on app startup: clear stale restoring flags from a crashed run.
+        session.state = 'closed';
+        delete session.restoreStartedAt;
+      } else {
+        session.state = session.state || 'closed';
+      }
+      return session;
+    }).filter((session: ClosedSession) => !!session.resumeId);
   } catch { return []; }
+}
+
+function resetStaleClosedSessionRestores(): void {
+  const list = loadClosedSessions({ resetRestoring: true });
+  saveClosedSessions(list);
 }
 
 function saveClosedSessions(sessions: ClosedSession[]): ClosedSession[] {
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   const filtered = sessions.filter(s => s.closedAt > cutoff).slice(-MAX_CLOSED_SESSIONS);
-  fs.writeFileSync(CLOSED_SESSIONS_FILE, JSON.stringify(filtered, null, 2));
+  const serialized = JSON.stringify(filtered, null, 2);
+  try {
+    fs.mkdirSync(path.dirname(CLOSED_SESSIONS_FILE), { recursive: true });
+    const temp = `${CLOSED_SESSIONS_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, serialized);
+    fs.renameSync(temp, CLOSED_SESSIONS_FILE);
+  } catch {
+    // Keep the old direct-write fallback for unusual read-only/userData setups.
+    try { fs.writeFileSync(CLOSED_SESSIONS_FILE, serialized); } catch { /* ignore */ }
+  }
   return filtered;
 }
 
-function addClosedSession(session: { title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string }): void {
+function addClosedSession(session: { title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; resumeSource?: ResumeCapture['source'] }): void {
   const list = loadClosedSessions();
-  list.push({
-    id: `closed-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+  const cli = identifyCli(session.presetCommand);
+  const duplicateIndex = list.findIndex(item => item.resumeId === session.resumeId && (item.cli || identifyCli(item.presetCommand)) === cli);
+  const entry: ClosedSession = {
+    id: duplicateIndex >= 0 ? list[duplicateIndex].id : `closed-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     title: session.title,
     cwd: session.cwd,
     presetCommand: session.presetCommand,
     resumeId: session.resumeId,
-    resumeCommand: session.resumeCommand,
+    resumeCommand: session.resumeCommand || buildResumeCommand(session.presetCommand, session.resumeId),
     displayName: getDisplayName(session.presetCommand),
     closedAt: Date.now(),
-  });
+    cli,
+    resumeSource: session.resumeSource,
+    state: 'closed',
+  };
+  if (duplicateIndex >= 0) list[duplicateIndex] = entry;
+  else list.push(entry);
   const saved = saveClosedSessions(list);
   safeSend('closed-sessions:update', saved);
 }
 
-// ========== 已关闭 Chat 会话持久化 ==========
-interface ClosedChatSession {
-  id: string;
-  title: string;
-  model: string;
-  workspace: string;
-  messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string; timestamp: number }>;
-  closedAt: number;
-}
-const CLOSED_CHAT_SESSIONS_FILE = path.join(app.getPath('userData'), 'closed-chat-sessions.json');
-const MAX_CLOSED_CHAT_SESSIONS = 20;
-
-function loadClosedChatSessions(): ClosedChatSession[] {
-  try {
-    const raw = fs.readFileSync(CLOSED_CHAT_SESSIONS_FILE, 'utf-8');
-    return JSON.parse(raw);
-  } catch { return []; }
-}
-
-function saveClosedChatSessions(sessions: ClosedChatSession[]): ClosedChatSession[] {
-  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  const filtered = sessions.filter(s => s.closedAt > cutoff).slice(-MAX_CLOSED_CHAT_SESSIONS);
-  fs.writeFileSync(CLOSED_CHAT_SESSIONS_FILE, JSON.stringify(filtered, null, 2));
-  return filtered;
-}
-
-function addClosedChatSession(session: { title: string; model: string; workspace: string; messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string; timestamp: number }> }): void {
-  const list = loadClosedChatSessions();
-  list.push({
-    id: `closed-chat-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    title: session.title,
-    model: session.model,
-    workspace: session.workspace,
-    messages: session.messages,
-    closedAt: Date.now(),
-  });
-  const saved = saveClosedChatSessions(list);
-  safeSend('closed-chat-sessions:update', saved);
-}
-
 function getPreferencePath(): string {
   return path.join(app.getPath('userData'), 'ai-preference.json');
+}
+
+const TERMINAL_AUTO_RESPONSE_FILE = path.join(app.getPath('userData'), 'terminal-auto-response.json');
+let terminalAutoResponseConfig: TerminalAutoResponseConfig = loadTerminalAutoResponseConfig();
+
+function loadTerminalAutoResponseConfig(): TerminalAutoResponseConfig {
+  try {
+    return normalizeTerminalAutoResponseConfig(JSON.parse(fs.readFileSync(TERMINAL_AUTO_RESPONSE_FILE, 'utf-8')));
+  } catch {
+    return normalizeTerminalAutoResponseConfig(DEFAULT_TERMINAL_AUTO_RESPONSE_CONFIG);
+  }
+}
+
+function saveTerminalAutoResponseConfig(value: unknown): TerminalAutoResponseConfig {
+  terminalAutoResponseConfig = normalizeTerminalAutoResponseConfig(value);
+  fs.writeFileSync(TERMINAL_AUTO_RESPONSE_FILE, JSON.stringify(terminalAutoResponseConfig, null, 2));
+  return terminalAutoResponseConfig;
 }
 
 interface AiPreferenceData {
@@ -259,6 +303,10 @@ function getCliProvider(presetCommand: string): string | null {
     return 'OpenCode';
   }
 
+  if (presetCommand.startsWith('qoder')) {
+    return 'Qoder';
+  }
+
   if (presetCommand.startsWith('devin')) {
     return 'Devin';
   }
@@ -270,6 +318,10 @@ function getCliProvider(presetCommand: string): string | null {
   if (presetCommand.startsWith('agent') || presetCommand.includes('cursor')) {
     // Cursor agent
     return 'Cursor';
+  }
+
+  if (presetCommand.startsWith('agy')) {
+    return 'Antigravity';
   }
 
   // 默认返回空
@@ -294,9 +346,70 @@ let mainWindow: BrowserWindow | null = null;
 let ptyManager: PtyManager;
 const aiConfigManager = new AIConfigManager();
 let cloudflaredManager: CloudflaredManager | null = null;
-let chatSessionManager: ChatSessionManager | null = null;
-let windsurfProxyManager: WindsurfProxyManager | null = null;
 let cachedRemoteServerInfo: any = null;
+let remoteServer: ReturnType<typeof startRemoteServer> | null = null;
+let remoteSyncMonitor: RemoteSyncMonitor | null = null;
+let remoteServerRestarting = false;
+
+function publishRemoteServerInfo(
+  info: { lanUrl: string; token: string; port: number },
+  tunnel?: ReturnType<CloudflaredManager['getStatus']>,
+  health?: RemoteSyncHealth,
+): void {
+  const serverInfo = {
+    ...info,
+    publicUrl: tunnel?.url || undefined,
+    tunnel,
+    health,
+  };
+  cachedRemoteServerInfo = serverInfo;
+  safeSend('remote:server-info', serverInfo);
+  if (health) safeSend('remote:health-update', health);
+}
+
+function mergeRemoteHealthIntoCache(health: RemoteSyncHealth): void {
+  if (!cachedRemoteServerInfo || !cloudflaredManager) {
+    safeSend('remote:health-update', health);
+    return;
+  }
+  const tunnel = cloudflaredManager.getStatus();
+  cachedRemoteServerInfo = {
+    ...cachedRemoteServerInfo,
+    publicUrl: tunnel.url || undefined,
+    tunnel,
+    health,
+  };
+  safeSend('remote:health-update', health);
+  safeSend('remote:server-info', cachedRemoteServerInfo);
+}
+
+function onRemoteServerStarted(info: { lanUrl: string; token: string; port: number }): void {
+  remoteServerRestarting = false;
+  const tunnel = cloudflaredManager?.ensureRunning();
+  publishRemoteServerInfo(info, tunnel);
+  void remoteSyncMonitor?.getHealth().then((health) => {
+    publishRemoteServerInfo(info, cloudflaredManager?.getStatus() ?? tunnel, health);
+  });
+}
+
+function restartRemoteAccessServer(): void {
+  if (remoteServerRestarting) return;
+  remoteServerRestarting = true;
+  const resetTimer = setTimeout(() => {
+    remoteServerRestarting = false;
+  }, 15_000);
+  remoteServer?.close();
+  remoteServer = startRemoteServer(
+    ptyManager,
+    (sessionInfo) => safeSend('pty:remote-created', sessionInfo),
+    (id) => safeSend('pty:exit', id),
+    (info) => {
+      clearTimeout(resetTimer);
+      onRemoteServerStarted(info);
+    },
+    (session) => addClosedSession(session),
+  );
+}
 
 function loadAppIcon(): Electron.NativeImage | undefined {
   // macOS 打包后用 .icns，开发模式用 .png
@@ -334,7 +447,7 @@ function createWindow(appIcon?: Electron.NativeImage): void {
   mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'));
 
   mainWindow.webContents.on('before-input-event', (event, input) => {
-    if ((input.meta || input.control) && input.key.toLowerCase() === 'w') {
+    if (input.type === 'keyDown' && (input.meta || input.control) && input.key.toLowerCase() === 'w') {
       event.preventDefault();
       mainWindow?.webContents.send('app:close-current-session');
     }
@@ -454,8 +567,8 @@ function setupPtyManager(): void {
       safeSend('pty:data', id, data);
       maybeNotifyAttention(id, data);
     },
-    onRawData: (id, data) => {
-      pushRawDataToRemote(id, data);
+    onRawData: (id, data, sequence) => {
+      pushRawDataToRemote(id, data, sequence);
     },
     onTitleUpdate: (id, title) => {
       safeSend('pty:title-update', id, title);
@@ -473,6 +586,7 @@ function setupPtyManager(): void {
           presetCommand: session.presetCommand,
           resumeId: session.resumeId,
           resumeCommand: session.resumeCommand || '',
+          resumeSource: session.resumeSource || undefined,
         });
       }
 
@@ -493,10 +607,10 @@ function setupPtyManager(): void {
       sessionLastInputAt.set(id, Date.now());
       sessionArmedForNotify.add(id);
     },
-    onAutoSwitchStatus: (id, status, detail) => {
-      safeSend('pty:auto-switch-status', id, status, detail);
-    },
-  }, () => loadAiPreferenceData().manualConfig || null);
+  },
+  () => loadAiPreferenceData().manualConfig || null,
+  () => terminalAutoResponseConfig,
+  );
 }
 
 function registerIPC(): void {
@@ -536,6 +650,8 @@ function registerIPC(): void {
       cwd: session.cwd,
       displayName: getDisplayName(session.presetCommand),
       provider,
+      cli: session.cliKind,
+      resumeId: session.resumeId,
     };
   });
 
@@ -553,27 +669,39 @@ function registerIPC(): void {
   });
 
   // 销毁终端
-  ipcMain.on('pty:destroy', (_e, id: string) => {
-    // 兜底：从 buffer 提取 resume ID，保存到已关闭列表
-    ptyManager.captureResumeFromBuffer(id);
-    const session = ptyManager.getSession(id);
-    if (session?.resumeId) {
+  ipcMain.handle('pty:destroy', async (_e, id: string) => {
+    // Resolve provider metadata before kill. This is intentionally awaited so
+    // Devin/OpenCode/Kimi/Kiro registries cannot race the PTY teardown.
+    sessionUserClosed.add(id);
+    const beforeClose = ptyManager.getSession(id);
+    const capture = await ptyManager.close(id);
+    if (beforeClose?.resumeId) {
       addClosedSession({
-        title: session.title,
-        cwd: session.cwd,
-        presetCommand: session.presetCommand,
-        resumeId: session.resumeId,
-        resumeCommand: session.resumeCommand || '',
+        title: beforeClose.title,
+        cwd: beforeClose.cwd,
+        presetCommand: beforeClose.presetCommand,
+        resumeId: beforeClose.resumeId,
+        resumeCommand: beforeClose.resumeCommand || '',
+        resumeSource: beforeClose.resumeSource || undefined,
+      });
+    } else if (capture?.sessionId) {
+      // `close` normally leaves the session object available until destroy;
+      // retain a defensive branch for future PtyManager implementations.
+      addClosedSession({
+        title: '终端',
+        cwd: beforeClose?.cwd || os.homedir(),
+        presetCommand: beforeClose?.presetCommand || capture.cli,
+        resumeId: capture.sessionId,
+        resumeCommand: capture.resumeCommand,
+        resumeSource: capture.source,
       });
     }
-
-    sessionUserClosed.add(id);
-    ptyManager.destroy(id);
     sessionOutputTail.delete(id);
     sessionLastInputAt.delete(id);
     sessionArmedForNotify.delete(id);
     sessionLastNotifyAt.delete(id);
     sessionUserClosed.delete(id);
+    return !!capture || !!beforeClose?.resumeId;
   });
 
   // 重命名终端
@@ -594,11 +722,35 @@ function registerIPC(): void {
       themeId: s.themeId,
       cwd: s.cwd,
       displayName: getDisplayName(s.presetCommand),
+      cli: s.cliKind,
+      resumeId: s.resumeId,
     }));
   });
 
   // ========== 已关闭会话 IPC ==========
   ipcMain.handle('closed-sessions:list', () => loadClosedSessions());
+  ipcMain.handle('closed-sessions:begin-restore', (_e, closedId: string) => {
+    const restoreList = loadClosedSessions();
+    const closed = restoreList.find(item => item.id === closedId);
+    // Claim before creating a PTY so duplicate clicks cannot launch another
+    // provider process for the same closed record.
+    if (!closed || closed.state === 'restoring') return false;
+    closed.state = 'restoring';
+    closed.restoreStartedAt = Date.now();
+    const saved = saveClosedSessions(restoreList);
+    safeSend('closed-sessions:update', saved);
+    return saved.some(item => item.id === closedId && item.state === 'restoring');
+  });
+  ipcMain.handle('closed-sessions:cancel-restore', (_e, closedId: string) => {
+    const restoreList = loadClosedSessions();
+    const closed = restoreList.find(item => item.id === closedId);
+    if (!closed || closed.state !== 'restoring') return false;
+    closed.state = 'closed';
+    delete closed.restoreStartedAt;
+    const saved = saveClosedSessions(restoreList);
+    safeSend('closed-sessions:update', saved);
+    return true;
+  });
   ipcMain.handle('closed-sessions:remove', (_e, id: string) => {
     const sessions = loadClosedSessions().filter(s => s.id !== id);
     saveClosedSessions(sessions);
@@ -608,28 +760,42 @@ function registerIPC(): void {
     saveClosedSessions([]);
     return [];
   });
-
-  // ========== 已关闭 Chat 会话 IPC ==========
-  ipcMain.handle('closed-chat:list', () => loadClosedChatSessions());
-  ipcMain.handle('closed-chat:remove', (_e, id: string) => {
-    const sessions = loadClosedChatSessions().filter(s => s.id !== id);
-    const saved = saveClosedChatSessions(sessions);
-    return saved;
-  });
-  ipcMain.handle('closed-chat:clear', () => {
-    saveClosedChatSessions([]);
-    return [];
-  });
-  ipcMain.handle('chat:restore', (_e, closedId: string) => {
-    if (!chatSessionManager) return null;
-    const list = loadClosedChatSessions();
-    const closed = list.find(s => s.id === closedId);
-    if (!closed) return null;
-    const session = chatSessionManager.restore(closed.workspace, closed.model, closed.messages, closed.title);
-    // 从已关闭列表中移除
-    const remaining = list.filter(s => s.id !== closedId);
-    saveClosedChatSessions(remaining);
-    return { id: session.id, title: session.title, model: session.model, workspace: session.workspace, createdAt: session.createdAt };
+  ipcMain.handle('closed-sessions:confirm-restore', async (_e, closedId: string, sessionId: string) => {
+    const restoreList = loadClosedSessions();
+    const closed = restoreList.find(item => item.id === closedId);
+    if (!closed || closed.state !== 'restoring') return false;
+    const markRestoreFailed = (): void => {
+      const current = loadClosedSessions();
+      const remaining = current.map(item => item.id === closedId ? { ...item, state: 'closed' as const, restoreStartedAt: undefined } : item);
+      saveClosedSessions(remaining);
+      safeSend('closed-sessions:update', remaining);
+    };
+    const failRestore = (): false => {
+      // Keep the PTY alive so the user can read provider errors in the pane.
+      markRestoreFailed();
+      return false;
+    };
+    // Watch for an explicit provider error after the command echo. Do not treat
+    // “any output after 300ms” as success, and do not kill a slow CLI on timeout.
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const session = ptyManager.getSession(sessionId);
+      if (!session) {
+        markRestoreFailed();
+        return false;
+      }
+      if (session.resumeId && closed.resumeId && session.resumeId !== closed.resumeId) {
+        return failRestore();
+      }
+      const verdict = evaluateRestoreProgress(ptyManager.getLaunchStatus(sessionId), Date.now());
+      if (verdict === 'failure') return failRestore();
+      if (verdict === 'success') return true;
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+    }
+    // A live PTY is not proof that the provider accepted the resume command.
+    // Keep the closed record available for another attempt and leave the pane
+    // open so the user can inspect a slow or failed provider launch.
+    return failRestore();
   });
 
   // 选择工作目录
@@ -810,6 +976,114 @@ function registerIPC(): void {
     }
   });
 
+  // ========== 桌面 Pane 文件预览 IPC ==========
+  // 只允许读取当前 workspace 内的白名单文件，Renderer 不直接接触 fs。
+  ipcMain.handle('file-preview:read', (_e, cwd: string, requestedPath: string) => {
+    try {
+      const cwdReal = fs.realpathSync(String(cwd || ''));
+      const raw = String(requestedPath || '').trim().replace(/^['"`]|['"`]$/g, '');
+      if (!raw) return { ok: false, error: '未指定文件' };
+      const expanded = raw.startsWith('@/') || raw.startsWith('@')
+        ? path.join(cwdReal, raw.replace(/^@\/?/, ''))
+        : path.isAbsolute(raw) ? raw : path.resolve(cwdReal, raw);
+      const filePath = fs.realpathSync(expanded);
+      if (filePath !== cwdReal && !filePath.startsWith(cwdReal + path.sep)) {
+        return { ok: false, error: '文件不在工作目录内' };
+      }
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile()) return { ok: false, error: '目标不是文件' };
+      if (stat.size > DESKTOP_MAX_PREVIEW_BYTES) return { ok: false, error: '文件过大，无法预览' };
+      const ext = path.extname(filePath).toLowerCase();
+      const buffer = fs.readFileSync(filePath);
+      if (DESKTOP_MEDIA_TYPES[ext]) {
+        return {
+          ok: true,
+          kind: 'media',
+          mediaType: DESKTOP_MEDIA_TYPES[ext],
+          name: path.basename(filePath),
+          path: filePath,
+          dataUrl: `data:${DESKTOP_MEDIA_TYPES[ext]};base64,${buffer.toString('base64')}`,
+          size: stat.size,
+        };
+      }
+      const baseName = path.basename(filePath).toLowerCase();
+      if (baseName === '.env' || baseName.startsWith('.env.')) {
+        return { ok: false, error: '不支持预览环境变量文件' };
+      }
+      if (!DESKTOP_PREVIEW_EXTENSIONS.has(ext)) {
+        return { ok: false, error: '不支持的文件类型' };
+      }
+      if (buffer.includes(0)) return { ok: false, error: '该文件不是文本文件' };
+      return {
+        ok: true,
+        kind: 'text',
+        name: path.basename(filePath),
+        path: filePath,
+        content: buffer.toString('utf8'),
+        size: stat.size,
+      };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || '文件读取失败' };
+    }
+  });
+
+  // ========== 桌面 Pane Android IPC ==========
+  ipcMain.handle('android:list-devices', async () => {
+    try {
+      const output = await runAdb(['devices', '-l']);
+      return { ok: true, devices: parseAndroidDevices(output.toString('utf8')) };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || '获取设备失败', devices: [] };
+    }
+  });
+
+  ipcMain.handle('android:screenshot', async (_e, deviceId?: string) => {
+    try {
+      const args = deviceId ? ['-s', String(deviceId), 'exec-out', 'screencap', '-p'] : ['exec-out', 'screencap', '-p'];
+      const png = await runAdb(args, { maxBuffer: 8 * 1024 * 1024 });
+      return { ok: true, dataUrl: `data:image/png;base64,${png.toString('base64')}` };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || '截图失败' };
+    }
+  });
+
+  ipcMain.handle('android:tap', async (_e, deviceId: string, x: number, y: number) => {
+    try {
+      const px = Number(x);
+      const py = Number(y);
+      if (!deviceId || !Number.isFinite(px) || !Number.isFinite(py)) return { ok: false, error: '无效的点击坐标' };
+      await runAdb(['-s', String(deviceId), 'shell', 'input', 'tap', String(Math.round(px)), String(Math.round(py))]);
+      return { ok: true };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || '点击失败' };
+    }
+  });
+
+  ipcMain.handle('android:swipe', async (_e, deviceId: string, x1: number, y1: number, x2: number, y2: number, duration = 300) => {
+    try {
+      const points = [x1, y1, x2, y2].map(Number);
+      if (!deviceId || points.some((point) => !Number.isFinite(point))) return { ok: false, error: '无效的滑动坐标' };
+      const ms = Math.max(100, Math.min(3000, Math.round(Number(duration) || 300)));
+      await runAdb(['-s', String(deviceId), 'shell', 'input', 'swipe', ...points.map((point) => String(Math.round(point))), String(ms)]);
+      return { ok: true };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || '滑动失败' };
+    }
+  });
+
+  ipcMain.handle('android:input-text', async (_e, deviceId: string, text: string) => {
+    try {
+      if (!deviceId || !String(text).trim()) return { ok: false, error: '请输入文字' };
+      // adb input text uses %s for spaces; keep the value as one execFile arg
+      // so shell metacharacters cannot escape into the host process.
+      const encoded = String(text).replace(/%/g, '%25').replace(/ /g, '%s');
+      await runAdb(['-s', String(deviceId), 'shell', 'input', 'text', encoded]);
+      return { ok: true };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || '输入失败' };
+    }
+  });
+
   ipcMain.handle('filewatcher:select-editor', async () => {
     if (!mainWindow) return null;
     let defaultPath: string;
@@ -895,6 +1169,17 @@ function registerIPC(): void {
     return null;
   });
 
+  // ========== 终端容错自动回复配置 ==========
+  ipcMain.handle('terminal-auto-response:get-config', () => terminalAutoResponseConfig);
+  ipcMain.handle('terminal-auto-response:save-config', (_e, config: unknown) => {
+    try {
+      return saveTerminalAutoResponseConfig(config);
+    } catch (error) {
+      console.error('保存终端容错自动回复配置失败:', error);
+      return terminalAutoResponseConfig;
+    }
+  });
+
   // 测试 AI 配置连通性
   ipcMain.handle('ai:test-config', async (_e, _config: { apiFormat: string; baseUrl: string; apiKey: string; model: string }) => {
     return { ok: false, error: 'AI 功能已移除' };
@@ -903,6 +1188,10 @@ function registerIPC(): void {
   // 获取 CLI 实际使用的模型提供商
   ipcMain.handle('cli:get-provider', (_e, presetCommand: string) => {
     return getCliProvider(presetCommand);
+  });
+
+  ipcMain.handle('cli:available-builtins', () => {
+    return getAvailableBuiltinPresets();
   });
 
   // ========== Claude 供应商配置 ==========
@@ -992,112 +1281,14 @@ function registerIPC(): void {
     return true;
   });
 
-  // ========== Devin 账号管理 ==========
-  const DEVIN_ACCOUNTS_PATH = path.join(os.homedir(), '.session-sync-manager', 'accounts.json');
-  const authCliPath = (() => {
-    try {
-      const syncPath = path.join(os.homedir(), '.local', 'bin', 'session-sync');
-      const resolved = fs.realpathSync(syncPath);
-      return path.join(path.dirname(resolved), 'auth-cli.mjs');
-    } catch { return null; }
-  })();
-
-  function runAuthCli(args: string[], stdin?: string): Promise<{ code: number; stdout: string; stderr: string }> {
-    return new Promise((resolve) => {
-      if (!authCliPath) { resolve({ code: 1, stdout: '', stderr: 'auth-cli.mjs 未找到' }); return; }
-      const child = spawn('node', [authCliPath, ...args], { stdio: 'pipe' });
-      let stdout = '', stderr = '';
-      child.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
-      child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
-      child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
-      child.on('error', (err) => resolve({ code: 1, stdout: '', stderr: err.message }));
-      if (stdin !== undefined) {
-        child.stdin.write(stdin);
-        child.stdin.end();
-      }
-    });
-  }
-
-  ipcMain.handle('devin-accounts:list', () => {
-    try {
-      if (fs.existsSync(DEVIN_ACCOUNTS_PATH)) {
-        return JSON.parse(fs.readFileSync(DEVIN_ACCOUNTS_PATH, 'utf-8'));
-      }
-    } catch { /* ignore */ }
-    return { accounts: [], currentIndex: 0 };
-  });
-
-  ipcMain.handle('devin-accounts:add', async (_e, email: string, password: string) => {
-    const { code, stderr } = await runAuthCli(['add', email, password]);
-    return { ok: code === 0, error: code !== 0 ? stderr.trim() : undefined };
-  });
-
-  ipcMain.handle('devin-accounts:add-batch', async (_e, text: string) => {
-    const { code, stderr } = await runAuthCli(['add', '--batch'], text);
-    // auth-cli.mjs 的 add --batch 把统计信息输出到 stderr
-    return { ok: code === 0, output: stderr.trim(), error: code !== 0 ? stderr.trim() : undefined };
-  });
-
-  ipcMain.handle('devin-accounts:remove', async (_e, email: string) => {
-    const { code, stderr } = await runAuthCli(['remove', email]);
-    return { ok: code === 0, error: code !== 0 ? stderr.trim() : undefined };
-  });
-
-  ipcMain.handle('devin-accounts:switch', async (_e, opts: { email?: string; next?: boolean }) => {
-    // next 为 true 或不传 email 时，auth-cli.mjs 默认执行轮转切到下一个账号
-    const args = opts.email ? ['switch', '--force', opts.email] : ['switch'];
-    const { code, stdout, stderr } = await runAuthCli([...args, '--json']);
-    // auth-cli.mjs 内部也会旋转 installation_id，这里作为兜底再旋转一次
-    rotateDevinInstallationId();
-    if (code !== 0) return { ok: false, error: stderr.trim() };
-    // 重新读取更新后的账号状态
-    try {
-      const updated = JSON.parse(fs.readFileSync(DEVIN_ACCOUNTS_PATH, 'utf-8'));
-      const cur = updated.accounts[updated.currentIndex];
-      return { ok: true, email: cur?.email, quota: cur?.quota };
-    } catch {
-      return { ok: true };
-    }
-  });
-
-  ipcMain.handle('devin-accounts:quota', async () => {
-    const { code, stdout, stderr } = await runAuthCli(['quota', '--json']);
-    if (code !== 0) return { ok: false, error: stderr.trim() };
-    try {
-      return { ok: true, ...JSON.parse(stdout.trim()) };
-    } catch {
-      return { ok: false, error: '解析失败' };
-    }
-  });
-
-  ipcMain.handle('devin-accounts:quota-all', async () => {
-    const { code, stdout, stderr } = await runAuthCli(['quota', '--all', '--json']);
-    if (code !== 0) return { ok: false, error: stderr.trim() };
-    try {
-      const results = JSON.parse(stdout.trim());
-      return { ok: true, results };
-    } catch {
-      return { ok: false, error: '解析失败' };
-    }
-  });
-
-  ipcMain.handle('devin-accounts:quota-one', async (_e, email: string) => {
-    const { code, stdout, stderr } = await runAuthCli(['quota', '--email', email, '--json']);
-    if (code !== 0) return { ok: false, error: stderr.trim() };
-    try {
-      return { ok: true, ...JSON.parse(stdout.trim()) };
-    } catch {
-      return { ok: false, error: '解析失败' };
-    }
-  });
-
-  ipcMain.handle('devin-accounts:rotate-device', () => {
-    rotateDevinInstallationId();
-    return { ok: true };
-  });
-
   // 渲染进程主动获取远程服务器信息（解决 IPC 消息早于渲染进程加载的竞态问题）
   ipcMain.handle('remote:get-server-info', () => cachedRemoteServerInfo);
+  ipcMain.handle('remote:get-health', async () => remoteSyncMonitor?.getHealth() ?? null);
+  ipcMain.handle('remote:retry-sync', async () => {
+    const health = await remoteSyncMonitor?.retrySync(true) ?? null;
+    if (health) mergeRemoteHealthIntoCache(health);
+    return health;
+  });
 
   // ========== 催工配置中转 IPC ==========
   // main 进程作为中转：remote-server API → renderer 的 sessionAutoContinue
@@ -1141,84 +1332,11 @@ function registerIPC(): void {
     (global as any).__sessionStatuses = statuses;
   });
 
-  // ========== Chat Session IPC ==========
-
-  ipcMain.handle('chat:create', (_e, opts: { workspace: string; model?: string }) => {
-    if (!chatSessionManager) return null;
-    const session = chatSessionManager.create(opts.workspace, opts.model);
-    return { id: session.id, title: session.title, model: session.model, workspace: session.workspace, createdAt: session.createdAt };
-  });
-
-  ipcMain.handle('chat:send', (_e, sessionId: string, content: string) => {
-    if (!chatSessionManager) return;
-    chatSessionManager.sendMessage(sessionId, content).catch(() => {});
-  });
-
-  ipcMain.handle('chat:list', () => {
-    if (!chatSessionManager) return [];
-    return chatSessionManager.getAllSessions().map(s => ({
-      id: s.id,
-      title: s.title,
-      model: s.model,
-      workspace: s.workspace,
-      createdAt: s.createdAt,
-      messageCount: s.messages.length,
-    }));
-  });
-
-  ipcMain.handle('chat:messages', (_e, sessionId: string) => {
-    if (!chatSessionManager) return [];
-    return chatSessionManager.getSession(sessionId)?.messages || [];
-  });
-
-  ipcMain.handle('chat:destroy', (_e, sessionId: string) => {
-    // 保存到已关闭列表后再销毁
-    const session = chatSessionManager?.getSession(sessionId);
-    if (session && session.messages.length > 0) {
-      addClosedChatSession({
-        title: session.title,
-        model: session.model,
-        workspace: session.workspace,
-        messages: session.messages,
-      });
-    }
-    chatSessionManager?.destroy(sessionId);
-    return true;
-  });
-
-  ipcMain.handle('chat:abort', (_e, sessionId: string) => {
-    chatSessionManager?.abortStream(sessionId);
-    return true;
-  });
-
-  ipcMain.handle('chat:rename', (_e, sessionId: string, title: string) => {
-    chatSessionManager?.rename(sessionId, title);
-    return true;
-  });
-
-  ipcMain.handle('chat:health', async () => {
-    if (!chatSessionManager) return { ok: false, error: 'Chat manager not ready' };
-    const health = await chatSessionManager.healthCheck();
-    return {
-      ...health,
-      autoManaged: windsurfProxyManager?.isAvailable() ?? false,
-      proxyDir: windsurfProxyManager?.getProxyDir() ?? null,
-    };
-  });
-
-  ipcMain.handle('chat:proxy-start', async () => {
-    if (!windsurfProxyManager) return { ok: false, error: 'Proxy manager not available' };
-    return windsurfProxyManager.start();
-  });
-
-  ipcMain.handle('chat:models', async () => {
-    if (!chatSessionManager) return [];
-    return chatSessionManager.listModels();
-  });
 }
 
 app.whenReady().then(async () => {
   setupPtyManager();
+  resetStaleClosedSessionRestores();
 
   // macOS Dock 图标 — 在窗口创建前设置
   const appIcon = loadAppIcon();
@@ -1228,67 +1346,20 @@ app.whenReady().then(async () => {
     }
   }
 
-  // 自动启动 Windsurf 代理
-  windsurfProxyManager = new WindsurfProxyManager((running, error) => {
-    if (running) {
-      console.log('[Main] Windsurf proxy is ready');
-    } else {
-      console.log('[Main] Windsurf proxy down:', error || 'unknown');
-    }
-  });
-  if (windsurfProxyManager.isAvailable()) {
-    console.log('[Main] Auto-starting Windsurf proxy...');
-    windsurfProxyManager.start().then((result) => {
-      console.log('[Main] Windsurf proxy start result:', result.ok ? 'OK' : result.error);
-    });
-  } else {
-    console.log('[Main] Windsurf proxy directory not found, chat features will be unavailable');
-  }
-
-  // 挂到 global 上供 remote-server 和 chat-session-manager 使用
-  (global as any).__windsurfProxyManager = windsurfProxyManager;
-
-  // 初始化 Chat Session Manager
-  chatSessionManager = new ChatSessionManager({
-    onDelta: (sessionId, text) => {
-      safeSend('chat:delta', sessionId, text);
-    },
-    onDone: (sessionId, content) => {
-      safeSend('chat:done', sessionId, content);
-    },
-    onError: (sessionId, error) => {
-      safeSend('chat:error', sessionId, error);
-    },
-    onTitleUpdate: (sessionId, title) => {
-      safeSend('chat:title-update', sessionId, title);
-    },
-  }, () => loadAiPreferenceData().manualConfig || null);
-
-  // 挂到 global 上供 remote-server 使用
-  (global as any).__chatSessionManager = chatSessionManager;
-
   registerIPC();
   cloudflaredManager = new CloudflaredManager(path.join(__dirname, '../..'));
   createWindow(appIcon);
 
+  remoteSyncMonitor = new RemoteSyncMonitor(
+    cloudflaredManager,
+    () => cachedRemoteServerInfo?.port ?? 9800,
+    () => restartRemoteAccessServer(),
+    (health) => mergeRemoteHealthIntoCache(health),
+  );
+
   // 启动远程访问服务器（手机端）
-  startRemoteServer(ptyManager, (sessionInfo) => {
-    // 手机端创建了会话，通知桌面端 renderer 刷新
-    safeSend('pty:remote-created', sessionInfo);
-  }, (id) => {
-    // 手机端销毁了会话，通知桌面端 renderer
-    safeSend('pty:exit', id);
-  }, (info) => {
-    // 服务器启动后，把连接信息发送给渲染进程显示
-    const tunnel = cloudflaredManager?.start();
-    const serverInfo = {
-      ...info,
-      publicUrl: tunnel?.url || undefined,
-      tunnel,
-    };
-    cachedRemoteServerInfo = serverInfo;
-    safeSend('remote:server-info', serverInfo);
-  });
+  restartRemoteAccessServer();
+  remoteSyncMonitor.start();
 
   // AI 配置已保存在偏好文件中，无需额外恢复
 
@@ -1306,6 +1377,9 @@ app.on('activate', () => {
 
 app.on('before-quit', async () => {
   globalShortcut.unregisterAll();
+  remoteSyncMonitor?.stop();
+  remoteSyncMonitor = null;
+  remoteServer?.close();
+  remoteServer = null;
   cloudflaredManager?.stopOwnedProcess();
-  windsurfProxyManager?.destroy();
 });

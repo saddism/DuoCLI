@@ -10,7 +10,7 @@ if [ -z "$LSOF_BIN" ] && [ -x /usr/sbin/lsof ]; then
 fi
 
 CONFIG_FILE=""
-for candidate in "cloudflared-config.local.yml" "cloudflared-config.private.yml" "cloudflared-config.yml"; do
+for candidate in "cloudflared-config.local.yml" "cloudflared-config.private.yml" "$HOME/.config/duocli-tunnel/config.yml" "cloudflared-config.yml"; do
     if [ -f "$candidate" ]; then
         CONFIG_FILE="$candidate"
         break
@@ -29,8 +29,8 @@ echo "════════════════════════�
 # 检查 cloudflared 进程
 echo ""
 echo "📊 进程状态:"
-if pgrep -f "cloudflared.*cloudflared-config" > /dev/null 2>&1; then
-    CF_PID=$(pgrep -f "cloudflared.*cloudflared-config")
+if pgrep -f "cloudflared.*cloudflared-config" > /dev/null 2>&1 || pgrep -f "cloudflared.*duocli-tunnel/config.yml" > /dev/null 2>&1; then
+    CF_PID=$(pgrep -f "cloudflared.*cloudflared-config" 2>/dev/null || pgrep -f "cloudflared.*duocli-tunnel/config.yml" 2>/dev/null)
     echo "   ✅ Cloudflare Tunnel 运行中 (PID: $CF_PID)"
 else
     echo "   ❌ Cloudflare Tunnel 未运行"
@@ -39,7 +39,10 @@ fi
 echo ""
 echo "🧩 配置文件:"
 if [ -n "$CONFIG_FILE" ]; then
-    echo "   $SCRIPT_DIR/$CONFIG_FILE"
+    case "$CONFIG_FILE" in
+        /*) echo "   $CONFIG_FILE" ;;
+        *) echo "   $SCRIPT_DIR/$CONFIG_FILE" ;;
+    esac
     if grep -q "YOUR_TUNNEL_NAME\\|YOUR_TUNNEL_ID\\|/ABSOLUTE/PATH/TO/\\|duocli.example.com" "$CONFIG_FILE"; then
         echo "   ⚠️  当前仍是模板占位符，不能用于真实访问"
     fi

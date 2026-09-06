@@ -1,11 +1,20 @@
 // DuoCLI Mobile - Service Worker
 
-const CACHE_NAME = 'duocli-v13';
+const CACHE_NAME = 'duocli-v14';
 const ASSETS = [
   '/',
   '/index.html',
   '/style.css',
   '/app.js',
+  '/xterm.css',
+  '/xterm.js',
+  '/addon-fit.js',
+  '/addon-unicode11.js',
+  '/android-mirror-client.js',
+  '/file-preview-helpers.js',
+  '/terminal-scroll-helpers.js',
+  '/spinner-interceptor.js',
+  '/terminal-content-helpers.js',
   '/manifest.json',
 ];
 

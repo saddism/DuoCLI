@@ -1,5 +1,13 @@
-import { Terminal, IBufferLine, ILinkProvider, ILink } from '@xterm/xterm';
+import { Terminal, ILinkProvider, ILink } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { TerminalScrollController } from './terminal-scroll-controller';
+
+const terminalContentHelpers = require('../../mobile/client/terminal-content-helpers.js') as {
+  readLogicalLine: (buffer: any, line: number) => any;
+  getSelectionText: (buffer: any, selection: any) => string;
+  findLinks: (text: string) => Array<any>;
+  matchRange: (logicalLine: any, match: any) => any;
+};
 
 // 终端配色方案
 const THEMES: Record<string, any> = {
@@ -148,15 +156,6 @@ const THEME_DOTS: Record<string, string> = {
   'nord': '#88c0d0',
 };
 
-// 文件路径正则
-// 1. 带目录的路径: /abs/path, rel/path, @alias/path, ./rel/path
-const PATH_RE = /(?:@\/?|\.\/|\/)?(?:[\w.\-\u4e00-\u9fff]+\/)+[\w.\-\u4e00-\u9fff]*(?:\.[\w]+)?/g;
-// 2. 单文件名（无目录，扩展名不限定为源码文件）
-const SINGLE_FILE_RE = /(?<![\/\w.\-])[\w.\-\u4e00-\u9fff]+\.[a-z0-9][a-z0-9_-]{0,15}(?![\w.\-])/gi;
-
-// URL 正则
-const URL_RE = /https?:\/\/[^\s<>"']+/g;
-
 // 文件路径链接检测器
 class FilePathLinkProvider implements ILinkProvider {
   private onClickCallback: (resolvedPath: string) => void;
@@ -171,128 +170,46 @@ class FilePathLinkProvider implements ILinkProvider {
 
   provideLinks(y: number, callback: (links: ILink[] | undefined) => void): void {
     const buffer = this.terminal.buffer.active;
-    let startLineIndex = y - 1;
-    const line = buffer.getLine(startLineIndex);
+    const line = buffer.getLine(y - 1);
     if (!line) { callback(undefined); return; }
-
-    // xterm 会按鼠标所在行请求链接；续行需要先回到逻辑行的起点。
-    while (startLineIndex > 0 && buffer.getLine(startLineIndex)?.isWrapped) {
-      startLineIndex--;
-    }
-
-    // 收集起始行及后续所有续行
-    const startLine = buffer.getLine(startLineIndex);
-    if (!startLine) { callback(undefined); return; }
-    const bufferLines: IBufferLine[] = [startLine];
-    let nextLineIndex = startLineIndex + 1;
-    while (true) {
-      const nextLine = buffer.getLine(nextLineIndex);
-      if (nextLine && nextLine.isWrapped) {
-        bufferLines.push(nextLine);
-        nextLineIndex++;
-      } else {
-        break;
-      }
-    }
-
-    // 拼接文本，记录每个字符对应的 buffer 行号和 cell 列号
-    let text = '';
-    const posLine: number[] = [];
-    const posCell: number[] = [];
-
-    for (let li = 0; li < bufferLines.length; li++) {
-      const bl = bufferLines[li];
-      const bufLineIdx = startLineIndex + li;
-      for (let i = 0; i < bl.length; i++) {
-        const cell = bl.getCell(i);
-        const chars = cell?.getChars() || '';
-        const width = cell?.getWidth() || 1;
-        if (chars.length > 0) {
-          for (let c = 0; c < chars.length; c++) {
-            posLine.push(bufLineIdx);
-            posCell.push(i);
-          }
-          text += chars;
-        } else if (width === 0) {
-          // 宽字符后续 cell
-        } else {
-          posLine.push(bufLineIdx);
-          posCell.push(i);
-          text += ' ';
-        }
-      }
-    }
-
+    const logical = terminalContentHelpers.readLogicalLine(buffer, y - 1);
     const cwd = this.getCwd();
-    const matched: Array<{ filePath: string; display: string; index: number; length: number; isUrl: boolean }> = [];
-
-    // 1. 匹配 URL
-    let match: RegExpExecArray | null;
-    URL_RE.lastIndex = 0;
-    while ((match = URL_RE.exec(text)) !== null) {
-      let url = match[0].replace(/[.,;:!?)\]}>]+$/, '');
-      if (url.length < 8) continue;
-      const overlaps = matched.some(r => match!.index >= r.index && match!.index < r.index + r.length);
-      if (overlaps) continue;
-      matched.push({ filePath: url, display: url, index: match.index, length: url.length, isUrl: true });
-    }
-
-    // 2. 匹配带目录的路径
-    PATH_RE.lastIndex = 0;
-    while ((match = PATH_RE.exec(text)) !== null) {
-      const fp = match[0].replace(/[.,;:!?)\]}>]+$/, '');
-      if (fp.length < 4) continue;
-      const before = text.substring(Math.max(0, match.index - 10), match.index);
-      if (/:\/{0,2}$/.test(before) || /:\d+$/.test(before)) continue;
-      if (fp.includes('node_modules')) continue;
-      const overlaps = matched.some(r => match!.index >= r.index && match!.index < r.index + r.length);
-      if (overlaps) continue;
-      matched.push({ filePath: fp, display: fp, index: match.index, length: fp.length, isUrl: false });
-    }
-
-    // 3. 匹配单文件名
-    SINGLE_FILE_RE.lastIndex = 0;
-    while ((match = SINGLE_FILE_RE.exec(text)) !== null) {
-      const fp = match[0];
-      const overlaps = matched.some(r => match!.index >= r.index && match!.index < r.index + r.length);
-      if (overlaps) continue;
-      matched.push({ filePath: fp, display: fp, index: match.index, length: fp.length, isUrl: false });
-    }
-
-    // 生成链接
     const links: ILink[] = [];
-    for (const m of matched) {
-      const si = m.index;
-      const ei = m.index + m.length - 1;
-      if (si >= posLine.length || ei >= posLine.length) continue;
-
-      if (m.isUrl) {
+    for (const match of terminalContentHelpers.findLinks(logical.text)) {
+      if (match.filePath?.includes('node_modules')) continue;
+      const range = terminalContentHelpers.matchRange(logical, match);
+      if (!range) continue;
+      if (match.kind === 'url') {
         links.push({
           range: {
-            start: { x: posCell[si] + 1, y: posLine[si] + 1 },
-            end: { x: posCell[ei] + 1, y: posLine[ei] + 1 },
+            start: { x: range.start.cell + 1, y: range.start.line + 1 },
+            end: { x: range.end.cell + 1, y: range.end.line + 1 },
           },
-          text: m.display,
-          activate: () => { (window as any).duocli?.openUrl?.(m.filePath); },
+          text: match.display,
+          activate: () => { (window as any).duocli?.openUrl?.(match.url); },
         });
       } else {
-        let resolved = m.filePath;
-        if (resolved.startsWith('/')) {
+        let resolved = match.filePath;
+        const separator = cwd.includes('\\') ? '\\' : '/';
+        if (/^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(resolved)) {
           // 绝对路径
-        } else if (resolved.startsWith('@/') || resolved.startsWith('@')) {
-          resolved = cwd + '/' + resolved.replace(/^@\/?/, '');
-        } else if (resolved.startsWith('./')) {
-          resolved = cwd + '/' + resolved.replace(/^\.\//, '');
+        } else if (/^~[\\/]/.test(resolved)) {
+          const homeDir = cwd.match(/^(\/Users\/[^/]+|\/home\/[^/]+|[A-Za-z]:\\Users\\[^\\]+)/)?.[1] || '';
+          resolved = homeDir ? homeDir + separator + resolved.slice(2) : resolved.slice(2);
+        } else if (/^@[\\/]/.test(resolved)) {
+          resolved = cwd + separator + resolved.replace(/^@[\\/]?/, '');
+        } else if (/^\.[\\/]/.test(resolved)) {
+          resolved = cwd + separator + resolved.replace(/^\.[\\/]/, '');
         } else {
-          resolved = cwd + '/' + resolved;
+          resolved = cwd + separator + resolved;
         }
-        if (resolved.endsWith('/')) resolved = resolved.slice(0, -1);
+        if (/[\\/]$/.test(resolved)) resolved = resolved.slice(0, -1);
         links.push({
           range: {
-            start: { x: posCell[si] + 1, y: posLine[si] + 1 },
-            end: { x: posCell[ei] + 1, y: posLine[ei] + 1 },
+            start: { x: range.start.cell + 1, y: range.start.line + 1 },
+            end: { x: range.end.cell + 1, y: range.end.line + 1 },
           },
-          text: m.display,
+          text: match.display,
           activate: () => { this.onClickCallback(resolved); },
         });
       }
@@ -333,41 +250,124 @@ function showTermContextMenu(x: number, y: number, fileName: string, openFn: () 
   setTimeout(() => document.addEventListener('click', close), 0);
 }
 
+interface Cell {
+  col: number;
+  row: number;
+}
+
+// Cmd+方向键：把行首/行尾发给 CLI。xterm 对 meta+方向键直接 break，一个字节都不发。
+// Shift+方向键：键盘扩展终端高亮选区。xterm 默认把它转成 ESC[1;2D 交给 CLI，
+// 而多数 CLI 并不处理，所以在终端侧自己维护选区并把按键吞掉。
+function attachCursorKeyBindings(
+  terminal: Terminal,
+  container: HTMLElement,
+  onData: (data: string) => void,
+): void {
+  let selection: { anchor: Cell; focus: Cell } | null = null;
+
+  const cursorCell = (): Cell => {
+    const buffer = terminal.buffer.active;
+    // cursorY 已是 buffer 绝对行号（= buffer.y），不要再加 baseY
+    return { col: buffer.cursorX, row: buffer.cursorY };
+  };
+
+  // 鼠标选区另起一套，点一下就丢掉键盘锚点，避免下次从旧位置接着扩
+  container.addEventListener('mousedown', () => { selection = null; });
+  // 松开 Shift 后清掉键盘选区，否则下次 Shift+方向键会从旧锚点接着扩
+  container.addEventListener('keyup', (e) => {
+    if (e.key === 'Shift') selection = null;
+  });
+
+  terminal.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true;
+    // 拼音等 IME 组合期间一律交回 xterm，插手会把组合中的文字截断
+    if (e.isComposing || e.keyCode === 229) return true;
+
+    if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return true;
+      selection = null;
+      // iTerm2 Natural Text Editing 同款：行首 Ctrl+A，行尾 Ctrl+E
+      onData(e.key === 'ArrowLeft' ? '\x01' : '\x05');
+      e.preventDefault();
+      return false;
+    }
+
+    const isShiftArrow = e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey
+      && (e.key === 'ArrowLeft' || e.key === 'ArrowRight'
+        || e.key === 'ArrowUp' || e.key === 'ArrowDown');
+    if (!isShiftArrow) {
+      selection = null;
+      return true;
+    }
+
+    const buffer = terminal.buffer.active;
+    const cols = terminal.cols;
+    const cursor = cursorCell();
+    if (!selection) selection = { anchor: cursor, focus: cursor };
+
+    const dCol = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0;
+    const dRow = e.key === 'ArrowUp' ? -1 : e.key === 'ArrowDown' ? 1 : 0;
+    selection.focus = {
+      col: Math.min(cols, Math.max(0, selection.focus.col + dCol)),
+      row: Math.min(buffer.length - 1, Math.max(0, selection.focus.row + dRow)),
+    };
+
+    // select() 只接受 (起点, 长度)，长度超过一行会自动折行，所以反向选择要交换锚点
+    const linear = (p: Cell) => p.row * cols + p.col;
+    const { anchor, focus } = selection;
+    const start = linear(anchor) <= linear(focus) ? anchor : focus;
+    const length = Math.abs(linear(focus) - linear(anchor));
+    if (length === 0) {
+      terminal.clearSelection();
+    } else {
+      terminal.select(start.col, start.row, length);
+    }
+
+    // 不 preventDefault 的话浏览器会去动那个隐藏的 textarea，把光标挪走
+    e.preventDefault();
+    return false;
+  });
+}
+
 interface TermInstance {
   id: string;
   terminal: Terminal;
   fitAddon: FitAddon;
   container: HTMLDivElement;
   themeId: string;
-  pendingInputScroll: boolean;
+  scroll: TerminalScrollController;
 }
 
 export class TerminalManager {
   private instances: Map<string, TermInstance> = new Map();
   private activeId: string | null = null;
   private terminalArea: HTMLElement;
+  private detachedHost: HTMLElement;
   private resizeObserver: ResizeObserver;
   private onResize: ((id: string, cols: number, rows: number) => void) | null = null;
-  private lastFitSize: { w: number; h: number } = { w: 0, h: 0 };
+  private lastFitSizes: Map<string, { w: number; h: number }> = new Map();
   private fitCheckTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(terminalArea: HTMLElement, onResize?: (id: string, cols: number, rows: number) => void) {
     this.terminalArea = terminalArea;
     this.onResize = onResize || null;
+    this.detachedHost = document.createElement('div');
+    this.detachedHost.className = 'terminal-detached-host';
+    (terminalArea.parentElement || terminalArea).appendChild(this.detachedHost);
     this.resizeObserver = new ResizeObserver(() => {
-      this.fitActive();
+      this.fitVisible();
     });
     this.resizeObserver.observe(terminalArea);
 
     // 窗口重新获得焦点时，重新 fit 并同步 pty 尺寸
     // 解决手机端远程控制后桌面端终端尺寸不同步的问题
     window.addEventListener('focus', () => {
-      this.fitActive();
+      this.fitVisible();
     });
 
     // 定时检查容器尺寸变化（兜底：ResizeObserver 可能漏掉某些布局变化）
     this.fitCheckTimer = setInterval(() => {
-      this.fitIfSizeChanged();
+      this.fitVisibleIfSizeChanged();
     }, 3000);
   }
 
@@ -386,12 +386,13 @@ export class TerminalManager {
     terminal.loadAddon(fitAddon);
 
     const container = document.createElement('div');
-    container.className = 'terminal-container';
+    container.className = 'terminal-container pane-detached';
     container.id = `tc-${id}`;
-    this.terminalArea.appendChild(container);
+    this.detachedHost.appendChild(container);
 
     terminal.open(container);
     terminal.onData((data) => onData(data));
+    attachCursorKeyBindings(terminal, container, onData);
 
     // 注册文件路径链接检测
     const linkProvider = new FilePathLinkProvider(
@@ -454,161 +455,146 @@ export class TerminalManager {
       } catch { /* 静默失败 */ }
     }, true);
 
+    // 拦截复制事件：将 isWrapped 的软换行合并为连贯文本
+    container.addEventListener('copy', (e: ClipboardEvent) => {
+      if (!terminal.hasSelection()) return;
+      const selPos = terminal.getSelectionPosition();
+      if (!selPos) return;
+
+      const result = terminalContentHelpers.getSelectionText(terminal.buffer.active, selPos);
+
+      e.preventDefault();
+      e.stopPropagation();
+      e.clipboardData?.setData('text/plain', result);
+    }, true);
+
     // 浮动"滚到底部"按钮
     const scrollBtn = document.createElement('button');
     scrollBtn.className = 'scroll-bottom-btn';
-    scrollBtn.textContent = '⬇';
+    scrollBtn.innerHTML = '<svg class="ui-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v13"></path><polyline points="6 11 12 17 18 11"></polyline><path d="M5 20h14"></path></svg>';
     scrollBtn.title = '滚到底部';
     scrollBtn.style.display = 'none';
     container.appendChild(scrollBtn);
 
-    scrollBtn.addEventListener('click', () => {
-      terminal.scrollToBottom();
-      scrollBtn.style.display = 'none';
-    });
+    const scroll = new TerminalScrollController(terminal, container, scrollBtn);
+    this.instances.set(id, { id, terminal, fitAddon, container, themeId, scroll });
+    // Keep the manager independently usable by the existing xterm tests and
+    // embedders. The desktop app mounts views through PaneWorkspace instead.
+    if (!this.terminalArea.classList.contains('pane-workspace-root')) this.switchTo(id);
+  }
 
-    // 监听滚动：不在底部时显示按钮
-    const checkScroll = () => {
-      const buf = terminal.buffer.active;
-      const atBottom = buf.viewportY >= buf.baseY;
-      scrollBtn.style.display = atBottom ? 'none' : 'block';
-    };
-    terminal.onScroll(() => checkScroll());
-    terminal.onWriteParsed(() => checkScroll());
+  /** Move an existing xterm view into a Pane body without recreating its PTY or buffer. */
+  mountTo(id: string, host: HTMLElement): boolean {
+    const instance = this.instances.get(id);
+    if (!instance) return false;
+    host.appendChild(instance.container);
+    instance.container.classList.remove('pane-detached');
+    this.fitTerminal(id, false);
+    return true;
+  }
 
-    // 有些情况下滚轮往下滚会停在接近底部但不贴底，向下滚时自动吸附到最新输出
-    const viewport = terminal.element?.querySelector('.xterm-viewport') as HTMLElement | null;
-    viewport?.addEventListener('wheel', (e: WheelEvent) => {
-      if (e.deltaY <= 0) return;
-      const snapIfNearBottom = () => {
-        const buf = terminal.buffer.active;
-        const distanceToBottom = buf.baseY - buf.viewportY;
-        if (distanceToBottom <= 18) {
-          terminal.scrollToBottom();
-          scrollBtn.style.display = 'none';
-        }
-      };
-      snapIfNearBottom();
-      requestAnimationFrame(() => requestAnimationFrame(snapIfNearBottom));
-    }, { passive: true });
-
-    this.instances.set(id, { id, terminal, fitAddon, container, themeId, pendingInputScroll: false });
-    this.switchTo(id);
-
-    // 创建终端后默认停在底部，避免交互式 CLI 初始化输出后停在历史顶部。
-    setTimeout(() => {
-      terminal.scrollToBottom();
-    }, 100);
+  /** Detach a view while keeping the PTY alive in the session list. */
+  detach(id: string): boolean {
+    const instance = this.instances.get(id);
+    if (!instance) return false;
+    this.detachedHost.appendChild(instance.container);
+    instance.container.classList.add('pane-detached');
+    return true;
   }
 
   switchTo(id: string): void {
-    // 隐藏所有
-    this.instances.forEach((inst) => {
-      inst.container.classList.remove('active');
-    });
-    // 显示目标
     const target = this.instances.get(id);
     if (!target) return;
     target.container.classList.add('active');
+    target.container.classList.remove('pane-detached');
     this.activeId = id;
-    // 延迟fit确保DOM更新
+    target.scroll.followAfterLayout();
     setTimeout(() => {
-      // 50ms 内用户可能已关闭这个终端 → instance 不在 map 里也不在 DOM 里
-      // 直接 fit 会抛 "ITerminalDimensions" 异常，再用 cols/rows 也是 0
-      const stillActive = this.instances.get(id);
-      if (!stillActive || stillActive !== target) return;
-      try {
-        target.fitAddon.fit();
-        if (this.onResize) {
-          const { cols, rows } = target.terminal;
-          if (cols > 0 && rows > 0) this.onResize(target.id, cols, rows);
-        }
-        target.terminal.focus();
-        target.terminal.scrollToBottom();
-      } catch {}
+      if (this.instances.get(id) !== target) return;
+      this.fitTerminal(id, true);
+      target.scroll.followAfterLayout();
     }, 50);
+  }
+
+  /** Keep the active session pinned to the latest output after sidebar switches. */
+  followSession(id: string): void {
+    if (this.activeId !== id) return;
+    this.instances.get(id)?.scroll.followAfterLayout();
   }
 
   write(id: string, data: string): void {
     const inst = this.instances.get(id);
     if (!inst) return;
-    // 记录写入前是否在底部（使用容差避免浮点/行高差异误判）
-    const buf = inst.terminal.buffer.active;
-    const wasAtBottom = buf.viewportY >= buf.baseY - 2;
-    inst.terminal.write(data, () => {
-      // 写入后双重判断：写入前在底部 或 pendingInputScroll → 滚到底
-      // 第二个条件兜底：若 fit() 在两次 write 之间改变了 viewport，
-      // wasAtBottom 仍记录着上一次真正的用户位置
-      const currentBuf = inst.terminal.buffer.active;
-      const stillAtBottom = currentBuf.viewportY >= currentBuf.baseY - 2;
-      if (wasAtBottom || inst.pendingInputScroll) {
-        inst.terminal.scrollToBottom();
-        inst.pendingInputScroll = false;
-      } else if (stillAtBottom && currentBuf.baseY > 0) {
-        // 如果用户之前不在底部，但写完后恰好在底部了（说明内容自动滚到底了），
-        // 且 buffer 已有内容，则保持在底部（正常追屏行为）
-        inst.terminal.scrollToBottom();
-      }
-    });
+    // onWriteParsed follows the latest user intent after the whole parse batch.
+    inst.terminal.write(data);
   }
 
   notifyInput(id: string): void {
-    const inst = this.instances.get(id);
-    if (!inst) return;
-    inst.pendingInputScroll = true;
-    inst.terminal.scrollToBottom();
+    this.instances.get(id)?.scroll.follow();
   }
 
   destroy(id: string): string | null {
     const inst = this.instances.get(id);
     if (!inst) return this.activeId;
+    inst.scroll.dispose();
     inst.terminal.dispose();
     inst.container.remove();
     this.instances.delete(id);
+    this.lastFitSizes.delete(id);
 
-    // 切换到其他终端
+    // Prefer a still-mounted pane when the focused terminal is destroyed.
+    // Detached instances belong to another workspace and must stay hidden
+    // until PaneWorkspace explicitly mounts/focuses them.
     if (this.activeId === id) {
-      const remaining = Array.from(this.instances.keys());
+      const remaining = Array.from(this.instances.values())
+        .filter((instance) => !instance.container.classList.contains('pane-detached'));
       if (remaining.length > 0) {
-        this.switchTo(remaining[remaining.length - 1]);
-        return this.activeId;
-      }
-      this.activeId = null;
+        const next = remaining[remaining.length - 1];
+        this.switchTo(next.id);
+      } else this.activeId = null;
     }
     return this.activeId;
   }
 
   fitActive(): void {
-    if (!this.activeId) return;
-    const inst = this.instances.get(this.activeId);
-    if (inst) {
-      // fit() 会调用 terminal.resize()，可能改变行列数导致 viewport 意外移位。
-      // 记录 fit 前是否在底部，fit 后恢复，避免跳到 buffer 顶部。
-      const buf = inst.terminal.buffer.active;
-      const wasAtBottom = buf.baseY > 0 && buf.viewportY >= buf.baseY - 2;
-      inst.fitAddon.fit();
-      if (wasAtBottom) {
-        inst.terminal.scrollToBottom();
-      }
-      // 记录当前容器尺寸，供定时检查使用
-      const rect = inst.container.getBoundingClientRect();
-      this.lastFitSize = { w: rect.width, h: rect.height };
-      if (this.onResize) {
-        const { cols, rows } = inst.terminal;
-        this.onResize(inst.id, cols, rows);
+    if (this.activeId) this.fitTerminal(this.activeId, false);
+  }
+
+  fitVisible(): void {
+    for (const [id, instance] of this.instances) {
+      if (instance.container.classList.contains('pane-detached')) continue;
+      const rect = instance.container.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      this.fitTerminal(id, false);
+    }
+  }
+
+  // 定时兜底：检查每个可见 Pane 尺寸是否变化，变了就重新 fit。
+  private fitVisibleIfSizeChanged(): void {
+    for (const [id, instance] of this.instances) {
+      if (instance.container.classList.contains('pane-detached')) continue;
+      const rect = instance.container.getBoundingClientRect();
+      const previous = this.lastFitSizes.get(id) || { w: 0, h: 0 };
+      if (Math.abs(rect.width - previous.w) > 1 || Math.abs(rect.height - previous.h) > 1) {
+        this.fitTerminal(id, false);
       }
     }
   }
 
-  // 定时兜底：检查容器尺寸是否变化，变了就重新 fit
-  private fitIfSizeChanged(): void {
-    if (!this.activeId) return;
-    const inst = this.instances.get(this.activeId);
-    if (!inst) return;
-    const rect = inst.container.getBoundingClientRect();
-    if (Math.abs(rect.width - this.lastFitSize.w) > 1 || Math.abs(rect.height - this.lastFitSize.h) > 1) {
-      this.fitActive();
-    }
+  private fitTerminal(id: string, focus: boolean): void {
+    const instance = this.instances.get(id);
+    if (!instance) return;
+    try {
+      instance.fitAddon.fit();
+      instance.scroll.sync();
+      const rect = instance.container.getBoundingClientRect();
+      this.lastFitSizes.set(id, { w: rect.width, h: rect.height });
+      if (this.onResize) {
+        const { cols, rows } = instance.terminal;
+        if (cols > 0 && rows > 0) this.onResize(instance.id, cols, rows);
+      }
+      if (focus) instance.terminal.focus();
+    } catch {}
   }
 
   getActiveId(): string | null {
@@ -624,6 +610,14 @@ export class TerminalManager {
 
   hasInstances(): boolean {
     return this.instances.size > 0;
+  }
+
+  setTheme(id: string, themeId: string): void {
+    const instance = this.instances.get(id);
+    if (!instance) return;
+    const theme = THEMES[themeId] || THEMES['vscode-dark'];
+    instance.themeId = themeId;
+    instance.terminal.options.theme = theme;
   }
 
   static getThemeDotColor(themeId: string): string {

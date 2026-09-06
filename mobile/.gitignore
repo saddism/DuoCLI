@@ -1,3 +1,6 @@
 node_modules/
 dist/
 *.js.map
+!client/addon-fit.js.map
+!client/addon-unicode11.js.map
+!client/xterm.js.map

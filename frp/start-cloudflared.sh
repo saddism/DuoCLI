@@ -11,7 +11,7 @@ if [ -z "$LSOF_BIN" ] && [ -x /usr/sbin/lsof ]; then
 fi
 
 CONFIG_FILE=""
-for candidate in "cloudflared-config.local.yml" "cloudflared-config.private.yml" "cloudflared-config.yml"; do
+for candidate in "cloudflared-config.local.yml" "cloudflared-config.private.yml" "$HOME/.config/duocli-tunnel/config.yml" "cloudflared-config.yml"; do
     if [ -f "$candidate" ]; then
         CONFIG_FILE="$candidate"
         break
@@ -47,7 +47,7 @@ if [ -z "$LSOF_BIN" ] || ! "$LSOF_BIN" -i :9800 > /dev/null 2>&1; then
 fi
 
 # 检查是否已运行
-if pgrep -f "cloudflared.*cloudflared-config" > /dev/null 2>&1; then
+if pgrep -f "cloudflared.*cloudflared-config" > /dev/null 2>&1 || pgrep -f "cloudflared.*duocli-tunnel/config.yml" > /dev/null 2>&1; then
     echo "✅ Cloudflare Tunnel 已经在运行中，无需重复启动。"
     exit 0
 fi
@@ -72,7 +72,7 @@ echo ""
 nohup cloudflared tunnel --protocol http2 --config "$CONFIG_FILE" run >> cloudflared.log 2>&1 &
 
 sleep 3
-if pgrep -f "cloudflared.*cloudflared-config" > /dev/null 2>&1; then
+if pgrep -f "cloudflared.*cloudflared-config" > /dev/null 2>&1 || pgrep -f "cloudflared.*duocli-tunnel/config.yml" > /dev/null 2>&1; then
     echo "✅ Cloudflare Tunnel 已启动"
     if [ -n "$HOSTNAME" ]; then
         echo "🌐 手机访问地址: https://$HOSTNAME"

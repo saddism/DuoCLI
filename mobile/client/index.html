@@ -16,11 +16,31 @@
   <!-- 登录页 -->
   <div id="login-page" class="page active">
     <div class="login-box">
-      <h1>🖥 DuoCLI</h1>
-      <p>远程终端控制</p>
+      <div class="login-logo-wrap">
+        <div class="login-logo-glow">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+            <rect width="48" height="48" rx="12" fill="url(#m-logo-grad)"/>
+            <path d="M14 18L22 24L14 30" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+            <line x1="24" y1="30" x2="34" y2="30" stroke="#fff" stroke-width="3" stroke-linecap="round"/>
+            <defs>
+              <linearGradient id="m-logo-grad" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#3b82f6"/>
+                <stop offset="1" stop-color="#6366f1"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+      </div>
+      <h1>DuoCLI</h1>
+      <p class="login-sub">移动端 AI 编程终端 · 实时同步</p>
       <div id="server-info" class="server-info"></div>
-      <input type="password" id="token-input" placeholder="输入 Token" autocomplete="off">
-      <button id="login-btn">连接</button>
+      <div class="login-input-wrap">
+        <input type="password" id="token-input" placeholder="输入访问 Token" autocomplete="off">
+      </div>
+      <button id="login-btn">
+        <span>连接终端</span>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
+      </button>
       <div id="login-error" class="error"></div>
     </div>
   </div>
@@ -29,33 +49,57 @@
   <div id="main-page" class="page">
     <header id="header">
       <div class="header-left">
-        <h2>DuoCLI</h2>
+        <button id="main-drawer-close" class="icon-btn landscape-panel-close" title="收起会话侧栏">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+        </button>
+        <div class="header-brand">
+          <span class="header-brand-dot"></span>
+          <h2>DuoCLI</h2>
+        </div>
         <button id="net-mode-btn" class="net-mode-btn" style="display:none;" title="切换网络模式"></button>
       </div>
       <div class="header-right">
-        <button id="device-console-btn" class="icon-btn" title="手机设备">📱</button>
-        <button id="new-session-btn" class="icon-btn" title="新建会话">＋</button>
-        <button id="new-chat-btn" class="icon-btn" title="新建聊天" style="font-size:14px;">💬</button>
+        <button id="device-console-btn" class="icon-btn" title="手机设备">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg>
+        </button>
+        <button id="new-session-btn" class="icon-btn icon-btn-primary" title="新建会话">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+        </button>
       </div>
     </header>
     <div id="session-list" class="session-list"></div>
     <div id="empty-state" class="empty-state">
-      <p>暂无会话</p>
-      <p>点击右上角 ＋ 创建新终端</p>
+      <div class="empty-state-icon">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+      </div>
+      <p class="empty-title">暂无活跃会话</p>
+      <p class="empty-subtitle">点击右上角 ＋ 创建新终端</p>
     </div>
   </div>
 
   <!-- 会话详情页 -->
   <div id="detail-page" class="page">
     <header id="detail-header">
-      <button id="back-btn" class="icon-btn">←</button>
+      <button id="back-btn" class="icon-btn" title="返回会话列表">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+      </button>
+      <button class="icon-btn landscape-panel-toggle landscape-sessions-toggle" title="展开会话侧栏" aria-label="展开会话侧栏" aria-expanded="false">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+      </button>
       <div class="detail-title">
         <span id="detail-name"></span>
         <span id="detail-status" class="status-dot"></span>
       </div>
-      <span id="detail-ac-label" class="ac-label">催</span>
-      <button id="detail-media-btn" class="icon-btn" title="浏览媒体文件">🎬</button>
-      <button id="delete-btn" class="icon-btn danger" title="终止会话">✕</button>
+      <span id="detail-ac-label" class="ac-label" title="点击配置循环">催</span>
+      <button id="detail-media-btn" class="icon-btn" title="浏览媒体文件">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"></rect><line x1="7" y1="2" x2="7" y2="22"></line><line x1="17" y1="2" x2="17" y2="22"></line><line x1="2" y1="12" x2="22" y2="12"></line><line x1="2" y1="7" x2="7" y2="7"></line><line x1="2" y1="17" x2="7" y2="17"></line><line x1="17" y1="17" x2="22" y2="17"></line><line x1="17" y1="7" x2="22" y2="7"></line></svg>
+      </button>
+      <button class="icon-btn landscape-panel-toggle landscape-device-toggle" title="展开手机侧栏" aria-label="展开手机侧栏" aria-expanded="false">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg>
+      </button>
+      <button id="delete-btn" class="icon-btn danger" title="终止会话">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+      </button>
     </header>
 
     <!-- xterm.js 终端 -->
@@ -83,9 +127,14 @@
     <!-- 输入区域 -->
     <div id="input-area">
       <input type="file" id="file-input" accept="image/*,*/*" multiple hidden>
-      <button id="upload-btn" class="icon-btn-sm" title="上传文件">📎</button>
-      <textarea id="msg-input" rows="1" placeholder="输入消息..." enterkeyhint="send" autocomplete="off"></textarea>
-      <button id="send-btn">发送</button>
+      <button id="upload-btn" class="icon-btn-sm" title="上传文件">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+      </button>
+      <textarea id="msg-input" rows="1" placeholder="输入终端消息或命令..." enterkeyhint="send" autocomplete="off"></textarea>
+      <button id="send-btn">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+        <span>发送</span>
+      </button>
     </div>
 
     <!-- 快捷命令栏 -->
@@ -95,7 +144,9 @@
   <!-- 文本文件预览页 -->
   <div id="file-preview-page" class="page">
     <header id="file-preview-header">
-      <button id="file-preview-back-btn" class="icon-btn" title="返回终端">←</button>
+      <button id="file-preview-back-btn" class="icon-btn" title="返回终端">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+      </button>
       <div id="file-preview-title">文件预览</div>
     </header>
     <main id="file-preview-body">
@@ -108,37 +159,21 @@
   <!-- 媒体浏览页 -->
   <div id="media-browse-page" class="page">
     <header id="media-browse-header">
-      <button id="media-browse-back-btn" class="icon-btn" title="返回终端">←</button>
+      <button id="media-browse-back-btn" class="icon-btn" title="返回终端">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+      </button>
       <div id="media-browse-title">媒体</div>
-      <button id="media-browse-refresh-btn" class="icon-btn" title="刷新">🔄</button>
+      <button id="media-browse-refresh-btn" class="icon-btn" title="刷新">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+      </button>
     </header>
     <main id="media-browse-body"></main>
-  </div>
-
-  <!-- Chat 详情页 -->
-  <div id="chat-detail-page" class="page">
-    <header id="chat-detail-header">
-      <button id="chat-back-btn" class="icon-btn">←</button>
-      <div class="detail-title">
-        <span id="chat-detail-name">Chat</span>
-      </div>
-      <button id="chat-delete-btn" class="icon-btn danger" title="删除对话">✕</button>
-    </header>
-
-    <!-- Chat 消息区域 -->
-    <div id="chat-messages" class="chat-messages-mobile"></div>
-
-    <!-- Chat 输入区域 -->
-    <div id="chat-input-area-mobile" class="chat-input-area-mobile">
-      <textarea id="chat-msg-input" rows="1" placeholder="输入消息或 / 命令..." enterkeyhint="send" autocomplete="off"></textarea>
-      <button id="chat-send-btn">发送</button>
-    </div>
-    <div class="chat-slash-hint-mobile">/auto-login /health /models /clear</div>
   </div>
 
   <!-- 新建会话弹窗 -->
   <div id="new-session-modal" class="modal">
     <div class="modal-content">
+      <div class="modal-drag-handle"></div>
       <h3>新建会话</h3>
       <label>工作目录</label>
       <select id="new-cwd">
@@ -147,8 +182,12 @@
       <div class="preset-label-row">
         <label>预设命令</label>
         <div class="preset-actions">
-          <button id="preset-add-btn" class="preset-action-btn" title="添加自定义预设">＋</button>
-          <button id="preset-manage-btn" class="preset-action-btn" title="管理自定义预设">⚙</button>
+          <button id="preset-add-btn" class="preset-action-btn" title="添加自定义预设">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          </button>
+          <button id="preset-manage-btn" class="preset-action-btn" title="管理自定义预设">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+          </button>
         </div>
       </div>
       <select id="new-preset">
@@ -174,31 +213,56 @@
   <!-- 循环配置弹窗 -->
   <div id="auto-continue-modal" class="modal">
     <div class="modal-content">
+      <div class="modal-drag-handle"></div>
       <div class="modal-header">
         <h3>循环配置</h3>
-        <button id="ac-cancel" class="modal-close">✕</button>
+        <button id="ac-cancel" class="modal-close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
       </div>
-      <label>命令列表（每行一条）</label>
-      <textarea id="ac-message" rows="3" placeholder="每行一条命令，按顺序发送"></textarea>
-      <label>循环间隔（分钟）</label>
-      <input type="number" id="ac-interval" min="1" placeholder="分钟" />
-      <label>首次循环延迟（分钟）</label>
-      <input type="number" id="ac-initial-delay" min="0" value="0" placeholder="分钟（0=立即）" />
-      <label>命令间隔（秒）</label>
-      <input type="number" id="ac-cmd-interval" min="0" value="2" placeholder="秒" />
-      <label>发送延迟（秒）</label>
-      <input type="number" id="ac-send-delay" min="0" value="2" placeholder="秒" />
-      <label>最大循环次数</label>
-      <input type="number" id="ac-max-loops" min="-1" value="-1" placeholder="-1 表示不限制，1 表示一次" />
-      <div style="margin-top: 14px;">
-        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0;">
-          <input type="checkbox" id="ac-auto-agree" checked style="width: auto;" />
-          开启自动同意（权限提示自动确认）
+      <div class="ac-config-body">
+        <label class="ac-config-command-label">命令列表（每行一条，按顺序发送）</label>
+        <textarea id="ac-message" class="ac-config-command" rows="3" placeholder="每行一条命令，按顺序发送"></textarea>
+        <section class="ac-config-group ac-config-group-primary">
+        <div class="ac-config-group-title">运行安排</div>
+        <div class="ac-config-grid">
+          <label class="ac-config-field">开始时间
+            <span class="ac-field-hint">延迟分钟，0 表示立即</span>
+            <input type="number" id="ac-initial-delay" min="0" value="0" placeholder="0" />
+          </label>
+          <label class="ac-config-field">运行次数
+            <span class="ac-field-hint">-1 表示不限制</span>
+            <input type="number" id="ac-max-loops" min="-1" value="-1" placeholder="-1" />
+          </label>
+        </div>
+      </section>
+      <section class="ac-config-group">
+        <div class="ac-config-group-title">循环与发送</div>
+        <div class="ac-config-grid">
+          <label class="ac-config-field">循环间隔（分钟）
+            <input type="number" id="ac-interval" min="1" placeholder="分钟" />
+          </label>
+          <label class="ac-config-field">命令间隔（秒）
+            <input type="number" id="ac-cmd-interval" min="0" value="2" placeholder="秒" />
+          </label>
+          <label class="ac-config-field ac-config-field-wide">发送延迟（秒）
+            <span class="ac-field-hint">文字写入后等待多久再发送回车</span>
+            <input type="number" id="ac-send-delay" min="0" value="2" placeholder="秒" />
+          </label>
+        </div>
+      </section>
+      <section class="ac-config-group">
+        <div class="ac-config-group-title">自动同意</div>
+        <label class="ac-config-toggle">
+          <input type="checkbox" id="ac-auto-agree" checked />
+          权限提示自动确认
         </label>
-      </div>
-      <div id="ac-agree-delay-row">
-        <label>自动同意延后时间（秒）</label>
-        <input type="number" id="ac-agree-delay" min="0" value="5" placeholder="秒" />
+        <div id="ac-agree-delay-row">
+          <label class="ac-config-field">确认延后时间（秒）
+            <input type="number" id="ac-agree-delay" min="0" value="5" placeholder="秒" />
+          </label>
+        </div>
+        </section>
       </div>
       <div class="modal-actions">
         <button id="ac-stop" class="btn-danger" style="display:none;">关闭循环</button>
@@ -210,57 +274,80 @@
   <!-- 设备页 -->
   <div id="device-page" class="page">
     <header>
-      <button id="device-back-btn" class="icon-btn">←</button>
+      <button id="device-back-btn" class="icon-btn" title="返回">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+      </button>
       <select id="device-select" class="device-select-header">
         <option value="">正在加载设备...</option>
       </select>
-      <button id="device-refresh-btn" class="icon-btn" title="刷新设备列表">🔄</button>
-      <button id="device-shot-btn" class="icon-btn" title="刷新截图">📷</button>
-      <button id="device-fullscreen-btn" class="icon-btn" title="全屏">⛶</button>
-      <button id="device-shell-btn" class="icon-btn" title="执行命令">⌨️</button>
-      <button id="device-tap-toggle" class="icon-btn" title="远程点击" style="opacity:0.4;">🖱</button>
-    </header>
-    <div class="device-page-body">
-      <div class="device-preview-wrap">
-        <img id="device-preview" alt="设备截图" style="display:none;max-width:100%;max-height:100%;object-fit:contain;" />
-        <div id="device-preview-empty" class="device-preview-empty">点击 📷 获取手机截图</div>
+      <div class="device-header-tools">
+        <button id="device-more-btn" class="icon-btn" type="button" title="更多" aria-haspopup="true" aria-expanded="false" aria-controls="device-more-menu">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="5" r="1.4"></circle><circle cx="12" cy="12" r="1.4"></circle><circle cx="12" cy="19" r="1.4"></circle></svg>
+        </button>
+        <div id="device-more-menu" class="device-more-menu" hidden>
+          <button id="device-fullscreen-btn" type="button">全屏操控</button>
+          <button id="device-refresh-btn" type="button">刷新设备</button>
+          <button id="device-shot-btn" type="button">刷新截图</button>
+          <button id="device-tap-toggle" type="button" aria-pressed="true">远程点击 · 已开</button>
+        </div>
       </div>
+    </header>
+    <nav id="device-panel-tabs" class="device-panel-tabs" role="tablist" aria-label="侧栏内容">
+      <button class="device-panel-tab active" data-device-panel="device" role="tab" aria-selected="true">设备</button>
+      <button class="device-panel-tab" data-device-panel="files" role="tab" aria-selected="false">文件树</button>
+      <button class="device-panel-tab" data-device-panel="preview" role="tab" aria-selected="false">预览</button>
+    </nav>
+    <div id="device-hint" role="status" aria-live="polite" hidden></div>
+    <div class="device-page-body">
+      <section id="device-panel-device" class="device-panel-view active">
+        <div class="device-preview-wrap">
+          <canvas id="device-video" aria-label="Android 实时画面" hidden></canvas>
+          <img id="device-preview" alt="设备截图" style="display:none;max-width:100%;max-height:100%;object-fit:contain;" />
+          <div id="device-preview-empty" class="device-preview-empty">正在连接 Android 实时镜像…</div>
+        </div>
+      </section>
+      <section id="device-panel-files" class="device-panel-view" hidden>
+        <div class="mobile-file-tree-toolbar">
+          <span id="mobile-file-tree-path">当前项目</span>
+          <button id="mobile-file-tree-refresh" class="mini-btn" type="button" title="刷新文件树">刷新</button>
+        </div>
+        <div id="mobile-file-tree-list" class="mobile-file-tree-list"></div>
+      </section>
+      <section id="device-panel-preview" class="device-panel-view" hidden>
+        <div id="mobile-file-preview-title" class="mobile-file-preview-title">文件预览</div>
+        <div id="mobile-file-preview-meta" class="mobile-file-preview-meta"></div>
+        <div id="mobile-file-preview-media" class="mobile-file-preview-media"></div>
+        <pre id="mobile-file-preview-content" class="mobile-file-preview-content"></pre>
+      </section>
     </div>
   </div>
 
   <!-- 全屏截图 overlay -->
   <div id="fullscreen-overlay" style="display:none;position:fixed;inset:0;z-index:200;background:#000;flex-direction:column;">
-    <button id="fullscreen-back-btn" style="position:absolute;top:calc(12px + env(safe-area-inset-top,0px));left:12px;z-index:201;width:40px;height:40px;border:none;border-radius:10px;background:rgba(0,0,0,0.5);color:#fff;font-size:20px;cursor:pointer;">←</button>
+    <button id="fullscreen-back-btn" style="position:absolute;top:calc(12px + env(safe-area-inset-top,0px));left:12px;z-index:201;width:40px;height:40px;border:none;border-radius:10px;background:rgba(0,0,0,0.5);color:#fff;font-size:20px;cursor:pointer;">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+    </button>
     <div style="position:absolute;top:calc(12px + env(safe-area-inset-top,0px));right:12px;z-index:201;display:flex;align-items:center;gap:6px;">
-      <button id="fullscreen-auto-btn" style="padding:4px 10px;border:none;border-radius:8px;background:rgba(0,0,0,0.5);color:#fff;font-size:13px;cursor:pointer;">停止刷新</button>
+      <span id="fullscreen-auto-btn" class="fullscreen-stream-status">实时流</span>
     </div>
-    <img id="fullscreen-preview" style="flex:1;min-height:0;width:100%;object-fit:contain;" />
+    <canvas id="fullscreen-video" aria-label="Android 实时画面" hidden></canvas>
+    <img id="fullscreen-preview" style="display:none;flex:1;min-height:0;width:100%;object-fit:contain;" />
     <div id="fullscreen-toolbar" style="display:flex;align-items:center;justify-content:center;gap:16px;padding:8px 12px;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px));background:#111;">
-      <button id="fullscreen-text-btn" style="width:44px;height:44px;border:none;border-radius:50%;background:#333;color:#fff;font-size:22px;cursor:pointer;">⌨️</button>
-    </div>
-  </div>
-
-  <!-- Shell 命令弹窗 -->
-  <div id="shell-modal" class="modal">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h3>执行命令</h3>
-        <button id="shell-modal-close" class="modal-close">✕</button>
-      </div>
-      <input type="text" id="shell-input" placeholder="输入 adb shell 命令，如 pm list packages" autocomplete="off" />
-      <div class="modal-actions">
-        <button id="shell-run-btn" class="btn-primary">执行</button>
-      </div>
-      <pre id="shell-output" style="margin-top:14px;max-height:200px;overflow:auto;background:#111426;color:#cfd7ff;padding:10px;border-radius:10px;font-size:12px;white-space:pre-wrap;word-break:break-word;display:none;"></pre>
+      <button id="fullscreen-text-btn" style="width:44px;height:44px;border:none;border-radius:50%;background:#333;color:#fff;font-size:22px;cursor:pointer;">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2" ry="2"></rect><line x1="6" y1="8" x2="6.01" y2="8"></line><line x1="10" y1="8" x2="10.01" y2="8"></line><line x1="14" y1="8" x2="14.01" y2="8"></line><line x1="18" y1="8" x2="18.01" y2="8"></line><line x1="8" y1="12" x2="16" y2="12"></line><line x1="6" y1="16" x2="18" y2="16"></line></svg>
+      </button>
     </div>
   </div>
 
   <!-- 输入文字弹窗 -->
   <div id="input-text-modal" class="modal" style="z-index:300;">
     <div class="modal-content">
+      <div class="modal-drag-handle"></div>
       <div class="modal-header">
         <h3>输入文字到手机</h3>
-        <button id="input-text-close" class="modal-close">✕</button>
+        <button id="input-text-close" class="modal-close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
       </div>
       <input type="text" id="fullscreen-text-input" placeholder="输入文字..." autocomplete="off" />
       <div class="modal-actions">
@@ -271,10 +358,11 @@
   <script src="xterm.js"></script>
   <script src="addon-fit.js"></script>
   <script src="addon-unicode11.js"></script>
-  <script src="chat-helpers.js"></script>
+  <script src="android-mirror-client.js"></script>
   <script src="file-preview-helpers.js"></script>
   <script src="terminal-scroll-helpers.js"></script>
   <script src="spinner-interceptor.js"></script>
+  <script src="terminal-content-helpers.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

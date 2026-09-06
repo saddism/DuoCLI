@@ -1,5 +1,26 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
+export type RemoteSyncStatus = 'healthy' | 'lan-only' | 'degraded' | 'retrying' | 'error';
+
+export interface RemoteSyncHealthPayload {
+  status: RemoteSyncStatus;
+  localOk: boolean;
+  tunnelRunning: boolean;
+  publicOk: boolean;
+  publicUrl?: string;
+  message: string;
+  lastCheckedAt: number;
+}
+
+export interface RemoteServerInfoPayload {
+  lanUrl: string;
+  token: string;
+  port: number;
+  publicUrl?: string;
+  tunnel?: { installed?: boolean; running: boolean; url: string; message?: string };
+  health?: RemoteSyncHealthPayload;
+}
+
 contextBridge.exposeInMainWorld('duocli', {
   // 设置窗口标题
   setWindowTitle: (title: string) => ipcRenderer.send('window:set-title', title),
@@ -20,7 +41,7 @@ contextBridge.exposeInMainWorld('duocli', {
 
   // 销毁终端
   destroyPty: (id: string) =>
-    ipcRenderer.send('pty:destroy', id),
+    ipcRenderer.invoke('pty:destroy', id),
 
   // 重命名终端
   renamePty: (id: string, title: string) =>
@@ -54,10 +75,14 @@ contextBridge.exposeInMainWorld('duocli', {
     ipcRenderer.on('pty:remote-created', (_e, info) => cb(info)),
 
   // 远程服务器连接信息
-  onRemoteServerInfo: (cb: (info: { lanUrl: string; token: string; port: number; publicUrl?: string; tunnel?: { running: boolean; url: string; message?: string } }) => void) =>
+  onRemoteServerInfo: (cb: (info: RemoteServerInfoPayload) => void) =>
     ipcRenderer.on('remote:server-info', (_e, info) => cb(info)),
+  onRemoteHealthUpdate: (cb: (health: RemoteSyncHealthPayload) => void) =>
+    ipcRenderer.on('remote:health-update', (_e, health) => cb(health)),
   // 渲染进程主动获取远程服务器信息（解决竞态问题）
   getRemoteServerInfo: () => ipcRenderer.invoke('remote:get-server-info'),
+  getRemoteHealth: () => ipcRenderer.invoke('remote:get-health'),
+  retryRemoteSync: () => ipcRenderer.invoke('remote:retry-sync'),
 
   // 剪贴板图片
   clipboardSaveImage: () => ipcRenderer.invoke('clipboard:save-image'),
@@ -81,6 +106,15 @@ contextBridge.exposeInMainWorld('duocli', {
 
   // 用默认应用打开文件
   openFile: (filePath: string) => ipcRenderer.invoke('shell:open-file', filePath),
+  // 桌面 Pane 只读文件预览
+  readFilePreview: (cwd: string, filePath: string) => ipcRenderer.invoke('file-preview:read', cwd, filePath),
+
+  // 桌面 Android Pane
+  androidListDevices: () => ipcRenderer.invoke('android:list-devices'),
+  androidScreenshot: (deviceId?: string) => ipcRenderer.invoke('android:screenshot', deviceId),
+  androidTap: (deviceId: string, x: number, y: number) => ipcRenderer.invoke('android:tap', deviceId, x, y),
+  androidSwipe: (deviceId: string, x1: number, y1: number, x2: number, y2: number, duration?: number) => ipcRenderer.invoke('android:swipe', deviceId, x1, y1, x2, y2, duration),
+  androidInputText: (deviceId: string, text: string) => ipcRenderer.invoke('android:input-text', deviceId, text),
 
   // 打开外部链接
   openUrl: (url: string) => ipcRenderer.invoke('shell:open-url', url),
@@ -89,23 +123,16 @@ contextBridge.exposeInMainWorld('duocli', {
   aiApplyConfig: (config: { apiFormat: string; baseUrl: string; apiKey: string; model: string }) => ipcRenderer.invoke('ai:apply-config', config),
   aiTestConfig: (config: { apiFormat: string; baseUrl: string; apiKey: string; model: string }) => ipcRenderer.invoke('ai:test-config', config),
   aiGetCurrentConfig: () => ipcRenderer.invoke('ai:get-current-config'),
+  terminalAutoResponseGetConfig: () => ipcRenderer.invoke('terminal-auto-response:get-config'),
+  terminalAutoResponseSaveConfig: (config: any) => ipcRenderer.invoke('terminal-auto-response:save-config', config),
   // 获取 CLI 实际使用的模型提供商
   getCliProvider: (presetCommand: string) => ipcRenderer.invoke('cli:get-provider', presetCommand),
+  // 本机可用的内置预制 CLI（不存在的会过滤掉）
+  getAvailableBuiltinPresets: () => ipcRenderer.invoke('cli:available-builtins'),
 
   // Claude 供应商配置
   claudeProvidersList: () => ipcRenderer.invoke('claude-providers:list'),
   claudeProvidersSave: (providers: any[]) => ipcRenderer.invoke('claude-providers:save', providers),
-
-  // Devin 账号管理
-  devinAccountsList: () => ipcRenderer.invoke('devin-accounts:list'),
-  devinAccountsAdd: (email: string, password: string) => ipcRenderer.invoke('devin-accounts:add', email, password),
-  devinAccountsAddBatch: (text: string) => ipcRenderer.invoke('devin-accounts:add-batch', text),
-  devinAccountsRemove: (email: string) => ipcRenderer.invoke('devin-accounts:remove', email),
-  devinAccountsSwitch: (opts: { email?: string; next?: boolean }) => ipcRenderer.invoke('devin-accounts:switch', opts),
-  devinAccountsQuota: () => ipcRenderer.invoke('devin-accounts:quota'),
-  devinAccountsQuotaAll: () => ipcRenderer.invoke('devin-accounts:quota-all'),
-  devinAccountsQuotaOne: (email: string) => ipcRenderer.invoke('devin-accounts:quota-one', email),
-  devinAccountsRotateDevice: () => ipcRenderer.invoke('devin-accounts:rotate-device'),
 
   // 会话状态同步：renderer → main（供手机端读取）
   syncSessionStatus: (statuses: Record<string, string>) =>
@@ -119,48 +146,15 @@ contextBridge.exposeInMainWorld('duocli', {
   onSetAutoContinueConfig: (cb: (sessionId: string, config: any) => void) =>
     ipcRenderer.on('auto-continue:set', (_e, sessionId, config) => cb(sessionId, config)),
 
-  // ========== Chat API ==========
-  chatCreate: (opts: { workspace: string; model?: string }) =>
-    ipcRenderer.invoke('chat:create', opts),
-  chatSend: (sessionId: string, content: string) =>
-    ipcRenderer.invoke('chat:send', sessionId, content),
-  chatList: () => ipcRenderer.invoke('chat:list'),
-  chatMessages: (sessionId: string) =>
-    ipcRenderer.invoke('chat:messages', sessionId),
-  chatDestroy: (sessionId: string) =>
-    ipcRenderer.invoke('chat:destroy', sessionId),
-  chatAbort: (sessionId: string) =>
-    ipcRenderer.invoke('chat:abort', sessionId),
-  chatRename: (sessionId: string, title: string) =>
-    ipcRenderer.invoke('chat:rename', sessionId, title),
-  chatHealth: () => ipcRenderer.invoke('chat:health'),
-  chatProxyStart: () => ipcRenderer.invoke('chat:proxy-start'),
-  chatModels: () => ipcRenderer.invoke('chat:models'),
-  onChatDelta: (cb: (sessionId: string, text: string) => void) =>
-    ipcRenderer.on('chat:delta', (_e, sessionId, text) => cb(sessionId, text)),
-  onChatDone: (cb: (sessionId: string, content: string) => void) =>
-    ipcRenderer.on('chat:done', (_e, sessionId, content) => cb(sessionId, content)),
-  onChatError: (cb: (sessionId: string, error: string) => void) =>
-    ipcRenderer.on('chat:error', (_e, sessionId, error) => cb(sessionId, error)),
-  onChatTitleUpdate: (cb: (sessionId: string, title: string) => void) =>
-    ipcRenderer.on('chat:title-update', (_e, sessionId, title) => cb(sessionId, title)),
-
   // ========== 已关闭会话 ==========
   closedSessionsList: () => ipcRenderer.invoke('closed-sessions:list'),
+  closedSessionsBeginRestore: (id: string) => ipcRenderer.invoke('closed-sessions:begin-restore', id),
+  closedSessionsCancelRestore: (id: string) => ipcRenderer.invoke('closed-sessions:cancel-restore', id),
   closedSessionsRemove: (id: string) => ipcRenderer.invoke('closed-sessions:remove', id),
   closedSessionsClear: () => ipcRenderer.invoke('closed-sessions:clear'),
+  closedSessionsConfirmRestore: (closedId: string, sessionId: string) =>
+    ipcRenderer.invoke('closed-sessions:confirm-restore', closedId, sessionId),
   onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>) => void) =>
     ipcRenderer.on('closed-sessions:update', (_e, sessions) => cb(sessions)),
 
-  // ========== 已关闭 Chat 会话 ==========
-  closedChatList: () => ipcRenderer.invoke('closed-chat:list'),
-  closedChatRemove: (id: string) => ipcRenderer.invoke('closed-chat:remove', id),
-  closedChatClear: () => ipcRenderer.invoke('closed-chat:clear'),
-  chatRestore: (closedId: string) => ipcRenderer.invoke('chat:restore', closedId),
-  onClosedChatUpdate: (cb: (sessions: Array<{ id: string; title: string; model: string; workspace: string; messages: Array<{ role: string; content: string; timestamp: number }>; closedAt: number }>) => void) =>
-    ipcRenderer.on('closed-chat-sessions:update', (_e, sessions) => cb(sessions)),
-
-  // 自动切号状态
-  onAutoSwitchStatus: (cb: (id: string, status: string, detail?: string) => void) =>
-    ipcRenderer.on('pty:auto-switch-status', (_e, id, status, detail) => cb(id, status, detail)),
 });

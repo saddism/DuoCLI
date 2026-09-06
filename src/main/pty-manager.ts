@@ -3,14 +3,34 @@ import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { execSync, spawn } from 'child_process';
+import { execSync } from 'child_process';
 import { requestTitleFromConfiguredAI, cleanGeneratedTitle, TitleAIConfig } from './title-ai';
+import { TerminalState, TerminalSnapshot } from './terminal-state';
+import {
+  findNewAutoResponseRule,
+  TerminalAutoResponseConfig,
+} from './terminal-auto-response';
+import {
+  CliKind,
+  ResumeCapture,
+  buildResumeCommand,
+  createCursorSessionId,
+  identifyCli,
+  parseResumeCommandLine,
+  parseResumeOutput,
+  preassignSessionId,
+  resolveSessionId,
+} from './session-resume';
 
 export interface PtySession {
   id: string;
   ptyProcess: pty.IPty;
   buffer: string;
   rawBuffer: string;          // 完整 ANSI 输出，用于远程终端回放
+  lastSequence: number;       // rawBuffer 对应的终端解析序号
+  terminalState: TerminalState;
+  submissions: Map<string, { text: string; result: Promise<void>; settled: boolean }>;
+  submitQueue: Promise<void>;
   userInputs: string[];
   commandCount: number;
   title: string;
@@ -25,31 +45,49 @@ export interface PtySession {
   summarizeTimer: NodeJS.Timeout | null;
   cwd: string;
   presetCommand: string;
+  launchCommand: string;           // preset plus a provider-specific preassigned id
+  cliKind: CliKind;
   themeId: string;
   provider: string | null;    // 实际使用的模型提供商 (如 MiniMax, GLM 等)
   createdAt: number;          // 创建时间戳
   resumeId: string | null;    // 捕获的 resume session ID (UUID)
   resumeCommand: string | null; // 完整 resume 命令 (如 "claude --resume xxx")
-  autoRetryCooldown: number;    // 自动重试冷却截止时间戳
-  prevData: string;              // 上一个 PTY 分片，与当前分片合并检测 rate limit
-  retryTimer: NodeJS.Timeout | null;  // 自动重试 / 切号延迟定时器
+  resumeSource: ResumeCapture['source'] | null;
+  closing: boolean;
+  closePromise?: Promise<ResumeCapture | null>;
+  launchSentAt: number | null;
+  launchCommandEchoed: boolean;
+  launchEchoBuffer: string;
+  launchPreExecSeen: boolean;
+  launchOutput: string;
+  launchReturnedToShell: boolean;
+  launchTimer: NodeJS.Timeout | null;
   disposables: pty.IDisposable[];
-  switchAttempts: number;        // 本轮自动切号已尝试次数
-  lastAutoSwitchAt: number;      // 上次自动切号时间戳
-  rateLimitRetryCount: number;   // 连续 rate limit 重试"继续"次数（成功后重置）
-  lastRateLimitAt: number;       // 上次检测到 rate limit 的时间戳（用于判断连续性）
+  autoResponseTail: string;      // 已处理输出的短尾，仅用于跨 PTY 分片匹配
+  autoResponseLastTriggeredAt: Map<string, number>;
+  autoResponseTimers: Set<NodeJS.Timeout>;
+  // —— pty 尺寸归属：桌面和手机共用一个 pty，尺寸跟着最后在输入的那一端走。
+  // 每次 SIGWINCH 都会让 TUI 全量重绘并在滚动区留下残帧，两端抢尺寸会刷屏。——
+  currentCols: number;
+  currentRows: number;
+  sizeBySource: Record<PtyInputSource, { cols: number; rows: number } | null>;
+  sizeOwner: PtyInputSource | null;
+  lastInputAt: Record<PtyInputSource, number>;
 }
+
+export type PtyInputSource = 'desktop' | 'mobile';
 
 interface PtyManagerEvents {
   onData: (id: string, data: string) => void;
   onTitleUpdate: (id: string, title: string) => void;
   onExit: (id: string) => void;
   onPasteInput?: (id: string, cwd: string) => void;
-  onRawData?: (id: string, data: string) => void;
-  onAutoSwitchStatus?: (id: string, status: string, detail?: string) => void;
+  onRawData?: (id: string, data: string, sequence: number) => void;
+  onResize?: (id: string, cols: number, rows: number) => void;
 }
 
 export type TitleAIConfigProvider = () => TitleAIConfig | null;
+export type TerminalAutoResponseConfigProvider = () => TerminalAutoResponseConfig;
 
 // 命令 → 友好显示名称映射
 const PRESET_DISPLAY_NAMES: Record<string, string> = {
@@ -57,12 +95,19 @@ const PRESET_DISPLAY_NAMES: Record<string, string> = {
   'codex --full-auto': 'Codex全自动',
   'codex -c sandbox_mode="danger-full-access" -c approval="never" -c network="enabled"': 'Codex全自动',
   'devin --permission-mode bypass': 'Devin全自动',
+  'kimi --auto': 'Kimi全自动',
+  'gemini --yolo': 'Gemini全自动',
+  'qoder chat --dangerously-skip-permissions': 'Qoder全自动',
+  'qodercn --dangerously-skip-permissions': 'QoderCN全自动',
   'opencode': 'OpenCode',
   'kiro-cli chat --trust-all-tools': 'Kiro全自动',
+  'agent --force --approve-mcps': 'Cursor全自动',
+  'agy --dangerously-skip-permissions': '反重力全自动',
 };
 
 // 终端会话标题「智能起名」：起名材料累加到第 N 段（用户每次回车发送算一段）后锁定，不再自动改名
 const TITLE_SEGMENT_CAP = 3;
+const AUTO_RESPONSE_TAIL_LENGTH = 512;
 
 /**
  * 把用户击键的原始字节流解析成「行缓冲」状态，供起名使用（旁路观察，绝不影响命令转发）。
@@ -157,102 +202,6 @@ function stripTerminalControlSequences(text: string): string {
     .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
 }
 
-// 各 CLI 的 resume 命令格式不同，逐一匹配
-// 返回完整恢复命令和会话 ID，无匹配返回 null
-function parseResumeCommand(text: string): { command: string; sessionId: string } | null {
-  const patterns: Array<{ re: RegExp; build: (m: RegExpMatchArray) => string }> = [
-    // Cursor Agent: "agent --resume=<uuid>"
-    { re: /\b(agent)\s+--resume=([\w-]+)/i, build: m => `${m[1]} --resume=${m[2]}` },
-    // Claude Code: "claude --resume <uuid>" —— id 必须是 UUID，
-    // 否则会把 Claude 自己打印的提示文案（如 "claude --resume to ..."）误抓成会话 id
-    { re: /\b(claude)\s+--resume\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i, build: m => `${m[1]} --resume ${m[2]}` },
-    // Kiro: "kiro-cli --resume-id <uuid>"
-    { re: /\b(kiro[\w-]*)\s+--resume-id\s+([\w-]+)/i, build: m => `${m[1]} --resume-id ${m[2]}` },
-    // Codex: "codex resume <id>"
-    { re: /\b(codex)\s+resume\s+([\w-]+)/i, build: m => `${m[1]} resume ${m[2]}` },
-    // OpenCode: "opencode -s <ses_id>"
-    { re: /\b(opencode)\s+-s\s+(\w+)/i, build: m => `${m[1]} -s ${m[2]}` },
-    // Devin: "devin -r <session_name>"
-    { re: /\b(devin)\s+-r\s+([\w-]+)/i, build: m => `${m[1]} -r ${m[2]}` },
-  ];
-
-  for (const { re, build } of patterns) {
-    const match = text.match(re);
-    if (match) {
-      return { command: build(match), sessionId: match[2] };
-    }
-  }
-  return null;
-}
-
-// 读取 Devin 可用账号数（用于限制自动切号轮次）
-function getDevinAccountCount(): number {
-  try {
-    const accountsPath = path.join(os.homedir(), '.session-sync-manager', 'accounts.json');
-    if (fs.existsSync(accountsPath)) {
-      const data = JSON.parse(fs.readFileSync(accountsPath, 'utf-8'));
-      return (data.accounts || []).filter((a: any) => a.enabled !== false).length || 1;
-    }
-  } catch { /* ignore */ }
-  return 1;
-}
-
-// Devin 设备指纹旋转（防止跨账号限流关联）
-const DEVIN_INSTALLATION_ID_PATHS = [
-  path.join(os.homedir(), '.local', 'share', 'devin', 'cli', 'installation_id'),
-  path.join(os.homedir(), '.local', 'share', 'devin', 'cli-next', 'installation_id'),
-];
-
-// Windsurf Electron 设备 ID（Devin 二进制会读取 Windsurf 配置路径）
-const WINDSURF_MACHINEID_PATHS = [
-  path.join(os.homedir(), 'Library', 'Application Support', 'Windsurf', 'machineid'),
-  path.join(os.homedir(), 'Library', 'Application Support', 'Windsurf - Next', 'machineid'),
-];
-
-export function rotateDevinInstallationId(): void {
-  const newId = crypto.randomUUID().toUpperCase();
-
-  // 1) Devin CLI installation_id
-  for (const p of DEVIN_INSTALLATION_ID_PATHS) {
-    try {
-      if (fs.existsSync(p)) {
-        fs.writeFileSync(p, newId);
-        console.log(`[PTY] Rotated installation_id: ${p} → ${newId}`);
-      } else {
-        const dir = path.dirname(p);
-        if (fs.existsSync(dir)) {
-          fs.writeFileSync(p, newId);
-          console.log(`[PTY] Created installation_id: ${p} → ${newId}`);
-        }
-      }
-    } catch (e) {
-      console.warn(`[PTY] Failed to rotate installation_id ${p}:`, (e as Error).message);
-    }
-  }
-
-  // 2) Windsurf machineid（用不同的 UUID，避免两个 ID 相同引发关联）
-  const newMachineId = crypto.randomUUID().toUpperCase();
-  for (const p of WINDSURF_MACHINEID_PATHS) {
-    try {
-      if (fs.existsSync(p)) {
-        fs.writeFileSync(p, newMachineId);
-        console.log(`[PTY] Rotated machineid: ${p} → ${newMachineId}`);
-      }
-    } catch (e) {
-      console.warn(`[PTY] Failed to rotate machineid ${p}:`, (e as Error).message);
-    }
-  }
-}
-
-// 解析 session-sync 的绝对路径（避免 Dock 启动时 PATH 缺失导致 ENOENT）
-const sessionSyncPath = (() => {
-  try {
-    const syncSymlink = path.join(os.homedir(), '.local', 'bin', 'session-sync');
-    if (fs.existsSync(syncSymlink)) return fs.realpathSync(syncSymlink);
-  } catch { /* ignore */ }
-  return 'session-sync'; // fallback to PATH lookup
-})();
-
 export function getDisplayName(presetCommand: string): string {
   return PRESET_DISPLAY_NAMES[presetCommand] || presetCommand || '终端';
 }
@@ -262,14 +211,43 @@ export class PtyManager {
   private nextId = 1;
   private events: PtyManagerEvents;
   private getTitleAIConfig?: TitleAIConfigProvider;
+  private getTerminalAutoResponseConfig?: TerminalAutoResponseConfigProvider;
 
-  constructor(events: PtyManagerEvents, getTitleAIConfig?: TitleAIConfigProvider) {
+  constructor(
+    events: PtyManagerEvents,
+    getTitleAIConfig?: TitleAIConfigProvider,
+    getTerminalAutoResponseConfig?: TerminalAutoResponseConfigProvider,
+  ) {
     this.events = events;
     this.getTitleAIConfig = getTitleAIConfig;
+    this.getTerminalAutoResponseConfig = getTerminalAutoResponseConfig;
   }
 
   create(cwd: string, presetCommand: string, themeId: string, envOverrides?: Record<string, string>): PtySession {
     const id = `term-${this.nextId++}`;
+    const cliKind = identifyCli(presetCommand);
+    let launchCommand = presetCommand;
+    let initialResume: ResumeCapture | null = parseResumeCommandLine(presetCommand);
+
+    // Allocate IDs before launching the CLIs that support it. This makes a
+    // forced PTY close recoverable even when the CLI never gets a chance to
+    // print its usual “to resume” hint.
+    if (!initialResume && cliKind === 'cursor') {
+      const cursorId = createCursorSessionId(cwd);
+      if (cursorId) {
+        launchCommand = buildResumeCommand(presetCommand, cursorId);
+        initialResume = {
+          cli: cliKind,
+          sessionId: cursorId,
+          resumeCommand: buildResumeCommand(presetCommand, cursorId),
+          source: 'preassigned',
+        };
+      }
+    } else if (!initialResume && (cliKind === 'claude' || cliKind === 'gemini' || cliKind === 'qoder' || cliKind === 'qodercn')) {
+      const preassigned = preassignSessionId(presetCommand, crypto.randomUUID());
+      launchCommand = preassigned.command;
+      initialResume = preassigned.capture;
+    }
     const shell = process.platform === 'win32'
       ? (process.env.COMSPEC || 'cmd.exe')
       : (process.env.SHELL || '/bin/zsh');
@@ -307,6 +285,10 @@ export class PtyManager {
       ptyProcess,
       buffer: '',
       rawBuffer: '',
+      lastSequence: 0,
+      terminalState: new TerminalState(),
+      submissions: new Map(),
+      submitQueue: Promise.resolve(),
       userInputs: [],
       commandCount: 0,
       title: '新会话',
@@ -320,18 +302,30 @@ export class PtyManager {
       summarizeTimer: null,
       cwd,
       presetCommand,
+      launchCommand,
+      cliKind,
       themeId,
       provider: null,
       createdAt: Date.now(),
-      resumeId: null,
-      resumeCommand: null,
-      autoRetryCooldown: 0,
-      prevData: '',
-      retryTimer: null,
-      switchAttempts: 0,
-      lastAutoSwitchAt: 0,
-      rateLimitRetryCount: 0,
-      lastRateLimitAt: 0,
+      resumeId: initialResume?.sessionId || null,
+      resumeCommand: initialResume?.resumeCommand || null,
+      resumeSource: initialResume?.source || null,
+      closing: false,
+      launchSentAt: null,
+      launchCommandEchoed: false,
+      launchEchoBuffer: '',
+      launchPreExecSeen: false,
+      launchOutput: '',
+      launchReturnedToShell: false,
+      launchTimer: null,
+      autoResponseTail: '',
+      autoResponseLastTriggeredAt: new Map(),
+      autoResponseTimers: new Set(),
+      currentCols: 80,
+      currentRows: 24,
+      sizeBySource: { desktop: null, mobile: null },
+      sizeOwner: 'desktop',
+      lastInputAt: { desktop: 0, mobile: 0 },
       disposables: [],
     };
 
@@ -341,18 +335,38 @@ export class PtyManager {
       if (session.buffer.length > 5000) {
         session.buffer = session.buffer.slice(-2500);
       }
-      // rawBuffer 用于远程终端回放（弱网下 replay 体积直接决定首屏速度，
-      // 上限 128KB：足够覆盖几屏可视内容 + 适量回滚，再多也很难真的滚到）
-      session.rawBuffer += data;
-      if (session.rawBuffer.length > 131072) {
-        // 直接 slice 可能把 ANSI 转义序列切成两半（半截 ESC），
-        // replay 时 xterm 收到残缺序列会把后续可见字符当成参数吃掉 → spinner 撕裂多行。
-        // 把切点往后推到下一个 ESC 字节，保证从一个完整序列开头处恢复。
-        let cut = session.rawBuffer.length - 131072;
-        const nextEsc = session.rawBuffer.indexOf('\x1b', cut);
-        if (nextEsc !== -1 && nextEsc - cut < 4096) cut = nextEsc;
-        session.rawBuffer = session.rawBuffer.slice(cut);
+      if (session.launchCommand && session.launchSentAt !== null) {
+        let postEchoData = data;
+        if (!session.launchCommandEchoed && session.resumeId) {
+          const directIndex = data.indexOf(session.resumeId);
+          session.launchEchoBuffer = (session.launchEchoBuffer + data).slice(-Math.max(512, session.resumeId.length * 2));
+          if (directIndex >= 0) {
+            session.launchCommandEchoed = true;
+            session.launchOutput = '';
+            session.launchReturnedToShell = false;
+            postEchoData = data.slice(directIndex + session.resumeId.length);
+          } else if (session.launchEchoBuffer.includes(session.resumeId)) {
+            session.launchCommandEchoed = true;
+            session.launchOutput = '';
+            session.launchReturnedToShell = false;
+          }
+        }
+        if (session.launchCommandEchoed) {
+          session.launchOutput += postEchoData;
+          if (session.launchOutput.length > 8000) session.launchOutput = session.launchOutput.slice(-4000);
+          const preExecIndex = postEchoData.indexOf('\x1b]697;PreExec\x07');
+          if (preExecIndex >= 0) session.launchPreExecSeen = true;
+          // Shell integration emits this OSC marker after PreExec when the
+          // command has returned to the prompt. Initial prompt markers can be
+          // delayed until after the PTY write, so ignore them before PreExec.
+          const promptMatch = /\x1b\]697;(?:StartPrompt|EndPrompt)\x07/.exec(postEchoData);
+          if (promptMatch && session.launchPreExecSeen
+              && (preExecIndex < 0 || promptMatch.index > preExecIndex)) {
+            session.launchReturnedToShell = true;
+          }
+        }
       }
+      this.maybeAutoRespondToTerminalOutput(session, data);
 
       // 拦截 OSC 0/1/2 窗口/图标标题序列：ESC ] 0;<title> BEL  或 ESC ] 0;<title> ESC \
       // 仅在用户未配置 AI 时使用 — 配了 AI 就让 AI 起标题，OSC 仅作兜底
@@ -375,146 +389,106 @@ export class PtyManager {
 
       // 实时捕获各 CLI 的 resume 命令（格式各异）
       if (!session.resumeId) {
-        const stripped = stripTerminalControlSequences(data);
-        const result = parseResumeCommand(stripped);
+        // Parse the rolling buffer, not only this PTY chunk: CLIs frequently
+        // wrap the resume command at the terminal width or split it across
+        // node-pty data events.
+        const result = parseResumeOutput(session.buffer, session.presetCommand);
         if (result) {
           session.resumeId = result.sessionId;
-          session.resumeCommand = result.command;
+          session.resumeCommand = result.resumeCommand;
+          session.resumeSource = result.source;
         }
-      }
-
-      // Devin 终端专属：自动重试与切号
-      // 仅对 devin presetCommand 生效，其他终端不触发
-      if (session.presetCommand.startsWith('devin')) {
-        const combinedLower = (session.prevData + data).toLowerCase();
-        session.prevData = data;
-
-        // 检测 rate limit 相关错误（涵盖硬限流和软限流）
-        // 典型特征: "Permission denied: Reached overall message rate limit"
-        const isRateLimit = combinedLower.includes('rate limit')
-          || combinedLower.includes('quota exhausted')
-          || combinedLower.includes('usage is exhausted');
-
-        // 严格匹配：连续出现 rate limit 错误的判定阈值
-        const RATE_LIMIT_RETRY_MAX = 3;       // 发"继续"最多尝试次数
-        const RATE_LIMIT_WINDOW = 15000;      // 窗口期：15 秒内的连续 rate limit 才算一轮
-
-        if (isRateLimit) {
-          session.prevData = '';
-          const now = Date.now();
-
-          // 防止 PTY 分片导致的重复触发：如果已有 retryTimer 在跑，跳过本次
-          if (session.retryTimer) return;
-
-          // 超出窗口期则重新计数（上一次 rate limit 已久，不算连续）
-          if (now - session.lastRateLimitAt > RATE_LIMIT_WINDOW) {
-            session.rateLimitRetryCount = 0;
-          }
-          session.lastRateLimitAt = now;
-          session.rateLimitRetryCount++;
-
-          const maxAccounts = getDevinAccountCount();
-
-          if (session.rateLimitRetryCount <= RATE_LIMIT_RETRY_MAX) {
-            // 阶段 1: 在 session 内发"继续"尝试恢复
-            console.log(`[PTY] 检测到 rate limit (${session.rateLimitRetryCount}/${RATE_LIMIT_RETRY_MAX})，${session.rateLimitRetryCount < RATE_LIMIT_RETRY_MAX ? '5' : 8} 秒后发"继续" (session: ${id})`);
-            session.retryTimer = setTimeout(() => {
-              session.retryTimer = null;
-              if (!this.sessions.has(id)) return;
-              ptyProcess.write('继续\r');
-              console.log(`[PTY] 已发送"继续" (${session.rateLimitRetryCount}/${RATE_LIMIT_RETRY_MAX}) (session: ${id})`);
-            }, session.rateLimitRetryCount < RATE_LIMIT_RETRY_MAX ? 5000 : 8000);
-          } else if (session.switchAttempts >= maxAccounts) {
-            // 阶段 3: 所有账号都试过了，放弃
-            const errMsg = `\n⚠️ [DuoCLI] 全部 ${maxAccounts} 个账号已耗尽，请稍后再试\n`;
-            ptyProcess.write(errMsg);
-            this.events.onAutoSwitchStatus?.(id, 'exhausted', `全部 ${maxAccounts} 个号已耗尽`);
-            console.log(`[PTY] 全部 ${maxAccounts} 个账号已耗尽 (session: ${id})`);
-            session.switchAttempts = 0;
-            session.rateLimitRetryCount = 0;
-            session.autoRetryCooldown = now + 60000;
-          } else if (now > session.autoRetryCooldown) {
-            // 阶段 2: 连续多次"继续"无效，走换号流程
-            session.switchAttempts++;
-            session.rateLimitRetryCount = 0;
-            session.lastAutoSwitchAt = now;
-            session.autoRetryCooldown = now + 30000;
-
-            this.events.onAutoSwitchStatus?.(id, 'switching', `换号中 (${session.switchAttempts}/${maxAccounts})`);
-            console.log(`[PTY] 连续 ${RATE_LIMIT_RETRY_MAX} 次 rate limit 未恢复，执行换号 ${session.switchAttempts}/${maxAccounts} (session: ${id})`);
-
-            // 1) 优雅退出当前 Devin
-            ptyProcess.write('/exit\r');
-
-            // 2) 等 3 秒让 Devin 完全退出，再执行 session-sync go（切号 + 启动新 Devin）
-            session.retryTimer = setTimeout(() => {
-              session.retryTimer = null;
-              if (!this.sessions.has(id)) return;
-              session.buffer = '';
-              session.rawBuffer = '';
-              session.prevData = '';
-              rotateDevinInstallationId();
-              ptyProcess.write('session-sync go\r');
-              this.events.onAutoSwitchStatus?.(id, 'switched', `已切换 (${session.switchAttempts}/${maxAccounts})`);
-              console.log(`[PTY] 已发送 session-sync go (session: ${id})`);
-
-              session.autoRetryCooldown = 0;
-              // 15 秒后如果没再触发 rate limit，重置计数
-              session.retryTimer = setTimeout(() => {
-                session.retryTimer = null;
-                if (this.sessions.has(id)) {
-                  session.switchAttempts = 0;
-                  this.events.onAutoSwitchStatus?.(id, 'idle');
-                }
-              }, 15000);
-            }, 3000);
-          }
-        }
-        // 非 rate limit 的普通警告 → 8 秒后发"继续"
-        else if (combinedLower.includes('⚠') || combinedLower.includes('something went wrong')) {
-          session.prevData = '';
-          if (Date.now() > session.autoRetryCooldown) {
-            console.log(`[PTY] 检测到 ⚠ 警告，8 秒后发送"继续" (session: ${id})`);
-            session.autoRetryCooldown = Date.now() + 10000;
-            session.retryTimer = setTimeout(() => {
-              session.retryTimer = null;
-              if (!this.sessions.has(id)) return;
-              ptyProcess.write('继续\r');
-              session.autoRetryCooldown = 0;
-            }, 8000);
-          }
-        }
-      } else {
-        session.prevData = data;
       }
 
       this.events.onData(id, data);
-      this.events.onRawData?.(id, data);
+      session.terminalState.write(data, sequence => {
+        // Only publish raw history after the same bytes have been parsed by
+        // TerminalState. This keeps rawBuffer and lastSequence aligned when
+        // a reconnect races with a burst of PTY output.
+        session.rawBuffer += data;
+        if (session.rawBuffer.length > 131072) {
+          // 直接 slice 可能把 ANSI 转义序列切成两半（半截 ESC），
+          // replay 时 xterm 收到残缺序列会把后续可见字符当成参数吃掉 → spinner 撕裂多行。
+          // 把切点往后推到下一个 ESC 字节，保证从一个完整序列开头处恢复。
+          let cut = session.rawBuffer.length - 131072;
+          const nextEsc = session.rawBuffer.indexOf('\x1b', cut);
+          if (nextEsc !== -1 && nextEsc - cut < 4096) cut = nextEsc;
+          session.rawBuffer = session.rawBuffer.slice(cut);
+        }
+        session.lastSequence = sequence;
+        this.events.onRawData?.(id, data, sequence);
+      });
     }));
 
     session.disposables.push(ptyProcess.onExit(() => {
-      this.events.onExit(id);
-      this.sessions.delete(id);
+      // Keep the session in the map while the provider registry is queried;
+      // the main-process onExit callback needs the resolved metadata before
+      // the object is removed.
+      const finalize = async () => {
+        if (session.launchTimer) {
+          clearTimeout(session.launchTimer);
+          session.launchTimer = null;
+        }
+        session.terminalState.dispose();
+        this.clearAutoResponseTimers(session);
+        this.captureResumeFromBuffer(id);
+        if (!session.resumeId) {
+          const resolved = resolveSessionId(session.cliKind, session.cwd, session.createdAt, session.presetCommand, session.ptyProcess.pid);
+          if (resolved) {
+            session.resumeId = resolved.sessionId;
+            session.resumeCommand = resolved.resumeCommand;
+            session.resumeSource = resolved.source;
+          }
+        }
+        this.events.onExit(id);
+        this.sessions.delete(id);
+      };
+      void finalize();
     }));
 
     this.sessions.set(id, session);
 
     // 如果有预设命令，延迟发送
-    if (presetCommand) {
-      setTimeout(() => {
-        ptyProcess.write(presetCommand + '\r');
+    if (launchCommand) {
+      session.launchTimer = setTimeout(() => {
+        session.launchTimer = null;
+        // A close can happen during the 300ms shell-start window. Do not
+        // inject a command into a session that is already being torn down.
+        if (this.sessions.get(id) !== session || session.closing) return;
+        session.launchSentAt = Date.now();
+        session.launchCommandEchoed = false;
+        session.launchEchoBuffer = '';
+        session.launchPreExecSeen = false;
+        session.launchOutput = '';
+        session.launchReturnedToShell = false;
+        ptyProcess.write(launchCommand + '\r');
       }, 300);
     }
 
     return session;
   }
 
-  write(id: string, data: string): void {
+  write(id: string, data: string, source: PtyInputSource = 'desktop'): void {
     const session = this.sessions.get(id);
-    if (!session) return;
+    if (!session || session.closing) return;
+    // 终端能力/光标报告不是用户输入，不能触发尺寸接管或取消任务。
+    if (/^(?:\x1b\[[?>]?[\d;:]*c|\x1b\[\d+n|\x1b\[\??\d+;\d+R|\x1b\[\?[\d;]+\$y|\x1b\](?:10|11|12);[^\x07\x1b]*(?:\x07|\x1b\\))+$/.test(data)) {
+      if (session.sizeOwner === source) session.ptyProcess.write(data);
+      return;
+    }
 
-    // 用户手动输入 → 重置自动切号计数（用户接管了）
-    session.switchAttempts = 0;
+    session.lastInputAt[source] = Date.now();
+    if (session.sizeOwner !== source) {
+      session.sizeOwner = source;
+      // 接管终端的那一端立刻拿回自己上次 fit 出的尺寸
+      const own = session.sizeBySource[source];
+      if (own && (own.cols !== session.currentCols || own.rows !== session.currentRows)) {
+        this.applyResize(session, own.cols, own.rows);
+      }
+    }
+
+    // 用户主动输入表示接管终端，取消尚未发送的容错回复。
+    this.clearAutoResponseTimers(session);
 
     // 「智能起名」：旁路观察用户击键，维护行缓冲（绝不影响下面的命令转发）
     const parsed = processUserInputData(session.currentLine, data);
@@ -548,26 +522,119 @@ export class PtyManager {
     session.ptyProcess.write(data);
   }
 
-  resize(id: string, cols: number, rows: number): void {
+  submit(id: string, submissionId: string, text: string): Promise<void> {
     const session = this.sessions.get(id);
-    if (!session) return;
+    if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
+    const existing = session.submissions.get(submissionId);
+    if (existing) return existing.text === text ? existing.result : Promise.reject(new Error('提交编号重复'));
+    const result = session.submitQueue.then(async () => {
+      if (this.sessions.get(id) !== session) throw new Error('会话已结束');
+      let bracketed = false;
+      await session.terminalState.snapshot(() => { bracketed = session.terminalState.terminal.modes.bracketedPasteMode; });
+      const normalized = text.replace(/\r\n?/g, '\n');
+      this.write(id, bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized, 'mobile');
+      // TUI 输入状态需要完成一次更新；回车不能与粘贴被识别成同一次 paste。
+      await new Promise(resolve => setTimeout(resolve, 50));
+      if (this.sessions.get(id) !== session) throw new Error('会话已结束');
+      this.write(id, '\r', 'mobile');
+    });
+    session.submitQueue = result.catch(() => {});
+    const entry = { text, result, settled: false };
+    session.submissions.set(submissionId, entry);
+    const prune = () => {
+      entry.settled = true;
+      for (const [key, value] of session.submissions) {
+        if (session.submissions.size <= 256) break;
+        // Never evict an in-flight ID: an HTTP retry may still be on its way.
+        if (value.settled) session.submissions.delete(key);
+      }
+    };
+    void result.then(prune, prune);
+    return result;
+  }
+
+  snapshot(id: string, consume: (snapshot: TerminalSnapshot) => void): Promise<void> {
+    const session = this.sessions.get(id);
+    if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
+    return session.terminalState.snapshot(consume);
+  }
+
+  resize(id: string, cols: number, rows: number, source: PtyInputSource = 'desktop', force = false): void {
+    const session = this.sessions.get(id);
+    if (!session || session.closing) return;
     // 过滤无效尺寸，node-pty resize(0,0) 会抛异常
-    if (cols > 0 && rows > 0) {
-      session.ptyProcess.resize(cols, rows);
+    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 2 || rows < 1 || cols > 1000 || rows > 1000) return;
+
+    session.sizeBySource[source] = { cols, rows };
+
+    // 另一端正在使用时不抢尺寸：每次 resize 都会让 TUI 重绘并在滚动区留下残帧。
+    // force 用于手机端刚打开会话的首次 resize，属于显式接管。
+    if (!force && session.sizeOwner && session.sizeOwner !== source) {
+      return;
     }
+
+    session.sizeOwner = source;
+    // force = 对端刚打开会话，等同于一次活跃接管，先盖上时间戳防止立刻被抢回
+    if (force) session.lastInputAt[source] = Date.now();
+    if (cols === session.currentCols && rows === session.currentRows) return;
+    this.applyResize(session, cols, rows);
+  }
+
+  private applyResize(session: PtySession, cols: number, rows: number): void {
+    session.currentCols = cols;
+    session.currentRows = rows;
+    session.ptyProcess.resize(cols, rows);
+    session.terminalState.resize(cols, rows, () => this.events.onResize?.(session.id, cols, rows));
+  }
+
+  /**
+   * Resolve and persist provider metadata before killing a PTY. The old
+   * renderer fire-and-forget destroy path could kill the shell before a CLI
+   * emitted its resume hint; this handshake closes that race.
+   */
+  async close(id: string): Promise<ResumeCapture | null> {
+    const session = this.sessions.get(id);
+    if (!session) return null;
+    if (session.closePromise) return session.closePromise;
+    session.closing = true;
+    session.closePromise = (async () => {
+      this.captureResumeFromBuffer(id);
+      if (!session.resumeId) {
+        const resolved = resolveSessionId(session.cliKind, session.cwd, session.createdAt, session.presetCommand, session.ptyProcess.pid);
+        if (resolved) {
+          session.resumeId = resolved.sessionId;
+          session.resumeCommand = resolved.resumeCommand;
+          session.resumeSource = resolved.source;
+        }
+      }
+      const result = session.resumeId && session.resumeCommand
+        ? {
+            cli: session.cliKind,
+            sessionId: session.resumeId,
+            resumeCommand: session.resumeCommand,
+            source: session.resumeSource || 'output',
+          } as ResumeCapture
+        : null;
+      this.destroy(id);
+      return result;
+    })();
+    return session.closePromise;
   }
 
   destroy(id: string): void {
     const session = this.sessions.get(id);
     if (!session) return;
+    session.closing = true;
+    if (session.launchTimer) {
+      clearTimeout(session.launchTimer);
+      session.launchTimer = null;
+    }
+    session.terminalState.dispose();
     if (session.summarizeTimer) {
       clearTimeout(session.summarizeTimer);
       session.summarizeTimer = null;
     }
-    if (session.retryTimer) {
-      clearTimeout(session.retryTimer);
-      session.retryTimer = null;
-    }
+    this.clearAutoResponseTimers(session);
     session.disposables.forEach(d => d.dispose());
     session.disposables = [];
     session.ptyProcess.kill();
@@ -576,6 +643,17 @@ export class PtyManager {
 
   getSession(id: string): PtySession | undefined {
     return this.sessions.get(id);
+  }
+
+  getLaunchStatus(id: string): { sentAt: number | null; commandEchoed: boolean; output: string; returnedToShell: boolean } | null {
+    const session = this.sessions.get(id);
+    if (!session) return null;
+    return {
+      sentAt: session.launchSentAt,
+      commandEchoed: session.launchCommandEchoed,
+      output: session.launchOutput,
+      returnedToShell: session.launchReturnedToShell,
+    };
   }
 
   rename(id: string, title: string): void {
@@ -609,17 +687,50 @@ export class PtyManager {
       .sort((a, b) => b.createdAt - a.createdAt);
   }
 
+  private maybeAutoRespondToTerminalOutput(session: PtySession, data: string): void {
+    const config = this.getTerminalAutoResponseConfig?.();
+    const newText = stripTerminalControlSequences(data);
+    const previousTail = session.autoResponseTail;
+    session.autoResponseTail = (previousTail + newText).slice(-AUTO_RESPONSE_TAIL_LENGTH);
+    if (!config?.enabled || config.rules.length === 0 || !newText) return;
+
+    const rule = findNewAutoResponseRule(previousTail, newText, config.rules);
+    if (!rule) return;
+
+    const key = rule.keyword.toLocaleLowerCase();
+    const now = Date.now();
+    const cooldownMs = config.cooldownSeconds * 1000;
+    const lastTriggeredAt = session.autoResponseLastTriggeredAt.get(key) || 0;
+    if (now - lastTriggeredAt < cooldownMs) return;
+    session.autoResponseLastTriggeredAt.set(key, now);
+
+    const delayMs = config.delaySeconds * 1000;
+    console.log(`[PTY] 容错规则命中: "${rule.keyword}"，${config.delaySeconds} 秒后发送 "${rule.response}" (session: ${session.id})`);
+    const timer = setTimeout(() => {
+      session.autoResponseTimers.delete(timer);
+      if (this.sessions.get(session.id) !== session) return;
+      session.ptyProcess.write(`${rule.response}\r`);
+      console.log(`[PTY] 容错自动回复已发送 (session: ${session.id})`);
+    }, delayMs);
+    session.autoResponseTimers.add(timer);
+  }
+
+  private clearAutoResponseTimers(session: PtySession): void {
+    for (const timer of session.autoResponseTimers) clearTimeout(timer);
+    session.autoResponseTimers.clear();
+  }
+
   /**
    * 从 buffer 中提取 resume 命令（关闭前的兜底，处理 resume 输出跨 chunk 的情况）
    */
   captureResumeFromBuffer(id: string): void {
     const session = this.sessions.get(id);
     if (!session || session.resumeId) return;
-    const stripped = stripTerminalControlSequences(session.buffer);
-    const result = parseResumeCommand(stripped);
+    const result = parseResumeOutput(session.buffer || '', session.presetCommand || '');
     if (result) {
       session.resumeId = result.sessionId;
-      session.resumeCommand = result.command;
+      session.resumeCommand = result.resumeCommand;
+      session.resumeSource = result.source;
       return;
     }
     // 不从 ~/.claude/projects 猜测“最新”会话：同一工作目录可同时运行多个 Claude，

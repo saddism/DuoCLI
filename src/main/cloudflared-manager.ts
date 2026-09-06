@@ -1,5 +1,6 @@
 import { ChildProcess, execFileSync, execSync, spawn } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 export interface CloudflaredStatus {
@@ -43,10 +44,30 @@ export class CloudflaredManager {
     };
   }
 
+  /** 与 start 相同，语义上表示“确保隧道在跑”。 */
+  ensureRunning(): CloudflaredStatus {
+    return this.start();
+  }
+
+  /**
+   * 清理不属于当前配置的 DuoCLI 隧道，并在需要时重新启动。
+   * force=true 时会先停掉所有 DuoCLI 相关 cloudflared 再启动。
+   */
+  reconcileTunnel(force = false): CloudflaredStatus {
+    if (force) {
+      this.killAllDuocliTunnels();
+      return this.start();
+    }
+    const status = this.getStatus();
+    if (status.running) return status;
+    this.killAllDuocliTunnels();
+    return this.start();
+  }
+
   start(): CloudflaredStatus {
     // 启动前清理：杀掉旧实例残留的 cloudflared 进程
     // 注意：9800 端口由 remote-server 启动前自行清理，此处不应再碰，否则会杀掉当前 Electron 进程
-    this.killStaleCloudflared();
+    this.killAllDuocliTunnels();
 
     const bin = this.resolveBinary();
     if (!bin) return this.getStatus();
@@ -83,12 +104,7 @@ export class CloudflaredManager {
     child.on('exit', () => {
       this.child = null;
     });
-    return {
-      installed: true,
-      running: true,
-      url: publicUrl,
-      configPath: this.configPath,
-    };
+    return this.getStatus();
   }
 
   stopOwnedProcess(): void {
@@ -101,28 +117,26 @@ export class CloudflaredManager {
     try { this.child.kill('SIGKILL'); } catch { /* ignore */ }
     this.child = null;
     // 确保残留的 cloudflared 进程也被清理
-    this.killStaleCloudflared();
+    this.killAllDuocliTunnels();
   }
 
-  /** 杀掉旧 DuoCLI 实例残留的 cloudflared 进程 */
-  private killStaleCloudflared(): void {
-    try {
-      // 匹配与此 config 相关的 cloudflared tunnel 进程
-      const out = execSync(
-        `pgrep -f 'cloudflared.*cloudflared-config' 2>/dev/null || true`,
-        { encoding: 'utf-8', timeout: 5000 },
-      );
-      const pids = out.trim().split('\n').filter(Boolean).map(Number).filter(n => !isNaN(n));
-      for (const pid of pids) {
-        try {
-          process.kill(pid, 'SIGKILL');
-          console.log(`[Cloudflared] Killed stale cloudflared PID ${pid}`);
-        } catch {
-          // 进程可能已不存在
-        }
+  /** Exported for tests: any cloudflared tunnel launched for DuoCLI. */
+  static isDuocliTunnelCommand(command: string): boolean {
+    const normalized = String(command || '');
+    if (!/(?:^|\/)cloudflared(?:\s|$)/.test(normalized)) return false;
+    return /(?:--config(?:=|\s+)\S*(?:cloudflared-config|duocli-tunnel\/config\.yml))/i.test(normalized)
+      || (/\btunnel\b/.test(normalized) && /\brun\b/.test(normalized) && /duocli/i.test(normalized));
+  }
+
+  /** 杀掉所有 DuoCLI 相关 cloudflared（含 ~/.config/duocli-tunnel 等旧配置路径）。 */
+  killAllDuocliTunnels(): void {
+    for (const pid of this.listDuocliTunnelProcesses()) {
+      try {
+        process.kill(pid, 'SIGKILL');
+        console.log(`[Cloudflared] Killed stale cloudflared PID ${pid}`);
+      } catch {
+        // 进程可能已不存在
       }
-    } catch {
-      // pgrep 失败，忽略
     }
   }
 
@@ -149,8 +163,10 @@ export class CloudflaredManager {
 
   private resolveConfigPath(projectRoot: string): string {
     const candidates = [
+      process.env.DUOCLI_CLOUDFLARED_CONFIG || '',
       path.join(projectRoot, 'frp', 'cloudflared-config.local.yml'),
       path.join(projectRoot, 'frp', 'cloudflared-config.private.yml'),
+      path.join(os.homedir(), '.config', 'duocli-tunnel', 'config.yml'),
       process.resourcesPath ? path.join(process.resourcesPath, 'frp', 'cloudflared-config.local.yml') : '',
       process.resourcesPath ? path.join(process.resourcesPath, 'frp', 'cloudflared-config.private.yml') : '',
       process.resourcesPath ? path.join(process.resourcesPath, 'frp', 'cloudflared-config.yml') : '',
@@ -187,11 +203,23 @@ export class CloudflaredManager {
 
   private isRunning(): boolean {
     if (this.child && !this.child.killed) return true;
+    return this.listDuocliTunnelProcesses().length > 0;
+  }
+
+  private listDuocliTunnelProcesses(): number[] {
     try {
-      execFileSync('/usr/bin/pgrep', ['-f', 'cloudflared.*cloudflared-config'], { stdio: 'ignore' });
-      return true;
-    } catch { /* not running */ }
-    return false;
+      const output = execFileSync('/bin/ps', ['-axo', 'pid=,command='], { encoding: 'utf-8' });
+      return output.split('\n').flatMap((line) => {
+        const match = line.trim().match(/^(\d+)\s+(.+)$/);
+        if (!match) return [];
+        const [, pidText, command] = match;
+        if (!CloudflaredManager.isDuocliTunnelCommand(command)) return [];
+        const pid = Number(pidText);
+        return Number.isSafeInteger(pid) && pid !== process.pid ? [pid] : [];
+      });
+    } catch {
+      return [];
+    }
   }
 
   private readConfig(): { exists: boolean; raw: string; hostname: string | null } {

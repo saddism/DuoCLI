@@ -1,0 +1,27 @@
+{
+  "name": "codex",
+  "cols": 43,
+  "rows": 33,
+  "chunks": [
+    {
+      "at": 0,
+      "data": "\u001b[?1049h\u001b[?25l\u001b[2J\u001b[H\u001b[1;36m╭─────────────────────────────────────────╮\u001b[0m\r\n\u001b[1;36m│\u001b[0m                 \u001b[1mCodex\u001b[22m                 \u001b[1;36m│\u001b[0m\r\n\u001b[1;36m│\u001b[0m  OpenAI coding agent                         \u001b[1;36m│\u001b[0m\r\n\u001b[1;36m╰─────────────────────────────────────────╯\u001b[0m\r\n\r\n\u001b[2m  /tmp/duocli-terminal-regression\u001b[22m\r\n"
+    },
+    {
+      "at": 24,
+      "data": "\u001b[?2004h\u001b[?25h\u001b[1;33m›\u001b[0m Ask Codex to make a change\u001b[?25l"
+    },
+    {
+      "at": 48,
+      "data": "\u001b[2K\u001b[G\r\u001b[32m⠋\u001b[0m Working\u001b[?25l"
+    },
+    {
+      "at": 72,
+      "data": "\u001b[2K\u001b[G\r\u001b[32m⠙\u001b[0m Working\u001b[?25l"
+    },
+    {
+      "at": 96,
+      "data": "\u001b[2K\u001b[G\r\u001b[1;32m✓\u001b[0m Done\r\n\u001b[?25h"
+    }
+  ]
+}

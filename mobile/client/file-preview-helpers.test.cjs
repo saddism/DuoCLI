@@ -15,6 +15,8 @@ test('preview helper accepts common text files case-insensitively', () => {
   // 无扩展名或非可预览扩展名仍为 false
   assert.equal(isPreviewableFileName('Makefile'), false);
   assert.equal(isPreviewableFileName('archive.zip'), false);
+  assert.equal(isPreviewableFileName('.env'), false);
+  assert.equal(isPreviewableFileName('.env.local'), false);
 });
 
 test('media kind detection', () => {
@@ -28,8 +30,8 @@ test('media kind detection', () => {
 });
 
 test('preview helper finds relative and absolute paths without trailing punctuation', () => {
-  const matches = findFilePathMatches('看 docs/README.MD 和 /tmp/config.JSON。');
-  assert.deepEqual(matches.map((item) => item.filePath), ['docs/README.MD', '/tmp/config.JSON']);
+  const matches = findFilePathMatches('看 docs/README.MD、"src/My File.ts":8 和 C:\\work\\main.py:4:2。');
+  assert.deepEqual(matches.map((item) => item.filePath), ['docs/README.MD', 'src/My File.ts', 'C:\\work\\main.py']);
 });
 
 test('preview helper does not turn URLs into file previews', () => {

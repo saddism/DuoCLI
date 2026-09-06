@@ -4,6 +4,8 @@ node_modules/
 # Build output
 dist/
 release/
+native/android-media/android-media
+native/android-media/android-media.exe
 
 # OS files
 .DS_Store

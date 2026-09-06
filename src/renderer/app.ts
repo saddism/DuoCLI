@@ -1,28 +1,61 @@
 import { TerminalManager } from './terminal-manager';
-import { ChatView } from './chat-view';
+import { PaneWorkspace } from './pane-workspace';
+import { countPanes, listPanes, type PaneContent } from './pane-layout';
+import { AndroidMirrorClient } from './android-mirror-client';
+import {
+  cancelAutoContinueRun,
+  resolveNextRunAt,
+  scheduleAutoContinueRunTimeout,
+  shouldResetAfterManualInput,
+} from './auto-continue-runtime';
 
-let remoteServerInfo: { lanUrl: string; token: string; port: number; publicUrl?: string; tunnel?: { running: boolean; url: string; message?: string } } | null = null;
+let remoteServerInfo: {
+  lanUrl: string;
+  token: string;
+  port: number;
+  publicUrl?: string;
+  tunnel?: { installed?: boolean; running: boolean; url: string; message?: string };
+  health?: RemoteSyncHealth;
+} | null = null;
+
+type RemoteSyncStatus = 'healthy' | 'lan-only' | 'degraded' | 'retrying' | 'error';
+
+interface RemoteSyncHealth {
+  status: RemoteSyncStatus;
+  localOk: boolean;
+  tunnelRunning: boolean;
+  publicOk: boolean;
+  publicUrl?: string;
+  message: string;
+  lastCheckedAt: number;
+}
+
+let remoteTokenVisible = false;
+let remoteTokenValue = '';
 
 declare global {
   interface Window {
     duocli: {
       setWindowTitle: (title: string) => void;
-      createPty: (cwd: string, presetCommand: string, themeId: string) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string }>;
+      createPty: (cwd: string, presetCommand: string, themeId: string) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }>;
       writePty: (id: string, data: string) => void;
       resizePty: (id: string, cols: number, rows: number) => void;
-      destroyPty: (id: string) => void;
+      destroyPty: (id: string) => Promise<boolean>;
       renamePty: (id: string, title: string) => void;
       regenerateTitle: (id: string) => Promise<void>;
-      getSessions: () => Promise<Array<{ id: string; title: string; themeId: string; cwd: string; displayName: string }>>;
+      getSessions: () => Promise<Array<{ id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }>>;
       selectFolder: (currentPath?: string) => Promise<string | null>;
       fileTreeListDir: (dirPath: string) => Promise<Array<{ name: string; path: string; isDir: boolean }>>;
       remoteAddRecentCwd: (cwd: string) => Promise<boolean>;
       onPtyData: (cb: (id: string, data: string) => void) => void;
       onTitleUpdate: (cb: (id: string, title: string) => void) => void;
       onPtyExit: (cb: (id: string) => void) => void;
-      onRemoteCreated: (cb: (sessionInfo: { id: string; title: string; themeId: string; cwd: string; displayName: string }) => void) => void;
-      onRemoteServerInfo: (cb: (info: { lanUrl: string; token: string; port: number; publicUrl?: string; tunnel?: { running: boolean; url: string; message?: string } }) => void) => void;
-      getRemoteServerInfo: () => Promise<{ lanUrl: string; token: string; port: number; publicUrl?: string; tunnel?: { running: boolean; url: string; message?: string } } | null>;
+      onRemoteCreated: (cb: (sessionInfo: { id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }) => void) => void;
+      onRemoteServerInfo: (cb: (info: NonNullable<typeof remoteServerInfo>) => void) => void;
+      onRemoteHealthUpdate: (cb: (health: RemoteSyncHealth) => void) => void;
+      getRemoteServerInfo: () => Promise<NonNullable<typeof remoteServerInfo> | null>;
+      getRemoteHealth: () => Promise<RemoteSyncHealth | null>;
+      retryRemoteSync: () => Promise<RemoteSyncHealth | null>;
       clipboardSaveImage: () => Promise<string | null>;
       clipboardGetFilePath: () => Promise<string | null>;
       // 文件监听 API
@@ -38,65 +71,66 @@ declare global {
       aiApplyConfig: (config: { apiFormat: string; baseUrl: string; apiKey: string; model: string }) => Promise<boolean>;
       aiTestConfig: (config: { apiFormat: string; baseUrl: string; apiKey: string; model: string }) => Promise<{ ok: boolean; error?: string; response?: string }>;
       aiGetCurrentConfig: () => Promise<{ apiFormat: string; baseUrl: string; apiKey: string; model: string; providerId: string | null } | null>;
+      terminalAutoResponseGetConfig: () => Promise<TerminalAutoResponseConfig>;
+      terminalAutoResponseSaveConfig: (config: TerminalAutoResponseConfig) => Promise<TerminalAutoResponseConfig>;
       getCliProvider: (presetCommand: string) => Promise<string | null>;
+      getAvailableBuiltinPresets: () => Promise<Array<{ value: string; label: string }>>;
       // Claude 供应商配置
       claudeProvidersList: () => Promise<Array<{ id: string; name: string; baseUrl: string; apiKey: string; model?: string }>>;
       claudeProvidersSave: (providers: Array<{ id: string; name: string; baseUrl: string; apiKey: string; model?: string }>) => Promise<boolean>;
-      // Devin 账号管理
-      devinAccountsList: () => Promise<{ accounts: Array<{ email: string; enabled: boolean; addedAt: number; lastLogin?: string; lastError?: string; quota?: { daily: number; weekly: number }; planName?: string; lastSwitchAt?: number }>; currentIndex: number }>;
-      devinAccountsAdd: (email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
-      devinAccountsAddBatch: (text: string) => Promise<{ ok: boolean; output?: string; error?: string }>;
-      devinAccountsRemove: (email: string) => Promise<{ ok: boolean; error?: string }>;
-      devinAccountsSwitch: (opts: { email?: string; next?: boolean }) => Promise<{ ok: boolean; error?: string; email?: string; quota?: { daily: number; weekly: number } }>;
-      devinAccountsQuota: () => Promise<{ ok: boolean; daily?: number; weekly?: number; planName?: string; error?: string }>;
-      devinAccountsQuotaAll: () => Promise<{ ok: boolean; results?: Array<{ email: string; ok: boolean; quota?: { daily: number; weekly: number; planName?: string }; error?: string }>; error?: string }>;
-      devinAccountsQuotaOne: (email: string) => Promise<{ ok: boolean; daily?: number; weekly?: number; planName?: string; error?: string }>;
-      devinAccountsRotateDevice: () => Promise<{ ok: boolean }>;
       // 文件操作
       openFile: (filePath: string) => Promise<void>;
+      readFilePreview: (cwd: string, filePath: string) => Promise<any>;
       readDirectory: (dirPath: string) => Promise<Array<{ name: string; isDirectory: boolean; isFile: boolean }>>;
+      androidListDevices: () => Promise<{ ok: boolean; error?: string; devices: Array<{ id: string; state: string; info: string; available: boolean }> }>;
+      androidScreenshot: (deviceId?: string) => Promise<{ ok: boolean; error?: string; dataUrl?: string }>;
+      androidTap: (deviceId: string, x: number, y: number) => Promise<{ ok: boolean; error?: string }>;
+      androidSwipe: (deviceId: string, x1: number, y1: number, x2: number, y2: number, duration?: number) => Promise<{ ok: boolean; error?: string }>;
+      androidInputText: (deviceId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
       // 会话状态同步
       syncSessionStatus: (statuses: Record<string, string>) => void;
       // 催工配置中转
       onGetAutoContinueConfig: (cb: (sessionId: string) => void) => void;
       sendAutoContinueConfig: (sessionId: string, config: any) => void;
       onSetAutoContinueConfig: (cb: (sessionId: string, config: any) => void) => void;
-      // Chat API
-      chatCreate: (opts: { workspace: string; model?: string }) => Promise<{ id: string; title: string; model: string; workspace: string; createdAt: number } | null>;
-      chatSend: (sessionId: string, content: string) => Promise<void>;
-      chatList: () => Promise<Array<{ id: string; title: string; model: string; workspace: string; createdAt: number; messageCount: number }>>;
-      chatMessages: (sessionId: string) => Promise<Array<{ role: string; content: string; timestamp: number }>>;
-      chatDestroy: (sessionId: string) => Promise<boolean>;
-      chatAbort: (sessionId: string) => Promise<boolean>;
-      chatRename: (sessionId: string, title: string) => Promise<boolean>;
-      chatHealth: () => Promise<{ ok: boolean; error?: string }>;
-      chatModels: () => Promise<Array<{ id: string; credits: string }>>;
-      onChatDelta: (cb: (sessionId: string, text: string) => void) => void;
-      onChatDone: (cb: (sessionId: string, content: string) => void) => void;
-      onChatError: (cb: (sessionId: string, error: string) => void) => void;
-      onChatTitleUpdate: (cb: (sessionId: string, title: string) => void) => void;
       // 已关闭会话
       closedSessionsList: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>>;
+      closedSessionsBeginRestore: (id: string) => Promise<boolean>;
+      closedSessionsCancelRestore: (id: string) => Promise<boolean>;
       closedSessionsRemove: (id: string) => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>>;
       closedSessionsClear: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>>;
+      closedSessionsConfirmRestore: (closedId: string, sessionId: string) => Promise<boolean>;
       onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>) => void) => void;
-      // 已关闭 Chat 会话
-      closedChatList: () => Promise<Array<{ id: string; title: string; model: string; workspace: string; messages: Array<{ role: string; content: string; timestamp: number }>; closedAt: number }>>;
-      closedChatRemove: (id: string) => Promise<Array<{ id: string; title: string; model: string; workspace: string; messages: Array<{ role: string; content: string; timestamp: number }>; closedAt: number }>>;
-      closedChatClear: () => Promise<Array<{ id: string; title: string; model: string; workspace: string; messages: Array<{ role: string; content: string; timestamp: number }>; closedAt: number }>>;
-      chatRestore: (closedId: string) => Promise<{ id: string; title: string; model: string; workspace: string; createdAt: number } | null>;
-      onClosedChatUpdate: (cb: (sessions: Array<{ id: string; title: string; model: string; workspace: string; messages: Array<{ role: string; content: string; timestamp: number }>; closedAt: number }>) => void) => void;
-      // 自动切号状态
-      onAutoSwitchStatus: (cb: (id: string, status: string, detail?: string) => void) => void;
       onCloseCurrentSession: (cb: () => void) => void;
     };
   }
 }
 
+interface TerminalAutoResponseRule {
+  keyword: string;
+  response: string;
+}
+
+interface TerminalAutoResponseConfig {
+  enabled: boolean;
+  rules: TerminalAutoResponseRule[];
+  delaySeconds: number;
+  cooldownSeconds: number;
+}
+
 // 状态
 const savedCwd = localStorage.getItem('duocli_cwd') || '';
 let currentCwd = savedCwd;
-let lastPreset = localStorage.getItem('duocli_preset') || '';
+const LEGACY_QODER_AUTO_COMMAND = 'qoder chat --dangerously-skip-permissions';
+const QODERCN_AUTO_COMMAND = 'qodercn --dangerously-skip-permissions';
+
+function migrateLegacyQoderPreset(value: string): string {
+  return value === LEGACY_QODER_AUTO_COMMAND ? QODERCN_AUTO_COMMAND : value;
+}
+
+const savedPreset = localStorage.getItem('duocli_preset') || '';
+let lastPreset = migrateLegacyQoderPreset(savedPreset);
+if (lastPreset !== savedPreset) localStorage.setItem('duocli_preset', lastPreset);
 const sessionTitles: Map<string, string> = new Map();
 const sessionThemes: Map<string, string> = new Map();
 const sessionUpdateTimes: Map<string, number> = new Map();
@@ -110,12 +144,6 @@ const sessionProviders: Map<string, string> = new Map();
 // 每个会话使用的自定义供应商 ID（用于切换终端时恢复选择）
 const sessionClaudeProviderIds: Map<string, string> = new Map();
 
-// ========== Chat 会话状态 ==========
-const chatViews: Map<string, ChatView> = new Map();
-const chatSessionTitles: Map<string, string> = new Map(); // chat session id → title
-const chatSessionCreateTimes: Map<string, number> = new Map();
-let activeChatId: string | null = null;
-
 // ========== 已关闭会话（可恢复） ==========
 interface ClosedSessionInfo {
   id: string;
@@ -126,32 +154,38 @@ interface ClosedSessionInfo {
   resumeCommand: string;
   displayName: string;
   closedAt: number;
+  state?: 'closed' | 'restoring';
 }
 let closedSessions: ClosedSessionInfo[] = [];
 let closedSessionsCollapsed = false;
-
-// ========== 已关闭 Chat 会话（可恢复） ==========
-interface ClosedChatSessionInfo {
-  id: string;
-  title: string;
-  model: string;
-  workspace: string;
-  messages: Array<{ role: string; content: string; timestamp: number }>;
-  closedAt: number;
-}
-let closedChatSessions: ClosedChatSessionInfo[] = [];
-
-// 自动切号状态：sessionId → { status, detail }
-const sessionAutoSwitchStatus: Map<string, { status: string; detail?: string }> = new Map();
+const restoringClosedSessionIds = new Set<string>();
 
 // 自动继续配置
-const sessionAutoContinue: Map<string, { enabled: boolean; messages: string[]; intervalMs: number; commandIntervalMs: number; lastSendTime: number; autoAgree: boolean; autoAgreeDelaySec: number; sendDelaySec: number; maxDurationMs: number; enabledAt: number }> = new Map();
+interface AutoContinueConfig {
+  enabled: boolean;
+  messages: string[];
+  intervalMs: number;
+  commandIntervalMs: number;
+  autoAgree: boolean;
+  autoAgreeDelaySec: number;
+  sendDelaySec: number;
+  maxLoops: number;
+  initialDelayMs: number;
+  loopCount: number;
+  nextRunAt: number;
+  sending: boolean;
+  runVersion: number;
+  timeoutIds: Set<ReturnType<typeof setTimeout>>;
+}
+
+const sessionAutoContinue: Map<string, AutoContinueConfig> = new Map();
 const AUTO_CONTINUE_DEFAULT_MESSAGES = ['继续'];
 const AUTO_CONTINUE_DEFAULT_INTERVAL = 10 * 60 * 1000; // 10 分钟
 const AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL = 2000; // 命令间隔 2 秒
 const AUTO_AGREE_DEFAULT_DELAY_SEC = 5; // 自动同意默认延后 5 秒
 const AUTO_CONTINUE_SEND_DELAY_SEC = 2; // 发送回车前默认延迟 2 秒
-const AUTO_CONTINUE_DEFAULT_MAX_DURATION = 0; // 0 表示不限制
+const AUTO_CONTINUE_DEFAULT_MAX_LOOPS = -1; // -1 表示不限制
+const AUTO_CONTINUE_DEFAULT_INITIAL_DELAY = 0; // 首次循环立即执行
 const AUTO_CONTINUE_STORAGE_KEY = 'duocli_auto_continue';
 
 function hasSessionInUI(sessionId: string): boolean {
@@ -166,21 +200,27 @@ function getSessionCreateTime(id: string): number {
   return fallback;
 }
 
+function serializeAutoContinueConfig(config: AutoContinueConfig): Record<string, unknown> {
+  return {
+    enabled: config.enabled,
+    messages: config.messages,
+    intervalMs: config.intervalMs,
+    commandIntervalMs: config.commandIntervalMs,
+    autoAgree: config.autoAgree,
+    autoAgreeDelaySec: config.autoAgreeDelaySec,
+    sendDelaySec: config.sendDelaySec,
+    maxLoops: config.maxLoops,
+    initialDelayMs: config.initialDelayMs,
+    loopCount: config.loopCount,
+    nextRunAt: config.nextRunAt,
+  };
+}
+
 // 持久化催工配置到 localStorage
 function saveAutoContinueToStorage(): void {
   const data: Record<string, any> = {};
   sessionAutoContinue.forEach((config, sessionId) => {
-    // lastSendTime / enabledAt 是运行时状态，不持久化
-    data[sessionId] = {
-      enabled: config.enabled,
-      messages: config.messages,
-      intervalMs: config.intervalMs,
-      commandIntervalMs: config.commandIntervalMs,
-      autoAgree: config.autoAgree,
-      autoAgreeDelaySec: config.autoAgreeDelaySec,
-      sendDelaySec: config.sendDelaySec,
-      maxDurationMs: config.maxDurationMs,
-    };
+    data[sessionId] = serializeAutoContinueConfig(config);
   });
   localStorage.setItem(AUTO_CONTINUE_STORAGE_KEY, JSON.stringify(data));
 }
@@ -196,21 +236,30 @@ function loadAutoContinueFromStorage(): void {
       const msgs = Array.isArray(config.messages)
         ? config.messages
         : (config.message ? [config.message] : [...AUTO_CONTINUE_DEFAULT_MESSAGES]);
+      const intervalMs = config.intervalMs ?? AUTO_CONTINUE_DEFAULT_INTERVAL;
+      const initialDelayMs = config.initialDelayMs ?? AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
       sessionAutoContinue.set(sessionId, {
         enabled: config.enabled ?? false,
         messages: msgs,
-        intervalMs: config.intervalMs ?? AUTO_CONTINUE_DEFAULT_INTERVAL,
+        intervalMs,
         commandIntervalMs: config.commandIntervalMs ?? AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL,
-        lastSendTime: Date.now(),
         autoAgree: config.autoAgree ?? true,
         autoAgreeDelaySec: config.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC,
         sendDelaySec: config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC,
-        maxDurationMs: config.maxDurationMs ?? AUTO_CONTINUE_DEFAULT_MAX_DURATION,
-        enabledAt: Date.now(),
+        maxLoops: config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
+        initialDelayMs,
+        loopCount: config.loopCount ?? 0,
+        nextRunAt: resolveNextRunAt(config.nextRunAt, Date.now(), initialDelayMs),
+        sending: false,
+        runVersion: 0,
+        timeoutIds: new Set(),
       });
     }
   } catch {}
 }
+
+// 自动继续定时器
+let autoContinueTimer: ReturnType<typeof setInterval> | null = null;
 
 // 启动时恢复催工配置并启动定时器
 loadAutoContinueFromStorage();
@@ -222,17 +271,14 @@ loadAutoContinueFromStorage();
 const hasEnabledConfig = Array.from(sessionAutoContinue.values()).some(c => c.enabled);
 if (hasEnabledConfig) initAutoContinueTimer();
 
-// 自动继续定时器
-let autoContinueTimer: ReturnType<typeof setInterval> | null = null;
-
-// 写入 PTY 并重置自动继续计时器
+// 首次循环有独立的启动时间；首次完成后，手动输入才重置下一轮计时。
 function writePtyWithAutoReset(id: string, data: string): void {
   termManager.notifyInput(id);
   window.duocli.writePty(id, data);
-  // 重置该会话的自动继续计时器
   const config = sessionAutoContinue.get(id);
-  if (config && config.enabled) {
-    config.lastSendTime = Date.now();
+  if (config?.enabled && shouldResetAfterManualInput(config.loopCount, config.sending)) {
+    config.nextRunAt = Date.now() + config.intervalMs;
+    saveAutoContinueToStorage();
   }
 }
 
@@ -250,26 +296,55 @@ function initAutoContinueTimer(): void {
         staleSessionIds.push(sessionId);
         return;
       }
-      // 检查最大持续时间，超时自动关闭催工
-      if (config.maxDurationMs > 0 && config.enabledAt > 0 && (now - config.enabledAt >= config.maxDurationMs)) {
-        console.log(`[循环] 会话 ${sessionId} 已达最大持续时间 ${config.maxDurationMs}ms，自动关闭催工`);
+      if (config.sending) return;
+      const maxLoops = config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
+      if (maxLoops > 0 && config.loopCount >= maxLoops) {
         config.enabled = false;
+        cancelAutoContinueRun(config);
         saveAutoContinueToStorage();
         renderSessionList();
         return;
       }
-      // 检查是否超时
-      if (now - config.lastSendTime >= config.intervalMs) {
+      if (now >= config.nextRunAt) {
         const messages = config.messages || AUTO_CONTINUE_DEFAULT_MESSAGES;
         const cmdInterval = config.commandIntervalMs ?? AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL;
         const sendDelay = (config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC) * 1000;
+        config.runVersion++;
+        const runVersion = config.runVersion;
+        config.loopCount++;
+        config.sending = true;
+        // 若本轮中途退出，重启后至少等待一个循环间隔再继续。
+        config.nextRunAt = now + config.intervalMs;
+        const stopAfterCycle = maxLoops > 0 && config.loopCount >= maxLoops;
+        saveAutoContinueToStorage();
         console.log(`[循环] 准备发送 ${messages.length} 条命令到会话 ${sessionId}`);
 
-        // 依次发送每条命令，命令之间有间隔
+        const isCurrentRun = () => (
+          config.enabled
+          && config.runVersion === runVersion
+          && sessionAutoContinue.get(sessionId) === config
+          && hasSessionInUI(sessionId)
+        );
+        const scheduleRunTimeout = (callback: () => void, delayMs: number) => {
+          scheduleAutoContinueRunTimeout(config, runVersion, () => {
+            if (isCurrentRun()) callback();
+          }, delayMs);
+        };
+
         let cmdIdx = 0;
         const sendNextCommand = () => {
+          if (!isCurrentRun()) return;
           if (cmdIdx >= messages.length) {
             console.log(`[循环] 已发送全部 ${messages.length} 条命令`);
+            config.sending = false;
+            if (stopAfterCycle) {
+              config.enabled = false;
+              cancelAutoContinueRun(config);
+              renderSessionList();
+            } else {
+              config.nextRunAt = Date.now() + config.intervalMs;
+            }
+            saveAutoContinueToStorage();
             return;
           }
           const msg = messages[cmdIdx];
@@ -277,18 +352,21 @@ function initAutoContinueTimer(): void {
           window.duocli.writePty(sessionId, msg);
           // 所有 PTY CLI 都以 CR (0x0d) 提交一条命令。
           // 过去依次发送多种换行/转义序列，会让部分 Agent 接收到多次提交。
-          setTimeout(() => {
+          scheduleRunTimeout(() => {
             window.duocli.writePty(sessionId, '\r');
             // 这条命令回车完成，发送下一条命令
-            setTimeout(sendNextCommand, cmdInterval);
+            scheduleRunTimeout(sendNextCommand, cmdInterval);
           }, sendDelay);
         };
         sendNextCommand();
-        config.lastSendTime = now;
       }
     });
     if (staleSessionIds.length > 0) {
-      staleSessionIds.forEach((id) => sessionAutoContinue.delete(id));
+      staleSessionIds.forEach((id) => {
+        const config = sessionAutoContinue.get(id);
+        if (config) cancelAutoContinueRun(config);
+        sessionAutoContinue.delete(id);
+      });
       saveAutoContinueToStorage();
       renderSessionList();
     }
@@ -304,20 +382,23 @@ function toggleAutoContinue(sessionId: string, enabled: boolean): void {
       messages: [...AUTO_CONTINUE_DEFAULT_MESSAGES],
       intervalMs: AUTO_CONTINUE_DEFAULT_INTERVAL,
       commandIntervalMs: AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL,
-      lastSendTime: Date.now(),
       autoAgree: true,
       autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
       sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
-      maxDurationMs: AUTO_CONTINUE_DEFAULT_MAX_DURATION,
-      enabledAt: 0,
+      maxLoops: AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
+      initialDelayMs: AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
+      loopCount: 0,
+      nextRunAt: Date.now() + AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
+      sending: false,
+      runVersion: 0,
+      timeoutIds: new Set(),
     };
     sessionAutoContinue.set(sessionId, config);
   }
+  cancelAutoContinueRun(config);
   config.enabled = enabled;
-  config.lastSendTime = Date.now();
-  if (enabled) {
-    config.enabledAt = Date.now();
-  }
+  config.loopCount = 0;
+  config.nextRunAt = Date.now() + (config.initialDelayMs ?? AUTO_CONTINUE_DEFAULT_INITIAL_DELAY);
   saveAutoContinueToStorage();
 
   // 启动定时器（如果尚未启动）
@@ -334,12 +415,16 @@ function showAutoContinueConfigDialog(sessionId: string): void {
     messages: [...AUTO_CONTINUE_DEFAULT_MESSAGES],
     intervalMs: AUTO_CONTINUE_DEFAULT_INTERVAL,
     commandIntervalMs: AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL,
-    lastSendTime: Date.now(),
     autoAgree: true,
     autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
     sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
-    maxDurationMs: AUTO_CONTINUE_DEFAULT_MAX_DURATION,
-    enabledAt: 0,
+    maxLoops: AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
+    initialDelayMs: AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
+    loopCount: 0,
+    nextRunAt: Date.now() + AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
+    sending: false,
+    runVersion: 0,
+    timeoutIds: new Set(),
   };
 
   const currentMessages = config.messages || AUTO_CONTINUE_DEFAULT_MESSAGES;
@@ -349,8 +434,8 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   const currentAutoAgree = config.autoAgree ?? true;
   const currentAutoAgreeDelay = config.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC;
   const currentSendDelay = config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC;
-  const currentMaxDuration = config.maxDurationMs ?? AUTO_CONTINUE_DEFAULT_MAX_DURATION;
-  const currentMaxDurationMinutes = currentMaxDuration > 0 ? Math.round(currentMaxDuration / 60000) : 0;
+  const currentMaxLoops = config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
+  const currentInitialDelay = config.initialDelayMs ?? AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
 
   const overlay = document.getElementById('auto-continue-overlay')!;
   const messageInput = document.getElementById('auto-continue-message') as HTMLTextAreaElement;
@@ -360,7 +445,8 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   const autoAgreeDelayInput = document.getElementById('auto-continue-agree-delay') as HTMLInputElement;
   const autoAgreeDelayRow = document.getElementById('auto-agree-delay-row')!;
   const sendDelayInput = document.getElementById('auto-continue-send-delay') as HTMLInputElement;
-  const maxDurationInput = document.getElementById('auto-continue-max-duration') as HTMLInputElement;
+  const maxLoopsInput = document.getElementById('auto-continue-max-loops') as HTMLInputElement;
+  const initialDelayInput = document.getElementById('auto-continue-initial-delay') as HTMLInputElement;
   const saveBtn = document.getElementById('auto-continue-save')!;
   const stopBtn = document.getElementById('auto-continue-stop')!;
   const cancelBtn = document.getElementById('auto-continue-cancel')!;
@@ -374,7 +460,8 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   autoAgreeDelayInput.value = String(currentAutoAgreeDelay);
   autoAgreeDelayRow.style.display = currentAutoAgree ? '' : 'none';
   sendDelayInput.value = String(currentSendDelay);
-  maxDurationInput.value = String(currentMaxDurationMinutes);
+  maxLoopsInput.value = String(currentMaxLoops);
+  initialDelayInput.value = String(Math.round(currentInitialDelay / 60000));
 
   // 根据当前状态设置按钮文字和显示
   if (config.enabled) {
@@ -413,36 +500,38 @@ function showAutoContinueConfigDialog(sessionId: string): void {
     const sendDelay = parseInt(sendDelayInput.value, 10);
     if (isNaN(sendDelay) || sendDelay < 0) { sendDelayInput.focus(); return; }
 
-    const maxDurationMinutes = parseInt(maxDurationInput.value, 10);
-    if (isNaN(maxDurationMinutes) || maxDurationMinutes < 0) { maxDurationInput.focus(); return; }
+    const maxLoops = parseInt(maxLoopsInput.value, 10);
+    if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { maxLoopsInput.focus(); return; }
 
+    const initialDelayMinutes = parseInt(initialDelayInput.value, 10);
+    if (isNaN(initialDelayMinutes) || initialDelayMinutes < 0) { initialDelayInput.focus(); return; }
+
+    cancelAutoContinueRun(config);
     config.messages = messages;
     config.intervalMs = intervalMinutes * 60000;
     if (commandIntervalInput) {
       const cmdIntervalSec = parseInt(commandIntervalInput.value, 10);
       config.commandIntervalMs = isNaN(cmdIntervalSec) || cmdIntervalSec < 0 ? AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL : cmdIntervalSec * 1000;
     }
-    config.lastSendTime = Date.now();
+    config.loopCount = 0;
     config.autoAgree = autoAgreeCheckbox.checked;
     config.autoAgreeDelaySec = isNaN(agreeDelay) ? AUTO_AGREE_DEFAULT_DELAY_SEC : agreeDelay;
     config.sendDelaySec = sendDelay;
-    config.maxDurationMs = maxDurationMinutes > 0 ? maxDurationMinutes * 60000 : 0;
+    config.maxLoops = maxLoops;
+    config.initialDelayMs = initialDelayMinutes * 60000;
+    config.nextRunAt = Date.now() + config.initialDelayMs;
+    config.enabled = true;
     sessionAutoContinue.set(sessionId, config);
 
-    if (!config.enabled) {
-      config.enabled = true;
-      config.enabledAt = Date.now();
-      initAutoContinueTimer();
-    }
-
     saveAutoContinueToStorage();
+    initAutoContinueTimer();
     close();
     renderSessionList();
   }
 
   function onStop(): void {
     config.enabled = false;
-    config.lastSendTime = Date.now();
+    cancelAutoContinueRun(config);
     sessionAutoContinue.set(sessionId, config);
     saveAutoContinueToStorage();
     initAutoContinueTimer();
@@ -577,15 +666,22 @@ function startPresetSyncTimer(): void {
   }, PRESET_SYNC_INTERVAL_MS);
 }
 
-// 内置 option 的 HTML（从 index.html 中提取，作为 renderPresetSelect 的基础）
-const BUILTIN_OPTIONS: Array<{ value: string; label: string }> = [
+// 内置 option：启动时从主进程拉取（按本机 CLI 是否存在过滤）
+const FALLBACK_BUILTIN_OPTIONS: Array<{ value: string; label: string }> = [
   { value: '', label: '空终端' },
-  { value: 'claude --dangerously-skip-permissions', label: 'Claude (全自动)' },
-  { value: 'codex -c sandbox_mode="danger-full-access" -c approval="never" -c network="enabled"', label: 'Codex (全自动)' },
-  { value: 'devin --permission-mode bypass', label: 'Devin (全自动)' },
-  { value: 'opencode', label: 'OpenCode' },
-  { value: 'kiro-cli chat --trust-all-tools', label: 'Kiro (全自动)' },
 ];
+let BUILTIN_OPTIONS: Array<{ value: string; label: string }> = FALLBACK_BUILTIN_OPTIONS.slice();
+
+async function refreshBuiltinOptions(): Promise<void> {
+  try {
+    const list = await window.duocli.getAvailableBuiltinPresets();
+    if (Array.isArray(list) && list.length > 0) {
+      BUILTIN_OPTIONS = list;
+    }
+  } catch (err) {
+    console.warn('[Preset] Failed to load available builtins:', err);
+  }
+}
 
 // 渲染远程服务器连接信息
 function renderRemoteServerInfo(): void {
@@ -594,14 +690,81 @@ function renderRemoteServerInfo(): void {
     return;
   }
   remoteServerInfoEl.style.display = 'block';
+
+  const pulseEl = remoteServerInfoEl.querySelector('.remote-status-pulse') as HTMLElement;
+  const statusEl = remoteServerInfoEl.querySelector('.remote-info-status') as HTMLElement;
   const urlEl = remoteServerInfoEl.querySelector('.remote-info-url') as HTMLElement;
-  const tokenEl = remoteServerInfoEl.querySelector('.remote-info-token')!;
-  const tunnelReady = Boolean(remoteServerInfo.tunnel?.running && remoteServerInfo.publicUrl);
+  const tokenValueEl = remoteServerInfoEl.querySelector('.remote-info-token-value') as HTMLElement;
+  const tokenToggleBtn = remoteServerInfoEl.querySelector('.remote-info-token-toggle') as HTMLButtonElement;
+  const retryBtn = remoteServerInfoEl.querySelector('.remote-info-retry') as HTMLButtonElement;
+
+  const health = remoteServerInfo.health;
+  const syncStatus = health?.status ?? 'degraded';
+
+  pulseEl.className = 'remote-status-pulse';
+  remoteServerInfoEl.classList.remove('status-error', 'status-warning', 'status-retrying');
+  if (syncStatus === 'healthy') pulseEl.classList.add('status-healthy');
+  else if (syncStatus === 'retrying') {
+    pulseEl.classList.add('status-retrying');
+    remoteServerInfoEl.classList.add('status-retrying');
+  } else if (syncStatus === 'error') {
+    pulseEl.classList.add('status-error');
+    remoteServerInfoEl.classList.add('status-error');
+  } else {
+    pulseEl.classList.add('status-warning');
+    remoteServerInfoEl.classList.add('status-warning');
+  }
+
+  statusEl.textContent = health?.message
+    ?? (syncStatus === 'healthy' ? '公网与局域网均正常' : '正在检测连接状态…');
+
+  const tunnelReady = syncStatus === 'healthy' && Boolean(remoteServerInfo.publicUrl);
   urlEl.textContent = tunnelReady
     ? remoteServerInfo.publicUrl!
-    : `${remoteServerInfo.lanUrl}${remoteServerInfo.tunnel?.message ? ` | ${remoteServerInfo.tunnel.message}` : ''}`;
-  urlEl.title = tunnelReady ? remoteServerInfo.lanUrl : '';
-  tokenEl.textContent = `Token: ${remoteServerInfo.token}`;
+    : remoteServerInfo.lanUrl;
+  urlEl.title = tunnelReady
+    ? `公网地址（局域网：${remoteServerInfo.lanUrl}）`
+    : '点击复制局域网地址';
+
+  if (remoteTokenValue !== remoteServerInfo.token) {
+    remoteTokenValue = remoteServerInfo.token;
+    remoteTokenVisible = false;
+  }
+  tokenValueEl.textContent = remoteTokenVisible
+    ? remoteServerInfo.token
+    : '•'.repeat(Math.min(Math.max(remoteServerInfo.token.length, 8), 24));
+  tokenValueEl.dataset.visible = remoteTokenVisible ? 'true' : 'false';
+  tokenValueEl.title = remoteTokenVisible ? '点击复制 Token' : 'Token 已隐藏';
+  tokenToggleBtn.setAttribute('aria-pressed', remoteTokenVisible ? 'true' : 'false');
+  tokenToggleBtn.title = remoteTokenVisible ? '隐藏 Token' : '显示 Token';
+  tokenToggleBtn.setAttribute('aria-label', tokenToggleBtn.title);
+
+  const showRetry = syncStatus === 'error' || syncStatus === 'degraded';
+  retryBtn.hidden = !showRetry;
+  retryBtn.disabled = syncStatus === 'retrying';
+  retryBtn.textContent = syncStatus === 'retrying' ? '恢复中…' : '重试';
+}
+
+async function handleRemoteRetryClick(): Promise<void> {
+  const retryBtn = remoteServerInfoEl.querySelector('.remote-info-retry') as HTMLButtonElement;
+  retryBtn.disabled = true;
+  retryBtn.textContent = '恢复中…';
+  try {
+    const health = await window.duocli.retryRemoteSync();
+    if (health && remoteServerInfo) {
+      remoteServerInfo = { ...remoteServerInfo, health };
+      renderRemoteServerInfo();
+    }
+    const info = await window.duocli.getRemoteServerInfo();
+    if (info) {
+      remoteServerInfo = info;
+      renderRemoteServerInfo();
+    }
+  } catch (err) {
+    console.warn('[RemoteSync] Manual retry failed:', err);
+  } finally {
+    renderRemoteServerInfo();
+  }
 }
 
 function renderPresetSelect(): void {
@@ -857,11 +1020,13 @@ const fileTreePanel = document.getElementById('file-tree-panel')!;
 const fileTreeToggle = document.getElementById('file-tree-toggle')!;
 const fileTreeResizer = document.getElementById('file-tree-resizer')!;
 const terminalArea = document.getElementById('terminal-area')!;
+const paneLayoutToolbar = document.getElementById('pane-layout-toolbar')!;
+const paneLayoutSummary = document.getElementById('pane-layout-summary')!;
+const paneTileBtn = document.getElementById('pane-tile-btn') as HTMLButtonElement;
+const paneWorkspaceRoot = document.getElementById('pane-workspace')!;
 const terminalContent = document.getElementById('terminal-content')!;
 const emptyState = document.getElementById('empty-state')!;
 const sessionList = document.getElementById('session-list')!;
-const chatContent = document.getElementById('chat-content')!;
-const chatEmptyState = document.getElementById('chat-empty-state')!;
 const sidebar = document.getElementById('sidebar')!;;
 const sidebarToggle = document.getElementById('sidebar-toggle')!;
 const sidebarResizer = document.getElementById('sidebar-resizer')!;
@@ -876,18 +1041,6 @@ const tabSessions = document.getElementById('tab-sessions')!;
 // AI 配置相关 DOM
 const tabAiConfig = document.getElementById('tab-ai-config')!;
 
-// Devin 账号管理相关 DOM
-const tabDevinAccounts = document.getElementById('tab-devin-accounts')!;
-const devinAccountsList = document.getElementById('devin-accounts-list')!;
-const devinCurrentLabel = document.getElementById('devin-current-label')!;
-const devinRefreshBtn = document.getElementById('devin-refresh-btn') as HTMLButtonElement;
-const devinQuotaBtn = document.getElementById('devin-quota-btn') as HTMLButtonElement;
-const devinQuotaAllBtn = document.getElementById('devin-quota-all-btn') as HTMLButtonElement;
-const devinAddEmail = document.getElementById('devin-add-email') as HTMLInputElement;
-const devinAddPassword = document.getElementById('devin-add-password') as HTMLInputElement;
-const devinAddBtn = document.getElementById('devin-add-btn') as HTMLButtonElement;
-const devinBatchInput = document.getElementById('devin-batch-input') as HTMLTextAreaElement;
-const devinBatchBtn = document.getElementById('devin-batch-btn') as HTMLButtonElement;
 const aiApplyBtn = document.getElementById('ai-apply-btn')!;
 const aiTestBtn = document.getElementById('ai-test-btn')!;
 const aiFormatSelect = document.getElementById('ai-format-select') as HTMLSelectElement;
@@ -895,6 +1048,11 @@ const aiBaseurlInput = document.getElementById('ai-baseurl-input') as HTMLInputE
 const aiApikeyInput = document.getElementById('ai-apikey-input') as HTMLInputElement;
 const aiModelInput = document.getElementById('ai-model-input') as HTMLInputElement;
 const aiKeyToggle = document.getElementById('ai-key-toggle')!;
+const terminalAutoResponseEnabled = document.getElementById('terminal-auto-response-enabled') as HTMLInputElement;
+const terminalAutoResponseRules = document.getElementById('terminal-auto-response-rules') as HTMLTextAreaElement;
+const terminalAutoResponseDelay = document.getElementById('terminal-auto-response-delay') as HTMLInputElement;
+const terminalAutoResponseCooldown = document.getElementById('terminal-auto-response-cooldown') as HTMLInputElement;
+const terminalAutoResponseSave = document.getElementById('terminal-auto-response-save') as HTMLButtonElement;
 
 
 // 文件监听状态（全局）
@@ -934,9 +1092,555 @@ function syncSessionStatusToMain(): void {
 }
 
 // 终端管理器
-const termManager = new TerminalManager(terminalContent, (id, cols, rows) => {
+const termManager = new TerminalManager(paneWorkspaceRoot, (id, cols, rows) => {
   window.duocli.resizePty(id, cols, rows);
 });
+
+let paneWorkspace: PaneWorkspace;
+
+function mountPaneContent(paneId: string, content: PaneContent, body: HTMLElement): void {
+  delete body.dataset.previewToken;
+  body.innerHTML = '';
+  if (content.kind === 'terminal') {
+    if (!termManager.mountTo(content.sessionId, body)) {
+      renderPaneMessage(body, '终端会话已结束', '请从右侧会话列表恢复或创建新终端。');
+    }
+    return;
+  }
+  if (content.kind === 'file') {
+    renderFilePane(body, content.path);
+    return;
+  }
+  if (content.kind === 'android') {
+    renderAndroidPane(paneId, body, content.deviceId || '');
+    return;
+  }
+  renderEmptyPane(body, paneId);
+}
+
+function unmountPaneContent(paneId: string, content: PaneContent): void {
+  if (content.kind === 'terminal') {
+    termManager.detach(content.sessionId);
+  } else if (content.kind === 'android') {
+    androidPanes.get(paneId)?.dispose();
+    androidPanes.delete(paneId);
+  }
+}
+
+function handlePaneFocus(paneId: string, content: PaneContent): void {
+  for (const [id, pane] of androidPanes) pane.setActive(id === paneId && content.kind === 'android');
+  if (content.kind === 'terminal') {
+    termManager.switchTo(content.sessionId);
+    updateSessionTitleBar();
+    void renderFileTree();
+    renderFileStatusbar();
+  } else {
+    updateSessionTitleBar();
+    void renderFileTree();
+    renderFileStatusbar();
+  }
+  updatePaneAccents();
+}
+
+function renderPaneMessage(body: HTMLElement, title: string, detail?: string): void {
+  body.innerHTML = '';
+  const message = document.createElement('div');
+  message.className = 'pane-error-content';
+  const heading = document.createElement('strong');
+  heading.textContent = title;
+  message.appendChild(heading);
+  if (detail) {
+    const text = document.createElement('span');
+    text.textContent = detail;
+    message.appendChild(text);
+  }
+  body.appendChild(message);
+}
+
+function renderEmptyPane(body: HTMLElement, paneId: string): void {
+  body.innerHTML = '';
+  const empty = document.createElement('div');
+  empty.className = 'pane-empty-content';
+  empty.innerHTML = '<strong>空 Pane</strong><span>从右侧选择会话，或使用拆分按钮创建内容。</span>';
+  const actions = document.createElement('div');
+  actions.className = 'pane-empty-actions';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = '创建终端';
+  button.addEventListener('click', () => {
+    paneWorkspace.focusPane(paneId);
+    openNewSessionDialog(paneWorkspace.getWorkspaceKey() || currentCwd);
+  });
+  const androidButton = document.createElement('button');
+  androidButton.type = 'button';
+  androidButton.textContent = 'Android 设备';
+  androidButton.addEventListener('click', () => {
+    paneWorkspace.focusPane(paneId);
+    paneWorkspace.replaceContent(paneId, { kind: 'android', label: 'Android 设备' });
+  });
+  actions.append(button, androidButton);
+  empty.appendChild(actions);
+  body.appendChild(empty);
+}
+
+function renderFilePane(body: HTMLElement, filePath: string): void {
+  const requestToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  body.dataset.previewToken = requestToken;
+  body.innerHTML = '<div class="pane-empty-content">正在读取文件…</div>';
+  const workspace = body.dataset.workspaceKey || currentCwd;
+  void window.duocli.readFilePreview(workspace, filePath).then((result) => {
+    if (body.dataset.previewToken !== requestToken) return;
+    if (!result?.ok) {
+      renderPaneMessage(body, '文件无法预览', result?.error || '读取失败');
+      return;
+    }
+    body.innerHTML = '';
+    if (result.kind === 'media') {
+      const media = document.createElement(result.mediaType === 'application/pdf' ? 'iframe' : 'img');
+      if (media instanceof HTMLIFrameElement) {
+        media.src = result.dataUrl;
+        media.className = 'pane-file-media pane-file-pdf';
+      } else {
+        media.src = result.dataUrl;
+        media.alt = result.name || filePath;
+        media.className = 'pane-file-media';
+      }
+      body.appendChild(media);
+      return;
+    }
+    const pre = document.createElement('pre');
+    pre.className = 'pane-file-text';
+    pre.textContent = result.content || '';
+    body.appendChild(pre);
+  }).catch((error) => {
+    if (body.dataset.previewToken === requestToken) renderPaneMessage(body, '文件无法预览', String(error));
+  });
+}
+
+const androidPanes = new Map<string, { setActive: (active: boolean) => void; dispose: () => void }>();
+
+function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: string): void {
+  body.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'pane-android';
+  const toolbar = document.createElement('div');
+  toolbar.className = 'pane-android-toolbar';
+  const select = document.createElement('select');
+  select.className = 'pane-android-select';
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.className = 'pane-action';
+  refresh.title = '刷新设备和画面';
+  setIcon(refresh, 'refresh', 13);
+  const hint = document.createElement('span');
+  hint.className = 'pane-android-hint';
+  toolbar.append(select, refresh, hint);
+  const preview = document.createElement('canvas');
+  preview.className = 'pane-android-preview';
+  preview.setAttribute('aria-label', 'Android 设备画面');
+  const fallback = document.createElement('img');
+  fallback.className = 'pane-android-preview pane-android-fallback';
+  fallback.alt = 'Android 设备截图回退';
+  fallback.style.display = 'none';
+  const controls = document.createElement('div');
+  controls.className = 'pane-android-controls';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.placeholder = '输入文字后回车';
+  controls.appendChild(input);
+  wrap.append(toolbar, preview, fallback, controls);
+  body.appendChild(wrap);
+
+  let currentDevice = selectedDeviceId;
+  let isPaneActive = false;
+  let mirror: AndroidMirrorClient | null = null;
+  let mirrorLastError = '';
+  let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  let fallbackInFlight = false;
+  let fallbackGeneration = 0;
+  let androidSession: { deviceId: string; sessionId: string; subscriptionId: string; expiresAt: number } | null = null;
+  let androidSessionPromise: Promise<typeof androidSession> | null = null;
+
+  const setHint = (value: string) => { hint.textContent = value; };
+  const setPreviewVisible = (live: boolean) => {
+    preview.hidden = !live;
+    fallback.style.display = live ? 'none' : (fallback.src ? 'block' : 'none');
+  };
+  const stopFallback = () => {
+    if (fallbackTimer) clearTimeout(fallbackTimer);
+    fallbackTimer = null;
+    fallbackGeneration++;
+  };
+  const loadScreenshot = async () => {
+    if (!currentDevice || fallbackInFlight) return;
+    fallbackInFlight = true;
+    try {
+      const result = await window.duocli.androidScreenshot(currentDevice);
+      if (result.ok && result.dataUrl) {
+        fallback.onload = () => {
+          fallback.dataset.deviceWidth = String(fallback.naturalWidth || '');
+          fallback.dataset.deviceHeight = String(fallback.naturalHeight || '');
+          fallback.dataset.latestGeometryVersion = '0';
+          fallback.dataset.presentedGeometryVersion = '0';
+        };
+        fallback.src = result.dataUrl;
+        if (!mirror?.hasFrame) setPreviewVisible(false);
+        if (!mirror?.isReady()) setHint('');
+      } else if (!mirror?.hasFrame) {
+        setHint(result.error || '截图失败');
+      }
+    } finally {
+      fallbackInFlight = false;
+    }
+  };
+  const startFallback = () => {
+    if (fallbackTimer) return;
+    const generation = ++fallbackGeneration;
+    setPreviewVisible(false);
+    const tick = async () => {
+      if (!fallbackTimer || generation !== fallbackGeneration) return;
+      await loadScreenshot();
+      if (fallbackTimer && generation === fallbackGeneration) fallbackTimer = setTimeout(tick, 450);
+    };
+    fallbackTimer = setTimeout(tick, 0);
+  };
+  const getServerInfo = async () => {
+    if (remoteServerInfo) return { port: remoteServerInfo.port, token: remoteServerInfo.token };
+    const info = await window.duocli.getRemoteServerInfo();
+    if (info) remoteServerInfo = info;
+    return info ? { port: info.port, token: info.token } : null;
+  };
+  const releaseSession = () => {
+    const session = androidSession;
+    androidSession = null;
+    if (!session) return;
+    void fetch(`http://127.0.0.1:${remoteServerInfo?.port || 0}/api/android/sessions/${encodeURIComponent(session.sessionId)}/unsubscribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${remoteServerInfo?.token || ''}` },
+      body: JSON.stringify({ subscriptionId: session.subscriptionId }),
+    }).catch(() => {});
+  };
+  const getTicket = async (deviceId: string, purpose: string) => {
+    const info = await getServerInfo();
+    if (!info) return '';
+    const id = String(deviceId || '').trim();
+    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${info.token}` };
+    const issue = async (session: NonNullable<typeof androidSession>) => {
+      const response = await fetch(`http://127.0.0.1:${info.port}/api/android/sessions/${encodeURIComponent(session.sessionId)}/socket-tickets`, {
+        method: 'POST', headers, body: JSON.stringify({ subscriptionId: session.subscriptionId, purpose }),
+      });
+      if (!response.ok) throw new Error(`Android socket ticket 获取失败 (${response.status})`);
+      const data = await response.json();
+      return data?.ticket || '';
+    };
+    if (androidSession && androidSession.deviceId === id && androidSession.expiresAt > Date.now() + 5000) {
+      try { return await issue(androidSession); } catch { releaseSession(); }
+    }
+    if (androidSessionPromise) {
+      const session = await androidSessionPromise;
+      return session ? issue(session) : '';
+    }
+    androidSessionPromise = (async () => {
+      const response = await fetch(`http://127.0.0.1:${info.port}/api/android/sessions`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ deviceId: id, videoPreference: 'balanced', clientCapabilities: { secureContext: true, webCodecs: true, webRtc: true } }),
+      });
+      if (!response.ok) throw new Error(`Android 会话创建失败 (${response.status})`);
+      const data = await response.json();
+      if (!data?.sessionId || !data?.subscriptionId) throw new Error('Android 会话响应无效');
+      const session = { deviceId: id, sessionId: data.sessionId, subscriptionId: data.subscriptionId, expiresAt: Number(data.expiresAt) || Date.now() + 30 * 60 * 1000 };
+      androidSession = session;
+      return session;
+    })();
+    try {
+      const session = await androidSessionPromise;
+      return session ? issue(session) : '';
+    } finally {
+      androidSessionPromise = null;
+    }
+  };
+  const ensureMirror = () => {
+    if (mirror) return mirror;
+    mirror = new AndroidMirrorClient({
+      getServerInfo,
+      getTicket,
+      protocolVersion: 2,
+      onStatus: (message) => {
+        if (message.error) mirrorLastError = String(message.error);
+        if (message.status === 'ready') mirrorLastError = '';
+        if (message.status === 'starting') setHint('正在建立实时镜像…');
+        else if (message.status === 'ready') {
+          setHint('');
+        } else if (message.status === 'error') {
+          setHint(mirrorLastError || '实时镜像不可用，已切换截图回退');
+          startFallback();
+        } else if (message.status === 'disconnected') {
+          setHint(mirrorLastError ? `${mirrorLastError}，实时镜像重连中…` : '实时镜像重连中…');
+          startFallback();
+        } else if (message.status === 'control-owner' && message.controller === false) {
+          setHint('设备正在由其他客户端控制');
+        }
+      },
+      onMeta: (meta) => {
+        if (meta?.geometryVersion) {
+          preview.dataset.latestGeometryVersion = String(meta.geometryVersion);
+        }
+        if (mirror?.hasFrame) setPreviewVisible(true);
+      },
+      onFrame: (meta) => {
+        if (meta?.geometryVersion) preview.dataset.presentedGeometryVersion = String(meta.geometryVersion);
+        setPreviewVisible(true);
+        stopFallback();
+        setHint('');
+      },
+      onError: (error) => {
+        setHint(error.message || '实时镜像失败，已切换截图回退');
+        startFallback();
+      },
+    });
+    mirror.attachCanvas(preview);
+    return mirror;
+  };
+  const startMirror = () => {
+    if (!isPaneActive || !currentDevice) return;
+    setPreviewVisible(false);
+    setHint('正在建立实时镜像…');
+    ensureMirror().connect(currentDevice);
+  };
+  const loadDevices = async () => {
+    const result = await window.duocli.androidListDevices();
+    select.innerHTML = '';
+    if (!result.ok || result.devices.length === 0) {
+      currentDevice = '';
+      hint.textContent = result.error || '未找到 Android 设备';
+      return;
+    }
+    for (const device of result.devices) {
+      const option = document.createElement('option');
+      option.value = device.id;
+      option.textContent = `${device.id}${device.info ? ` · ${device.info}` : ''}`;
+      option.disabled = !device.available;
+      select.appendChild(option);
+    }
+    const preferred = result.devices.find((device) => device.id === currentDevice && device.available)
+      || result.devices.find((device) => device.available);
+    const nextDevice = preferred?.id || '';
+    const changed = currentDevice !== nextDevice;
+    currentDevice = nextDevice;
+    if (currentDevice) {
+      select.value = currentDevice;
+      if (changed) {
+        paneWorkspace.replaceContent(paneId, {
+          kind: 'android',
+          deviceId: currentDevice,
+          label: `Android · ${currentDevice}`,
+        });
+        return;
+      }
+      startMirror();
+      if (!mirror?.isReady()) await loadScreenshot();
+    }
+  };
+  select.addEventListener('change', () => {
+    releaseSession();
+    currentDevice = select.value;
+    mirror?.close();
+    stopFallback();
+    setPreviewVisible(false);
+    paneWorkspace.replaceContent(paneId, {
+      kind: 'android',
+      deviceId: currentDevice,
+      label: currentDevice ? `Android · ${currentDevice}` : 'Android 设备',
+    });
+  });
+  refresh.addEventListener('click', () => { void loadDevices(); });
+  const surfacePoint = (surface: HTMLCanvasElement | HTMLImageElement, event: PointerEvent): { x: number; y: number } | null => {
+    if (!currentDevice) return null;
+    const width = surface instanceof HTMLCanvasElement ? surface.width : surface.naturalWidth;
+    const height = surface instanceof HTMLCanvasElement ? surface.height : surface.naturalHeight;
+    if (!width || !height) return null;
+    const rect = surface.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const scale = Math.min(rect.width / width, rect.height / height);
+    const renderedWidth = width * scale;
+    const renderedHeight = height * scale;
+    const offsetX = (rect.width - renderedWidth) / 2;
+    const offsetY = (rect.height - renderedHeight) / 2;
+    const renderedLeft = rect.left + offsetX;
+    const renderedTop = rect.top + offsetY;
+    if (event.clientX < renderedLeft || event.clientX > renderedLeft + renderedWidth
+      || event.clientY < renderedTop || event.clientY > renderedTop + renderedHeight) return null;
+    const deviceWidth = Number(surface.dataset.deviceWidth) || width;
+    const deviceHeight = Number(surface.dataset.deviceHeight) || height;
+    const latestGeometry = Number(surface.dataset.latestGeometryVersion) || 0;
+    const presentedGeometry = Number(surface.dataset.presentedGeometryVersion) || 0;
+    if (latestGeometry && presentedGeometry !== latestGeometry) return null;
+    return {
+      x: Math.max(0, Math.min(deviceWidth - 1, Math.round((event.clientX - renderedLeft) / renderedWidth * (deviceWidth - 1)))),
+      y: Math.max(0, Math.min(deviceHeight - 1, Math.round((event.clientY - renderedTop) / renderedHeight * (deviceHeight - 1)))),
+    };
+  };
+  const sendLegacyGesture = (deviceId: string, start: { x: number; y: number }, end: { x: number; y: number }) => {
+    const moved = Math.hypot(end.x - start.x, end.y - start.y);
+    const action = moved >= 12
+      ? window.duocli.androidSwipe(deviceId, start.x, start.y, end.x, end.y)
+      : window.duocli.androidTap(deviceId, end.x, end.y);
+    void action.then(() => loadScreenshot());
+  };
+  const bindSurface = (surface: HTMLCanvasElement | HTMLImageElement) => {
+    surface.style.touchAction = 'none';
+    const activePointers = new Map<number, { deviceId: string; start: { x: number; y: number }; last: { x: number; y: number }; sentDown: boolean }>();
+    const pendingMoves = new Map<number, { x: number; y: number }>();
+    let moveFrame = 0;
+    const flushMoves = () => {
+      moveFrame = 0;
+      for (const [pointerId, point] of pendingMoves) {
+        pendingMoves.delete(pointerId);
+        const state = activePointers.get(pointerId);
+        if (state?.sentDown && mirror?.isReady()) {
+          mirror.sendInput({ type: 'touch', action: 'move', pointerId, x: point.x, y: point.y, pressure: 1 });
+        }
+      }
+    };
+    surface.addEventListener('pointerdown', (event) => {
+      if ((event.pointerType === 'mouse' && event.button !== 0) || !currentDevice) return;
+      const point = surfacePoint(surface, event);
+      if (!point) return;
+      event.preventDefault();
+      const deviceId = currentDevice;
+      const sentDown = mirror?.isReady()
+        ? (mirror.isController
+          ? mirror.sendInput({ type: 'touch', action: 'down', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 1 }) != null
+          : (mirror.claimControl(true), false))
+        : false;
+      activePointers.set(event.pointerId, { deviceId, start: point, last: point, sentDown });
+      surface.setPointerCapture?.(event.pointerId);
+    });
+    surface.addEventListener('pointermove', (event) => {
+      const state = activePointers.get(event.pointerId);
+      if (!state) return;
+      const point = surfacePoint(surface, event);
+      if (!point) return;
+      event.preventDefault();
+      state.last = point;
+      pendingMoves.set(event.pointerId, point);
+      if (!moveFrame) moveFrame = requestAnimationFrame(flushMoves);
+    });
+    surface.addEventListener('pointerup', (event) => {
+      const state = activePointers.get(event.pointerId);
+      if (!state) return;
+      const point = surfacePoint(surface, event) || state.last;
+      activePointers.delete(event.pointerId);
+      pendingMoves.delete(event.pointerId);
+      if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; flushMoves(); }
+      surface.releasePointerCapture?.(event.pointerId);
+      event.preventDefault();
+      if (state.sentDown && mirror?.isReady()) {
+        mirror.sendInput({ type: 'touch', action: 'up', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 0 });
+      } else if (!state.sentDown) {
+        sendLegacyGesture(state.deviceId, state.start, point);
+      }
+    });
+    surface.addEventListener('pointercancel', (event) => {
+      const state = activePointers.get(event.pointerId);
+      activePointers.delete(event.pointerId);
+      pendingMoves.delete(event.pointerId);
+      if (state?.sentDown && mirror?.isReady()) {
+        mirror.sendInput({ type: 'touch', action: 'cancel', pointerId: event.pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
+      }
+    });
+  };
+  bindSurface(preview);
+  bindSurface(fallback);
+  input.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || !input.value.trim() || !currentDevice) return;
+    const value = input.value;
+    if (mirror?.isReady()) {
+      const sequence = mirror.sendInput({ type: 'text', text: value });
+      if (sequence == null) { setHint('文字发送失败'); return; }
+      void mirror.waitForAck(sequence).then((ack) => {
+        if (ack?.ok === false) throw new Error(ack.error || '设备未接受文字');
+        input.value = '';
+      }).catch((error) => setHint(error.message || '文字发送结果未知'));
+      return;
+    }
+    void window.duocli.androidInputText(currentDevice, value).then((result) => {
+      if (result.ok) input.value = '';
+      else setHint(result.error || '文字发送失败');
+      return loadScreenshot();
+    });
+  });
+  const setActive = (nextActive: boolean) => {
+    isPaneActive = Boolean(nextActive);
+    // The pane is the owner of its live stream. Closing an unfocused stream
+    // keeps a split workspace from sending duplicate H.264 video.
+    if (isPaneActive) {
+      startMirror();
+      if (!mirror?.isReady()) void loadScreenshot();
+      return;
+    }
+    mirror?.close();
+    stopFallback();
+    releaseSession();
+    setPreviewVisible(false);
+  };
+  androidPanes.get(paneId)?.dispose();
+  androidPanes.set(paneId, {
+    setActive,
+    dispose: () => {
+      setActive(false);
+      mirror?.close();
+      releaseSession();
+    },
+  });
+  // A restored Android pane can mount synchronously while PaneWorkspace is
+  // still constructing. The workspace is available by the time the async
+  // device discovery resolves, but do not dereference it during that first
+  // render.
+  setActive(paneWorkspace?.getFocusedPaneId() === paneId);
+  void loadDevices();
+}
+
+paneWorkspace = new PaneWorkspace(paneWorkspaceRoot, currentCwd, {
+  onContentMount: mountPaneContent,
+  onContentUnmount: unmountPaneContent,
+  onFocus: handlePaneFocus,
+  getAgentTagColors: getCliTagColors,
+  onLayoutChange: (layout) => {
+    const count = countPanes(layout.root);
+    const isEmptyLayout = layout.root.type === 'pane' && layout.root.content.kind === 'empty';
+    paneLayoutToolbar.hidden = count < 2;
+    paneLayoutSummary.textContent = `${count} 个窗口`;
+    // Keep the existing welcome card as the single-pane insertion state. Once
+    // real content exists, the pane workspace owns the entire terminal area.
+    paneWorkspaceRoot.style.display = isEmptyLayout ? 'none' : '';
+    terminalContent.style.display = isEmptyLayout ? 'flex' : 'none';
+    emptyState.style.display = isEmptyLayout ? 'flex' : 'none';
+    requestAnimationFrame(() => updatePaneAccents());
+  },
+  onRequestClose: (paneId, content) => {
+    if (content.kind === 'terminal') {
+      void handleCloseClick(content.sessionId);
+      return;
+    }
+    paneWorkspace.closePane(paneId);
+  },
+});
+
+paneTileBtn.addEventListener('click', () => paneWorkspace.arrangeTiled());
+
+function applyCurrentCwd(cwd: string): void {
+  const next = cwd.trim();
+  if (!next) return;
+  currentCwd = next;
+  cwdInput.value = next;
+  localStorage.setItem('duocli_cwd', next);
+  addRecentCwd(next);
+  paneWorkspace.setWorkspace(next);
+  startFileWatcher(next);
+  updateSessionTitleBar();
+  void renderFileTree();
+}
 
 // 恢复上次的工作目录和预设命令
 if (savedCwd) {
@@ -944,10 +1648,13 @@ if (savedCwd) {
 }
 syncRecentCwdsToRemote();
 // 初始化 preset select（含自定义预设），然后恢复上次选中
-renderPresetSelect();
-if (lastPreset) {
-  presetSelect.value = lastPreset;
-}
+void (async () => {
+  await refreshBuiltinOptions();
+  renderPresetSelect();
+  if (lastPreset) {
+    presetSelect.value = lastPreset;
+  }
+})();
 
 // 自定义配色下拉组件
 const themeColorMap: Record<string, string> = {
@@ -1000,6 +1707,21 @@ const CLI_TAG_COLORS: Record<string, [string, string]> = {
   'Claude全自动':  ['#e5a100', '#3d3010'],
   'Codex':        ['#73c991', '#1e3328'],
   'Codex全自动':   ['#56d4a0', '#1a3d2e'],
+  'Kimi':         ['#c678dd', '#2e1e3d'],
+  'Kimi全自动':    ['#d19ae8', '#33204a'],
+  'Gemini':       ['#82aaff', '#1e2540'],
+  'Gemini全自动':  ['#99bbff', '#222d4a'],
+  'OpenCode':     ['#61afef', '#1e2e3d'],
+  'Qoder':        ['#e5c07b', '#3d3520'],
+  'Qoder全自动':   ['#d4a020', '#3d3520'],
+  'QoderCN':      ['#e5c07b', '#3d3520'],
+  'QoderCN全自动': ['#d4a020', '#3d3520'],
+  'Cursor':       ['#56b6c2', '#1e3338'],
+  'Cursor全自动':  ['#56b6c2', '#1e3338'],
+  '反重力':       ['#c792ea', '#2e1e3d'],
+  '反重力全自动':  ['#c792ea', '#2e1e3d'],
+  'Kiro':         ['#f78c6c', '#3d2518'],
+  'Kiro全自动':    ['#ff9e7a', '#4a2a1a'],
 };
 
 function getCliTagColors(displayName: string): [string, string] {
@@ -1019,6 +1741,26 @@ function getCliTagColors(displayName: string): [string, string] {
     ['#f78c6c', '#3d2518'], ['#c792ea', '#2e1e3d'], ['#ff5370', '#3d1825'],
   ];
   return palette[Math.abs(h) % palette.length];
+}
+
+function buildTerminalPaneContent(sessionId: string): Extract<PaneContent, { kind: 'terminal' }> {
+  return {
+    kind: 'terminal',
+    sessionId,
+    label: sessionTitles.get(sessionId) || '终端',
+    agentLabel: sessionDisplayNames.get(sessionId) || '',
+  };
+}
+
+function syncTerminalPaneHeaders(): void {
+  for (const pane of listPanes(paneWorkspace.getLayout().root)) {
+    if (pane.content.kind !== 'terminal') continue;
+    const meta = buildTerminalPaneContent(pane.content.sessionId);
+    paneWorkspace.updateTerminalPaneMeta(pane.content.sessionId, {
+      label: meta.label,
+      agentLabel: meta.agentLabel,
+    });
+  }
 }
 
 // ========== 路径自动颜色 ==========
@@ -1056,44 +1798,121 @@ function cwdShortName(cwd: string): string {
   return parts[parts.length - 1] || cwd;
 }
 
-// 自动配色：根据 cwd 映射到一个实际主题，尽量让不同项目分配到不同主题
+// 自动配色：多窗口分割时优先给每个终端分配不同主题，便于辨认
 const AUTO_THEME_LIST = ['vscode-dark', 'monokai', 'dracula', 'solarized-dark', 'one-dark', 'nord'];
-const autoThemeCache: Map<string, string> = new Map(); // cwd → themeId
 
-function cwdHash(cwd: string): number {
-  let h = 0;
-  for (let i = 0; i < cwd.length; i++) {
-    h = ((h << 5) - h + cwd.charCodeAt(i)) | 0;
-  }
-  return Math.abs(h);
-}
-
-function cwdToThemeId(cwd: string): string {
-  if (!cwd) return AUTO_THEME_LIST[0];
-  const cached = autoThemeCache.get(cwd);
-  if (cached) return cached;
-
-  // 已被占用的主题
-  const usedThemes = new Set(autoThemeCache.values());
-  // 优先选未被占用的主题
-  const available = AUTO_THEME_LIST.filter(t => !usedThemes.has(t));
-  const hash = cwdHash(cwd);
-  let theme: string;
+function nextAutoThemeId(): string {
+  const usedThemes = new Set(sessionThemes.values());
+  const available = AUTO_THEME_LIST.filter((theme) => !usedThemes.has(theme));
   if (available.length > 0) {
-    theme = available[hash % available.length];
-  } else {
-    theme = AUTO_THEME_LIST[hash % AUTO_THEME_LIST.length];
+    return available[sessionThemes.size % available.length];
   }
-  autoThemeCache.set(cwd, theme);
-  return theme;
+  return AUTO_THEME_LIST[sessionThemes.size % AUTO_THEME_LIST.length];
 }
 
-// 解析实际 themeId：auto 时根据 cwd 决定
-function resolveThemeId(themeId: string, cwd: string): string {
-  return themeId === 'auto' ? cwdToThemeId(cwd) : themeId;
+// 解析实际 themeId：auto 时为当前工作区里的下一个未占用主题
+function resolveThemeId(themeId: string, _cwd: string): string {
+  return themeId === 'auto' ? nextAutoThemeId() : themeId;
+}
+
+function paneAccentForContent(content: PaneContent): string {
+  if (content.kind === 'terminal') {
+    const themeId = sessionThemes.get(content.sessionId);
+    if (themeId) return TerminalManager.getThemeDotColor(themeId);
+  }
+  if (content.kind === 'android') return '#34d399';
+  if (content.kind === 'file') return cwdToColor(content.path.replace(/[/\\][^/\\]+$/, ''));
+  return '#60a5fa';
+}
+
+function updatePaneAccents(): void {
+  if (!paneWorkspace) return;
+  const layout = paneWorkspace.getLayout();
+  for (const pane of listPanes(layout.root)) {
+    const leaf = document.querySelector<HTMLElement>(`.pane-leaf[data-pane-id="${pane.id}"]`);
+    if (!leaf) continue;
+    leaf.style.setProperty('--pane-accent', paneAccentForContent(pane.content));
+    leaf.dataset.paneKind = pane.content.kind;
+  }
+}
+
+/** 自动配色模式下，恢复会话后把重复主题重新分配成不同配色。 */
+function rebalanceDistinctAutoThemes(): void {
+  if (currentThemeId !== 'auto') return;
+  const sessionIds = Array.from(sessionThemes.keys());
+  if (sessionIds.length < 2) return;
+  const used = new Set<string>();
+  for (const id of sessionIds) {
+    const current = sessionThemes.get(id);
+    if (!current) continue;
+    if (!used.has(current)) {
+      used.add(current);
+      continue;
+    }
+    const available = AUTO_THEME_LIST.filter((theme) => !used.has(theme));
+    const next = available.length > 0
+      ? available[sessionIds.indexOf(id) % available.length]
+      : AUTO_THEME_LIST[sessionIds.indexOf(id) % AUTO_THEME_LIST.length];
+    sessionThemes.set(id, next);
+    termManager.setTheme(id, next);
+    used.add(next);
+  }
+  updatePaneAccents();
 }
 
 // ========== 工具函数 ==========
+
+type UiIconName =
+  | 'archive'
+  | 'audio'
+  | 'chevron-down'
+  | 'chevron-left'
+  | 'chevron-right'
+  | 'edit'
+  | 'file'
+  | 'folder'
+  | 'image'
+  | 'pin'
+  | 'plus'
+  | 'refresh'
+  | 'restore'
+  | 'trash'
+  | 'video'
+  | 'x';
+
+const UI_ICON_PATHS: Record<UiIconName, string> = {
+  archive: '<path d="M4 7h16v13H4z"></path><path d="M3 4h18v3H3z"></path><path d="M9 11h6"></path>',
+  audio: '<path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle>',
+  'chevron-down': '<polyline points="6 9 12 15 18 9"></polyline>',
+  'chevron-left': '<polyline points="15 18 9 12 15 6"></polyline>',
+  'chevron-right': '<polyline points="9 18 15 12 9 6"></polyline>',
+  edit: '<path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>',
+  file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline>',
+  folder: '<path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z"></path>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><path d="m21 15-5-5L5 21"></path>',
+  pin: '<path d="m15 4 5 5-3 1-3.5 3.5.5 3.5-1.5 1.5-2.5-2.5L7 20l-1-1 4-4.5L7.5 12 9 10.5l3.5.5L16 7.5 15 4z"></path>',
+  plus: '<line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line>',
+  refresh: '<path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.5 9A9 9 0 0 1 18.8 5.2L23 10M1 14l4.2 4.8A9 9 0 0 0 20.5 15"></path>',
+  restore: '<polyline points="1 4 1 10 7 10"></polyline><path d="M3.5 15A9 9 0 1 0 2 10"></path>',
+  trash: '<polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14H5V6m3 0V3h8v3"></path><line x1="10" y1="10" x2="10" y2="17"></line><line x1="14" y1="10" x2="14" y2="17"></line>',
+  video: '<rect x="3" y="5" width="13" height="14" rx="2"></rect><polygon points="16 10 21 7 21 17 16 14"></polygon>',
+  x: '<line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>',
+};
+
+function iconSvg(name: UiIconName, size = 14): string {
+  return `<svg class="ui-icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${UI_ICON_PATHS[name]}</svg>`;
+}
+
+function setIcon(element: HTMLElement, name: UiIconName, size = 14): void {
+  element.innerHTML = iconSvg(name, size);
+}
+
+function appendIcon(element: HTMLElement, name: UiIconName, size = 14): void {
+  const wrapper = document.createElement('span');
+  wrapper.className = 'ui-icon-wrap';
+  wrapper.innerHTML = iconSvg(name, size);
+  element.appendChild(wrapper);
+}
 
 function friendlyTime(ts: number): string {
   const now = Date.now();
@@ -1107,11 +1926,14 @@ function friendlyTime(ts: number): string {
 }
 
 function updateEmptyState(): void {
-  emptyState.style.display = termManager.hasInstances() ? 'none' : 'flex';
+  const root = paneWorkspace?.getLayout().root;
+  const isEmptyLayout = !root || (root.type === 'pane' && root.content.kind === 'empty');
+  emptyState.style.display = isEmptyLayout ? 'flex' : 'none';
 }
 
 function updateSessionTitleBar(): void {
-  const activeId = termManager.getActiveId();
+  const focused = paneWorkspace.getFocusedContent();
+  const activeId = focused?.kind === 'terminal' ? focused.sessionId : null;
   if (activeId) {
     const cwd = sessionCwds.get(activeId) || '';
     // 左侧目录树顶部：显示最右侧目录名
@@ -1125,6 +1947,14 @@ function updateSessionTitleBar(): void {
     if (displayName) parts.push(displayName);
     if (title && title !== '新会话' && title !== '新对话') parts.push(title);
     window.duocli.setWindowTitle(parts.join('-'));
+  } else if (focused?.kind === 'file') {
+    fileTreePath.textContent = focused.path.split(/[/\\]/).pop() || '文件';
+    fileTreePath.title = focused.path;
+    window.duocli.setWindowTitle(`DuoCLI-${focused.label || fileTreePath.textContent}`);
+  } else if (focused?.kind === 'android') {
+    fileTreePath.textContent = 'Android';
+    fileTreePath.title = focused.deviceId || '';
+    window.duocli.setWindowTitle(`DuoCLI-${focused.label || 'Android'}`);
   } else {
     fileTreePath.textContent = '目录';
     fileTreePath.title = '';
@@ -1133,13 +1963,14 @@ function updateSessionTitleBar(): void {
 }
 
 function getActiveSessionId(): string | null {
-  return termManager.getActiveId();
+  const focused = paneWorkspace.getFocusedContent();
+  return focused?.kind === 'terminal' ? focused.sessionId : null;
 }
 
 function getActiveSessionCwd(): string {
   const activeId = getActiveSessionId();
   if (activeId) return sessionCwds.get(activeId) || currentCwd;
-  return currentCwd;
+  return paneWorkspace.getWorkspaceKey() || currentCwd;
 }
 
 function quotePathForShell(filePath: string): string {
@@ -1154,6 +1985,13 @@ function insertPathToActiveTerminal(filePath: string): void {
   writePtyWithAutoReset(activeId, quotePathForShell(filePath) + ' ');
 }
 
+function openFileInPane(filePath: string): void {
+  const workspace = getActiveSessionCwd() || currentCwd || paneWorkspace.getWorkspaceKey();
+  if (workspace && workspace !== paneWorkspace.getWorkspaceKey()) paneWorkspace.setWorkspace(workspace);
+  const label = filePath.split(/[/\\]/).pop() || filePath;
+  paneWorkspace.openContent({ kind: 'file', path: filePath, label });
+}
+
 function showTreeContextMenu(e: MouseEvent, itemPath: string, isDir: boolean): void {
   // 移除已有菜单
   document.querySelectorAll('.term-context-menu').forEach(m => m.remove());
@@ -1166,15 +2004,17 @@ function showTreeContextMenu(e: MouseEvent, itemPath: string, isDir: boolean): v
   if (isDir) {
     items.push(
       { label: '复制绝对路径', action: () => { navigator.clipboard.writeText(itemPath); } },
-      { label: '在 Finder 中打开', action: () => window.duocli.openFolder(itemPath) },
+      { label: '在 Finder 中显示', action: () => window.duocli.openFolder(itemPath) },
       { label: '插入路径到终端', action: () => insertPathToActiveTerminal(itemPath) },
     );
   } else {
     items.push(
       { label: '复制绝对路径', action: () => { navigator.clipboard.writeText(itemPath); } },
+      { label: '在 Finder 中显示', action: () => window.duocli.openFolder(itemPath) },
+      { label: '在 Pane 中预览', action: () => openFileInPane(itemPath) },
+      { label: '插入路径到终端', action: () => insertPathToActiveTerminal(itemPath) },
       { label: '用默认应用打开', action: () => window.duocli.openFile(itemPath) },
       { label: '用编辑器打开', action: () => window.duocli.filewatcherOpen(itemPath) },
-      { label: '插入路径到终端', action: () => insertPathToActiveTerminal(itemPath) },
     );
   }
 
@@ -1226,7 +2066,7 @@ async function renderFileTree(): Promise<void> {
 
   const rootArrow = document.createElement('span');
   rootArrow.className = 'file-tree-arrow';
-  rootArrow.textContent = '▼';
+  setIcon(rootArrow, 'chevron-down', 12);
   rootRow.appendChild(rootArrow);
 
   const rootName = document.createElement('span');
@@ -1237,8 +2077,8 @@ async function renderFileTree(): Promise<void> {
 
   const rootOpenBtn = document.createElement('span');
   rootOpenBtn.className = 'file-tree-open-folder';
-  rootOpenBtn.textContent = '\u{1F4C2}';
-  rootOpenBtn.title = '在 Finder 中打开';
+  setIcon(rootOpenBtn, 'folder', 13);
+  rootOpenBtn.title = '在 Finder 中显示';
   rootOpenBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     window.duocli.openFolder(rootCwd);
@@ -1264,7 +2104,9 @@ async function renderFileTree(): Promise<void> {
 
       const arrow = document.createElement('span');
       arrow.className = 'file-tree-arrow';
-      if (item.isDir) arrow.textContent = fileTreeExpandedDirs.has(item.path) ? '▼' : '▶';
+      setIcon(arrow, item.isDir
+        ? (fileTreeExpandedDirs.has(item.path) ? 'chevron-down' : 'chevron-right')
+        : 'file', item.isDir ? 12 : 11);
       row.appendChild(arrow);
 
       const name = document.createElement('span');
@@ -1273,12 +2115,12 @@ async function renderFileTree(): Promise<void> {
       name.title = item.path;
       row.appendChild(name);
 
-      // 目录行：添加"在 Finder 中打开"图标按钮
+      // 目录行：添加「在 Finder 中显示」图标按钮
       if (item.isDir) {
         const openFolderBtn = document.createElement('span');
         openFolderBtn.className = 'file-tree-open-folder';
-        openFolderBtn.textContent = '\u{1F4C2}';
-        openFolderBtn.title = '在 Finder 中打开';
+        setIcon(openFolderBtn, 'folder', 13);
+        openFolderBtn.title = '在 Finder 中显示';
         openFolderBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           window.duocli.openFolder(item.path);
@@ -1390,6 +2232,7 @@ function startTitleEdit(id: string, titleSpan: HTMLElement): void {
       sessionTitles.set(id, val);
       sessionTitleLocked.add(id);
       window.duocli.renamePty(id, val);
+      paneWorkspace.updateContentLabel('terminal', id, val);
     }
     renderSessionList();
   };
@@ -1472,7 +2315,7 @@ function showSessionContextMenu(e: MouseEvent, targetId: string): void {
 }
 
 function renderSessionList(): void {
-  const activeId = termManager.getActiveId();
+  const activeId = getActiveSessionId();
 
   // 同步会话状态到 main 进程（供手机端读取）
   syncSessionStatusToMain();
@@ -1489,62 +2332,66 @@ function renderSessionList(): void {
   }
   sessionList.innerHTML = '';
 
-  // pinned 优先，其余按创建时间降序（新创建的排最上面）
+  // 置顶会话单独放在列表顶部，其余会话按创建时间降序（新创建的排最上面）
   const allIds = Array.from(sessionTitles.keys());
   const byCreated = (a: string, b: string) =>
     getSessionCreateTime(b) - getSessionCreateTime(a);
-  const sortedIds = [
-    ...allIds.filter(id => pinnedSessions.has(id)).sort(byCreated),
-    ...allIds.filter(id => !pinnedSessions.has(id)).sort(byCreated),
-  ];
+  const pinnedIds = allIds.filter(id => pinnedSessions.has(id)).sort(byCreated);
+  const unpinnedIds = allIds.filter(id => !pinnedSessions.has(id)).sort(byCreated);
 
   // 按 cwd 分组（组间顺序固定：按该组最早会话的创建时间排序，新建不改变组顺序）
   // 同一目录可能因末尾斜杠 / macOS /private 前缀差异被拆成多组，先归一化再分组
   const groups: Map<string, string[]> = new Map();
   const groupDisplayCwd: Map<string, string> = new Map();
   const groupFirstCreatedAt: Map<string, number> = new Map(); // 组排序键：该组最早会话的创建时间
-  for (const id of sortedIds) {
+  for (const id of unpinnedIds) {
     const rawCwd = sessionCwds.get(id) || '';
     const key = normalizeCwd(rawCwd);
     if (!groups.has(key)) {
       groups.set(key, []);
       groupDisplayCwd.set(key, rawCwd);
-      // 记录该组第一个出现的会话创建时间（sortedIds 已按时间排好，第一个就是最早的）
+      // 记录该组第一个出现的会话创建时间（unpinnedIds 已按时间排好，第一个就是最早的）
       groupFirstCreatedAt.set(key, getSessionCreateTime(id));
     }
     groups.get(key)!.push(id);
   }
 
-  // 组间排序：置顶组优先，其余按首个会话创建时间升序（先创建的组在上面）
-  const pinnedGroupKeys = new Set<string>();
-  for (const id of pinnedSessions) {
-    const key = normalizeCwd(sessionCwds.get(id) || '');
-    if (key) pinnedGroupKeys.add(key);
+  // 插入一个独立的置顶区域，避免置顶会话继续混在各自的项目分组中。
+  const pinnedGroupKey = '__duocli_pinned__';
+  if (pinnedIds.length > 0) {
+    groups.set(pinnedGroupKey, pinnedIds);
+    groupDisplayCwd.set(pinnedGroupKey, '');
+    groupFirstCreatedAt.set(pinnedGroupKey, -Infinity);
   }
+
+  // 组间排序：置顶区域固定在最上方，其余按首个会话创建时间升序（先创建的组在上面）
   const sortedGroupKeys = Array.from(groups.keys()).sort((a, b) => {
-    const aPinned = pinnedGroupKeys.has(a);
-    const bPinned = pinnedGroupKeys.has(b);
-    if (aPinned !== bPinned) return aPinned ? -1 : 1;
+    if (a === pinnedGroupKey) return -1;
+    if (b === pinnedGroupKey) return 1;
     return (groupFirstCreatedAt.get(a) || 0) - (groupFirstCreatedAt.get(b) || 0);
   });
 
   for (const groupKey of sortedGroupKeys) {
     const ids = groups.get(groupKey)!;
-    const cwd = groupDisplayCwd.get(groupKey) || groupKey;
-    const color = cwdToColor(cwd);
+    const isPinnedGroup = groupKey === pinnedGroupKey;
+    const cwd = isPinnedGroup ? '' : (groupDisplayCwd.get(groupKey) || groupKey);
+    const color = isPinnedGroup ? '#e5a100' : cwdToColor(cwd);
 
     // 分组头
     const groupHeader = document.createElement('div');
-    groupHeader.className = 'session-group-header';
+    groupHeader.className = 'session-group-header' + (isPinnedGroup ? ' session-pinned-header' : '');
     groupHeader.style.borderLeftColor = color;
     const groupName = document.createElement('span');
     groupName.className = 'session-group-name';
-    groupName.textContent = cwdShortName(cwd);
-    groupName.title = cwd;
+    appendIcon(groupName, isPinnedGroup ? 'pin' : 'folder', 12);
+    const groupLabel = document.createElement('span');
+    groupLabel.textContent = isPinnedGroup ? '置顶会话' : cwdShortName(cwd);
+    groupName.appendChild(groupLabel);
+    groupName.title = isPinnedGroup ? '置顶会话' : cwd;
     // 添加按钮：点击在该目录下创建新终端
     const groupAddBtn = document.createElement('button');
     groupAddBtn.className = 'session-group-add-btn';
-    groupAddBtn.textContent = '+';
+    setIcon(groupAddBtn, 'plus', 13);
     groupAddBtn.title = '在此目录下创建新终端';
     groupAddBtn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -1554,7 +2401,7 @@ function renderSessionList(): void {
     groupCount.className = 'session-group-count';
     groupCount.textContent = String(ids.length);
     groupHeader.appendChild(groupName);
-    groupHeader.appendChild(groupAddBtn);
+    if (!isPinnedGroup) groupHeader.appendChild(groupAddBtn);
     groupHeader.appendChild(groupCount);
     sessionList.appendChild(groupHeader);
 
@@ -1579,7 +2426,7 @@ function renderSessionList(): void {
 
       const pinBtn = document.createElement('button');
       pinBtn.className = 'session-pin' + (isPinned ? ' pinned' : '');
-      pinBtn.textContent = '\u{1F4CC}';
+      setIcon(pinBtn, 'pin', 12);
       pinBtn.title = isPinned ? '取消置顶' : '置顶';
       pinBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -1595,7 +2442,7 @@ function renderSessionList(): void {
       // 铅笔图标按钮，点击修改名称
       const editBtn = document.createElement('button');
       editBtn.className = 'session-edit-btn';
-      editBtn.textContent = '✏️';
+      setIcon(editBtn, 'edit', 11);
       editBtn.title = '修改名称';
       editBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -1613,6 +2460,7 @@ function renderSessionList(): void {
         const nameSpan = document.createElement('span');
         nameSpan.className = 'session-display-name';
         nameSpan.textContent = displayName;
+        nameSpan.title = displayName;
         const [tagColor, tagBg] = getCliTagColors(displayName);
         nameSpan.style.setProperty('--cli-tag-color', tagColor);
         nameSpan.style.setProperty('--cli-tag-bg', tagBg);
@@ -1635,7 +2483,7 @@ function renderSessionList(): void {
 
       const closeBtn = document.createElement('button');
       closeBtn.className = 'session-close';
-      closeBtn.textContent = '\u00d7';
+      setIcon(closeBtn, 'x', 12);
       closeBtn.addEventListener('click', (e) => { e.stopPropagation(); handleCloseClick(id); });
 
       const titleRow = document.createElement('div');
@@ -1660,21 +2508,10 @@ function renderSessionList(): void {
         showAutoContinueConfigDialog(id);
       });
 
-      // 自动切号状态标签（显示在"催"胶囊右侧）
-      const switchStatus = sessionAutoSwitchStatus.get(id);
-      let switchStatusLabel: HTMLSpanElement | null = null;
-      if (switchStatus) {
-        switchStatusLabel = document.createElement('span');
-        switchStatusLabel.className = 'session-switch-status ' + switchStatus.status;
-        switchStatusLabel.textContent = switchStatus.detail || (switchStatus.status === 'switching' ? '换号中...' : switchStatus.status === 'switched' ? '已切换' : switchStatus.status === 'exhausted' ? '账号耗尽' : '切号失败');
-        switchStatusLabel.title = `自动切号: ${switchStatus.status}`;
-      }
-
       const bottomRow = document.createElement('div');
       bottomRow.className = 'session-item-bottom';
       bottomRow.appendChild(metaRow);
       bottomRow.appendChild(autoContinueLabel);
-      if (switchStatusLabel) bottomRow.appendChild(switchStatusLabel);
 
       // 右键菜单
       item.addEventListener('contextmenu', (e) => {
@@ -1691,64 +2528,6 @@ function renderSessionList(): void {
     }
   }
 
-  // Chat 会话区域
-  if (chatSessionTitles.size > 0) {
-    const chatHeader = document.createElement('div');
-    chatHeader.className = 'session-group-header';
-    chatHeader.style.borderLeftColor = '#a78bfa';
-    const chatName = document.createElement('span');
-    chatName.className = 'session-group-name';
-    chatName.textContent = '💬 Chat 对话';
-    chatHeader.appendChild(chatName);
-    sessionList.appendChild(chatHeader);
-
-    const sortedChatIds = Array.from(chatSessionTitles.keys()).sort((a, b) =>
-      (chatSessionCreateTimes.get(b) || 0) - (chatSessionCreateTimes.get(a) || 0)
-    );
-
-    for (const id of sortedChatIds) {
-      const title = chatSessionTitles.get(id)! || '';
-      const item = document.createElement('div');
-      item.className = 'session-item session-item-chat' + (id === activeChatId ? ' active' : '');
-      item.dataset.sessionId = id;
-      item.dataset.sessionType = 'chat';
-      item.style.setProperty('--group-color', '#a78bfa12');
-      const titleSpan = document.createElement('span');
-      titleSpan.className = 'session-title chat-session-title';
-      titleSpan.textContent = title || '新对话';
-      titleSpan.style.opacity = title ? '1' : '0.5';
-
-      const delBtn = document.createElement('button');
-      delBtn.className = 'session-close-btn';
-      delBtn.textContent = '✕';
-      delBtn.title = '删除对话';
-      delBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        void handleChatCloseClick(id);
-      });
-
-      const topRow = document.createElement('div');
-      topRow.className = 'session-top-row';
-      topRow.appendChild(titleSpan);
-      topRow.appendChild(delBtn);
-
-      const metaRow = document.createElement('div');
-      metaRow.className = 'session-meta-row';
-      const timeSpan = document.createElement('span');
-      timeSpan.className = 'session-time';
-      timeSpan.textContent = friendlyTime(chatSessionCreateTimes.get(id) || Date.now());
-      metaRow.appendChild(timeSpan);
-
-      item.addEventListener('click', () => {
-        switchToTerminal();
-        switchToChat(id);
-      });
-      item.appendChild(topRow);
-      item.appendChild(metaRow);
-      sessionList.appendChild(item);
-    }
-  }
-
   // ========== 已关闭会话（可恢复） ==========
   if (closedSessions.length > 0) {
     const header = document.createElement('div');
@@ -1757,11 +2536,14 @@ function renderSessionList(): void {
 
     const name = document.createElement('span');
     name.className = 'session-group-name';
-    name.textContent = `🔄 已关闭 (${closedSessions.length})`;
+    appendIcon(name, 'archive', 12);
+    const closedLabel = document.createElement('span');
+    closedLabel.textContent = `已关闭 (${closedSessions.length})`;
+    name.appendChild(closedLabel);
 
     const toggleBtn = document.createElement('button');
     toggleBtn.className = 'session-group-add-btn';
-    toggleBtn.textContent = closedSessionsCollapsed ? '▸' : '▾';
+    setIcon(toggleBtn, closedSessionsCollapsed ? 'chevron-right' : 'chevron-down', 12);
     toggleBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       closedSessionsCollapsed = !closedSessionsCollapsed;
@@ -1770,7 +2552,7 @@ function renderSessionList(): void {
 
     const clearBtn = document.createElement('button');
     clearBtn.className = 'session-group-add-btn';
-    clearBtn.textContent = '✕';
+    setIcon(clearBtn, 'trash', 12);
     clearBtn.title = '清空全部';
     clearBtn.style.color = '#f87171';
     clearBtn.addEventListener('click', async (e) => {
@@ -1807,6 +2589,7 @@ function renderSessionList(): void {
           const nameSpan = document.createElement('span');
           nameSpan.className = 'session-display-name';
           nameSpan.textContent = cs.displayName;
+          nameSpan.title = cs.displayName;
           const [tagColor, tagBg] = getCliTagColors(cs.displayName);
           nameSpan.style.setProperty('--cli-tag-color', tagColor);
           nameSpan.style.setProperty('--cli-tag-bg', tagBg);
@@ -1815,17 +2598,21 @@ function renderSessionList(): void {
 
         const restoreBtn = document.createElement('button');
         restoreBtn.className = 'session-edit-btn';
-        restoreBtn.textContent = '↩';
+        const restoring = restoringClosedSessionIds.has(cs.id) || cs.state === 'restoring';
+        if (restoring) restoreBtn.textContent = '…';
+        else setIcon(restoreBtn, 'restore', 12);
         restoreBtn.title = '恢复会话';
+        restoreBtn.disabled = restoring;
         restoreBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          restoreClosedSession(cs);
+          void restoreClosedSession(cs);
         });
 
         const delBtn = document.createElement('button');
         delBtn.className = 'session-close';
-        delBtn.textContent = '×';
+        setIcon(delBtn, 'x', 12);
         delBtn.title = '删除记录';
+        delBtn.disabled = restoring;
         delBtn.addEventListener('click', async (e) => {
           e.stopPropagation();
           closedSessions = await window.duocli.closedSessionsRemove(cs.id);
@@ -1853,144 +2640,85 @@ function renderSessionList(): void {
     }
   }
 
-  // ========== 已关闭 Chat 会话（可恢复） ==========
-  if (closedChatSessions.length > 0) {
-    const header = document.createElement('div');
-    header.className = 'session-group-header closed-sessions-header';
-    header.style.borderLeftColor = '#a78bfa';
-
-    const name = document.createElement('span');
-    name.className = 'session-group-name';
-    name.textContent = `💬 已关闭对话 (${closedChatSessions.length})`;
-
-    const clearBtn = document.createElement('button');
-    clearBtn.className = 'session-group-add-btn';
-    clearBtn.textContent = '✕';
-    clearBtn.title = '清空全部';
-    clearBtn.style.color = '#f87171';
-    clearBtn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      closedChatSessions = await window.duocli.closedChatClear();
-      renderSessionList();
-    });
-
-    header.appendChild(name);
-    header.appendChild(clearBtn);
-    sessionList.appendChild(header);
-
-    const sorted = [...closedChatSessions].sort((a, b) => b.closedAt - a.closedAt);
-    for (const cs of sorted) {
-      const item = document.createElement('div');
-      item.className = 'session-item session-item-closed session-item-chat';
-      item.style.setProperty('--group-color', '#a78bfa12');
-
-      const titleSpan = document.createElement('span');
-      titleSpan.className = 'session-title chat-session-title';
-      titleSpan.textContent = cs.title || '新对话';
-      titleSpan.style.opacity = cs.title ? '1' : '0.5';
-
-      const metaRow = document.createElement('div');
-      metaRow.className = 'session-meta-row';
-      const timeSpan = document.createElement('span');
-      timeSpan.className = 'session-time';
-      timeSpan.textContent = friendlyTime(cs.closedAt);
-      metaRow.appendChild(timeSpan);
-
-      const restoreBtn = document.createElement('button');
-      restoreBtn.className = 'session-edit-btn';
-      restoreBtn.textContent = '↩';
-      restoreBtn.title = '恢复对话';
-      restoreBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        restoreClosedChatSession(cs);
-      });
-
-      const delBtn = document.createElement('button');
-      delBtn.className = 'session-close';
-      delBtn.textContent = '×';
-      delBtn.title = '删除记录';
-      delBtn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        closedChatSessions = await window.duocli.closedChatRemove(cs.id);
-        renderSessionList();
-      });
-
-      const titleRow = document.createElement('div');
-      titleRow.className = 'session-title-row';
-      titleRow.appendChild(titleSpan);
-      titleRow.appendChild(restoreBtn);
-
-      const topRow = document.createElement('div');
-      topRow.className = 'session-item-top';
-      const dot = document.createElement('span');
-      dot.className = 'session-color-dot';
-      dot.style.backgroundColor = '#a78bfa';
-      topRow.appendChild(dot);
-      topRow.appendChild(titleRow);
-      topRow.appendChild(delBtn);
-
-      // 点击整个 item 也可恢复
-      item.addEventListener('click', () => {
-        restoreClosedChatSession(cs);
-      });
-
-      item.appendChild(topRow);
-      item.appendChild(metaRow);
-      sessionList.appendChild(item);
-    }
-  }
+  syncTerminalPaneHeaders();
 }
 
 // ========== 核心操作 ==========
 
-// 恢复已关闭的会话
-async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
-  // 优先用终端输出的完整恢复命令，兜底自己拼
-  const resumeCmd = cs.resumeCommand
-    || (cs.presetCommand
-      ? `${cs.presetCommand} --resume ${cs.resumeId}`
-      : `claude --resume ${cs.resumeId}`);
-  const cwd = cs.cwd || sessionCwds.get(termManager.getActiveId() || '') || '';
-  const themeId = resolveThemeId(currentThemeId, cwd);
-
-  const result = await window.duocli.createPty(cwd, resumeCmd, themeId);
-  const now = Date.now();
-  sessionTitles.set(result.id, cs.title);
-  sessionThemes.set(result.id, result.themeId);
-  sessionUpdateTimes.set(result.id, now);
-  sessionCreateTimes.set(result.id, now);
-  sessionCwds.set(result.id, result.cwd);
-  sessionDisplayNames.set(result.id, cs.displayName || result.displayName);
-  termManager.create(result.id, result.themeId, cwd, (data) => { writePtyWithAutoReset(result.id, data); });
-
-  // 从已关闭列表中移除
-  closedSessions = await window.duocli.closedSessionsRemove(cs.id);
-
-  updateEmptyState();
-  renderSessionList();
-  updateSessionTitleBar();
-  void renderFileTree();
-  setTimeout(() => {
-    const dims = termManager.getActiveDimensions();
-    if (dims) window.duocli.resizePty(result.id, dims.cols, dims.rows);
-  }, 100);
+function getClosedSessionResumeCommand(cs: ClosedSessionInfo): string {
+  return (cs.resumeCommand || '').trim();
 }
 
-// 恢复已关闭的 Chat 会话
-async function restoreClosedChatSession(cs: ClosedChatSessionInfo): Promise<void> {
+function syncPaneLiveSessions(): void {
+  paneWorkspace.setLiveSessions(sessionTitles.keys());
+}
+
+// 恢复已关闭的会话
+async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
+  if (restoringClosedSessionIds.has(cs.id) || cs.state === 'restoring') return;
+  const resumeCmd = getClosedSessionResumeCommand(cs);
+  if (!resumeCmd) {
+    console.warn('[Renderer] 无法确定该 CLI 的恢复命令，保留关闭记录:', cs);
+    return;
+  }
+
+  restoringClosedSessionIds.add(cs.id);
+  renderSessionList();
+  let claimed = false;
+  let restored = false;
+  let resultId: string | null = null;
   try {
-    const result = await window.duocli.chatRestore(cs.id);
-    if (!result) return;
+    // Claim the record before creating a PTY so duplicate requests cannot
+    // create two provider processes.
+    claimed = await window.duocli.closedSessionsBeginRestore(cs.id);
+    if (!claimed) return;
+
+    const cwd = cs.cwd || sessionCwds.get(getActiveSessionId() || '') || paneWorkspace.getWorkspaceKey() || '';
+    const themeId = resolveThemeId(currentThemeId, cwd);
+    const result = await window.duocli.createPty(cwd, resumeCmd, themeId);
+    resultId = result.id;
     const now = Date.now();
-    chatSessionTitles.set(result.id, result.title);
-    chatSessionCreateTimes.set(result.id, now);
-    // 从已关闭列表中移除
-    closedChatSessions = await window.duocli.closedChatRemove(cs.id);
-    switchToTerminal();
-    switchToChat(result.id);
+    sessionTitles.set(result.id, cs.title);
+    sessionThemes.set(result.id, result.themeId);
+    sessionUpdateTimes.set(result.id, now);
+    sessionCreateTimes.set(result.id, now);
+    sessionCwds.set(result.id, result.cwd);
+    sessionDisplayNames.set(result.id, cs.displayName || result.displayName);
+    syncPaneLiveSessions();
+    termManager.create(result.id, result.themeId, cwd, (data) => { writePtyWithAutoReset(result.id, data); });
+    paneWorkspace.setWorkspace(result.cwd || cwd);
+    paneWorkspace.openContent(buildTerminalPaneContent(result.id));
+    paneWorkspace.focusContent('terminal', result.id);
+    termManager.followSession(result.id);
+    updatePaneAccents();
+
+    // The main process only confirms after the launch handshake has produced
+    // post-launch output and has not reported a provider error.
+    restored = await window.duocli.closedSessionsConfirmRestore(cs.id, result.id);
+    if (!restored) return;
+
+    closedSessions = await window.duocli.closedSessionsRemove(cs.id);
+    updateEmptyState();
     renderSessionList();
-  } catch (e) {
-    console.error('恢复 Chat 会话失败:', e);
+    updateSessionTitleBar();
+    void renderFileTree();
+    syncPaneLiveSessions();
+    setTimeout(() => {
+      const dims = termManager.getActiveDimensions();
+      if (dims) window.duocli.resizePty(result.id, dims.cols, dims.rows);
+    }, 100);
+  } catch (error) {
+    console.error('恢复终端会话失败:', error);
+  } finally {
+    if (claimed && !restored) {
+      await window.duocli.closedSessionsCancelRestore(cs.id).catch(() => false);
+      showCopyToast('恢复未确认，请查看终端输出');
+      updateEmptyState();
+      updateSessionTitleBar();
+    }
+    restoringClosedSessionIds.delete(cs.id);
+    syncPaneLiveSessions();
+    renderSessionList();
   }
 }
 
@@ -2021,10 +2749,14 @@ async function createSession(): Promise<boolean> {
   }
   // 初始化终端
   termManager.create(result.id, result.themeId, currentCwd, (data) => { writePtyWithAutoReset(result.id, data); });
+  paneWorkspace.setWorkspace(currentCwd);
+  paneWorkspace.openContent(buildTerminalPaneContent(result.id));
+  updatePaneAccents();
   updateEmptyState();
   renderSessionList();
   updateSessionTitleBar();
   void renderFileTree();
+  syncPaneLiveSessions();
   setTimeout(() => {
     const dims = termManager.getActiveDimensions();
     if (dims) window.duocli.resizePty(result.id, dims.cols, dims.rows);
@@ -2033,11 +2765,11 @@ async function createSession(): Promise<boolean> {
 }
 
 function switchSession(id: string): void {
-  // 确保从 chat 视图切回终端视图
-  switchToTerminal();
-
-  const prev = termManager.getActiveId();
-  termManager.switchTo(id);
+  const cwd = sessionCwds.get(id) || currentCwd;
+  if (cwd) paneWorkspace.setWorkspace(cwd);
+  const prev = getActiveSessionId();
+  const content = buildTerminalPaneContent(id);
+  if (!paneWorkspace.focusContent('terminal', id)) paneWorkspace.openContent(content);
 
   // 用户切换到该会话 → 清除所有状态指示灯（黄/绿→灰）
   const hadUnread = sessionUnread.delete(id);
@@ -2049,6 +2781,7 @@ function switchSession(id: string): void {
   renderFileStatusbar();
   const dims = termManager.getActiveDimensions();
   if (dims) window.duocli.resizePty(id, dims.cols, dims.rows);
+  termManager.followSession(id);
 }
 
 // 点击 × 时弹确认
@@ -2056,25 +2789,13 @@ async function handleCloseClick(id: string): Promise<void> {
   const title = sessionTitles.get(id) || '终端';
   const action = await showConfirmDialog(title);
   if (action === 'cancel') return;
-  destroySession(id);
-}
-
-async function handleChatCloseClick(id: string): Promise<void> {
-  const title = chatSessionTitles.get(id) || '新对话';
-  const action = await showConfirmDialog(title, '对话');
-  if (action === 'cancel') return;
-  destroyChatSession(id);
+  await destroySession(id);
 }
 
 async function closeCurrentSession(): Promise<void> {
   if (document.querySelector('.confirm-overlay')) return;
 
-  if (activeChatId) {
-    await handleChatCloseClick(activeChatId);
-    return;
-  }
-
-  const activeId = termManager.getActiveId();
+  const activeId = getActiveSessionId();
   if (activeId) await handleCloseClick(activeId);
 }
 
@@ -2095,12 +2816,18 @@ function clearSessionState(id: string): void {
   sessionDisplayNames.delete(id);
   sessionProviders.delete(id);
   sessionClaudeProviderIds.delete(id);
+  const autoContinueConfig = sessionAutoContinue.get(id);
+  if (autoContinueConfig) cancelAutoContinueRun(autoContinueConfig);
   sessionAutoContinue.delete(id);
-  sessionAutoSwitchStatus.delete(id);
 }
 
-function destroySession(id: string): void {
-  window.duocli.destroyPty(id);
+async function destroySession(id: string): Promise<void> {
+  try {
+    await window.duocli.destroyPty(id);
+  } catch (error) {
+    console.error('关闭终端失败:', error);
+  }
+  paneWorkspace.removeContent('terminal', id);
   clearSessionState(id);
   saveAutoContinueToStorage();
   termManager.destroy(id);
@@ -2108,13 +2835,15 @@ function destroySession(id: string): void {
   renderSessionList();
   updateSessionTitleBar();
   void renderFileTree();
+  syncPaneLiveSessions();
 }
 
 function destroySessions(ids: string[]): void {
   const uniqIds = Array.from(new Set(ids)).filter(id => sessionTitles.has(id));
   if (uniqIds.length === 0) return;
   for (const id of uniqIds) {
-    window.duocli.destroyPty(id);
+    void Promise.resolve(window.duocli.destroyPty(id)).catch((error) => console.error('关闭终端失败:', error));
+    paneWorkspace.removeContent('terminal', id);
     clearSessionState(id);
     termManager.destroy(id);
   }
@@ -2123,86 +2852,13 @@ function destroySessions(ids: string[]): void {
   renderSessionList();
   updateSessionTitleBar();
   void renderFileTree();
-}
-
-// ========== Chat 会话管理 ==========
-
-async function createChatSession(workspace?: string): Promise<void> {
-  const ws = workspace || currentCwd || '';
-  try {
-    const result = await window.duocli.chatCreate({ workspace: ws });
-    if (!result) return;
-    const now = Date.now();
-    chatSessionTitles.set(result.id, result.title);
-    chatSessionCreateTimes.set(result.id, now);
-    switchToChat(result.id);
-    renderSessionList();
-  } catch (e) {
-    console.error('创建聊天会话失败:', e);
-  }
-}
-
-function switchToChat(id: string): void {
-  // 隐藏终端区域，显示聊天区域
-  terminalContent.style.display = 'none';
-  chatContent.style.display = 'flex';
-  chatContent.style.flexDirection = 'column';
-  chatContent.style.height = '100%';
-  chatEmptyState.style.display = 'none';
-
-  // 销毁旧的 chat view
-  if (activeChatId && activeChatId !== id) {
-    const oldView = chatViews.get(activeChatId);
-    oldView?.destroy();
-    chatViews.delete(activeChatId);
-  }
-
-  activeChatId = id;
-
-  // 创建或恢复 chat view
-  let view = chatViews.get(id);
-  if (!view) {
-    view = new ChatView(chatContent, id, {
-      onTitleChange: (sessionId, title) => {
-        chatSessionTitles.set(sessionId, title);
-        renderSessionList();
-      },
-    });
-    chatViews.set(id, view);
-  }
-  view.focus();
-}
-
-function switchToTerminal(): void {
-  chatContent.style.display = 'none';
-  terminalContent.style.display = '';
-  activeChatId = null;
-  updateEmptyState();
-}
-
-function destroyChatSession(id: string): void {
-  window.duocli.chatDestroy(id);
-  const view = chatViews.get(id);
-  view?.destroy();
-  chatViews.delete(id);
-  chatSessionTitles.delete(id);
-  chatSessionCreateTimes.delete(id);
-  if (activeChatId === id) {
-    activeChatId = null;
-    switchToTerminal();
-  }
-  renderSessionList();
+  syncPaneLiveSessions();
 }
 
 async function browseCwd(): Promise<void> {
   const folder = await window.duocli.selectFolder(currentCwd || undefined);
   if (folder) {
-    currentCwd = folder;
-    cwdInput.value = folder;
-    localStorage.setItem('duocli_cwd', folder);
-    addRecentCwd(folder);
-    startFileWatcher(folder);
-    void renderFileTree();
+    applyCurrentCwd(folder);
   }
 }
 
@@ -2218,12 +2874,60 @@ function startFileWatcher(cwd: string): void {
 
 async function refreshAiConfig(): Promise<void> {
   // 从主进程加载当前生效的配置，填充到表单
-  const config = await window.duocli.aiGetCurrentConfig();
+  const [config, autoResponseConfig] = await Promise.all([
+    window.duocli.aiGetCurrentConfig(),
+    window.duocli.terminalAutoResponseGetConfig(),
+  ]);
   if (config) {
     aiFormatSelect.value = config.apiFormat || 'anthropic';
     aiBaseurlInput.value = config.baseUrl || '';
     aiApikeyInput.value = config.apiKey || '';
     aiModelInput.value = config.model || '';
+  }
+  applyTerminalAutoResponseConfig(autoResponseConfig);
+}
+
+function applyTerminalAutoResponseConfig(config: TerminalAutoResponseConfig): void {
+  terminalAutoResponseEnabled.checked = config.enabled;
+  terminalAutoResponseRules.value = config.rules
+    .map((rule) => `${rule.keyword} => ${rule.response}`)
+    .join('\n');
+  terminalAutoResponseDelay.value = String(config.delaySeconds);
+  terminalAutoResponseCooldown.value = String(config.cooldownSeconds);
+}
+
+function parseTerminalAutoResponseRules(text: string): TerminalAutoResponseRule[] {
+  const rules: TerminalAutoResponseRule[] = [];
+  for (const line of text.split('\n')) {
+    const separatorIndex = line.includes('=>') ? line.indexOf('=>') : line.indexOf('→');
+    if (separatorIndex === -1) continue;
+    const separatorLength = line.startsWith('=>', separatorIndex) ? 2 : 1;
+    const keyword = line.slice(0, separatorIndex).trim();
+    const response = line.slice(separatorIndex + separatorLength).trim();
+    if (keyword && response) rules.push({ keyword, response });
+  }
+  return rules;
+}
+
+async function saveTerminalAutoResponseConfig(): Promise<void> {
+  const config: TerminalAutoResponseConfig = {
+    enabled: terminalAutoResponseEnabled.checked,
+    rules: parseTerminalAutoResponseRules(terminalAutoResponseRules.value),
+    delaySeconds: Number(terminalAutoResponseDelay.value),
+    cooldownSeconds: Number(terminalAutoResponseCooldown.value),
+  };
+  terminalAutoResponseSave.textContent = '保存中...';
+  terminalAutoResponseSave.setAttribute('disabled', 'true');
+  try {
+    const saved = await window.duocli.terminalAutoResponseSaveConfig(config);
+    applyTerminalAutoResponseConfig(saved);
+    terminalAutoResponseSave.textContent = '已保存';
+  } catch (error) {
+    console.error('保存终端容错规则失败:', error);
+    terminalAutoResponseSave.textContent = '保存失败';
+  } finally {
+    terminalAutoResponseSave.removeAttribute('disabled');
+    setTimeout(() => { terminalAutoResponseSave.textContent = '保存容错规则'; }, 1500);
   }
 }
 
@@ -2282,9 +2986,7 @@ function switchTab(tabName: string): void {
   });
   tabSessions.classList.toggle('active', tabName === 'sessions');
   tabAiConfig.classList.toggle('active', tabName === 'ai-config');
-  tabDevinAccounts.classList.toggle('active', tabName === 'devin-accounts');
   if (tabName === 'ai-config') refreshAiConfig();
-  if (tabName === 'devin-accounts') refreshDevinAccounts();
 }
 
 // ========== 事件绑定 ==========
@@ -2309,12 +3011,7 @@ function renderRecentCwdDropdown(): void {
     item.textContent = path;
     item.title = path;
     item.addEventListener('click', () => {
-      currentCwd = path;
-      cwdInput.value = path;
-      localStorage.setItem('duocli_cwd', path);
-      addRecentCwd(path);
-      startFileWatcher(path);
-      void renderFileTree();
+      applyCurrentCwd(path);
       cwdRecentDropdown.classList.remove('open');
     });
     cwdRecentDropdown.appendChild(item);
@@ -2338,13 +3035,7 @@ document.addEventListener('click', () => {
 cwdRecentDropdown.addEventListener('click', (e) => { e.stopPropagation(); });
 cwdInput.addEventListener('change', () => {
   const v = cwdInput.value.trim();
-  if (v) {
-    currentCwd = v;
-    localStorage.setItem('duocli_cwd', v);
-    addRecentCwd(v);
-    startFileWatcher(v);
-    void renderFileTree();
-  }
+  if (v) applyCurrentCwd(v);
 });
 cwdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') cwdInput.blur(); });
 
@@ -2354,19 +3045,47 @@ cwdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') cwdInput.bl
 let fileTreeCollapsed = false;
 let fileTreeLastWidth = 220;
 
+function syncPanelTogglePositions(): void {
+  const toggleInset = 8;
+  const toggleSize = 26;
+
+  if (fileTreeCollapsed) {
+    fileTreeToggle.style.left = '10px';
+  } else {
+    const left = Math.max(8, fileTreePanel.offsetWidth - toggleSize - toggleInset);
+    fileTreeToggle.style.left = `${left}px`;
+  }
+
+  if (sidebarCollapsed) {
+    sidebarToggle.style.right = '10px';
+  } else {
+    const right = Math.max(8, sidebar.offsetWidth - toggleSize - toggleInset);
+    sidebarToggle.style.right = `${right}px`;
+  }
+}
+
+function updatePanelToggleA11y(toggle: HTMLElement, collapsed: boolean, panelName: string): void {
+  const expanded = !collapsed;
+  toggle.setAttribute('aria-expanded', String(expanded));
+  toggle.setAttribute('aria-label', `${expanded ? '收起' : '展开'}${panelName}`);
+  toggle.setAttribute('title', `${expanded ? '收起' : '展开'}${panelName}`);
+}
+
 fileTreeToggle.addEventListener('click', () => {
   fileTreeCollapsed = !fileTreeCollapsed;
   if (fileTreeCollapsed) {
     fileTreeLastWidth = fileTreePanel.offsetWidth;
     fileTreePanel.classList.add('collapsed');
     fileTreeToggle.classList.add('collapsed');
-    fileTreeToggle.textContent = '\u25B6';
+    setIcon(fileTreeToggle, 'chevron-right', 12);
   } else {
     fileTreePanel.style.width = fileTreeLastWidth + 'px';
     fileTreePanel.classList.remove('collapsed');
     fileTreeToggle.classList.remove('collapsed');
-    fileTreeToggle.textContent = '\u25C4';
+    setIcon(fileTreeToggle, 'chevron-left', 12);
   }
+  updatePanelToggleA11y(fileTreeToggle, fileTreeCollapsed, '目录树');
+  syncPanelTogglePositions();
   localStorage.setItem('duocli_filetree_collapsed', String(fileTreeCollapsed));
 });
 
@@ -2380,13 +3099,15 @@ sidebarToggle.addEventListener('click', () => {
     sidebarLastWidth = sidebar.offsetWidth;
     sidebar.classList.add('collapsed');
     sidebarToggle.classList.add('collapsed');
-    sidebarToggle.textContent = '\u25C0';
+    setIcon(sidebarToggle, 'chevron-left', 12);
   } else {
     sidebar.style.width = sidebarLastWidth + 'px';
     sidebar.classList.remove('collapsed');
     sidebarToggle.classList.remove('collapsed');
-    sidebarToggle.textContent = '\u25B6';
+    setIcon(sidebarToggle, 'chevron-right', 12);
   }
+  updatePanelToggleA11y(sidebarToggle, sidebarCollapsed, '会话列表');
+  syncPanelTogglePositions();
   localStorage.setItem('duocli_sidebar_collapsed', String(sidebarCollapsed));
 });
 
@@ -2446,6 +3167,7 @@ document.addEventListener('mousemove', (e) => {
   }
   newWidth = Math.max(dragState.minWidth, Math.min(dragState.maxWidth, newWidth));
   dragState.panel.style.width = newWidth + 'px';
+  syncPanelTogglePositions();
 });
 
 document.addEventListener('mouseup', () => {
@@ -2458,9 +3180,12 @@ document.addEventListener('mouseup', () => {
     } else if (dragState.panel === sidebar) {
       localStorage.setItem('duocli_sidebar_width', String(sidebar.offsetWidth));
     }
+    syncPanelTogglePositions();
     dragState.panel = null;
   }
 });
+
+window.addEventListener('resize', syncPanelTogglePositions);
 
 // 恢复保存的面板状态
 (function restorePanelStates() {
@@ -2479,22 +3204,25 @@ document.addEventListener('mouseup', () => {
     fileTreeCollapsed = true;
     fileTreePanel.classList.add('collapsed');
     fileTreeToggle.classList.add('collapsed');
-    fileTreeToggle.textContent = '\u25B6';
+    setIcon(fileTreeToggle, 'chevron-right', 12);
+    updatePanelToggleA11y(fileTreeToggle, true, '目录树');
   }
   const savedSidebarCollapsed = localStorage.getItem('duocli_sidebar_collapsed');
   if (savedSidebarCollapsed === 'true') {
     sidebarCollapsed = true;
     sidebar.classList.add('collapsed');
     sidebarToggle.classList.add('collapsed');
-    sidebarToggle.textContent = '\u25C0';
+    setIcon(sidebarToggle, 'chevron-left', 12);
+    updatePanelToggleA11y(sidebarToggle, true, '会话列表');
   }
+  syncPanelTogglePositions();
 })();
 
 fileTreeRefreshBtn.addEventListener('click', () => { void refreshFileTree(true); });
 
 // 打开目录按钮
 fileTreeOpenBtn.addEventListener('click', () => {
-  const activeId = termManager.getActiveId();
+  const activeId = getActiveSessionId();
   if (activeId) {
     const cwd = sessionCwds.get(activeId);
     if (cwd) {
@@ -2508,7 +3236,7 @@ let fileTreeAutoRefreshTimer: ReturnType<typeof setInterval> | null = null;
 function startFileTreeAutoRefresh(): void {
   if (fileTreeAutoRefreshTimer) return;
   fileTreeAutoRefreshTimer = setInterval(() => {
-    const activeId = termManager.getActiveId();
+    const activeId = getActiveSessionId();
     if (activeId) {
       void refreshFileTree(true);
     }
@@ -2558,15 +3286,12 @@ document.addEventListener('drop', (e) => {
 
 function openNewSessionDialog(cwd?: string): void {
   const targetCwd = (cwd || currentCwd || '').trim();
-  cwdInput.value = targetCwd;
   // 程序设值不触发 change 事件，需手动同步 currentCwd，
   // 否则点击分组头加号创建的终端仍走旧 currentCwd
   if (targetCwd && targetCwd !== currentCwd) {
-    currentCwd = targetCwd;
-    localStorage.setItem('duocli_cwd', targetCwd);
-    addRecentCwd(targetCwd);
-    startFileWatcher(targetCwd);
-    void renderFileTree();
+    applyCurrentCwd(targetCwd);
+  } else {
+    cwdInput.value = targetCwd;
   }
   presetSelect.value = lastPreset || presetSelect.value || '';
   setThemeValue(currentThemeId);
@@ -2619,6 +3344,7 @@ sidebarTabs.forEach((tab) => {
 // AI 配置按钮
 aiTestBtn.addEventListener('click', () => handleAiTest());
 aiApplyBtn.addEventListener('click', () => handleAiApply());
+terminalAutoResponseSave.addEventListener('click', () => { void saveTerminalAutoResponseConfig(); });
 aiKeyToggle.addEventListener('click', () => {
   aiApikeyInput.type = aiApikeyInput.type === 'password' ? 'text' : 'password';
 });
@@ -2631,7 +3357,7 @@ window.duocli.onPtyData((id, data) => {
     sessionUpdateTimes.set(id, Date.now());
   }
   // 所有会话都追踪状态（工作中/等待输入），确保切换查看后状态不丢失
-  const activeId = termManager.getActiveId();
+  const activeId = getActiveSessionId();
   if (sessionTitles.has(id)) {
     // 有新输出就优先显示"工作中"（黄点），并清掉旧的"待处理"（绿点）
     const prevBusy = sessionBusy.has(id);
@@ -2698,7 +3424,7 @@ window.duocli.onPtyData((id, data) => {
         // 超时兜底：如果仍然是黄灯状态，转为绿灯或灰灯
         if (sessionBusy.has(id)) {
           sessionBusy.delete(id);
-          const currentActiveId = termManager.getActiveId();
+          const currentActiveId = getActiveSessionId();
           if (id !== currentActiveId) {
             sessionUnread.add(id);
           }
@@ -2714,20 +3440,14 @@ window.duocli.onTitleUpdate((id, title) => {
   if (sessionTitles.has(id)) {
     sessionTitles.set(id, title);
     sessionUpdateTimes.set(id, Date.now());
+    paneWorkspace.updateContentLabel('terminal', id, title);
     renderSessionList();
     updateSessionTitleBar();
   }
 });
 
-// Chat 会话标题更新（全局处理，避免只在 ChatView 内部监听导致丢失）
-window.duocli.onChatTitleUpdate((id, title) => {
-  if (chatSessionTitles.has(id)) {
-    chatSessionTitles.set(id, title);
-    renderSessionList();
-  }
-});
-
 window.duocli.onPtyExit((id) => {
+  paneWorkspace.removeContent('terminal', id);
   clearSessionState(id);
   saveAutoContinueToStorage();
   termManager.destroy(id);
@@ -2735,6 +3455,7 @@ window.duocli.onPtyExit((id) => {
   renderSessionList();
   updateSessionTitleBar();
   void renderFileTree();
+  syncPaneLiveSessions();
 });
 
 // 手机端远程创建了会话，桌面端同步显示
@@ -2748,10 +3469,14 @@ window.duocli.onRemoteCreated((info) => {
   sessionDisplayNames.set(info.id, info.displayName);
   // 创建 xterm 实例（桌面端也能看到和操作）
   termManager.create(info.id, info.themeId, info.cwd, (data) => { writePtyWithAutoReset(info.id, data); });
+  if (normalizeCwd(paneWorkspace.getWorkspaceKey()) === normalizeCwd(info.cwd || currentCwd)) {
+    paneWorkspace.openContent(buildTerminalPaneContent(info.id));
+  }
   updateEmptyState();
   renderSessionList();
   updateSessionTitleBar();
   void renderFileTree();
+  syncPaneLiveSessions();
   setTimeout(() => {
     const dims = termManager.getActiveDimensions();
     if (dims) window.duocli.resizePty(info.id, dims.cols, dims.rows);
@@ -2761,17 +3486,57 @@ window.duocli.onRemoteCreated((info) => {
 // 远程服务器信息处理：合并推送/拉取预设
 async function handleRemoteServerInfo(info: typeof remoteServerInfo) {
   if (!info) return;
+  const isInitial = !remoteServerInfo;
+  const identityChanged = Boolean(
+    remoteServerInfo
+    && (remoteServerInfo.port !== info.port || remoteServerInfo.token !== info.token),
+  );
   console.log('[Renderer] Remote server info:', info);
   remoteServerInfo = info;
+  if (!info.health) {
+    const health = await window.duocli.getRemoteHealth();
+    if (health) remoteServerInfo = { ...info, health };
+  }
   renderRemoteServerInfo();
+  if (!isInitial && !identityChanged) return;
+
   startPresetSyncTimer();
-  
   console.log('[Preset Sync] Remote server started, initiating preset sync');
   await reconcilePresetsWithServer('remote-ready');
 }
 
+function handleRemoteHealthUpdate(health: RemoteSyncHealth): void {
+  if (!remoteServerInfo) return;
+  remoteServerInfo = { ...remoteServerInfo, health };
+  renderRemoteServerInfo();
+}
+
 // 方式1：IPC 推送（可能因竞态丢失）
 window.duocli.onRemoteServerInfo(handleRemoteServerInfo);
+window.duocli.onRemoteHealthUpdate(handleRemoteHealthUpdate);
+
+remoteServerInfoEl.querySelector('.remote-info-retry')?.addEventListener('click', () => {
+  void handleRemoteRetryClick();
+});
+
+remoteServerInfoEl.querySelector('.remote-info-url')?.addEventListener('click', () => {
+  if (!remoteServerInfo) return;
+  const text = remoteServerInfo.publicUrl && remoteServerInfo.health?.status === 'healthy'
+    ? remoteServerInfo.publicUrl
+    : remoteServerInfo.lanUrl;
+  void navigator.clipboard.writeText(text).catch(() => { /* ignore */ });
+});
+
+remoteServerInfoEl.querySelector('.remote-info-token-toggle')?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  remoteTokenVisible = !remoteTokenVisible;
+  renderRemoteServerInfo();
+});
+
+remoteServerInfoEl.querySelector('.remote-info-token-value')?.addEventListener('click', () => {
+  if (!remoteServerInfo || !remoteTokenVisible) return;
+  void navigator.clipboard.writeText(remoteServerInfo.token).catch(() => { /* ignore */ });
+});
 
 // 方式2：渲染进程加载后主动拉取；服务器启动和页面加载都有竞态，需短时重试。
 async function waitForRemoteServerInfo(): Promise<void> {
@@ -2800,30 +3565,32 @@ window.duocli.onClosedSessionsUpdate((sessions) => {
   renderSessionList();
 });
 
-// ========== 已关闭 Chat 会话：启动加载 + 实时更新 ==========
-window.duocli.closedChatList().then(sessions => {
-  closedChatSessions = sessions;
-  renderSessionList();
-});
-window.duocli.onClosedChatUpdate((sessions) => {
-  closedChatSessions = sessions;
-  renderSessionList();
-});
-
-// 自动切号状态监听
-window.duocli.onAutoSwitchStatus((id, status, detail) => {
-  if (status === 'idle') {
-    sessionAutoSwitchStatus.delete(id);
-  } else {
-    sessionAutoSwitchStatus.set(id, { status, detail });
+window.duocli.getSessions().then((sessions) => {
+  for (const info of sessions) {
+    if (sessionTitles.has(info.id)) continue;
+    const now = Date.now();
+    sessionTitles.set(info.id, info.title);
+    sessionThemes.set(info.id, info.themeId);
+    sessionUpdateTimes.set(info.id, now);
+    sessionCreateTimes.set(info.id, now);
+    sessionCwds.set(info.id, info.cwd);
+    sessionDisplayNames.set(info.id, info.displayName);
+    termManager.create(info.id, info.themeId, info.cwd, (data) => { writePtyWithAutoReset(info.id, data); });
   }
+  syncPaneLiveSessions();
+  rebalanceDistinctAutoThemes();
+  paneWorkspace.remountAll();
+  updatePaneAccents();
+  updateEmptyState();
   renderSessionList();
+}).catch(() => {
+  syncPaneLiveSessions();
 });
 
 // 催工配置：手机端通过 main 进程读取桌面端配置
 window.duocli.onGetAutoContinueConfig((sessionId) => {
   const config = sessionAutoContinue.get(sessionId);
-  window.duocli.sendAutoContinueConfig(sessionId, config || null);
+  window.duocli.sendAutoContinueConfig(sessionId, config ? serializeAutoContinueConfig(config) : null);
 });
 
 // 催工配置：手机端通过 main 进程写入桌面端配置
@@ -2834,18 +3601,25 @@ window.duocli.onSetAutoContinueConfig((sessionId, config) => {
     messages: [...AUTO_CONTINUE_DEFAULT_MESSAGES],
     intervalMs: AUTO_CONTINUE_DEFAULT_INTERVAL,
     commandIntervalMs: AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL,
-    lastSendTime: Date.now(),
     autoAgree: true,
     autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
     sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
-    maxDurationMs: AUTO_CONTINUE_DEFAULT_MAX_DURATION,
-    enabledAt: 0,
+    maxLoops: AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
+    initialDelayMs: AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
+    loopCount: 0,
+    nextRunAt: Date.now() + AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
+    sending: false,
+    runVersion: 0,
+    timeoutIds: new Set(),
   };
+  cancelAutoContinueRun(existing);
   Object.assign(existing, config);
-  existing.lastSendTime = Date.now();
-  if (config.enabled && !existing.enabledAt) {
-    existing.enabledAt = Date.now();
-  }
+  existing.maxLoops ??= AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
+  existing.initialDelayMs ??= AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
+  existing.loopCount = 0;
+  existing.sending = false;
+  existing.nextRunAt = Date.now() + existing.initialDelayMs;
+  existing.timeoutIds = new Set();
   sessionAutoContinue.set(sessionId, existing);
   saveAutoContinueToStorage();
   if (existing.enabled) initAutoContinueTimer();
@@ -2964,23 +3738,13 @@ function navigateSession(direction: 'up' | 'down'): void {
 
   const targetItem = navigable[targetIdx];
   const sessionId = targetItem.dataset.sessionId!;
-  const sessionType = targetItem.dataset.sessionType;
-
-  // 触发切换
-  if (sessionType === 'chat') {
-    switchToTerminal();
-    switchToChat(sessionId);
-  } else {
-    switchSession(sessionId);
-  }
+  switchSession(sessionId);
 
   // 滚动到可见区域
   targetItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
-// 在 renderSessionList 中给每个 session-item 打上 data 属性
-// （在 renderSessionList 末尾的 PTY 和 Chat 渲染处已有点击事件，
-//   这里需要在创建 DOM 时标记 sessionId 和 sessionType）
+// 在 renderSessionList 中给每个 session-item 打上 data-session-id 属性
 
 // 全局键盘监听：侧边栏有焦点时拦截上下箭头
 sessionList.addEventListener('keydown', (e) => {
@@ -3022,254 +3786,4 @@ document.querySelector('.footer-tip')!.addEventListener('click', () => {
     if (e.target === overlay) overlay.remove();
   });
   dialog.addEventListener('click', () => overlay.remove());
-});
-
-// ========== Devin 账号管理 ==========
-
-let devinLoading = false;
-
-async function refreshDevinAccounts(): Promise<void> {
-  if (devinLoading) return;
-  devinLoading = true;
-  try {
-    const data = await window.duocli.devinAccountsList();
-    renderDevinAccountsList(data);
-  } catch {
-    devinAccountsList.innerHTML = '<div class="devin-accounts-empty">加载失败</div>';
-  } finally {
-    devinLoading = false;
-  }
-}
-
-function renderDevinAccountsList(data: { accounts: any[]; currentIndex: number }): void {
-  devinAccountsList.innerHTML = '';
-  if (!data.accounts || data.accounts.length === 0) {
-    devinAccountsList.innerHTML = '<div class="devin-accounts-empty">暂无账号，请在下方添加</div>';
-    devinCurrentLabel.textContent = '当前: 无';
-    return;
-  }
-  const cur = data.accounts[data.currentIndex];
-  devinCurrentLabel.textContent = `当前: ${cur ? cur.email.split('@')[0] : '无'}`;
-
-  for (let i = 0; i < data.accounts.length; i++) {
-    const acc = data.accounts[i];
-    const isActive = i === data.currentIndex;
-
-    // 状态圆点
-    let dotClass = 'idle';
-    if (acc.lastLogin && !acc.lastError) dotClass = 'ok';
-    else if (acc.lastError) dotClass = 'err';
-
-    // 配额
-    const quota = acc.quota;
-    let quotaText = '--';
-    let quotaClass = '';
-    if (quota) {
-      quotaText = `D${quota.daily}% W${quota.weekly}%`;
-      if (quota.daily <= 10 || quota.weekly <= 10) quotaClass = ' low';
-    }
-
-    const item = document.createElement('div');
-    item.className = 'devin-account-item' + (isActive ? ' active' : '');
-
-    // 时间信息
-    let meta = '';
-    if (acc.planName) meta = acc.planName;
-    if (acc.lastLogin) {
-      const d = new Date(acc.lastLogin);
-      meta += (meta ? ' · ' : '') + `${d.getMonth()+1}/${d.getDate()} ${d.getHours()}:${String(d.getMinutes()).padStart(2,'0')}`;
-    }
-    if (acc.lastError) meta = `❌ ${acc.lastError.slice(0, 30)}`;
-
-    item.innerHTML = `
-      <div class="devin-account-top">
-        <div class="devin-account-dot ${dotClass}"></div>
-        <span class="devin-account-email">${escHtml(acc.email)}</span>
-        <span class="devin-account-quota-tag${quotaClass}">${quotaText}</span>
-      </div>
-      <div class="devin-account-bottom">
-        <span class="devin-account-meta">${escHtml(meta)}</span>
-        <div class="devin-account-actions">
-          <button class="devin-quota-one-btn" title="刷新额度">&#8635;</button>
-          <button class="devin-switch-btn" ${isActive ? 'disabled' : ''}>切换</button>
-          <button class="devin-delete-btn">删除</button>
-        </div>
-      </div>
-    `;
-
-    // 切换按钮
-    const switchBtn = item.querySelector('.devin-switch-btn') as HTMLButtonElement;
-    switchBtn.addEventListener('click', async () => {
-      switchBtn.textContent = '切换中...';
-      switchBtn.disabled = true;
-      try {
-        const result = await window.duocli.devinAccountsSwitch({ email: acc.email });
-        if (result.ok) {
-          switchBtn.textContent = '✓';
-          await refreshDevinAccounts();
-        } else {
-          switchBtn.textContent = '失败';
-          alert('切换失败：' + (result.error || '未知错误'));
-          setTimeout(() => { switchBtn.textContent = '切换'; switchBtn.disabled = false; }, 1500);
-        }
-      } catch {
-        switchBtn.textContent = '切换';
-        switchBtn.disabled = false;
-      }
-    });
-
-    // 删除按钮
-    const deleteBtn = item.querySelector('.devin-delete-btn') as HTMLButtonElement;
-    deleteBtn.addEventListener('click', async () => {
-      if (!confirm(`确认删除账号 ${acc.email}？`)) return;
-      deleteBtn.textContent = '...';
-      deleteBtn.disabled = true;
-      try {
-        const result = await window.duocli.devinAccountsRemove(acc.email);
-        if (result.ok) {
-          await refreshDevinAccounts();
-        } else {
-          alert('删除失败：' + (result.error || '未知错误'));
-          deleteBtn.textContent = '删除';
-          deleteBtn.disabled = false;
-        }
-      } catch {
-        deleteBtn.textContent = '删除';
-        deleteBtn.disabled = false;
-      }
-    });
-
-    // 单个账号刷新额度按钮
-    const quotaOneBtn = item.querySelector('.devin-quota-one-btn') as HTMLButtonElement;
-    quotaOneBtn.addEventListener('click', async () => {
-      quotaOneBtn.disabled = true;
-      quotaOneBtn.textContent = '...';
-      try {
-        const result = await window.duocli.devinAccountsQuotaOne(acc.email);
-        if (result.ok) {
-          quotaOneBtn.textContent = '✓';
-          await refreshDevinAccounts();
-          setTimeout(() => { quotaOneBtn.innerHTML = '&#8635;'; quotaOneBtn.disabled = false; }, 2000);
-        } else {
-          quotaOneBtn.innerHTML = '&#8635;';
-          quotaOneBtn.disabled = false;
-          alert('查询失败：' + (result.error || '未知错误'));
-        }
-      } catch {
-        quotaOneBtn.innerHTML = '&#8635;';
-        quotaOneBtn.disabled = false;
-      }
-    });
-
-    devinAccountsList.appendChild(item);
-  }
-}
-
-function escHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-// 刷新按钮
-devinRefreshBtn.addEventListener('click', () => refreshDevinAccounts());
-
-// 配额查询
-devinQuotaBtn.addEventListener('click', async () => {
-  devinQuotaBtn.disabled = true;
-  devinQuotaBtn.textContent = '查询中...';
-  try {
-    const result = await window.duocli.devinAccountsQuota();
-    if (result.ok) {
-      devinQuotaBtn.textContent = `D${result.daily}% W${result.weekly}%`;
-      await refreshDevinAccounts();
-      setTimeout(() => { devinQuotaBtn.textContent = '配额'; }, 5000);
-    } else {
-      devinQuotaBtn.textContent = '失败';
-      setTimeout(() => { devinQuotaBtn.textContent = '配额'; }, 2000);
-    }
-  } catch {
-    devinQuotaBtn.textContent = '配额';
-  } finally {
-    devinQuotaBtn.disabled = false;
-  }
-});
-
-// 刷新全部额度
-devinQuotaAllBtn.addEventListener('click', async () => {
-  devinQuotaAllBtn.disabled = true;
-  devinQuotaAllBtn.textContent = '刷新中...';
-  try {
-    const result = await window.duocli.devinAccountsQuotaAll();
-    if (result.ok) {
-      const total = result.results?.length || 0;
-      const success = result.results?.filter(r => r.ok).length || 0;
-      devinQuotaAllBtn.textContent = `${success}/${total} 完成`;
-      await refreshDevinAccounts();
-      setTimeout(() => { devinQuotaAllBtn.textContent = '刷新全部额度'; }, 4000);
-    } else {
-      devinQuotaAllBtn.textContent = '失败';
-      setTimeout(() => { devinQuotaAllBtn.textContent = '刷新全部额度'; }, 2000);
-    }
-  } catch {
-    devinQuotaAllBtn.textContent = '刷新全部额度';
-  } finally {
-    devinQuotaAllBtn.disabled = false;
-  }
-});
-
-// 添加账号
-devinAddBtn.addEventListener('click', async () => {
-  const email = devinAddEmail.value.trim();
-  const password = devinAddPassword.value.trim();
-  if (!email || !password) return;
-  devinAddBtn.textContent = '添加中...';
-  devinAddBtn.disabled = true;
-  try {
-    const result = await window.duocli.devinAccountsAdd(email, password);
-    if (result.ok) {
-      devinAddEmail.value = '';
-      devinAddPassword.value = '';
-      devinAddBtn.textContent = '✓ 已添加';
-      await refreshDevinAccounts();
-    } else {
-      devinAddBtn.textContent = '失败';
-      alert('添加失败：' + (result.error || '未知错误'));
-    }
-  } catch {
-    devinAddBtn.textContent = '失败';
-  }
-  setTimeout(() => { devinAddBtn.textContent = '添加账号'; devinAddBtn.disabled = false; }, 1500);
-});
-
-// 批量添加账号
-devinBatchBtn.addEventListener('click', async () => {
-  const text = devinBatchInput.value.trim();
-  if (!text) return;
-  // 基本校验：至少包含一个 @
-  if (!text.includes('@')) {
-    alert('请输入有效的账号数据（每行：邮箱 密码）');
-    return;
-  }
-  devinBatchBtn.textContent = '导入中...';
-  devinBatchBtn.disabled = true;
-  try {
-    const result = await window.duocli.devinAccountsAddBatch(text);
-    if (result.ok) {
-      devinBatchInput.value = '';
-      devinBatchBtn.textContent = '✓ 完成';
-      await refreshDevinAccounts();
-      // 显示统计信息
-      if (result.output) {
-        const statsMatch = result.output.match(/已添加\s*\d+\s*\|.*/);
-        if (statsMatch) {
-          devinBatchBtn.textContent = statsMatch[0];
-        }
-      }
-    } else {
-      devinBatchBtn.textContent = '失败';
-      alert('批量导入失败：' + (result.error || '未知错误'));
-    }
-  } catch {
-    devinBatchBtn.textContent = '失败';
-  }
-  setTimeout(() => { devinBatchBtn.textContent = '批量导入'; devinBatchBtn.disabled = false; }, 3000);
 });

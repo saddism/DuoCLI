@@ -1,16 +1,21 @@
 {
   "name": "duocli",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "手机电脑实时同步的 AI 编程终端 | AI Coding Terminal with Real-time Mobile-Desktop Sync — Wireless LAN connection, code from anywhere",
   "main": "dist/main/index.js",
   "scripts": {
     "build:main": "tsc -p tsconfig.main.json",
     "build:preload": "tsc -p tsconfig.preload.json",
-    "build:renderer": "esbuild src/renderer/app.ts --bundle --outfile=dist/renderer/app.js --platform=browser --external:electron",
+    "build:renderer": "node scripts/patch-xterm.mjs && esbuild src/renderer/app.ts --bundle --outfile=dist/renderer/app.js --platform=browser --external:electron",
+    "build:android-media": "go -C native/android-media build -trimpath -ldflags='-s -w' -o android-media .",
     "build:ts": "npm run build:main && npm run build:preload && npm run build:renderer",
     "copy:html": "node -e \"const fs=require('fs'),p=require('path');const d=p.join('dist','renderer');fs.mkdirSync(d,{recursive:true});fs.copyFileSync(p.join('src','renderer','index.html'),p.join(d,'index.html'));fs.copyFileSync(p.join('src','renderer','styles.css'),p.join(d,'styles.css'));fs.copyFileSync(p.join('src','renderer','qrcode.jpg'),p.join(d,'qrcode.jpg'));\"",
     "start": "npm run build:ts && npm run copy:html && electron .",
+    "restart:latest": "bash scripts/restart-latest.sh",
     "rebuild": "electron-rebuild",
+    "test:unit": "npm run build:main && node --test \"mobile/client/*.test.cjs\" \"tests/*.test.mjs\" tests/mobile-page-visibility.test.js",
+    "test:e2e": "node tests/e2e/mobile.e2e.mjs && node tests/e2e/desktop-copy.e2e.mjs && node tests/e2e/desktop-scroll.e2e.mjs && node tests/e2e/mobile-remote.e2e.mjs",
+    "test": "npm run test:unit && npm run test:e2e",
     "build": "npm run build:ts && npm run copy:html && electron-builder",
     "build:mac": "npm run build:ts && npm run copy:html && electron-builder --mac",
     "build:win": "npm run build:ts && npm run copy:html && electron-builder --win",
@@ -49,12 +54,15 @@
     "electron-rebuild": "^3.2.9",
     "esbuild": "^0.27.3",
     "png-to-ico": "^3.0.1",
+    "puppeteer-core": "^22.15.0",
     "typescript": "^5.3.0"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-serialize": "0.14.0",
     "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/headless": "5.5.0",
     "@xterm/xterm": "^5.5.0",
     "express": "^5.2.1",
     "node-pty": "^1.0.0",
@@ -71,7 +79,6 @@
     },
     "files": [
       "dist/**/*",
-      "mobile/client/**/*",
       "node_modules/**/*",
       "!node_modules/.cache",
       "!node_modules/png-to-ico"
@@ -80,10 +87,19 @@
       "node_modules/sharp/**/*",
       "node_modules/@img/**/*"
     ],
+    "afterPack": "scripts/after-pack.mjs",
     "extraResources": [
       {
         "from": "node_modules/@xterm/xterm/css/xterm.css",
         "to": "xterm.css"
+      },
+      {
+        "from": "mobile/client",
+        "to": "mobile/client",
+        "filter": [
+          "**/*",
+          "!*.test.cjs"
+        ]
       },
       {
         "from": "frp",
