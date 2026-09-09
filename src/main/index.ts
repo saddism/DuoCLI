@@ -159,6 +159,10 @@ function loadEditorPreference(): string | null {
 
 let mainWindow: BrowserWindow | null = null;
 let ptyManager: PtyManager;
+let isQuitting = false;
+let quitConfirmed = false;
+let quitDialogOpen = false;
+let ignoreActivateUntil = 0;
 const aiConfigManager = new AIConfigManager();
 let cloudflaredManager: CloudflaredManager | null = null;
 let cachedRemoteServerInfo: any = null;
@@ -299,25 +303,18 @@ function createWindow(appIcon?: Electron.NativeImage): void {
     // 不做任何操作，阻止默认刷新行为
   });
 
-  // 关闭窗口时，如果有活跃终端则弹确认
-  mainWindow.on('close', (e) => {
-    const sessions = ptyManager.getAllSessions();
-    if (sessions.length === 0 || !mainWindow) return;
+  // 关窗口只隐藏：进程留下给远程服务（9800 / Cloudflare）。
+  // 真正退出走 Cmd+Q / 菜单退出。macOS 关最后一扇窗会误触发 activate，
+  // 若这里直接 destroy，窗口会马上被再创建出来。
+  const createdWindow = mainWindow;
+  createdWindow.on('close', (e) => {
+    if (isQuitting) return;
     e.preventDefault();
-    dialog.showMessageBox(mainWindow, {
-      type: 'warning',
-      title: '关闭 DuoCLI',
-      message: `当前有 ${sessions.length} 个终端正在运行`,
-      detail: '关闭应用后所有终端进程都会被终止，确定要关闭吗？',
-      buttons: ['取消', '关闭'],
-      defaultId: 0,
-      cancelId: 0,
-    }).then(({ response }) => {
-      if (response === 1) {
-        mainWindow?.removeAllListeners('close');
-        mainWindow?.close();
-      }
-    });
+    ignoreActivateUntil = Date.now() + 500;
+    createdWindow.hide();
+  });
+  createdWindow.on('closed', () => {
+    if (mainWindow === createdWindow) mainWindow = null;
   });
 }
 
@@ -1285,16 +1282,65 @@ app.on('window-all-closed', () => {
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
+  if (isQuitting || Date.now() < ignoreActivateUntil) return;
+  if (!mainWindow || mainWindow.isDestroyed()) {
     createWindow();
+    return;
   }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
 });
 
-app.on('before-quit', async () => {
+function cleanupForQuit(): void {
   globalShortcut.unregisterAll();
   remoteSyncMonitor?.stop();
   remoteSyncMonitor = null;
   remoteServer?.close();
   remoteServer = null;
   cloudflaredManager?.stopOwnedProcess();
+}
+
+app.on('before-quit', (event) => {
+  if (quitConfirmed) {
+    isQuitting = true;
+    cleanupForQuit();
+    return;
+  }
+
+  const sessions = ptyManager.getAllSessions();
+  if (sessions.length === 0) {
+    quitConfirmed = true;
+    isQuitting = true;
+    cleanupForQuit();
+    return;
+  }
+
+  event.preventDefault();
+  if (quitDialogOpen) return;
+  quitDialogOpen = true;
+
+  const boxOptions: Electron.MessageBoxOptions = {
+    type: 'warning',
+    title: '退出 DuoCLI',
+    message: `当前有 ${sessions.length} 个终端正在运行`,
+    detail: '退出后所有终端进程都会被终止，手机远程服务也会停止。确定要退出吗？',
+    buttons: ['取消', '退出'],
+    defaultId: 0,
+    cancelId: 0,
+  };
+  const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+  const prompt = parent
+    ? dialog.showMessageBox(parent, boxOptions)
+    : dialog.showMessageBox(boxOptions);
+
+  prompt.then(({ response }) => {
+    quitDialogOpen = false;
+    if (response !== 1) return;
+    quitConfirmed = true;
+    isQuitting = true;
+    app.quit();
+  }).catch(() => {
+    quitDialogOpen = false;
+  });
 });

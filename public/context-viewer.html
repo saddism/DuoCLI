@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DuoCLI 上下文查看器</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f5f5f5;
+      color: #333;
+      line-height: 1.6;
+      padding: 20px;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      padding: 24px;
+    }
+    h1 {
+      color: #1a73e4;
+      margin-bottom: 16px;
+      font-size: 24px;
+    }
+    .info-section {
+      background: #f8f9fa;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 24px;
+    }
+    .info-row {
+      display: flex;
+      margin-bottom: 8px;
+    }
+    .info-label {
+      font-weight: 600;
+      width: 120px;
+      color: #666;
+    }
+    .info-value {
+      flex: 1;
+      color: #333;
+    }
+    .history-section {
+      margin-top: 24px;
+    }
+    .history-title {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #1a73e4;
+    }
+    .conversation-card {
+      border-left: 4px solid;
+      padding: 16px;
+      margin-bottom: 16px;
+      background: #fafafa;
+      border-radius: 0 8px 8px 0;
+    }
+    .conversation-card.user {
+      border-color: #34a0c1;
+    }
+    .conversation-card.assistant {
+      border-color: #202124;
+    }
+    .role-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 16px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .user .role-badge {
+      background: #e8f0fe;
+      color: #1a73e4;
+    }
+    .assistant .role-badge {
+      background: #e8eaed;
+      color: #5f6368;
+    }
+    .content {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .timestamp {
+      font-size: 12px;
+      color: #9aa0a6;
+      margin-top: 8px;
+    }
+    .export-tips {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 8px;
+      padding: 16px;
+      margin-top: 24px;
+    }
+    .export-tips h3 {
+      font-size: 16px;
+      margin-bottom: 8px;
+      color: #856404;
+    }
+    .export-tips ol {
+      margin-left: 20px;
+      color: #856404;
+    }
+    .copy-btn {
+      background: #1a73e4;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      margin-top: 12px;
+    }
+    .copy-btn:hover {
+      background: #1557b0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>📦 DuoCLI 会话上下文</h1>
+    
+    <div class="info-section">
+      <div class="info-row">
+        <span class="info-label">标题:</span>
+        <span class="info-value" id="sessionTitle"></span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">工作目录:</span>
+        <span class="info-value" id="cwd"></span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">源 AI Agent:</span>
+        <span class="info-value" id="sourceAgent"></span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">目标 AI Agent:</span>
+        <span class="info-value" id="targetAgent"></span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">导出时间:</span>
+        <span class="info-value" id="createdAt"></span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">对话数量:</span>
+        <span class="info-value" id="messageCount"></span>
+      </div>
+    </div>
+
+    <div class="history-section">
+      <div class="history-title">💬 对话历史</div>
+      <div id="conversationList"></div>
+    </div>
+
+    <div class="export-tips">
+      <h3>🎯 如何使用此上下文</h3>
+      <ol>
+        <li><strong>复制全部对话内容</strong>（点击下方的“复制全部”按钮）</li>
+        <li><strong>打开新的 AI Agent</strong>（如 Cursor、Codex、Claude 等）</li>
+        <li><strong>粘贴到对话框中</strong></li>
+        <li><strong>继续之前的工作</strong></li>
+      </ol>
+      <button class="copy-btn" onclick="copyAll()">📋 复制全部对话内容</button>
+    </div>
+  </div>
+
+  <script>
+    // 从 URL 参数读取会话 ID
+    const urlParams = new URLSearchParams(window.location.search);
+    const sessionId = urlParams.get('id');
+    const sessionPath = urlParams.get('path');
+
+    if (!sessionId && !sessionPath) {
+      document.body.innerHTML = '<div class="container"><h1>错误 ❌</h1><p>请提供有效的会话 ID 或文件路径</p></div>';
+      exit;
+    }
+
+    // 加载会话数据
+    async function loadSessionData() {
+      let context = null;
+
+      if (sessionPath) {
+        // 直接从本地文件加载
+        try {
+          const response = await fetch(sessionPath);
+          context = await response.json();
+        } catch (err) {
+          document.getElementById('conversationList').innerHTML = 
+            `<p style="color:red;">无法读取文件：${err.message}</p>`;
+          return;
+        }
+      } else if (sessionId) {
+        // TODO: 通过 IPC 从数据库加载（Electron 桌面端）
+        console.log('加载会话:', sessionId);
+      }
+
+      if (!context || !context.contextHistory) {
+        document.getElementById('conversationList').innerHTML = 
+          '<p style="color:red;">无效的会话数据</p>';
+        return;
+      }
+
+      renderSession(context);
+    }
+
+    function renderSession(context) {
+      // 填充基本信息
+      document.getElementById('sessionTitle').textContent = context.title;
+      document.getElementById('cwd').textContent = context.cwd;
+      document.getElementById('sourceAgent').textContent = `_${context.sourceAgent}_`;
+      document.getElementById('targetAgent').textContent = context.targetAgent ? `→ ${context.targetAgent}` : '-';
+      document.getElementById('createdAt').textContent = new Date(context.createdAt).toLocaleString('zh-CN');
+      document.getElementById('messageCount').textContent = `${context.contextHistory.length} 条消息`;
+
+      // 渲染对话历史
+      const container = document.getElementById('conversationList');
+      
+      context.contextHistory.forEach((entry, index) => {
+        const card = document.createElement('div');
+        card.className = `conversation-card ${entry.role}`;
+        
+        const roleLabel = entry.role === 'user' ? '👤 用户' : '🤖 AI';
+        
+        card.innerHTML = `
+          <span class="role-badge">${roleLabel}</span>
+          <div class="content">${escapeHtml(entry.content)}</div>
+          ${entry.timestamp ? `<div class="timestamp">${new Date(entry.timestamp).toLocaleString('zh-CN')}</div>` : ''}
+        `;
+        
+        container.appendChild(card);
+      });
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML.replace(/\n/g, '<br>');
+    }
+
+    function copyAll() {
+      const lines = [
+        `# ${document.getElementById('sessionTitle').textContent}`,
+        ``,
+        `## 背景信息`,
+        `- 工作目录：\`\`\`${document.getElementById('cwd').textContent}\`\`\``,
+        `- 源 AI Agent: \`${document.getElementById('sourceAgent').textContent}\``,
+        document.getElementById('targetAgent').textContent !== '-' &&
+        `- 目标 AI Agent: \`${document.getElementById('targetAgent').textContent.replace('→ ', '').replace(/_/g, '')}\``,
+        ``,
+        `## 完整对话`,
+        ``,
+      ];
+
+      const messages = document.querySelectorAll('.conversation-card');
+      messages.forEach(msg => {
+        const role = msg.classList.contains('user') ? '**用户**' : '**AI**';
+        const content = msg.querySelector('.content').innerHTML.replace('<br>', '\n');
+        lines.push(`${role}:`);
+        lines.push(content);
+        lines.push('');
+        lines.push('---');
+        lines.push('');
+      });
+
+      const textToCopy = lines.filter(Boolean).join('\n');
+      navigator.clipboard.writeText(textToCopy).then(() => {
+        alert('✅ 已复制到剪贴板！\n\n现在可以粘贴到新的 AI Agent 中继续工作。');
+      }).catch(err => {
+        alert('❌ 复制失败：' + err.message);
+      });
+    }
+
+    // 初始化
+    loadSessionData();
+  </script>
+</body>
+</html>

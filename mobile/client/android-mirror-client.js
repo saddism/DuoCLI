@@ -8,13 +8,6 @@
   const MAX_DECODE_QUEUE = 3;
   const MAX_PACKET_BYTES = 16 * 1024 * 1024;
 
-  function canvasIsVisible(canvas) {
-    if (!canvas || canvas.hidden) return false;
-    const overlay = canvas.closest && canvas.closest('#fullscreen-overlay');
-    if (overlay && overlay.style && overlay.style.display === 'none') return false;
-    return true;
-  }
-
   function avcCodecFromAnnexB(data) {
     for (let i = 0; i + 4 < data.length; i++) {
       let start = 0;
@@ -159,8 +152,9 @@
       this.onError(value);
     }
 
-    sendInput(input) {
-      if (!this.isReady()) return null;
+    sendInput(input, allowWithoutController = false) {
+      if (!this.isReady() || (!this.isController && !allowWithoutController)) return null;
+      if (this.protocolVersion === 2 && this.geometryVersion <= 0) return null;
       const sequence = ++this.sequence;
       try {
         this.socket.send(JSON.stringify(this.protocolVersion === 2
@@ -171,6 +165,14 @@
         this.onError(error);
         return null;
       }
+    }
+
+    // A pointer that was already pressed must be released even if the browser
+    // has not processed the latest control-owner notification yet. The server
+    // still checks the lease and rejects this when another client owns it.
+    sendEmergencyInput(input) {
+      if (input?.type !== 'touch' || !['up', 'cancel'].includes(input.action)) return null;
+      return this.sendInput(input, true);
     }
 
     waitForAck(sequence, timeoutMs = 1200) {
@@ -468,7 +470,6 @@
               return;
             }
             for (const canvas of this.canvases) {
-              if (!canvasIsVisible(canvas)) continue;
               const context = this.contexts.get(canvas);
               if (!context) continue;
               try { context.drawImage(frame, 0, 0, canvas.width, canvas.height); } catch { /* surface may be detached */ }
@@ -772,7 +773,6 @@
         if (typeof global.createImageBitmap === 'function') bitmap = await global.createImageBitmap(blob);
         if (generation !== this.generation) { bitmap?.close?.(); return; }
         for (const canvas of this.canvases) {
-          if (!canvasIsVisible(canvas)) continue;
           const context = this.contexts.get(canvas);
           if (!context) continue;
           try {

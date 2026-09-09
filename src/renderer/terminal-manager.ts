@@ -156,6 +156,37 @@ const THEME_DOTS: Record<string, string> = {
   'nord': '#88c0d0',
 };
 
+export const USER_THEMES_CONFIG = [
+  { id: 'theme-0', name: 'VS Code Dark', text: '#ffffff', bg: '#0078d4' },
+  { id: 'theme-1', name: 'Monokai', text: '#f8f8f2', bg: '#a6e22e' },
+  { id: 'theme-2', name: 'Dracula', text: '#f8f8f2', bg: '#bd93f9' },
+  { id: 'theme-3', name: 'Solarized Dark', text: '#fff', bg: '#268bd2' },
+  { id: 'theme-4', name: 'One Dark', text: '#abb2bf', bg: '#61afef' },
+  { id: 'theme-5', name: 'Nord', text: '#eceff4', bg: '#88c0d0' },
+  { id: 'theme-6', name: 'CRT 荧光绿', text: '#0a0a0a', bg: '#39ff14' },
+  { id: 'theme-7', name: 'CRT 琥珀色', text: '#0a0a0a', bg: '#ffb000' },
+  { id: 'theme-8', name: 'CRT 蓝色', text: '#0a0a0a', bg: '#00ffff' },
+  { id: 'theme-9', name: '老式显示器', text: '#0a0a0a', bg: '#00ff00' },
+  { id: 'theme-10', name: '霓虹粉', text: '#0a0a0a', bg: '#ff00ff' },
+  { id: 'theme-11', name: '赛博青', text: '#0a0a0a', bg: '#00ffff' },
+  { id: 'theme-12', name: '电光紫', text: '#0a0a0a', bg: '#bf00ff' },
+  { id: 'theme-13', name: '火焰橙', text: '#0a0a0a', bg: '#ff4500' },
+  { id: 'theme-14', name: '淡蓝', text: '#0a0a0a', bg: '#6cb2eb' },
+  { id: 'theme-15', name: '薄荷绿', text: '#0a0a0a', bg: '#7fffd4' },
+  { id: 'theme-16', name: '薰衣草紫', text: '#0a0a0a', bg: '#b39eb5' },
+  { id: 'theme-17', name: '珊瑚粉', text: '#0a0a0a', bg: '#ff7f50' },
+  { id: 'theme-18', name: '海洋蓝', text: '#0a0a0a', bg: '#1e90ff' },
+  { id: 'theme-19', name: '森林绿', text: '#0a0a0a', bg: '#228b22' },
+  { id: 'theme-20', name: '日落橙', text: '#0a0a0a', bg: '#ff8c00' },
+  { id: 'theme-21', name: '午夜紫', text: '#0a0a0a', bg: '#9370db' },
+  { id: 'theme-22', name: '极简白', text: '#000000', bg: '#ffffff' },
+  { id: 'theme-23', name: '极简黑', text: '#ffffff', bg: '#000000' },
+  { id: 'theme-24', name: '红黑', text: '#ff0000', bg: '#1a1a1a' },
+  { id: 'theme-25', name: '黄黑', text: '#ffd700', bg: '#1a1a1a' },
+];
+
+const DYNAMIC_THEMES = new Map<string, any>();
+
 function openTerminalExternalUrl(url: string): void {
   const trimmed = String(url || '').trim();
   if (!/^https?:\/\//i.test(trimmed)) return;
@@ -384,7 +415,7 @@ export class TerminalManager {
   }
 
   create(id: string, themeId: string, cwd: string, onData: (data: string) => void): void {
-    const theme = THEMES[themeId] || THEMES['vscode-dark'];
+    const theme = resolveTheme(themeId);
     const terminal = new Terminal({
       theme,
       fontSize: 14,
@@ -641,12 +672,25 @@ export class TerminalManager {
   setTheme(id: string, themeId: string): void {
     const instance = this.instances.get(id);
     if (!instance) return;
-    const theme = THEMES[themeId] || THEMES['vscode-dark'];
     instance.themeId = themeId;
-    instance.terminal.options.theme = theme;
+    instance.terminal.options.theme = resolveTheme(themeId);
+  }
+
+  static registerDynamicTheme(themeId: string, theme: any): void {
+    DYNAMIC_THEMES.set(themeId, theme);
+    if (theme && typeof theme.background === 'string') {
+      THEME_DOTS[themeId] = theme.background;
+    }
   }
 
   static getThemeDotColor(themeId: string): string {
     return THEME_DOTS[themeId] || '#0078d4';
   }
+}
+
+function resolveTheme(themeId: string): any {
+  if (themeId.startsWith('custom-')) {
+    return DYNAMIC_THEMES.get(themeId) || THEMES['vscode-dark'];
+  }
+  return THEMES[themeId] || THEMES['vscode-dark'];
 }

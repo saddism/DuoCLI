@@ -5,6 +5,7 @@ import {
   DVM2_KIND_JPEG,
   decodeDvm2Frame,
   encodeDvm2Frame,
+  syncMediaEnvelopeSize,
 } from '../dist/main/android-mirror-protocol.js';
 
 test('DVM2 JPEG envelope round-trips with strict length and BigInt timestamps', () => {
@@ -31,4 +32,12 @@ test('DVM2 rejects truncated and trailing payloads', () => {
   const packet = encodeDvm2Frame({ kind: DVM2_KIND_JPEG, width: 1, height: 1, payload: Buffer.from([1]) });
   assert.throws(() => decodeDvm2Frame(packet.subarray(0, packet.length - 1)), /长度/);
   assert.throws(() => decodeDvm2Frame(Buffer.concat([packet, Buffer.from([0])])), /长度/);
+});
+
+test('wrapping the first encoded frame does not mint a new geometryVersion', () => {
+  const envelope = { width: 0, height: 0, geometryVersion: 1 };
+  syncMediaEnvelopeSize(envelope, 1080, 2400);
+  assert.deepEqual(envelope, { width: 1080, height: 2400, geometryVersion: 1 });
+  syncMediaEnvelopeSize(envelope, 2400, 1080);
+  assert.equal(envelope.geometryVersion, 1);
 });

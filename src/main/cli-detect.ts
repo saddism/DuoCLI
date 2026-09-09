@@ -16,11 +16,12 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
   { value: 'devin --permission-mode bypass', label: 'Devin (全自动)' },
   { value: 'kimi --auto', label: 'Kimi (全自动)' },
   { value: 'gemini --yolo', label: 'Gemini (全自动)' },
+  { value: 'qodercli --dangerously-skip-permissions', label: 'Qoder (全自动)' },
   { value: 'qodercn --dangerously-skip-permissions', label: 'QoderCN (全自动)' },
   { value: 'opencode', label: 'OpenCode' },
   { value: 'kiro-cli chat --trust-all-tools', label: 'Kiro (全自动)' },
   { value: 'agent --force --approve-mcps', label: 'Cursor (全自动)' },
-  { value: 'agy --dangerously-skip-permissions', label: '反重力 (全自动)' },
+  { value: 'agy --dangerously-skip-permissions', label: 'Antigravity (全自动)' },
 ];
 
 const existsCache = new Map<string, boolean>();
@@ -31,6 +32,7 @@ function candidatePaths(bin: string): string[] {
     path.join(home, '.local', 'bin', bin),
     path.join(home, '.opencode', 'bin', bin),
     path.join(home, '.kimi-code', 'bin', bin),
+    path.join(home, '.qoder', 'bin', bin),
     path.join(home, '.qoder-cn', 'entry', bin),
     path.join('/opt/homebrew/bin', bin),
     path.join('/usr/local/bin', bin),
@@ -83,16 +85,58 @@ export function extractCommandBin(presetCommand: string): string {
   return trimmed.split(/\s+/)[0] || '';
 }
 
+/** 同一产品线可能装成不同命令名；探测时任一命中即可。 */
+const CLI_BIN_ALIASES: Record<string, string[]> = {
+  qodercli: ['qodercli', 'qoder'],
+  qoder: ['qoder', 'qodercli'],
+  qodercn: ['qodercn', 'qoderclicn'],
+  qoderclicn: ['qoderclicn', 'qodercn'],
+};
+
+function resolveAvailableBin(bin: string): string | null {
+  const aliases = CLI_BIN_ALIASES[bin] || [bin];
+  for (const candidate of aliases) {
+    if (commandExists(candidate)) return candidate;
+  }
+  return null;
+}
+
 export function isPresetCliAvailable(presetCommand: string): boolean {
   const bin = extractCommandBin(presetCommand);
-  return commandExists(bin);
+  return resolveAvailableBin(bin) !== null;
 }
 
 /** 返回本机可用的内置预制（空终端始终包含） */
 export function getAvailableBuiltinPresets(): BuiltinPreset[] {
-  return BUILTIN_PRESETS.filter((p) => isPresetCliAvailable(p.value));
+  return BUILTIN_PRESETS.flatMap((preset) => {
+    if (!preset.value) return [preset];
+    const bin = extractCommandBin(preset.value);
+    const resolved = resolveAvailableBin(bin);
+    if (!resolved) return [];
+    if (resolved === bin) return [preset];
+    return [{ ...preset, value: preset.value.replace(new RegExp(`^${bin}\\b`), resolved) }];
+  });
 }
 
 export function clearCliExistsCache(): void {
   existsCache.clear();
+}
+
+/**
+ * 启动后预热检测缓存。commandExists 是同步的，第一次探测某个未安装的 CLI 还要
+ * fork 一个登录 shell；不预热的话这份阻塞会落在第一个来问的请求上——通常正是
+ * 手机端打开“新建会话”面板的时候，整个主进程会跟着卡住。
+ * 一次只探测一个，让 PTY 数据和 HTTP 请求能在中间被处理。
+ */
+export function prewarmCliDetection(): void {
+  let index = 0;
+  const step = () => {
+    if (index >= BUILTIN_PRESETS.length) return;
+    try {
+      commandExists(extractCommandBin(BUILTIN_PRESETS[index].value));
+    } catch { /* 探测失败只是记为不可用 */ }
+    index++;
+    setTimeout(step, 0);
+  };
+  setTimeout(step, 0);
 }

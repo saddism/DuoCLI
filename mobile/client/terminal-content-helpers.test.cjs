@@ -32,7 +32,12 @@ test('quoted spaces, Windows, parent, alias and URL formats are distinguished', 
 });
 
 test('common prose tokens are not mistaken for file links', () => {
-  const text = 'and/or input/output yes/no 2026/09/06 50/100 example.com v1.2.3 user@host.com @types/node README';
+  const text = 'and/or input/output yes/no 档案/聊天 2026/09/06 50/100 example.com v1.2.3 user@host.com @types/node README';
+  assert.deepEqual(helpers.findLinks(text), []);
+});
+
+test('Chinese prose containing a slash does not decorate the whole paragraph as a path', () => {
+  const text = '家长在确认选回「一年级」，或档案/聊天改回来，本学年就会锁住。没法在自动升之前预知谁会留级。';
   assert.deepEqual(helpers.findLinks(text), []);
 });
 
@@ -67,4 +72,47 @@ test('separate full-width code rows are not mistaken for a TUI paragraph', async
   await write(term, '  const first = 1\r\n  const next = 2');
   const text = helpers.getSelectionText(term.buffer.active, { start: { x: 0, y: 0 }, end: { x: 20, y: 1 } });
   assert.equal(text, '  const first = 1\n  const next = 2');
+});
+
+test('long press selects the token under the finger, not the whole line', async t => {
+  const term = terminal(40, 6);
+  t.after(() => term.dispose());
+  await write(term, 'edit src/app.ts now');
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  const range = helpers.wordRangeAt(logical, { row: 0, col: 7 });
+  assert.deepEqual(range.start, { line: 0, cell: 5 });
+  assert.deepEqual(range.end, { line: 0, cell: 14 });
+  assert.equal(logical.text.slice(range.start.cell, range.end.cell + 1), 'src/app.ts');
+});
+
+test('quotes and trailing punctuation are dropped from the selected word', async t => {
+  const term = terminal(40, 6);
+  t.after(() => term.dispose());
+  await write(term, 'see "src/My File.ts":8 run npm test.');
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  const quoted = helpers.wordRangeAt(logical, { row: 0, col: 5 });
+  assert.equal(logical.text.slice(quoted.start.cell, quoted.end.cell + 1), 'src/My');
+  const trailing = helpers.wordRangeAt(logical, { row: 0, col: 32 });
+  assert.equal(logical.text.slice(trailing.start.cell, trailing.end.cell + 1), 'test');
+});
+
+test('Chinese text selects one character per long press, wide cell halves included', async t => {
+  const term = terminal(20, 5);
+  t.after(() => term.dispose());
+  await write(term, '你好世界');
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  for (const col of [2, 3]) {
+    const range = helpers.wordRangeAt(logical, { row: 0, col });
+    assert.deepEqual(range, { start: { line: 0, cell: 2 }, end: { line: 0, cell: 2 } });
+  }
+});
+
+test('a soft-wrapped token selects across buffer rows', async t => {
+  const term = terminal(12, 6);
+  t.after(() => term.dispose());
+  await write(term, 'prefix src/components/LongName.tsx:12:3 suffix');
+  const logical = helpers.readLogicalLine(term.buffer.active, 1);
+  const range = helpers.wordRangeAt(logical, { row: 1, col: 0 });
+  assert.equal(range.start.line, 0);
+  assert.ok(range.end.line > range.start.line);
 });

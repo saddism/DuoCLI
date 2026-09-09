@@ -23,7 +23,41 @@ const MIME = {
 // 记录服务端收到的输入，供断言
 const receivedInputs = [];
 const receivedSubmissions = [];
+const receivedDeletes = [];
 let wsClient = null;
+let sseClient = null;
+
+function pushSessionsEvent() {
+  if (!sseClient) return false;
+  sseClient.write(`event: sessions\ndata: ${JSON.stringify(mockSessions)}\n\n`);
+  return true;
+}
+
+let mockSessions = [{
+  id: 's1', title: 'e2e-session', status: 'running',
+  cwd: '/tmp/e2e-proj', presetCommand: 'claude', createdAt: Date.now(),
+}];
+
+// 新建会话面板的数据源：内置预制 / 自定义预设 / 最近目录 / 预设使用次数
+const mockBuiltinPresets = [
+  { value: '', label: '空终端' },
+  { value: 'claude --dangerously-skip-permissions', label: 'Claude (全自动)' },
+  { value: 'opencode', label: 'OpenCode' },
+];
+let mockCustomPresets = [{ id: 'custom-5', name: 'ds-cc', command: 'ds-cc', autoFlag: '' }];
+const mockRecentCwds = ['/tmp/e2e-proj', '/Users/e2e/Documents/demo'];
+const mockPresetUsage = { opencode: 5, '': 2 };
+const receivedPresetPuts = [];
+
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      try { resolve(JSON.parse(raw || 'null')); } catch { resolve(null); }
+    });
+  });
+}
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, ORIGIN);
@@ -34,20 +68,26 @@ const server = http.createServer((req, res) => {
     res.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'));
     return;
   }
-  if (p === '/api/sessions') {
+  if (p === '/api/sessions' && req.method !== 'DELETE') {
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify([{
-      id: 's1', title: 'e2e-session', status: 'running',
-      cwd: '/tmp/e2e-proj', presetCommand: 'claude', createdAt: Date.now(),
-    }]));
+    res.end(JSON.stringify(mockSessions));
+    return;
+  }
+  if (p.startsWith('/api/sessions/') && req.method === 'DELETE') {
+    const id = decodeURIComponent(p.slice('/api/sessions/'.length));
+    receivedDeletes.push(id);
+    mockSessions = mockSessions.filter(s => s.id !== id);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
   if (p === '/api/events') {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-store');
     res.write(': ok\n\n');
+    sseClient = res;
     const t = setInterval(() => res.write(': ping\n\n'), 5000);
-    req.on('close', () => clearInterval(t));
+    req.on('close', () => { clearInterval(t); if (sseClient === res) sseClient = null; });
     return;
   }
   if (p.startsWith('/api/sessions/') && p.endsWith('/file-preview')) {
@@ -59,6 +99,39 @@ const server = http.createServer((req, res) => {
   if (p.startsWith('/api/sessions/') && p.endsWith('/auto-continue')) {
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ enabled: false }));
+    return;
+  }
+  if (p === '/api/builtin-presets') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify(mockBuiltinPresets));
+    return;
+  }
+  if (p === '/api/preset-usage') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({
+      items: Object.entries(mockPresetUsage).map(([command, count]) => ({ command, count })),
+    }));
+    return;
+  }
+  if (p === '/api/recent-cwds') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ items: mockRecentCwds }));
+    return;
+  }
+  if (p === '/api/custom-presets' && req.method === 'PUT') {
+    void readJsonBody(req).then((list) => {
+      if (Array.isArray(list)) {
+        mockCustomPresets = list;
+        receivedPresetPuts.push(list);
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
+  if (p === '/api/custom-presets') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify(mockCustomPresets));
     return;
   }
   if (p.startsWith('/api/')) {
@@ -140,6 +213,34 @@ async function main() {
   const cols = await page.evaluate(() => term.cols);
   console.log(`terminal cols = ${cols}`);
 
+  // ===== Test 0: 长回放在平滑滚动配置下也必须瞬时到末尾 =====
+  // 某些移动端/缓存中的 xterm 会把公开 scrollToBottom() 变成平滑动画。
+  // 这个场景模拟已有长历史后重新跟尾，确保 jumpTerminalToLatest 不会沿着
+  // 数千行逐帧播放。
+  const replayScroll = await page.evaluate(async () => {
+    const history = Array.from({ length: 700 }, (_, i) => `replay-${i} ${'x'.repeat(40)}\r\n`).join('');
+    await new Promise(resolve => term.write(`\r\n${history}`, resolve));
+    term.options.smoothScrollDuration = 1200;
+    term._core._viewport.scrollToLine(0, true);
+    term.scrollToBottom();
+    const animated = {
+      viewportY: term.buffer.active.viewportY,
+      baseY: term.buffer.active.baseY,
+    };
+    jumpTerminalToLatest();
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    const jumped = {
+      viewportY: term.buffer.active.viewportY,
+      baseY: term.buffer.active.baseY,
+      smoothScrollDuration: term.options.smoothScrollDuration,
+    };
+    return { animated, jumped };
+  });
+  check('长回放跟尾在一帧内到达最新输出',
+    replayScroll.jumped.viewportY === replayScroll.jumped.baseY
+      && replayScroll.jumped.smoothScrollDuration === 0,
+    JSON.stringify(replayScroll));
+
   // ===== Test 1: spinner wrap 不累积空白行 =====
   // CLI must move back over wrapped rows before repainting. Erase-line alone
   // cannot erase a previous physical row; filtering that stream hides data.
@@ -155,43 +256,55 @@ async function main() {
   const growth = after - before;
   check('spinner 25 帧后 buffer 增长受控（不累积空白行）', growth <= 4, `growth=${growth} lines`);
 
-  // ===== Test 2: 长按复制得到连贯逻辑行 =====
-  const logical = 'FIRSTPART-' + 'A'.repeat(cols + 15) + '-SECONDPART-' + 'B'.repeat(cols + 15) + '-THIRDPART';
+  // ===== Test 2: 长按锚定后拖拽跨软换行选中完整逻辑行并复制 =====
+  const logical = 'FIRSTPART-' + 'A'.repeat(cols + 15) + ' -SECONDPART- ' + 'B'.repeat(cols + 15) + '-THIRDPART';
   pushOutput('\r\n' + logical + '\r\n');
   await sleep(400);
-  await page.evaluate(() => { term.scrollToBottom(); });
+  await page.evaluate(() => { term.clearSelection(); term.scrollToBottom(); });
   await sleep(300);
 
-  // 找到该逻辑行第一视觉行的视口位置并长按
-  const tapY = await page.evaluate(() => {
+  // 逻辑行被软换行拆成多个视觉行，从第一行行首拖到最后一行行尾才是完整选区
+  const drag = await page.evaluate(() => {
     const buf = term.buffer.active;
-    const container = document.getElementById('terminal-container');
-    const rect = container.getBoundingClientRect();
-    const rowsEl = container.querySelector('.xterm-rows');
-    const rowHeight = rowsEl.children[0].getBoundingClientRect().height;
+    const grid = document.getElementById('terminal-container').querySelector('.xterm-rows').getBoundingClientRect();
+    const rowHeight = grid.height / term.rows;
+    const colWidth = grid.width / term.cols;
+    let first = -1;
+    let last = -1;
     for (let i = buf.length - 1; i >= 0; i--) {
       const t = buf.getLine(i).translateToString(true);
-      if (t.includes('FIRSTPART-')) {
-        const visual = i - buf.viewportY;
-        const y = rect.top + visual * rowHeight + rowHeight / 2;
-        return Math.min(Math.max(y, rect.top + rowHeight / 2), rect.bottom - rowHeight / 2);
-      }
+      if (t.includes('FIRSTPART-')) first = i;
+      if (t.includes('-THIRDPART')) last = i;
     }
-    return rect.top + 100;
+    if (first < 0 || last < 0) return null;
+    const y = row => grid.top + (row - buf.viewportY + 0.5) * rowHeight;
+    return {
+      startX: grid.left + 0.5 * colWidth,
+      startY: y(first),
+      endX: grid.left + (term.cols - 0.5) * colWidth,
+      endY: y(last),
+      rows: last - first + 1,
+    };
   });
-
-  const box = await page.evaluate(() => {
-    const r = document.getElementById('terminal-container').getBoundingClientRect();
-    return { x: r.left + r.width / 2, top: r.top };
-  });
-  await page.touchscreen.touchStart(box.x, tapY);
-  await sleep(600);
-  await page.touchscreen.touchEnd();
-  await sleep(300);
-  const clip = await page.evaluate(() => navigator.clipboard.readText());
-  const toast = await page.evaluate(() => (document.getElementById('copy-toast') || {}).textContent || '');
-  const visiblySelected = await page.evaluate(() => term.hasSelection());
-  check('长按选中并复制完整连贯逻辑行', visiblySelected && clip.includes('FIRSTPART-') && clip.includes('-THIRDPART') && !clip.includes('\n'), `len=${clip.length} selected=${visiblySelected} toast="${toast}"`);
+  if (!drag) {
+    check('定位可拖拽复制的逻辑行', false, 'line not found');
+  } else {
+    // 长按先锚定手指下的词，再拖到行尾扩选（没长按的拖动是滚动，见 Test 4b）
+    await page.touchscreen.touchStart(drag.startX, drag.startY);
+    await sleep(700);
+    const anchored = await page.evaluate(() => term.getSelection());
+    await page.touchscreen.touchMove(drag.endX, drag.endY);
+    await page.touchscreen.touchEnd();
+    await sleep(200);
+    const selected = await page.evaluate(() => term.hasSelection());
+    await page.click('#terminal-copy-selection-btn');
+    await sleep(300);
+    const clip = await page.evaluate(() => navigator.clipboard.readText());
+    check('长按后拖拽选中并复制完整连贯逻辑行',
+      selected && !anchored.includes('-THIRDPART')
+        && clip.includes('FIRSTPART-') && clip.includes('-THIRDPART') && !clip.includes('\n'),
+      `rows=${drag.rows} anchored=${anchored.length} selected=${selected} len=${clip.length}`);
+  }
 
   // ===== Test 3: 点击 wrap 到第二行的文件路径 =====
   const pad = 'y'.repeat(Math.max(5, cols - 22));
@@ -200,17 +313,16 @@ async function main() {
   const pathPos = await page.evaluate(() => {
     const buf = term.buffer.active;
     const container = document.getElementById('terminal-container');
-    const rect = container.getBoundingClientRect();
     const rowsEl = container.querySelector('.xterm-rows');
-    const rowHeight = rowsEl.children[0].getBoundingClientRect().height;
-    const rowWidth = rowsEl.getBoundingClientRect().width;
-    const colWidth = rowWidth / term.cols;
+    const grid = rowsEl.getBoundingClientRect();
+    const rowHeight = grid.height / term.rows;
+    const colWidth = grid.width / term.cols;
     for (let i = buf.length - 1; i >= 0; i--) {
       const t = buf.getLine(i).translateToString(true);
       const idx = t.indexOf('PreviewTarget.tsx');
       if (idx >= 0) {
         const visual = i - buf.viewportY;
-        return { x: rect.left + Math.min(idx + 3, term.cols - 2) * colWidth, y: rect.top + visual * rowHeight + rowHeight / 2 };
+        return { x: grid.left + Math.min(idx + 3, term.cols - 2) * colWidth, y: grid.top + visual * rowHeight + rowHeight / 2 };
       }
     }
     return null;
@@ -239,35 +351,120 @@ async function main() {
     check('竖屏文件预览返回原终端', previewBackPage.detail && !previewBackPage.main, JSON.stringify(previewBackPage));
   }
 
-  // ===== Test 4: TUI 手动画出的视觉换行复制为自然段落 =====
+  // ===== Test 4: 长按选词 + 拖手柄扩选，TUI 视觉换行复制为自然段落 =====
   pushOutput('\r\n\r\n  这是输入测试，不要读文件，不要调用\r\n  工具，只回复“CURSOR_SE\r\n  ND_OK”。\r\n\r\n');
   await sleep(400);
-  const tuiCopyY = await page.evaluate(() => {
+  const tui = await page.evaluate(() => {
     term.clearSelection(); term.scrollToBottom();
     const buffer = term.buffer.active;
     const container = document.getElementById('terminal-container');
-    const rect = container.getBoundingClientRect();
-    const rows = container.querySelector('.xterm-rows');
-    const rowHeight = rows.children[0].getBoundingClientRect().height;
+    const grid = container.querySelector('.xterm-rows').getBoundingClientRect();
+    const rowHeight = grid.height / term.rows;
+    const colWidth = grid.width / term.cols;
+    const point = (row, col) => ({
+      x: grid.left + (col + 0.5) * colWidth,
+      y: grid.top + (row - buffer.viewportY + 0.5) * rowHeight,
+    });
+    let first = -1; let middle = -1; let last = -1;
     for (let row = buffer.length - 1; row >= 0; row--) {
-      if (buffer.getLine(row).translateToString(true).includes('工具，只回复')) {
-        return rect.top + (row - buffer.viewportY + 0.5) * rowHeight;
-      }
+      const text = buffer.getLine(row).translateToString(true);
+      if (text.includes('这是输入测试')) first = row;
+      if (text.includes('工具，只回复')) middle = row;
+      if (text.includes('ND_OK')) last = row;
     }
-    return null;
+    if (first < 0 || middle < 0 || last < 0) return null;
+    return {
+      press: point(middle, 2),
+      paragraphStart: point(first, 2),
+      paragraphEnd: point(last, term.cols - 1),
+    };
   });
-  if (tuiCopyY == null) {
-    check('手机长按复制：定位 TUI 视觉换行段落', false, 'row not found');
+  if (!tui) {
+    check('手机长按选词：定位 TUI 视觉换行段落', false, 'row not found');
   } else {
-    await page.touchscreen.touchStart(box.x, tuiCopyY);
+    const clipBefore = await page.evaluate(() => navigator.clipboard.readText());
+    await page.touchscreen.touchStart(tui.press.x, tui.press.y);
     await sleep(600);
+    const pressed = await page.evaluate(() => ({
+      text: term.getSelection(),
+      handles: [...document.querySelectorAll('.terminal-select-handle')].filter(el => !el.hidden).length,
+      copyButton: !document.getElementById('terminal-copy-selection-btn').hidden,
+    }));
     await page.touchscreen.touchEnd();
     await sleep(250);
-    const tuiClip = await page.evaluate(() => navigator.clipboard.readText());
-    check('手机长按复制：TUI 视觉换行恢复为自然段落',
+    const clipAfterPress = await page.evaluate(() => navigator.clipboard.readText());
+    check('长按只选中手指下的字，并给出复制入口',
+      pressed.text === '工' && pressed.handles === 2 && pressed.copyButton,
+      `selected=${JSON.stringify(pressed.text)} handles=${pressed.handles} copyButton=${pressed.copyButton}`);
+    check('长按不再自动写剪贴板', clipAfterPress === clipBefore, `clip=${JSON.stringify(clipAfterPress)}`);
+
+    for (const [which, target] of [['start', tui.paragraphStart], ['end', tui.paragraphEnd]]) {
+      const handle = await page.evaluate((side) => {
+        const el = document.querySelector(`.terminal-select-handle[data-handle="${side}"]`);
+        if (!el || el.hidden) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      }, which);
+      if (!handle) {
+        check(`拖动${which === 'start' ? '起点' : '终点'}手柄扩选`, false, 'handle not visible');
+        continue;
+      }
+      await page.touchscreen.touchStart(handle.x, handle.y);
+      await page.touchscreen.touchMove(target.x, target.y);
+      await page.touchscreen.touchEnd();
+      await sleep(200);
+    }
+    const expanded = await page.evaluate(() => getUnwrappedSelection());
+    check('拖手柄可把选区从起点扩到终点', expanded.startsWith('这是输入测试') && expanded.endsWith('ND_OK”。'),
+      `selection=${JSON.stringify(expanded)}`);
+
+    await page.click('#terminal-copy-selection-btn');
+    await sleep(400);
+    const afterCopy = await page.evaluate(async () => {
+      const toast = document.getElementById('copy-toast');
+      return {
+        clip: await navigator.clipboard.readText(),
+        toastShown: toast ? toast.classList.contains('show') && toast.textContent : 'none',
+        selected: term.hasSelection(),
+      };
+    });
+    const tuiClip = afterCopy.clip;
+    check('手机复制：TUI 视觉换行恢复为自然段落',
       tuiClip === '这是输入测试，不要读文件，不要调用工具，只回复“CURSOR_SEND_OK”。',
-      `copied=${JSON.stringify(tuiClip)}`);
+      `copied=${JSON.stringify(tuiClip)} toast="${afterCopy.toastShown}" cleared=${!afterCopy.selected}`);
   }
+
+  // ===== Test 4b: 未长按的单指拖动＝回看滚动，不能被抢成选区 =====
+  pushOutput('\r\n' + Array.from({ length: 80 }, (_, i) => `scrollback-line-${i}`).join('\r\n') + '\r\n');
+  await sleep(400);
+  const pan = await page.evaluate(() => {
+    term.clearSelection();
+    term.scrollToBottom();
+    const grid = document.getElementById('terminal-container').querySelector('.xterm-rows').getBoundingClientRect();
+    return {
+      x: grid.left + grid.width / 2,
+      y: grid.top + grid.height * 0.4,
+      viewportY: term.buffer.active.viewportY,
+      length: term.buffer.active.length,
+      rows: term.rows,
+    };
+  });
+  await page.touchscreen.touchStart(pan.x, pan.y);
+  // 分段快速下拉：每段都远超长按判定位移，但整段耗时远小于长按阈值
+  for (let i = 1; i <= 6; i++) {
+    await page.touchscreen.touchMove(pan.x, pan.y + i * 30);
+  }
+  await page.touchscreen.touchEnd();
+  await sleep(300);
+  const panResult = await page.evaluate(() => ({
+    selected: term.hasSelection(),
+    text: term.getSelection(),
+    handles: [...document.querySelectorAll('.terminal-select-handle')].filter(el => !el.hidden).length,
+    viewportY: term.buffer.active.viewportY,
+  }));
+  check('未长按的单指拖动只滚动，不触发选中',
+    !panResult.selected && panResult.handles === 0 && panResult.viewportY < pan.viewportY,
+    `viewportY ${pan.viewportY}->${panResult.viewportY} buf=${pan.length}/${pan.rows} selected=${JSON.stringify(panResult.text)} handles=${panResult.handles}`);
 
   // ===== Test 5: 跨 TUI 硬行的带空格路径仍可点击 =====
   const hardPrefix = '  ' + 'x'.repeat(Math.max(1, cols - 18));
@@ -277,13 +474,12 @@ async function main() {
     term.scrollToBottom();
     const buffer = term.buffer.active;
     const container = document.getElementById('terminal-container');
-    const rect = container.getBoundingClientRect();
-    const rows = container.querySelector('.xterm-rows');
-    const rowHeight = rows.children[0].getBoundingClientRect().height;
-    const colWidth = rows.getBoundingClientRect().width / term.cols;
+    const grid = container.querySelector('.xterm-rows').getBoundingClientRect();
+    const rowHeight = grid.height / term.rows;
+    const colWidth = grid.width / term.cols;
     for (let row = buffer.length - 1; row >= 0; row--) {
       if (buffer.getLine(row).translateToString(true).includes('le.ts')) {
-        return { x: rect.left + 5 * colWidth, y: rect.top + (row - buffer.viewportY + 0.5) * rowHeight };
+        return { x: grid.left + 5 * colWidth, y: grid.top + (row - buffer.viewportY + 0.5) * rowHeight };
       }
     }
     return null;
@@ -301,6 +497,56 @@ async function main() {
     await page.evaluate(() => showPage('detail-page'));
     await sleep(200);
   }
+
+  // ===== Test 5.5: 详情页「更多」下拉入口 =====
+  await page.click('#detail-more-btn');
+  await sleep(150);
+  const menuState = await page.evaluate(() => {
+    const menu = document.getElementById('detail-more-menu');
+    return {
+      hidden: menu.hidden,
+      items: [...menu.querySelectorAll('button')].map(b => b.textContent).join(','),
+      expanded: document.getElementById('detail-more-btn').getAttribute('aria-expanded'),
+    };
+  });
+  check('详情页更多入口展开三项菜单',
+    !menuState.hidden && menuState.items === '项目文件,计划设置,手机设备' && menuState.expanded === 'true',
+    JSON.stringify(menuState));
+
+  await page.click('#detail-menu-plan-btn');
+  await sleep(200);
+  const planOpen = await page.evaluate(() => ({
+    modal: document.getElementById('auto-continue-modal').classList.contains('active'),
+    menuHidden: document.getElementById('detail-more-menu').hidden,
+  }));
+  check('更多菜单可打开计划设置', planOpen.modal && planOpen.menuHidden, JSON.stringify(planOpen));
+  await page.click('#ac-cancel');
+  await sleep(150);
+
+  await page.click('#detail-more-btn');
+  await sleep(150);
+  await page.click('#detail-menu-files-btn');
+  await sleep(300);
+  const filesOpen = await page.evaluate(() => document.getElementById('media-browse-page').classList.contains('active'));
+  check('更多菜单可打开项目文件', filesOpen, `active=${filesOpen}`);
+  await page.click('#media-browse-back-btn');
+  await sleep(200);
+
+  await page.click('#detail-more-btn');
+  await sleep(150);
+  await page.click('#detail-menu-device-btn');
+  await sleep(300);
+  const deviceOpen = await page.evaluate(() => document.getElementById('device-page').classList.contains('active'));
+  check('更多菜单可打开手机设备', deviceOpen, `active=${deviceOpen}`);
+  await page.click('#device-back-btn');
+  await sleep(200);
+
+  await page.click('#detail-more-btn');
+  await sleep(150);
+  await page.click('#terminal-container');
+  await sleep(150);
+  const menuClosed = await page.evaluate(() => document.getElementById('detail-more-menu').hidden);
+  check('点击菜单外部收起更多菜单', menuClosed, `hidden=${menuClosed}`);
 
   // ===== Test 6: 终端重连时禁止发送但保留草稿 =====
   receivedSubmissions.length = 0;
@@ -377,6 +623,142 @@ async function main() {
       status: (await fetch(name)).status,
     }))));
   check('xterm 调试映射均可读取', sourceMapStatuses.every(({ status }) => status === 200), JSON.stringify(sourceMapStatuses));
+
+  // ===== Test 10: 会话列表左滑关闭（需二次确认） =====
+  // 前面的视口切换会把应用留在会话列表页，这里直接回到列表并刷新。
+  await page.evaluate(() => { showPage('main-page'); return refreshSessions(); });
+  await page.waitForFunction(() => document.querySelector('.session-card[data-id="s1"]'), { timeout: 5000 });
+  const cardPoint = await page.evaluate(() => {
+    const body = document.querySelector('.session-card[data-id="s1"] .session-card-body');
+    const r = body.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  });
+  await page.touchscreen.touchStart(cardPoint.x, cardPoint.y);
+  await page.touchscreen.touchMove(cardPoint.x - 40, cardPoint.y);
+  await page.touchscreen.touchMove(cardPoint.x - 110, cardPoint.y);
+  await page.touchscreen.touchEnd();
+  await sleep(300);
+  const swipeState = await page.evaluate(() => {
+    const card = document.querySelector('.session-card[data-id="s1"]');
+    const button = card.querySelector('.session-close-action');
+    const r = button.getBoundingClientRect();
+    return {
+      swiped: card.classList.contains('swiped'),
+      transform: getComputedStyle(card.querySelector('.session-card-body')).transform,
+      buttonOnTop: document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) === button,
+      detailOpen: document.getElementById('detail-page').classList.contains('active'),
+      status: card.querySelector('.status-dot').className,
+    };
+  });
+  check('左滑会话卡片露出关闭按钮，且不误打开会话',
+    swipeState.swiped && swipeState.transform.includes('-84') && swipeState.buttonOnTop && !swipeState.detailOpen,
+    JSON.stringify(swipeState));
+  check('左滑本身不会关闭会话', receivedDeletes.length === 0, `deletes=${JSON.stringify(receivedDeletes)}`);
+
+  // 列表随时可能被 SSE 重建，滑开状态必须跟着新节点恢复
+  mockSessions = mockSessions.map(s => ({ ...s, status: 'idle' }));
+  const pushed = pushSessionsEvent();
+  await sleep(300);
+  const afterRerender = await page.evaluate(() => {
+    const card = document.querySelector('.session-card[data-id="s1"]');
+    return {
+      status: card.querySelector('.status-dot').className,
+      swiped: card.classList.contains('swiped'),
+      transform: getComputedStyle(card.querySelector('.session-card-body')).transform,
+    };
+  });
+  check('列表被 SSE 重建后滑开状态保留',
+    pushed && swipeState.status !== afterRerender.status && afterRerender.status.includes('idle')
+      && afterRerender.swiped && afterRerender.transform.includes('-84'),
+    `before=${swipeState.status} ${JSON.stringify(afterRerender)}`);
+
+  const cardStillThere = async () => page.evaluate(() => !!document.querySelector('.session-card[data-id="s1"]'));
+  page.once('dialog', dialog => dialog.dismiss());
+  await page.click('.session-card[data-id="s1"] .session-close-action');
+  await sleep(300);
+  check('取消确认后会话保持打开', receivedDeletes.length === 0 && await cardStillThere(),
+    `deletes=${JSON.stringify(receivedDeletes)}`);
+
+  page.once('dialog', dialog => dialog.accept());
+  await page.click('.session-card[data-id="s1"] .session-close-action');
+  await sleep(400);
+  check('确认后关闭会话并从列表移除',
+    receivedDeletes.length === 1 && receivedDeletes[0] === 's1' && !(await cardStillThere()),
+    `deletes=${JSON.stringify(receivedDeletes)} cardLeft=${!(await cardStillThere())}`);
+
+  // ===== Test 10b: 空列表欢迎屏居中，按钮与右上角新建相同 =====
+  await page.evaluate(() => {
+    activeSessionsCache = [];
+    closedSessions = [];
+    showPage('main-page');
+    renderSessionList();
+  });
+  await page.waitForFunction(() => {
+    const empty = document.getElementById('empty-state');
+    return empty && empty.style.display === 'flex';
+  }, { timeout: 5000 });
+  const splash = await page.evaluate(() => {
+    const empty = document.getElementById('empty-state');
+    const list = document.getElementById('session-list');
+    const header = document.getElementById('header');
+    const emptyRect = empty.getBoundingClientRect();
+    const headerRect = header.getBoundingClientRect();
+    const contentTop = headerRect.bottom;
+    const contentH = window.innerHeight - contentTop;
+    return {
+      listHidden: list.hidden || getComputedStyle(list).display === 'none',
+      emptyHeightRatio: contentH ? emptyRect.height / contentH : 0,
+      hasBtn: !!document.getElementById('empty-new-session-btn'),
+    };
+  });
+  check('空列表欢迎屏铺满剩余高度并显示新建按钮',
+    splash.listHidden && splash.emptyHeightRatio > 0.9 && splash.hasBtn,
+    JSON.stringify(splash));
+  await page.click('#empty-new-session-btn');
+  await page.waitForFunction(
+    () => document.getElementById('new-session-modal').classList.contains('active'),
+    { timeout: 5000 }
+  );
+  check('欢迎屏新建按钮打开与右上角相同的新建会话面板',
+    await page.evaluate(() => document.getElementById('new-session-modal').classList.contains('active')));
+  await page.evaluate(() => document.getElementById('new-session-modal').classList.remove('active'));
+
+  // ===== Test 11: 新建会话面板与电脑端同步 =====
+  await page.evaluate(() => {
+    showPage('main-page');
+    // custom-2 曾同步过、已被电脑端删掉；custom-9 是本地新建还没推上去的
+    localStorage.setItem('duocli_custom_presets', JSON.stringify([
+      { id: 'custom-2', name: 'GLM-CC', command: 'glm-cc', autoFlag: '' },
+      { id: 'custom-9', name: '本地新增', command: 'local-cli', autoFlag: '' },
+    ]));
+    localStorage.setItem('duocli_custom_presets_synced', JSON.stringify(['custom-2']));
+  });
+  receivedPresetPuts.length = 0;
+  await page.click('#new-session-btn');
+  await page.waitForFunction(
+    () => document.getElementById('new-session-modal').classList.contains('active'),
+    { timeout: 5000 }
+  );
+  const sheet = await page.evaluate(() => ({
+    presetValues: [...document.querySelectorAll('#new-preset option')].map(o => o.value),
+    presetLabels: [...document.querySelectorAll('#new-preset option')].map(o => o.textContent),
+    cwds: [...document.querySelectorAll('#new-cwd option')].map(o => o.value),
+    synced: JSON.parse(localStorage.getItem('duocli_custom_presets_synced') || '[]'),
+  }));
+  check('电脑端删掉的预设不复活，本地未推送的保留',
+    !sheet.presetValues.includes('glm-cc') && sheet.presetValues.includes('ds-cc')
+      && sheet.presetValues.includes('local-cli'),
+    JSON.stringify(sheet.presetValues));
+  check('本地未推送的预设回推服务端，并记为已同步',
+    receivedPresetPuts.some(list => list.some(p => p.id === 'custom-9') && !list.some(p => p.id === 'custom-2'))
+      && sheet.synced.includes('custom-9') && !sheet.synced.includes('custom-2'),
+    `puts=${JSON.stringify(receivedPresetPuts.map(l => l.map(p => p.id)))} synced=${JSON.stringify(sheet.synced)}`);
+  check('预设下拉按使用频率排序，用得多的靠上',
+    sheet.presetValues.slice(0, 3).join('|') === 'opencode||claude --dangerously-skip-permissions',
+    JSON.stringify(sheet.presetLabels));
+  check('最近目录取自服务端目录池',
+    sheet.cwds.slice(1).join('|') === mockRecentCwds.join('|'),
+    JSON.stringify(sheet.cwds));
 
   await browser.close();
   server.close();

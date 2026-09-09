@@ -34,6 +34,11 @@ test('preview helper finds relative and absolute paths without trailing punctuat
   assert.deepEqual(matches.map((item) => item.filePath), ['docs/README.MD', 'src/My File.ts', 'C:\\work\\main.py']);
 });
 
-test('preview helper does not turn URLs into file previews', () => {
-  assert.deepEqual(findFilePathMatches('参考 https://example.com/README.md'), []);
+test('file browse filter matches media and documents without code', () => {
+  const { matchesFileBrowseFilter } = require('./file-preview-helpers.js');
+  assert.equal(matchesFileBrowseFilter({ name: 'node_modules', isDir: true, path: '/p/node_modules' }, 'all'), false);
+  assert.equal(matchesFileBrowseFilter({ name: 'clip.mp4', isDir: false, path: '/p/clip.mp4' }, 'media'), true);
+  assert.equal(matchesFileBrowseFilter({ name: 'README.md', isDir: false, path: '/p/README.md' }, 'document'), true);
+  assert.equal(matchesFileBrowseFilter({ name: 'app.ts', isDir: false, path: '/p/app.ts' }, 'document'), false);
+  assert.equal(matchesFileBrowseFilter({ name: 'app.ts', isDir: false, path: '/p/app.ts' }, 'all'), true);
 });

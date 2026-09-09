@@ -16,8 +16,9 @@ const { getCliTagColors } = require('../../mobile/client/cli-tag-colors.js') as 
 };
 
 // 与手机端共用同一份 CLI Logo，见 mobile/client/cli-logos.js
-const { getLogoUrl, hasLogo } = require('../../mobile/client/cli-logos.js') as {
+const { getLogoUrl, getDefaultLogoUrl, hasLogo } = require('../../mobile/client/cli-logos.js') as {
   getLogoUrl: (cliName: string) => string;
+  getDefaultLogoUrl: () => string;
   hasLogo: (cliName: string) => boolean;
 };
 
@@ -909,9 +910,38 @@ async function saveRemoteTokenEdit(): Promise<void> {
   }
 }
 
+function appendCliLogo(parent: HTMLElement, cliName: string): HTMLImageElement {
+  const fallback = getDefaultLogoUrl();
+  const img = document.createElement('img');
+  img.className = 'cli-logo' + (hasLogo(cliName) ? '' : ' cli-logo-default');
+  img.src = getLogoUrl(cliName);
+  img.alt = '';
+  img.loading = 'lazy';
+  img.referrerPolicy = 'no-referrer';
+  img.addEventListener('error', () => {
+    if (img.src !== fallback) {
+      img.src = fallback;
+      img.classList.add('cli-logo-default');
+      return;
+    }
+    img.style.display = 'none';
+  });
+  parent.appendChild(img);
+  return img;
+}
+
+function fillCliCaption(parent: HTMLElement, label: string): void {
+  parent.replaceChildren();
+  appendCliLogo(parent, label);
+  const text = document.createElement('span');
+  text.textContent = label;
+  parent.appendChild(text);
+}
+
 function renderPresetSelect(): void {
   const prev = presetSelect.value;
   presetSelect.innerHTML = '';
+  presetDropdown.innerHTML = '';
 
   const options = BUILTIN_OPTIONS.map(o => ({ value: o.value, label: o.label }));
   for (const p of getCustomPresets()) {
@@ -920,7 +950,6 @@ function renderPresetSelect(): void {
       label: p.autoFlag ? p.name + ' (全自动)' : p.name,
     });
   }
-  // 用得多的靠上；次数相同时保持内置在前、自定义在后（sort 稳定）
   options.sort((a, b) => (presetUsage.get(b.value) || 0) - (presetUsage.get(a.value) || 0));
 
   for (const opt of options) {
@@ -928,12 +957,26 @@ function renderPresetSelect(): void {
     el.value = opt.value;
     el.textContent = opt.label;
     presetSelect.appendChild(el);
+
+    const row = document.createElement('div');
+    row.className = 'custom-select-option';
+    row.dataset.value = opt.value;
+    fillCliCaption(row, opt.label);
+    presetDropdown.appendChild(row);
   }
 
-  // 恢复之前的选中值
-  presetSelect.value = prev;
-  // 如果之前的值不存在了，回退到空终端
+  setPresetValue(prev);
+}
+
+function setPresetValue(value: string): void {
+  presetSelect.value = value;
   if (presetSelect.selectedIndex === -1) presetSelect.value = '';
+  const selected = presetSelect.options[presetSelect.selectedIndex];
+  const label = selected?.textContent || '空终端';
+  fillCliCaption(presetDisplay, label);
+  presetDropdown.querySelectorAll('.custom-select-option').forEach((el) => {
+    el.classList.toggle('selected', el.getAttribute('data-value') === presetSelect.value);
+  });
 }
 
 function showPresetDialog(preset?: CustomPreset): Promise<CustomPreset | null> {
@@ -1162,6 +1205,9 @@ const cwdOpenBtn = document.getElementById('cwd-open-btn')!;
 const cwdRecentBtn = document.getElementById('cwd-recent-btn')!;
 const cwdRecentDropdown = document.getElementById('cwd-recent-dropdown')!;
 const presetSelect = document.getElementById('preset-select') as HTMLSelectElement;
+const presetSelectWrap = document.getElementById('preset-select-wrap')!;
+const presetDisplay = document.getElementById('preset-display')!;
+const presetDropdown = document.getElementById('preset-dropdown')!;
 const presetAddBtn = document.getElementById('preset-add-btn')!;
 const presetManageBtn = document.getElementById('preset-manage-btn')!;
 const themeSelect = document.getElementById('theme-select')!;
@@ -1910,9 +1956,7 @@ syncRecentCwdsToRemote();
 void (async () => {
   await Promise.all([refreshBuiltinOptions(), refreshPresetUsage()]);
   renderPresetSelect();
-  if (lastPreset) {
-    presetSelect.value = lastPreset;
-  }
+  if (lastPreset) setPresetValue(lastPreset);
 })();
 
 // 自定义配色下拉组件
@@ -1940,6 +1984,7 @@ function setThemeValue(value: string): void {
 
 themeDisplay.addEventListener('click', (e) => {
   e.stopPropagation();
+  presetSelectWrap.classList.remove('open');
   themeSelect.classList.toggle('open');
 });
 
@@ -1951,8 +1996,23 @@ themeDropdown.addEventListener('click', (e) => {
   themeSelect.classList.remove('open');
 });
 
+presetDisplay.addEventListener('click', (e) => {
+  e.stopPropagation();
+  themeSelect.classList.remove('open');
+  presetSelectWrap.classList.toggle('open');
+});
+
+presetDropdown.addEventListener('click', (e) => {
+  const target = (e.target as HTMLElement).closest('.custom-select-option') as HTMLElement | null;
+  if (!target) return;
+  const value = target.getAttribute('data-value');
+  if (value != null) setPresetValue(value);
+  presetSelectWrap.classList.remove('open');
+});
+
 document.addEventListener('click', () => {
   themeSelect.classList.remove('open');
+  presetSelectWrap.classList.remove('open');
 });
 
 // 启动时恢复保存的配色
@@ -2073,16 +2133,16 @@ function updatePaneAccents(): void {
         dotIndicator = document.createElement('span');
         dotIndicator.className = 'pane-color-indicator';
         titleElement.insertBefore(dotIndicator, titleElement.firstChild);
+        const paneId = pane.id;
+        const sid = sessionId;
+        dotIndicator.addEventListener('click', (e) => {
+          e.stopPropagation();
+          showColorPickerDialogForPane(paneId, sid, dotIndicator as HTMLElement);
+        });
       }
-      dotIndicator.style.backgroundColor = themeDotColor;
-      
-      // 添加点击事件
-      dotIndicator.style.cursor = 'pointer';
-      dotIndicator.title = '点击更改颜色';
-      dotIndicator.addEventListener('click', (e) => {
-        e.stopPropagation();
-        showColorPickerDialogForPane(pane.id, sessionId, dotIndicator);
-      });
+      (dotIndicator as HTMLElement).style.backgroundColor = themeDotColor;
+      (dotIndicator as HTMLElement).style.cursor = 'pointer';
+      (dotIndicator as HTMLElement).title = '点击更改颜色';
     }
   }
 }
@@ -2752,7 +2812,7 @@ async function applyNewThemeToClosedSession(closedSessionId: string, bgColor: st
 }
 
 // 为分格窗口中的会话应用新主题
-async function applyNewThemeToPane(paneId: string, sessionId: string, bgColor: string, fgColor: string, themeName: string): Promise<void> {
+async function applyNewThemeToPane(sessionId: string, bgColor: string, fgColor: string, themeName: string): Promise<void> {
   await applyNewThemeToSession(sessionId, bgColor, fgColor, themeName);
 }
 
@@ -3026,22 +3086,7 @@ function renderSessionList(): void {
         const nameSpan = document.createElement('span');
         nameSpan.className = 'session-display-name';
         nameSpan.title = displayName;
-        
-        // 如果该 CLI 有 logo，则显示 logo + 名称
-        if (hasLogo(displayName)) {
-          const logoImg = document.createElement('img');
-          logoImg.className = 'cli-logo';
-          logoImg.src = getLogoUrl(displayName);
-          logoImg.alt = displayName;
-          logoImg.loading = 'lazy';
-          nameSpan.appendChild(logoImg);
-          
-          const nameText = document.createElement('span');
-          nameText.textContent = displayName;
-          nameSpan.appendChild(nameText);
-        } else {
-          nameSpan.textContent = displayName;
-        }
+        fillCliCaption(nameSpan, displayName);
         
         const [tagColor, tagBg] = getCliTagColors(displayName);
         nameSpan.style.setProperty('--cli-tag-color', tagColor);
@@ -3171,22 +3216,7 @@ function renderSessionList(): void {
           const nameSpan = document.createElement('span');
           nameSpan.className = 'session-display-name';
           nameSpan.title = cs.displayName;
-          
-          // 如果该 CLI 有 logo，则显示 logo + 名称
-          if (hasLogo(cs.displayName)) {
-            const logoImg = document.createElement('img');
-            logoImg.className = 'cli-logo';
-            logoImg.src = getLogoUrl(cs.displayName);
-            logoImg.alt = cs.displayName;
-            logoImg.loading = 'lazy';
-            nameSpan.appendChild(logoImg);
-            
-            const nameText = document.createElement('span');
-            nameText.textContent = cs.displayName;
-            nameSpan.appendChild(nameText);
-          } else {
-            nameSpan.textContent = cs.displayName;
-          }
+          fillCliCaption(nameSpan, cs.displayName);
           
           const [tagColor, tagBg] = getCliTagColors(cs.displayName);
           nameSpan.style.setProperty('--cli-tag-color', tagColor);
@@ -3935,6 +3965,7 @@ function openNewSessionDialog(cwd?: string): void {
     cwdInput.value = targetCwd;
   }
   presetSelect.value = lastPreset || presetSelect.value || '';
+  setPresetValue(presetSelect.value);
   setThemeValue(currentThemeId);
   newSessionOverlay.classList.add('active');
   setTimeout(() => cwdInput.focus(), 0);
@@ -3946,6 +3977,7 @@ function closeNewSessionDialog(): void {
   newSessionOverlay.classList.remove('active');
   cwdRecentDropdown.classList.remove('open');
   themeSelect.classList.remove('open');
+  presetSelectWrap.classList.remove('open');
 }
 
 toolbarNewBtn.addEventListener('click', () => { openNewSessionDialog(); });
@@ -3955,8 +3987,14 @@ newSessionOverlay.addEventListener('click', (e) => {
   if (e.target === newSessionOverlay) closeNewSessionDialog();
 });
 newSessionCreateBtn.addEventListener('click', async () => {
-  const ok = await createSession();
-  if (ok) closeNewSessionDialog();
+  try {
+    const ok = await createSession();
+    if (ok) closeNewSessionDialog();
+  } catch (error) {
+    console.error('创建终端失败:', error);
+    closeNewSessionDialog();
+    alert('创建终端失败：' + (error instanceof Error ? error.message : String(error)));
+  }
 });
 
 // 自定义预设按钮
@@ -3967,8 +4005,7 @@ presetAddBtn.addEventListener('click', async () => {
     list.push(result);
     saveCustomPresets(list);
     renderPresetSelect();
-    // 自动选中新建的预设
-    presetSelect.value = result.autoFlag ? result.command + ' ' + result.autoFlag : result.command;
+    setPresetValue(result.autoFlag ? result.command + ' ' + result.autoFlag : result.command);
   }
 });
 

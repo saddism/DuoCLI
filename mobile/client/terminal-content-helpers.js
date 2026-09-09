@@ -218,6 +218,14 @@
 
     const last = segments[segments.length - 1];
     const hasExtension = hasSourceExtension(last) || isSpecialFilename(last);
+    const hasExplicitPrefix = /^(?:file:\/\/|[A-Za-z]:[\\/]|\\\\|\/|~[\\/]|\.{1,2}[\\/]|@[\\/])/.test(plain);
+
+    // A slash in prose (for example, “档案/聊天”) is common Chinese
+    // punctuation, not a path. Bare slash paths without a file extension
+    // must use conventional ASCII path segments; explicit prefixes still
+    // allow intentionally named non-ASCII directories.
+    if (!hasExplicitPrefix && !hasExtension
+      && !segments.every(segment => /^[A-Za-z0-9._~@+\-]+$/.test(segment))) return false;
 
     if (/^@[^/\\]+/.test(filePath) && segments.length <= 2 && !hasExtension) return false;
 
@@ -279,14 +287,72 @@
     return matches.sort((a, b) => a.index - b.index);
   }
 
-  function matchRange(logicalLine, match) {
-    let start = match.index;
-    let end = match.index + match.length - 1;
-    while (start <= end && !logicalLine.positions[start]) start++;
-    while (end >= start && !logicalLine.positions[end]) end--;
-    if (start > end) return null;
-    return { start: logicalLine.positions[start], end: logicalLine.positions[end] };
+  function positionsRange(logicalLine, start, end) {
+    let from = start;
+    let to = end;
+    while (from <= to && !logicalLine.positions[from]) from++;
+    while (to >= from && !logicalLine.positions[to]) to--;
+    if (from > to) return null;
+    return { start: logicalLine.positions[from], end: logicalLine.positions[to] };
   }
 
-  return { readLogicalLine, getSelectionText, findLinks, matchRange };
+  function matchRange(logicalLine, match) {
+    return positionsRange(logicalLine, match.index, match.index + match.length - 1);
+  }
+
+  function isHighSurrogate(value) {
+    const code = value.charCodeAt(0);
+    return code >= 0xd800 && code <= 0xdbff;
+  }
+
+  function charEnd(text, index) {
+    return index + (isHighSurrogate(text[index]) ? 2 : 1);
+  }
+
+  // 中文没有空格分词，一次选中一个字，剩下的交给用户拖手柄扩选。
+  function isCjkChar(value) {
+    const code = value.codePointAt(0);
+    return (code >= 0x3040 && code <= 0x30ff)
+      || (code >= 0x3400 && code <= 0x4dbf)
+      || (code >= 0x4e00 && code <= 0x9fff)
+      || (code >= 0xac00 && code <= 0xd7af)
+      || (code >= 0xf900 && code <= 0xfaff)
+      || (code >= 0xff00 && code <= 0xffef);
+  }
+
+  // positions 里同一个宽字符会出现两次（指向同一 cell），命中后半格时退到字符起点。
+  function indexAtCell(logicalLine, cell) {
+    let best = -1;
+    for (let index = 0; index < logicalLine.positions.length; index++) {
+      const position = logicalLine.positions[index];
+      if (!position) continue;
+      if (position.line > cell.row || (position.line === cell.row && position.cell > cell.col)) break;
+      best = index;
+    }
+    return best;
+  }
+
+  function wordRangeAt(logicalLine, cell) {
+    if (!logicalLine || !cell) return null;
+    const text = logicalLine.text;
+    const index = indexAtCell(logicalLine, cell);
+    if (index < 0 || index >= text.length) return null;
+    let start = index;
+    let end = charEnd(text, index);
+    if (/\s/.test(text[index])) {
+      while (start > 0 && /\s/.test(text[start - 1])) start--;
+      while (end < text.length && /\s/.test(text[end])) end = charEnd(text, end);
+    } else if (!isCjkChar(text[index])) {
+      while (start > 0 && !/\s/.test(text[start - 1])) start--;
+      while (end < text.length && !/\s/.test(text[end])) end = charEnd(text, end);
+      const rawStart = start;
+      const rawEnd = end;
+      while (start < end && /[([{<"'`“‘（【]/.test(text[start])) start++;
+      while (end > start && /[.,;:!?)\]}>，。；！？、"'`”’）】]/.test(text[end - 1])) end--;
+      if (start >= end) { start = rawStart; end = rawEnd; }
+    }
+    return positionsRange(logicalLine, start, end - 1);
+  }
+
+  return { readLogicalLine, getSelectionText, findLinks, matchRange, wordRangeAt };
 });

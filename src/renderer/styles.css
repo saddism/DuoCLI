@@ -331,10 +331,20 @@ html, body {
   background: var(--hover-bg);
 }
 
-.custom-select-option.selected {
-  background: var(--active-bg);
-  color: var(--accent);
-  font-weight: 500;
+.custom-select-display .cli-logo,
+.custom-select-option .cli-logo {
+  width: 16px;
+  height: 16px;
+}
+
+.preset-select {
+  flex: 1;
+  min-width: 180px;
+}
+
+.preset-select .custom-select-dropdown {
+  max-height: 280px;
+  overflow-y: auto;
 }
 
 .theme-dot {
@@ -1648,10 +1658,35 @@ html, body {
 }
 
 .session-color-dot {
-  width: 7px;
-  height: 7px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
   flex-shrink: 0;
+  cursor: pointer;
+  position: relative;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18);
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+.session-color-dot::after {
+  content: '';
+  position: absolute;
+  inset: -7px;
+}
+
+.session-color-dot:hover {
+  transform: scale(1.25);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.35);
+}
+
+.pane-color-indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: inline-block;
+  cursor: pointer;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2);
 }
 
 .session-info {

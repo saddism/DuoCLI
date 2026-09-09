@@ -297,12 +297,16 @@ header h2 {
   padding: 12px;
 }
 
+.session-list:empty,
+.session-list[hidden] {
+  display: none;
+  flex: none;
+  padding: 0;
+}
+
 .session-card {
   display: flex;
-  align-items: center;
-  padding: 15px 16px;
   margin-bottom: 10px;
-  background: var(--bg2);
   border-radius: 14px;
   border: 1px solid var(--border);
   cursor: pointer;
@@ -310,6 +314,48 @@ header h2 {
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   position: relative;
   overflow: hidden;
+  /* 纵向滚动交给浏览器，横向留给左滑手势 */
+  touch-action: pan-y;
+}
+
+.session-card-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  padding: 15px 16px;
+  background: var(--bg2);
+  position: relative;
+  z-index: 1;
+  transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), background 0.2s ease;
+}
+
+.session-card.dragging .session-card-body {
+  transition: none;
+}
+
+.session-close-action {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 84px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  background: linear-gradient(150deg, #ef4444, #b91c1c);
+  cursor: pointer;
+}
+
+.session-close-action:active {
+  background: linear-gradient(150deg, #dc2626, #991b1b);
 }
 
 .session-card::before {
@@ -319,14 +365,22 @@ header h2 {
   left: 0;
   right: 0;
   height: 1px;
+  z-index: 2;
   background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
 }
 
 .session-card:active {
-  transform: scale(0.98);
   background: var(--bg3);
   border-color: rgba(255, 255, 255, 0.15);
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+
+.session-card:active:not(.dragging):not(.swiped) {
+  transform: scale(0.98);
+}
+
+.session-card:active:not(.swiped) .session-card-body {
+  background: var(--bg3);
 }
 
 .session-card .status-dot {
@@ -437,6 +491,21 @@ header h2 {
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+/* CLI Logo */
+.cli-logo-img {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  margin-right: 6px;
+  object-fit: contain;
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+.cli-logo-img:hover {
+  transform: scale(1.2);
+}
+
 .session-arrow {
   color: var(--text-dim);
   font-size: 16px;
@@ -451,9 +520,92 @@ header h2 {
   color: var(--accent);
 }
 
-.empty-state {
-  flex: 1;
+.closed-sessions-header {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 16px 4px 8px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+}
+
+.closed-sessions-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text2);
+}
+
+.closed-sessions-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.closed-toggle-btn,
+.closed-clear-btn,
+.closed-restore-btn,
+.closed-remove-btn {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.closed-clear-btn {
+  color: var(--danger);
+  border-color: rgba(244, 63, 94, 0.25);
+}
+
+.closed-toggle-btn:active,
+.closed-clear-btn:active,
+.closed-restore-btn:active,
+.closed-remove-btn:active {
+  transform: scale(0.94);
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.session-card-closed {
+  opacity: 0.88;
+}
+
+.session-card-closed .session-title {
+  color: var(--text2);
+}
+
+.closed-session-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+}
+
+.closed-restore-btn {
+  color: var(--green);
+  border-color: rgba(16, 185, 129, 0.25);
+}
+
+.closed-remove-btn {
+  color: var(--text-dim);
+}
+
+.empty-state {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
   flex-direction: column;
   justify-content: center;
   align-items: center;
@@ -461,6 +613,24 @@ header h2 {
   gap: 12px;
   padding: 32px 16px;
   text-align: center;
+}
+
+.empty-new-btn {
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 168px;
+  padding: 12px 22px;
+  border: none;
+  border-radius: 12px;
+  background: var(--accent-gradient);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 16px var(--accent-glow);
 }
 
 /* ========== 详情页 ========== */
@@ -669,6 +839,52 @@ header h2 {
   transform: scale(0.92);
   background: var(--bg3);
   border-color: rgba(255, 255, 255, 0.2);
+}
+
+#terminal-copy-selection-btn {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 16;
+  padding: 8px 18px;
+  border-radius: 999px;
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  background: rgba(22, 27, 34, 0.95);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+#terminal-copy-selection-btn:active {
+  transform: translateX(-50%) scale(0.96);
+}
+
+.terminal-select-handle {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: #e94560;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.45);
+  z-index: 17;
+  touch-action: none;
+}
+
+/* 视觉只有 16px，命中区扩到约 28px；再大就会盖住另一个手柄。 */
+.terminal-select-handle::after {
+  content: '';
+  position: absolute;
+  inset: -6px;
+}
+
+.terminal-select-handle:active {
+  transform: translate(-50%, -50%) scale(1.15);
 }
 
 #file-preview-header {
@@ -1264,7 +1480,7 @@ header h2 {
   font-size: 13px;
 }
 
-/* ========== 催工标签 ========== */
+/* ========== 计划设置标签 ========== */
 
 .ac-label {
   font-size: 12px;
@@ -1314,12 +1530,14 @@ header h2 {
   flex-shrink: 0;
 }
 
-.device-header-tools {
+.device-header-tools,
+.detail-header-tools {
   position: relative;
   flex-shrink: 0;
 }
 
-.device-more-menu {
+.device-more-menu,
+.detail-more-menu {
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
@@ -1332,11 +1550,13 @@ header h2 {
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
 }
 
-.device-more-menu[hidden] {
+.device-more-menu[hidden],
+.detail-more-menu[hidden] {
   display: none;
 }
 
-.device-more-menu button {
+.device-more-menu button,
+.detail-more-menu button {
   display: block;
   width: 100%;
   padding: 10px 12px;
@@ -1350,7 +1570,8 @@ header h2 {
 }
 
 .device-more-menu button:active,
-.device-more-menu button[aria-pressed="true"] {
+.device-more-menu button[aria-pressed="true"],
+.detail-more-menu button:active {
   background: rgba(59, 130, 246, 0.16);
 }
 
@@ -1400,7 +1621,11 @@ header h2 {
 
 #device-preview,
 #fullscreen-preview {
+  display: none;
   touch-action: none;
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .device-preview-empty {
@@ -1582,6 +1807,7 @@ header h2 {
        (orientation: landscape) and (min-width: 720px) {
   :root {
     --landscape-panel-width: clamp(220px, 28vw, 300px);
+    --landscape-device-panel-width: clamp(260px, calc((100vh - 96px) * 9 / 19.5), min(46vw, 480px));
   }
 
   #detail-header {
@@ -1606,14 +1832,15 @@ header h2 {
     box-shadow: 0 0 22px rgba(0, 0, 0, 0.42);
   }
 
+  #device-page.landscape-drawer-open {
+    width: var(--landscape-device-panel-width);
+    left: auto;
+    border-left: 1px solid var(--border);
+  }
+
   #main-page.landscape-drawer-open {
     right: auto;
     border-right: 1px solid var(--border);
-  }
-
-  #device-page.landscape-drawer-open {
-    left: auto;
-    border-left: 1px solid var(--border);
   }
 
   body.landscape-sessions-open #detail-page.active {
@@ -1621,7 +1848,7 @@ header h2 {
   }
 
   body.landscape-device-open #detail-page.active {
-    right: var(--landscape-panel-width);
+    right: var(--landscape-device-panel-width, var(--landscape-panel-width));
   }
 
   #detail-page.active {
@@ -1655,8 +1882,11 @@ header h2 {
     font-size: 16px;
   }
 
-  #main-page.landscape-drawer-open .session-card {
+  #main-page.landscape-drawer-open .session-card-body {
     padding: 12px 10px;
+  }
+
+  #main-page.landscape-drawer-open .session-card {
     border-radius: 10px;
   }
 
@@ -1683,6 +1913,7 @@ header h2 {
        (hover: hover) and (pointer: fine) and (max-width: 719px) {
   :root {
     --landscape-panel-width: min(78vw, 300px);
+    --landscape-device-panel-width: min(78vw, calc((100vh - 72px) * 9 / 19.5), 360px);
   }
 
   #main-page.landscape-drawer-open,
@@ -1693,14 +1924,15 @@ header h2 {
     box-shadow: 0 0 22px rgba(0, 0, 0, 0.42);
   }
 
+  #device-page.landscape-drawer-open {
+    width: var(--landscape-device-panel-width);
+    left: auto;
+    border-left: 1px solid var(--border);
+  }
+
   #main-page.landscape-drawer-open {
     right: auto;
     border-right: 1px solid var(--border);
-  }
-
-  #device-page.landscape-drawer-open {
-    left: auto;
-    border-left: 1px solid var(--border);
   }
 
   #detail-header {
@@ -1855,6 +2087,14 @@ header h2 {
   text-align: center;
   padding: 24px;
   font-size: 13px;
+}
+
+.preset-form-hint {
+  margin: -4px 0 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
 }
 .preset-manage-item {
   display: flex;
@@ -2034,13 +2274,55 @@ header h2 {
   margin-bottom: 0;
 }
 
-/* ========== 媒体浏览页 ========== */
+/* ========== 项目文件浏览页 ========== */
+.file-browse-filters {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.file-browse-filter {
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text2);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.file-browse-filter.active {
+  color: var(--text);
+  border-color: rgba(59, 130, 246, 0.45);
+  background: rgba(59, 130, 246, 0.16);
+}
+
+.file-browse-body,
 #media-browse-body {
   flex: 1;
   min-height: 0;
-  overflow: auto;
-  padding: 12px;
-  -webkit-overflow-scrolling: touch;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#file-browse-tree-list {
+  flex: 1;
+  min-height: 0;
+}
+
+#media-browse-page {
+  display: none;
+  flex-direction: column;
+  height: 100%;
+}
+
+#media-browse-page.active {
+  display: flex;
 }
 
 .media-browse-loading,
@@ -2228,12 +2510,15 @@ header h2 {
 
 .session-card {
   min-height: 72px;
-  padding: 14px 13px;
   margin-bottom: 9px;
   border-radius: 13px;
   border-color: rgba(148, 163, 184, 0.13);
-  background: linear-gradient(145deg, rgba(23, 33, 49, 0.96), rgba(15, 23, 35, 0.96));
   box-shadow: 0 7px 18px rgba(0, 0, 0, 0.22);
+}
+
+.session-card-body {
+  padding: 14px 13px;
+  background: linear-gradient(145deg, rgba(23, 33, 49, 0.96), rgba(15, 23, 35, 0.96));
 }
 
 .session-card .status-dot {
@@ -2259,6 +2544,11 @@ header h2 {
 
 .empty-state {
   padding: 40px 22px;
+}
+
+.empty-new-btn:active {
+  transform: scale(0.97);
+  filter: brightness(0.95);
 }
 
 .empty-state-icon {
@@ -2381,19 +2671,39 @@ header h2 {
   background: #080d14;
 }
 
-#device-video,
-#fullscreen-video {
-  display: block;
-  flex: 1 1 auto;
-  width: 100%;
-  height: 100%;
+.android-screen {
+  flex: 1;
   min-width: 0;
   min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+}
+
+#device-video,
+#fullscreen-video,
+#device-preview,
+#fullscreen-preview {
+  display: block;
+  flex: 0 0 auto;
+  width: auto;
+  height: auto;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
   object-fit: contain;
   background: #080d14;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
+  cursor: crosshair;
+}
+
+#device-preview,
+#fullscreen-preview {
+  display: none;
 }
 
 #device-video[hidden],
@@ -2545,7 +2855,7 @@ header h2 {
     padding-right: 14px;
   }
 
-  .session-card {
+  .session-card-body {
     padding-left: 14px;
     padding-right: 14px;
   }

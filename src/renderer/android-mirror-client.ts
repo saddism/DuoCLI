@@ -174,6 +174,10 @@ export class AndroidMirrorClient {
     return this.controlEpoch;
   }
 
+  getGeometryVersion(): number {
+    return this.geometryVersion;
+  }
+
   private reportError(error: unknown, code = 'DECODE_FAILED', stage = 'decode'): void {
     const value = (error instanceof Error ? error : new Error(String(error))) as Error & {
       code?: string;
@@ -185,8 +189,9 @@ export class AndroidMirrorClient {
     this.onError(value);
   }
 
-  sendInput(input: AndroidMirrorInput): number | null {
-    if (!this.isReady()) return null;
+  sendInput(input: AndroidMirrorInput, allowWithoutController = false): number | null {
+    if (!this.isReady() || (!this.isController && !allowWithoutController)) return null;
+    if (this.protocolVersion === 2 && this.geometryVersion <= 0) return null;
     const sequence = ++this.sequence;
     try {
       this.socket!.send(JSON.stringify({
@@ -199,6 +204,14 @@ export class AndroidMirrorClient {
       this.onError(error instanceof Error ? error : new Error(String(error)));
       return null;
     }
+  }
+
+  // Release a pointer that was already pressed even when the browser has not
+  // processed the newest control-owner notification. The server still enforces
+  // the lease and rejects the message if another client owns the device.
+  sendEmergencyInput(input: AndroidMirrorInput): number | null {
+    if (input.type !== 'touch' || !['up', 'cancel'].includes(input.action || '')) return null;
+    return this.sendInput(input, true);
   }
 
   waitForAck(sequence: number, timeoutMs = 1200): Promise<any> {
@@ -327,7 +340,7 @@ export class AndroidMirrorClient {
         } else if (message.error) this.lastError = String(message.error);
         if (message.status === 'ready' && message.width && message.height) this.setMeta(message);
         this.onStatus(message);
-        if (message.status === 'error') this.scheduleResubscribe(generation);
+        if (message.status === 'error') this.scheduleResubscribe(this.generation);
         return;
       }
       if (message.type === 'android:meta') {

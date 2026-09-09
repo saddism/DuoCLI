@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DuoCLI</title>
   <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-src 'self' data:; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://cdn.jsdelivr.net https://raw.githubusercontent.com; frame-src 'self' data:; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*;">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -37,11 +37,13 @@
 
         <label>CLI</label>
         <div class="new-session-row">
-          <select id="preset-select" class="toolbar-select">
+          <select id="preset-select" class="toolbar-select" hidden>
             <option value="">空终端</option>
-            <option value="claude --dangerously-skip-permissions">Claude (全自动)</option>
-            <option value="codex -c sandbox_mode=&quot;danger-full-access&quot; -c approval=&quot;never&quot; -c network=&quot;enabled&quot;">Codex (全自动)</option>
           </select>
+          <div id="preset-select-wrap" class="custom-select preset-select">
+            <div class="custom-select-display" id="preset-display">空终端</div>
+            <div class="custom-select-dropdown" id="preset-dropdown"></div>
+          </div>
           <button id="preset-add-btn" class="toolbar-icon-btn" title="新建自定义 CLI 预设">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
           </button>

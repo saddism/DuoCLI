@@ -24,6 +24,32 @@
     pdf: 'pdf',
   };
 
+  const CODE_EXTENSIONS = new Set([
+    'js', 'jsx', 'ts', 'tsx', 'vue', 'css', 'scss', 'less', 'html', 'htm',
+    'py', 'pyw', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'cc', 'cpp', 'h',
+    'hpp', 'sh', 'bash', 'zsh', 'fish', 'sql', 'nvue', 'wxml', 'wxss',
+    'rb', 'php', 'cs', 'm', 'mm', 'scala', 'clj', 'ex', 'exs', 'erl', 'hs',
+    'lua', 'r', 'dart', 'svelte', 'astro',
+  ]);
+
+  const DOCUMENT_EXTENSIONS = new Set([
+    'md', 'markdown', 'txt', 'log', 'pdf', 'rtf', 'doc', 'docx', 'odt',
+    'pages', 'epub', 'mobi', 'csv', 'tsv', 'xls', 'xlsx', 'ppt', 'pptx',
+    'numbers', 'key', 'json', 'jsonl', 'yaml', 'yml', 'toml', 'xml', 'ini',
+    'conf', 'config', 'properties',
+  ]);
+
+  const SKIP_DIR_NAMES = new Set([
+    'node_modules', '.git', '.hg', '.svn', '__pycache__', '.next', '.nuxt',
+  ]);
+
+  function getFileExtension(filePath) {
+    const name = String(filePath || '').split(/[\\/]/).pop() || '';
+    const dot = name.lastIndexOf('.');
+    if (dot <= 0) return '';
+    return name.slice(dot + 1).toLowerCase();
+  }
+
   function getMediaKind(filePath) {
     const name = String(filePath || '').split(/[\\/]/).pop() || '';
     const dot = name.lastIndexOf('.');
@@ -34,10 +60,24 @@
   function isPreviewableFileName(filePath) {
     const name = String(filePath || '').split(/[\\/]/).pop() || '';
     if (name.toLowerCase() === '.env' || name.toLowerCase().startsWith('.env.')) return false;
-    const dot = name.lastIndexOf('.');
-    if (dot <= 0) return false;
-    const ext = name.slice(dot + 1).toLowerCase();
+    const ext = getFileExtension(filePath);
+    if (!ext) return false;
     return PREVIEW_EXTENSIONS.has(ext) || MEDIA_EXT_KIND[ext] != null;
+  }
+
+  function shouldSkipDirName(name) {
+    return SKIP_DIR_NAMES.has(String(name || ''));
+  }
+
+  function matchesFileBrowseFilter(item, filter) {
+    if (!item || item.isDir) return !shouldSkipDirName(item?.name);
+    if (filter === 'all') return true;
+    const ext = getFileExtension(item.path || item.name);
+    if (filter === 'media') return MEDIA_EXT_KIND[ext] != null;
+    if (filter === 'document') {
+      return DOCUMENT_EXTENSIONS.has(ext) && !CODE_EXTENSIONS.has(ext);
+    }
+    return true;
   }
 
   function findFilePathMatches(text) {
@@ -47,5 +87,16 @@
       .map(item => ({ filePath: item.filePath, index: item.index, length: item.length }));
   }
 
-  return { PREVIEW_EXTENSIONS, MEDIA_EXT_KIND, isPreviewableFileName, findFilePathMatches, getMediaKind };
+  return {
+    PREVIEW_EXTENSIONS,
+    MEDIA_EXT_KIND,
+    DOCUMENT_EXTENSIONS,
+    CODE_EXTENSIONS,
+    isPreviewableFileName,
+    findFilePathMatches,
+    getMediaKind,
+    getFileExtension,
+    shouldSkipDirName,
+    matchesFileBrowseFilter,
+  };
 });

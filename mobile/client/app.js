@@ -226,7 +226,11 @@ const { getCliTagColors } = globalThis.DuoCliTagColors || {
 };
 
 // CLI Logo 来自 cli-logos.js，桌面端用的也是同一份
-const { getLogoUrl, hasLogo } = globalThis.DuoCliLogos || { getLogoUrl: () => '', hasLogo: () => false };
+const { getLogoUrl, getDefaultLogoUrl, hasLogo } = globalThis.DuoCliLogos || {
+  getLogoUrl: () => '',
+  getDefaultLogoUrl: () => '',
+  hasLogo: () => false,
+};
 
 function hideTerminalLoading() {
   const el = $('terminal-loading');
@@ -2216,20 +2220,18 @@ async function refreshSessions() {
   }
 }
 
+function cliTagHtml(dn, tagColor, tagBg) {
+  const logoUrl = getLogoUrl(dn);
+  const fallback = typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : logoUrl;
+  return `<span class="cli-tag" style="--cli-c:${tagColor};--cli-bg:${tagBg}"><img class="cli-logo-img" src="${logoUrl}" alt="${escHtml(dn)}" data-fallback="${fallback}" onerror="this.onerror=null;this.src=this.dataset.fallback||this.src"><span>${escHtml(dn)}</span></span>`;
+}
+
 function renderClosedSessionCard(cs) {
   const dn = cs.displayName || '';
   const [tagColor, tagBg] = dn ? getCliTagColors(dn) : ['', ''];
-  
-  // 构建 CLI 标签 HTML（带 logo）
+
   let tagHtml = '';
-  if (dn) {
-    if (hasLogo(dn)) {
-      const logoUrl = getLogoUrl(dn);
-      tagHtml = `<span class="cli-tag" style="--cli-c:${tagColor};--cli-bg:${tagBg}"><img class="cli-logo-img" src="${logoUrl}" alt="${escHtml(dn)}"><span>${escHtml(dn)}</span></span>`;
-    } else {
-      tagHtml = `<span class="cli-tag" style="--cli-c:${tagColor};--cli-bg:${tagBg}">${escHtml(dn)}</span>`;
-    }
-  }
+  if (dn) tagHtml = cliTagHtml(dn, tagColor, tagBg);
   
   const restoring = restoringClosedSessionIds.has(cs.id) || cs.state === 'restoring';
   return `
@@ -2499,14 +2501,7 @@ function renderSessionList() {
     
     // 构建 CLI 标签 HTML（带 logo）
     let tagHtml = '';
-    if (dn) {
-      if (hasLogo(dn)) {
-        const logoUrl = getLogoUrl(dn);
-        tagHtml = `<span class="cli-tag" style="--cli-c:${tagColor};--cli-bg:${tagBg}"><img class="cli-logo-img" src="${logoUrl}" alt="${escHtml(dn)}"><span>${escHtml(dn)}</span></span>`;
-      } else {
-        tagHtml = `<span class="cli-tag" style="--cli-c:${tagColor};--cli-bg:${tagBg}">${escHtml(dn)}</span>`;
-      }
-    }
+    if (dn) tagHtml = cliTagHtml(dn, tagColor, tagBg);
     return `
     <div class="session-card" data-id="${s.id}">
       <button type="button" class="session-close-action" aria-hidden="true" aria-label="关闭对话">

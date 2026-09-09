@@ -18,8 +18,11 @@ test('identifies all built-in CLI families', () => {
     ['devin --permission-mode bypass', 'devin'],
     ['kimi --auto', 'kimi'],
     ['gemini --yolo', 'gemini'],
+    ['qodercli --dangerously-skip-permissions', 'qoder'],
+    ['qoder --dangerously-skip-permissions', 'qoder'],
     ['qoder chat --dangerously-skip-permissions', 'qoder'],
     ['qodercn --dangerously-skip-permissions', 'qodercn'],
+    ['qoderclicn --dangerously-skip-permissions', 'qodercn'],
     ['opencode', 'opencode'],
     ['kiro-cli chat --trust-all-tools', 'kiro'],
     ['agent --force --approve-mcps', 'cursor'],
@@ -55,6 +58,10 @@ test('parses ANSI and line-wrapped close hints', () => {
   const result = parseResumeOutput(`To resume this session: qoderclicn --resume\n${id}`, 'qodercn --dangerously-skip-permissions');
   assert.equal(result?.sessionId, id);
   assert.equal(result?.resumeCommand, `qodercn --dangerously-skip-permissions --resume ${id}`);
+  const intl = parseResumeOutput(`To resume this session: qodercli --resume\n${id}`, 'qodercli --dangerously-skip-permissions');
+  assert.equal(intl?.cli, 'qoder');
+  assert.equal(intl?.sessionId, id);
+  assert.equal(intl?.resumeCommand, `qodercli --dangerously-skip-permissions --resume ${id}`);
   const kimi = parseResumeOutput('\x1b[2KTo resume this session: kimi -r session_abc', 'kimi --auto');
   assert.equal(kimi?.sessionId, 'session_abc');
   const opencode = parseResumeCommandLine('opencode --session ses_long_alias');

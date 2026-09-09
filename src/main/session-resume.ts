@@ -36,7 +36,7 @@ export function identifyCli(presetCommand: string): CliKind {
   if (bin === 'devin') return 'devin';
   if (bin === 'kimi') return 'kimi';
   if (bin === 'gemini') return 'gemini';
-  if (bin === 'qoder') return 'qoder';
+  if (bin === 'qoder' || bin === 'qodercli') return 'qoder';
   if (bin === 'qodercn' || bin === 'qoderclicn') return 'qodercn';
   if (bin === 'opencode') return 'opencode';
   if (bin === 'kiro-cli' || bin === 'kiro') return 'kiro';
@@ -175,48 +175,58 @@ export function parseResumeCommandLine(command: string): ResumeCapture | null {
   return result;
 }
 
+// parseResumeOutput 在每个 PTY 数据块上都会跑一次（直到抓到 resume id），
+// 所以这些表和正则必须是模块级常量，不能每次调用重新构造。
+const RESUME_OUTPUT_PATTERNS: (readonly [CliKind, RegExp])[] = [
+  ['claude', new RegExp(`\\bclaude\\s+--resume(?:=|\\s+)(${UUID})\\b`, 'i')],
+  ['codex', /\bcodex\s+resume(?:=|\s+)([A-Za-z0-9_-]+)/i],
+  ['devin', /\bdevin\s+-r(?:=|\s+)([A-Za-z0-9_-]+)/i],
+  ['kimi', /\bkimi\s+(?:-r|-S|--session)(?:=|\s+)([A-Za-z0-9_-]+)/i],
+  ['gemini', new RegExp(`\\bgemini\\s+--resume(?:=|\\s+)(${SESSION_ID})`, 'i')],
+  ['qoder', /\bqoder(?:cli)?\s+(?:chat\s+)?--resume(?:=|\s+)([A-Za-z0-9_-]+)/i],
+  ['qodercn', /\bqoderc(?:n|licn)\s+--resume(?:=|\s+)([A-Za-z0-9_-]+)/i],
+  ['opencode', /\bopencode\s+(?:-s|--session)(?:=|\s+)(ses_[A-Za-z0-9_-]+)/i],
+  ['kiro', /\bkiro(?:-cli)?(?:\s+chat)?\s+--resume-id(?:=|\s+)([A-Za-z0-9_-]+)/i],
+  ['cursor', /\bagent\s+--resume(?:=|\s+)([A-Za-z0-9_-]+)/i],
+  ['agy', /\bagy\s+--conversation(?:=|\s+)([A-Za-z0-9_-]+)/i],
+];
+
+// JSON event formats emitted by the headless and streaming modes.
+const RESUME_JSON_PATTERNS: (readonly [CliKind, RegExp])[] = [
+  ['codex', /"thread_id"\s*:\s*"([^"]+)"/i],
+  ['cursor', /"session_id"\s*:\s*"([^"]+)"/i],
+  ['agy', /"conversation_id"\s*:\s*"([^"]+)"/i],
+  ['opencode', /"sessionID"\s*:\s*"(ses_[^"]+)"/i],
+  ['kimi', /"sessionId"\s*:\s*"(session_[^"]+)"/i],
+];
+
+// Codex's interactive TUI may only print “Session ID: …” on exit.
+const CODEX_SESSION_ID_HINT = new RegExp(`Session\\s+ID:\\s*(${UUID})`, 'i');
+
 /** Parse both human-facing close hints and machine-readable JSON events. */
 export function parseResumeOutput(text: string, presetCommand: string): ResumeCapture | null {
   const cli = identifyCli(presetCommand);
   const normalized = normalizeOutput(text);
-  const patterns: Array<[CliKind, RegExp]> = [
-    ['claude', new RegExp(`\\bclaude\\s+--resume(?:=|\\s+)(${UUID})\\b`, 'i')],
-    ['codex', /\bcodex\s+resume(?:=|\s+)([A-Za-z0-9_-]+)/i],
-    ['devin', /\bdevin\s+-r(?:=|\s+)([A-Za-z0-9_-]+)/i],
-    ['kimi', /\bkimi\s+(?:-r|-S|--session)(?:=|\s+)([A-Za-z0-9_-]+)/i],
-    ['gemini', new RegExp(`\\bgemini\\s+--resume(?:=|\\s+)(${SESSION_ID})`, 'i')],
-    ['qoder', /\bqoder\s+(?:chat\s+)?--resume(?:=|\s+)([A-Za-z0-9_-]+)/i],
-    ['qodercn', /\bqoderc(?:n|licn)\s+--resume(?:=|\s+)([A-Za-z0-9_-]+)/i],
-    ['opencode', /\bopencode\s+(?:-s|--session)(?:=|\s+)(ses_[A-Za-z0-9_-]+)/i],
-    ['kiro', /\bkiro(?:-cli)?(?:\s+chat)?\s+--resume-id(?:=|\s+)([A-Za-z0-9_-]+)/i],
-    ['cursor', /\bagent\s+--resume(?:=|\s+)([A-Za-z0-9_-]+)/i],
-    ['agy', /\bagy\s+--conversation(?:=|\s+)([A-Za-z0-9_-]+)/i],
-  ];
   // Prefer the command belonging to this preset. This prevents an embedded
   // shell message from another CLI from attaching to the wrong session.
-  const ordered = cli === 'unknown' ? patterns : patterns.filter(([kind]) => kind === cli);
+  const ordered = cli === 'unknown'
+    ? RESUME_OUTPUT_PATTERNS
+    : RESUME_OUTPUT_PATTERNS.filter(([kind]) => kind === cli);
   for (const [kind, re] of ordered) {
     const match = normalized.match(re);
     if (match) return capture(kind, match[1], 'output', presetCommand);
   }
 
-  // JSON event formats emitted by the headless and streaming modes.
-  const jsonKeys: Array<[CliKind, RegExp]> = [
-    ['codex', /"thread_id"\s*:\s*"([^"]+)"/i],
-    ['cursor', /"session_id"\s*:\s*"([^"]+)"/i],
-    ['agy', /"conversation_id"\s*:\s*"([^"]+)"/i],
-    ['opencode', /"sessionID"\s*:\s*"(ses_[^"]+)"/i],
-    ['kimi', /"sessionId"\s*:\s*"(session_[^"]+)"/i],
-  ];
-  const jsonCandidates = cli === 'unknown' ? jsonKeys : jsonKeys.filter(([kind]) => kind === cli);
+  const jsonCandidates = cli === 'unknown'
+    ? RESUME_JSON_PATTERNS
+    : RESUME_JSON_PATTERNS.filter(([kind]) => kind === cli);
   for (const [kind, re] of jsonCandidates) {
     const match = text.match(re);
     if (match) return capture(kind, match[1], 'output', presetCommand);
   }
 
-  // Codex's interactive TUI may only print “Session ID: …” on exit.
   if (cli === 'codex') {
-    const match = text.match(new RegExp(`Session\\s+ID:\\s*(${UUID})`, 'i'));
+    const match = text.match(CODEX_SESSION_ID_HINT);
     if (match) return capture(cli, match[1], 'output', presetCommand);
   }
   return null;
@@ -237,6 +247,7 @@ function resolveExecutablePath(command: string): string {
     path.join(home, '.local', 'bin', command),
     path.join(home, '.opencode', 'bin', command),
     path.join(kimiHome, 'bin', command),
+    path.join(home, '.qoder', 'bin', command),
     path.join(home, '.qoder-cn', 'entry', command),
     path.join('/opt/homebrew/bin', command),
     path.join('/usr/local/bin', command),

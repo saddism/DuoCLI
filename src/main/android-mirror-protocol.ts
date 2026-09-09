@@ -128,3 +128,18 @@ export function decodeDvm2Frame(packet: Buffer): ParsedDvm2Frame {
     mediaEpoch: packet.readUInt32BE(48),
   };
 }
+
+/**
+ * Copy the encoded frame size onto the WebSocket envelope without minting a
+ * new geometryVersion. control.input is checked against the scrcpy session
+ * version; bumping here on the first packet that reveals width/height makes
+ * desktop WebCodecs clients send GEOMETRY_STALE forever.
+ */
+export function syncMediaEnvelopeSize(
+  envelope: { width: number; height: number; geometryVersion: number },
+  frameWidth: number,
+  frameHeight: number,
+): void {
+  envelope.width = frameWidth;
+  envelope.height = frameHeight;
+}

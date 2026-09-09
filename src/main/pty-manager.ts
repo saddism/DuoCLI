@@ -21,6 +21,7 @@ import {
   preassignSessionId,
   resolveSessionId,
 } from './session-resume';
+import { buildLaunchWrite, normalizePresetEnv } from './preset-env';
 
 export interface PtySession {
   id: string;
@@ -89,7 +90,34 @@ interface PtyManagerEvents {
 export type TitleAIConfigProvider = () => TitleAIConfig | null;
 export type TerminalAutoResponseConfigProvider = () => TerminalAutoResponseConfig;
 
-// 命令 → 友好显示名称映射
+/**
+ * Build the environment inherited by a PTY. Cursor Agent sets this marker
+ * while running its own child agents so their credentials stay in memory;
+ * forwarding it into DuoCLI would make an interactive Cursor CLI forget its
+ * login as soon as each PTY exits.
+ */
+export function buildPtyEnvironment(
+  cliKind: CliKind,
+  envOverrides?: Record<string, string>,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value !== undefined) env[key] = value;
+  }
+  if (envOverrides) {
+    for (const [key, value] of Object.entries(envOverrides)) {
+      if (value === '') delete env[key];
+      else env[key] = value;
+    }
+  }
+  if (cliKind === 'cursor' && env.AGENT_CLI_CREDENTIAL_STORE?.toLowerCase() === 'memory') {
+    delete env.AGENT_CLI_CREDENTIAL_STORE;
+  }
+  return env;
+}
+
+// 命令 → 友好显示名称映射（精确匹配，优先于启发式推断）
 const PRESET_DISPLAY_NAMES: Record<string, string> = {
   'claude --dangerously-skip-permissions': 'Claude全自动',
   'codex --full-auto': 'Codex全自动',
@@ -97,13 +125,60 @@ const PRESET_DISPLAY_NAMES: Record<string, string> = {
   'devin --permission-mode bypass': 'Devin全自动',
   'kimi --auto': 'Kimi全自动',
   'gemini --yolo': 'Gemini全自动',
+  'qodercli --dangerously-skip-permissions': 'Qoder全自动',
+  'qoder --dangerously-skip-permissions': 'Qoder全自动',
   'qoder chat --dangerously-skip-permissions': 'Qoder全自动',
   'qodercn --dangerously-skip-permissions': 'QoderCN全自动',
   'opencode': 'OpenCode',
   'kiro-cli chat --trust-all-tools': 'Kiro全自动',
   'agent --force --approve-mcps': 'Cursor全自动',
-  'agy --dangerously-skip-permissions': '反重力全自动',
+  'agy --dangerously-skip-permissions': 'Antigravity全自动',
 };
+
+const CLI_BASE_DISPLAY_NAMES: Record<CliKind, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  devin: 'Devin',
+  kimi: 'Kimi',
+  gemini: 'Gemini',
+  qoder: 'Qoder',
+  qodercn: 'QoderCN',
+  opencode: 'OpenCode',
+  kiro: 'Kiro',
+  cursor: 'Cursor',
+  agy: 'Antigravity',
+  unknown: '',
+};
+
+function isAutoPresetCommand(presetCommand: string, cli: CliKind): boolean {
+  switch (cli) {
+    case 'claude':
+      return /--dangerously-skip-permissions/.test(presetCommand);
+    case 'codex':
+      return /--full-auto/.test(presetCommand)
+        || /sandbox_mode=["']danger-full-access["']/.test(presetCommand)
+        || /approval=["']never["']/.test(presetCommand);
+    case 'devin':
+      return /--permission-mode\s+bypass/.test(presetCommand);
+    case 'kimi':
+      return /--auto\b/.test(presetCommand);
+    case 'gemini':
+      return /--yolo/.test(presetCommand);
+    case 'qoder':
+    case 'qodercn':
+      return /--dangerously-skip-permissions/.test(presetCommand)
+        || /--permission-mode\s+bypass_permissions/.test(presetCommand)
+        || /--yolo\b/.test(presetCommand);
+    case 'kiro':
+      return /--trust-all-tools/.test(presetCommand);
+    case 'cursor':
+      return /--force/.test(presetCommand) && /--approve-mcps/.test(presetCommand);
+    case 'agy':
+      return /--dangerously-skip-permissions/.test(presetCommand);
+    default:
+      return false;
+  }
+}
 
 // 终端会话标题「智能起名」：起名材料累加到第 N 段（用户每次回车发送算一段）后锁定，不再自动改名
 const TITLE_SEGMENT_CAP = 3;
@@ -203,7 +278,15 @@ function stripTerminalControlSequences(text: string): string {
 }
 
 export function getDisplayName(presetCommand: string): string {
-  return PRESET_DISPLAY_NAMES[presetCommand] || presetCommand || '终端';
+  if (!presetCommand) return '终端';
+  const exact = PRESET_DISPLAY_NAMES[presetCommand];
+  if (exact) return exact;
+
+  const cli = identifyCli(presetCommand);
+  const base = CLI_BASE_DISPLAY_NAMES[cli];
+  if (!base) return '终端';
+
+  return isAutoPresetCommand(presetCommand, cli) ? `${base}全自动` : base;
 }
 
 export class PtyManager {
@@ -258,22 +341,8 @@ export class PtyManager {
       ? (process.env.COMSPEC || 'cmd.exe')
       : (process.env.SHELL || '/bin/zsh');
 
-    // 先复制 process.env，过滤掉 undefined 值，然后应用覆盖（空字符串用于清除）
-    const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (value !== undefined) {
-        env[key] = value;
-      }
-    }
+    const env = buildPtyEnvironment(cliKind, envOverrides ? normalizePresetEnv(envOverrides) : undefined);
     if (envOverrides) {
-      for (const [key, value] of Object.entries(envOverrides)) {
-        if (value === '') {
-          // 空字符串表示清除该变量
-          delete env[key];
-        } else {
-          env[key] = value;
-        }
-      }
       // 调试日志
       console.log('[PtyManager] 设置的环境变量:', JSON.stringify(envOverrides));
     }
@@ -467,7 +536,7 @@ export class PtyManager {
         session.launchPreExecSeen = false;
         session.launchOutput = '';
         session.launchReturnedToShell = false;
-        ptyProcess.write(launchCommand + '\r');
+        ptyProcess.write(buildLaunchWrite(launchCommand, envOverrides));
       }, 300);
     }
 
