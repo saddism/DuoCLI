@@ -60,6 +60,7 @@ contextBridge.exposeInMainWorld('duocli', {
   fileTreeListDir: (dirPath: string) => ipcRenderer.invoke('file-tree:list-dir', dirPath),
   // 同步最近目录到手机端远程服务
   remoteAddRecentCwd: (cwd: string) => ipcRenderer.invoke('remote:add-recent-cwd', cwd),
+  remoteSyncRecentCwds: (cwds: string[]) => ipcRenderer.invoke('remote:sync-recent-cwds', cwds),
 
   // 监听事件
   onPtyData: (cb: (id: string, data: string) => void) =>
@@ -83,6 +84,10 @@ contextBridge.exposeInMainWorld('duocli', {
   getRemoteServerInfo: () => ipcRenderer.invoke('remote:get-server-info'),
   getRemoteHealth: () => ipcRenderer.invoke('remote:get-health'),
   retryRemoteSync: () => ipcRenderer.invoke('remote:retry-sync'),
+  setRemoteToken: (token: string) => ipcRenderer.invoke('remote:set-token', token) as Promise<
+    { ok: true; token: string } | { ok: false; error: string }
+  >,
+  generateRemoteToken: () => ipcRenderer.invoke('remote:generate-token') as Promise<string>,
 
   // 剪贴板图片
   clipboardSaveImage: () => ipcRenderer.invoke('clipboard:save-image'),
@@ -154,7 +159,15 @@ contextBridge.exposeInMainWorld('duocli', {
   closedSessionsClear: () => ipcRenderer.invoke('closed-sessions:clear'),
   closedSessionsConfirmRestore: (closedId: string, sessionId: string) =>
     ipcRenderer.invoke('closed-sessions:confirm-restore', closedId, sessionId),
-  onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>) => void) =>
+  onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; contextHistory?: Array<{ role: 'user' | 'assistant'; content: string; timestamp?: number }>; exportPath?: string }>) => void) =>
     ipcRenderer.on('closed-sessions:update', (_e, sessions) => cb(sessions)),
 
+  // ========== 上下文导出功能 ==========
+  exportContextToExportDirectory: (sessionId: string, targetAgent?: string) => ipcRenderer.invoke('context-export:export', sessionId, targetAgent),
+  listExportedContexts: () => ipcRenderer.invoke('context-export:list'),
+  openExportedContextFile: (filePath: string) => ipcRenderer.invoke('context-export:open-file', filePath),
+  
+  // ========== 通知功能 ==========
+  onNotification: (cb: (title: string, body: string, sessionId?: string) => void) =>
+    ipcRenderer.on('notification', (_e, title, body, sessionId) => cb(title, body, sessionId)),
 });

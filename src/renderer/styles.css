@@ -1468,6 +1468,80 @@ html, body {
   display: none;
 }
 
+.remote-info-token-input {
+  flex: 1;
+  min-width: 0;
+  height: 22px;
+  padding: 0 6px;
+  font-family: 'SF Mono', 'Menlo', monospace;
+  font-size: 10px;
+  color: var(--text-primary);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  outline: none;
+}
+
+.remote-info-token-input:focus {
+  border-color: var(--accent-hover);
+}
+
+.remote-info-token-edit,
+.remote-info-token-save,
+.remote-info-token-cancel {
+  flex-shrink: 0;
+  height: 18px;
+  padding: 0 6px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.remote-info-token-edit:hover,
+.remote-info-token-save:hover,
+.remote-info-token-cancel:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.1);
+  border-color: var(--border-light);
+}
+
+.remote-info-token-save {
+  color: var(--accent-hover);
+}
+
+.remote-info-token-save:disabled,
+.remote-info-token-edit:disabled,
+.remote-info-token-cancel:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.remote-server-info.token-editing .remote-info-token-toggle {
+  display: none;
+}
+
+.remote-server-info.token-editing .remote-info-token-value {
+  display: none;
+}
+
+.remote-info-token-hint {
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+
+.remote-info-token-hint.is-error {
+  color: var(--danger, #ff5f57);
+}
+
+.remote-info-token-hint.is-ok {
+  color: var(--success, #3dd68c);
+}
+
 /* 侧边栏 Tab 切换 */
 #sidebar-tabs {
   display: flex;
@@ -1542,7 +1616,7 @@ html, body {
   transition: all 0.15s ease;
 }
 
-/* 标题行：置顶按钮 + 标题 + 铅笔 + 催工开关 */
+/* 标题行：置顶按钮 + 标题 + 铅笔 + 计划设置 */
 .session-item-top {
   display: flex;
   align-items: center;
@@ -1551,7 +1625,7 @@ html, body {
   min-width: 0;
 }
 
-/* 操作行：时间 / Agent 胶囊 / 催工 — 窄栏时截断 Agent 名，不换行 */
+/* 操作行：时间 / Agent 胶囊 / 计划设置 — 窄栏时截断 Agent 名，不换行 */
 .session-item-bottom {
   display: flex;
   align-items: center;
@@ -1662,6 +1736,23 @@ html, body {
   color: var(--cli-tag-color, var(--accent));
   background: var(--cli-tag-bg, rgba(59, 130, 246, 0.12));
   border: 1px solid rgba(255, 255, 255, 0.06);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* CLI Logo */
+.cli-logo {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  object-fit: contain;
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+.cli-logo:hover {
+  transform: scale(1.2);
 }
 
 /* 模型提供商标签（显示在 CLI 标签右侧） */
@@ -2525,6 +2616,35 @@ select.ai-form-input {
   border-color: var(--accent);
 }
 
+.preset-form-field textarea {
+  padding: 6px 8px;
+  min-height: 84px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  outline: none;
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.preset-form-field textarea:focus {
+  border-color: var(--accent);
+}
+
+.preset-form-field textarea::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.6;
+}
+
+.preset-form-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
 .preset-form-field input::placeholder {
   color: var(--text-secondary);
   opacity: 0.6;
@@ -2823,6 +2943,106 @@ textarea:focus-visible,
 
 #session-list {
   padding: 8px 0 12px;
+}
+
+/* ========== 颜色选择器样式 ========== */
+.color-picker-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.color-picker-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg);
+  padding: 16px;
+  min-width: 520px;
+  max-width: 700px;
+  width: 90%;
+}
+
+.color-picker-dialog h3 {
+  margin: 0 0 4px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.color-picker-dialog .picker-note {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.color-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+  gap: 8px;
+  max-height: 400px;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.color-picker-btn {
+  width: 100%;
+  aspect-ratio: 1;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  position: relative;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.color-picker-btn:hover {
+  transform: scale(1.1);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.color-picker-section {
+  grid-column: 1 / -1;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  margin-top: 8px;
+}
+
+.color-picker-section h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.color-picker-cancel {
+  margin-top: 12px;
+  width: 100%;
+  padding: 10px 16px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.color-picker-cancel:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: var(--text-muted);
 }
 
 .session-group-header {

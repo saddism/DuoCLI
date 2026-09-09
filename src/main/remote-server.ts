@@ -16,121 +16,21 @@ import {
   DVM2_MAX_H264_BYTES,
   DVM2_MAX_JPEG_BYTES,
   encodeDvm2Frame,
+  syncMediaEnvelopeSize,
 } from './android-mirror-protocol';
 import { WebSocketServer, WebSocket } from 'ws';
 import webpush from 'web-push';
 import sharp from 'sharp';
 import { PtyManager, getDisplayName } from './pty-manager';
-import { getAvailableBuiltinPresets } from './cli-detect';
+import { CustomPreset, getCliProvider, resolveSessionDisplayName } from './cli-provider';
+import { resolvePresetEnv } from './preset-env';
+import { BUILTIN_PRESETS, getAvailableBuiltinPresets } from './cli-detect';
 import { buildResumeCommand } from './session-resume';
+import { ClosedSessionsManager } from './closed-sessions';
 
 // 缓存 ptyManager 和回调供远程创建使用（在 startRemoteServer 中设置）
 let cachedPtyManager: PtyManager | null = null;
 let cachedOnRemoteCreate: ((sessionInfo: any) => void) | null = null;
-
-// 根据 preset 命令获取实际使用的模型提供商（与 index.ts 保持一致）
-function getCliProvider(presetCommand: string): string | null {
-  const home = os.homedir();
-
-  if (presetCommand.startsWith('claude')) {
-    const settingsPath = path.join(home, '.claude', 'settings.json');
-    try {
-      if (fs.existsSync(settingsPath)) {
-        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-        const env = settings.env || {};
-        const baseUrl = env.ANTHROPIC_BASE_URL || '';
-
-        if (baseUrl.includes('minimaxi')) return 'MiniMax';
-        if (baseUrl.includes('deepseek')) return 'DeepSeek';
-        if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) return 'GLM';
-        if (baseUrl.includes('cloudflare')) return 'Cloudflare';
-        if (baseUrl.includes('anthropic') || !baseUrl) return 'Anthropic';
-
-        if (baseUrl) {
-          try {
-            const url = new URL(baseUrl);
-            return url.hostname.replace(/^api\./, '').split('.')[0].toUpperCase();
-          } catch { /* ignore */ }
-        }
-      }
-    } catch { /* ignore */ }
-
-    const rcFiles = [path.join(home, '.zshrc'), path.join(home, '.bashrc')];
-    for (const rcFile of rcFiles) {
-      if (!fs.existsSync(rcFile)) continue;
-      const content = fs.readFileSync(rcFile, 'utf-8');
-      const vars = parseShellExports(content);
-      const baseUrl = vars.get('ANTHROPIC_BASE_URL') || '';
-      if (baseUrl.includes('minimaxi')) return 'MiniMax';
-      if (baseUrl.includes('deepseek')) return 'DeepSeek';
-      if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) return 'GLM';
-    }
-
-    return 'Anthropic';
-  }
-
-  if (presetCommand.startsWith('codex')) {
-    return 'OpenAI';
-  }
-
-  if (presetCommand.startsWith('kimi')) {
-    return 'Moonshot';
-  }
-
-  if (presetCommand.startsWith('gemini')) {
-    return 'Google';
-  }
-
-  if (presetCommand.startsWith('opencode')) {
-    return 'OpenCode';
-  }
-
-  if (presetCommand.startsWith('qoder')) {
-    return 'Qoder';
-  }
-
-  if (presetCommand.startsWith('devin')) {
-    return 'Devin';
-  }
-
-  if (presetCommand.startsWith('kiro-cli')) {
-    return 'Kiro';
-  }
-
-  if (presetCommand.startsWith('agent') || presetCommand.includes('cursor')) {
-    return 'Cursor';
-  }
-
-  if (presetCommand.startsWith('agy')) {
-    return 'Antigravity';
-  }
-
-  return null;
-}
-
-function parseShellExports(content: string): Map<string, string> {
-  const vars = new Map<string, string>();
-  for (const line of content.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('#')) continue;
-    const match = trimmed.match(/^export\s+([A-Z_][A-Z0-9_]*)=["']?([^"'\n]+?)["']?\s*$/);
-    if (match) {
-      vars.set(match[1], match[2]);
-    }
-  }
-  return vars;
-}
-
-function resolveSessionDisplayName(presetCommand: string, customPresets: CustomPreset[]): string {
-  const displayName = getDisplayName(presetCommand);
-  const customPreset = customPresets.find(p =>
-    presetCommand === p.command || (p.autoFlag && presetCommand === p.command + ' ' + p.autoFlag)
-  );
-  return customPreset
-    ? (presetCommand === customPreset.command + ' ' + customPreset.autoFlag
-        ? customPreset.name + '全自动' : customPreset.name)
-    : displayName;
-}
 
 let PORT = parseInt(process.env.DUOCLI_REMOTE_PORT || '9800');
 const HOST = process.env.DUOCLI_REMOTE_HOST || '0.0.0.0';
@@ -231,13 +131,6 @@ function getLocalIP(): string {
 const CONFIG_DIR = process.env.DUOCLI_REMOTE_CONFIG_DIR || path.join(process.env.HOME || os.homedir(), '.duocli-mobile');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 
-interface CustomPreset {
-  id: string;
-  name: string;
-  command: string;
-  autoFlag: string;
-}
-
 interface RemoteConfig {
   token: string;
   vapidPublic: string;
@@ -245,10 +138,47 @@ interface RemoteConfig {
   pushSubscriptions: webpush.PushSubscription[];
   recentCwds: string[];
   customPresets: CustomPreset[];
+  /** 预设命令 → 累计使用次数，两端共用它给新建会话下拉排序 */
+  presetUsage: Record<string, number>;
 }
 
-function generateAccessToken(): string {
+export function generateAccessToken(): string {
   return crypto.randomBytes(16).toString('hex');
+}
+
+/** 规范化用户输入的访问 Token：去首尾空白。 */
+export function normalizeAccessToken(raw: unknown): string {
+  return String(raw ?? '').trim();
+}
+
+/**
+ * 校验可保存的 Token。
+ * 允许用户自定义，但限制为 8–128 位可见 ASCII（不含空格），避免粘贴进空白/换行。
+ */
+export function isValidAccessToken(token: string): boolean {
+  return /^[\x21-\x7E]{8,128}$/.test(token);
+}
+
+function sanitizePresetUsage(raw: unknown): Record<string, number> {
+  const usage: Record<string, number> = {};
+  if (!raw || typeof raw !== 'object') return usage;
+  for (const [command, count] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof count === 'number' && count > 0) usage[command] = Math.floor(count);
+  }
+  return usage;
+}
+
+/** 配置里存着 token 和推送私钥，写一半崩溃会让所有已配对手机失效，所以统一走临时文件再改名 */
+function saveConfig(config: RemoteConfig): void {
+  const serialized = JSON.stringify(config, null, 2);
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    const temp = `${CONFIG_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, serialized);
+    fs.renameSync(temp, CONFIG_FILE);
+  } catch (err) {
+    console.error('[RemoteServer] 配置写入失败:', err);
+  }
 }
 
 function loadOrCreateConfig(): RemoteConfig {
@@ -262,10 +192,15 @@ function loadOrCreateConfig(): RemoteConfig {
         vapidPublic: raw.vapidPublic || fallbackKeys.publicKey,
         vapidPrivate: raw.vapidPrivate || fallbackKeys.privateKey,
         pushSubscriptions: Array.isArray(raw.pushSubscriptions) ? raw.pushSubscriptions : [],
-        recentCwds: Array.isArray(raw.recentCwds) ? raw.recentCwds.filter(Boolean).slice(0, 20) : [],
+        recentCwds: Array.isArray(raw.recentCwds) ? raw.recentCwds.filter(Boolean).slice(0, MAX_RECENT_CWDS) : [],
         customPresets: Array.isArray(raw.customPresets) ? raw.customPresets : [],
+        presetUsage: sanitizePresetUsage(raw.presetUsage),
       };
-    } catch {}
+    } catch (err) {
+      // 重建会顺手换掉 token，所有已配对手机都会被无声踢下线；先把坏文件挪开留下证据。
+      console.error('[RemoteServer] config.json 解析失败，将重新生成:', err);
+      try { fs.renameSync(CONFIG_FILE, `${CONFIG_FILE}.corrupt-${Date.now()}`); } catch { /* ignore */ }
+    }
   }
   const vapidKeys = webpush.generateVAPIDKeys();
   const config: RemoteConfig = {
@@ -275,14 +210,16 @@ function loadOrCreateConfig(): RemoteConfig {
     pushSubscriptions: [],
     recentCwds: [],
     customPresets: [],
+    presetUsage: {},
   };
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  saveConfig(config);
   return config;
 }
 
 const MAX_RECENT_CWDS = 20;
+const MAX_PRESET_USAGE_ENTRIES = 100;
 const MAX_PREVIEW_BYTES = 1024 * 1024;
-const PREVIEW_EXTENSIONS = new Set([
+export const PREVIEW_EXTENSIONS = new Set([
   '.md', '.markdown', '.txt', '.log', '.json', '.jsonl', '.yaml', '.yml', '.toml',
   '.xml', '.csv', '.tsv', '.ini', '.conf', '.config', '.properties',
   '.js', '.jsx', '.ts', '.tsx', '.vue', '.css', '.scss', '.less', '.html', '.htm',
@@ -290,8 +227,49 @@ const PREVIEW_EXTENSIONS = new Set([
   '.hpp', '.sh', '.bash', '.zsh', '.fish', '.sql', '.nvue', '.wxml', '.wxss',
 ]);
 
+// 媒体扩展名 → { mime, kind }；kind 供手机端分流渲染（image/video/audio/pdf），
+// 与 mobile/client/file-preview-helpers.js 的 MEDIA_EXT_KIND 一一对应，改动两边都要跟着改。
+export const MEDIA_EXT_MAP: Record<string, { mime: string; kind: string }> = {
+  // 图片
+  '.jpg': { mime: 'image/jpeg', kind: 'image' },
+  '.jpeg': { mime: 'image/jpeg', kind: 'image' },
+  '.png': { mime: 'image/png', kind: 'image' },
+  '.gif': { mime: 'image/gif', kind: 'image' },
+  '.webp': { mime: 'image/webp', kind: 'image' },
+  '.bmp': { mime: 'image/bmp', kind: 'image' },
+  '.svg': { mime: 'image/svg+xml', kind: 'image' },
+  '.avif': { mime: 'image/avif', kind: 'image' },
+  '.heic': { mime: 'image/heic', kind: 'image' },   // 原生不可显示，下面转 JPEG
+  '.heif': { mime: 'image/heif', kind: 'image' },
+  // 视频
+  '.mp4': { mime: 'video/mp4', kind: 'video' },
+  '.m4v': { mime: 'video/mp4', kind: 'video' },
+  '.mov': { mime: 'video/quicktime', kind: 'video' },
+  '.webm': { mime: 'video/webm', kind: 'video' },
+  // 音频
+  '.mp3': { mime: 'audio/mpeg', kind: 'audio' },
+  '.m4a': { mime: 'audio/mp4', kind: 'audio' },
+  '.aac': { mime: 'audio/aac', kind: 'audio' },
+  '.wav': { mime: 'audio/wav', kind: 'audio' },
+  '.ogg': { mime: 'audio/ogg', kind: 'audio' },
+  '.flac': { mime: 'audio/flac', kind: 'audio' },
+  // 文档
+  '.pdf': { mime: 'application/pdf', kind: 'pdf' },
+};
+const MEDIA_EXTS = new Set(Object.keys(MEDIA_EXT_MAP));
+
+function getMediaMeta(filePath: string) {
+  const ext = path.extname(filePath).toLowerCase();
+  return MEDIA_EXT_MAP[ext] || null;
+}
+
+// macOS 的 /private/var 与 /var 是同一个目录，桌面端与手机端会合并同一份最近目录列表，
+// 两端必须用同样的规范化规则，否则下拉里会出现重复项。
 function normalizeCwd(cwd: string): string {
-  return (cwd || '').trim().replace(/\/+$/, '');
+  let p = (cwd || '').trim();
+  if (p.startsWith('/private/')) p = p.slice('/private'.length);
+  if (p.length > 1) p = p.replace(/\/+$/, '');
+  return p;
 }
 
 function isPreviewableFile(filePath: string): boolean {
@@ -358,6 +336,42 @@ function addRecentCwdInConfig(config: RemoteConfig, cwd: string): void {
   config.recentCwds = next.slice(0, MAX_RECENT_CWDS);
 }
 
+/** 自定义预设的环境变量在启动 PTY 时注入，恢复会话也能对上原命令。 */
+function mergeSessionEnv(
+  customPresets: CustomPreset[],
+  presetCommand: string,
+  providerEnv?: Record<string, string>,
+): Record<string, string> | undefined {
+  const extra = providerEnv && typeof providerEnv === 'object' ? providerEnv : {};
+  const merged = { ...resolvePresetEnv(customPresets, presetCommand), ...extra };
+  return Object.keys(merged).length ? merged : undefined;
+}
+
+/** 只有下拉里真实存在的预设才计入频率，恢复会话用的 resume 命令不算 */
+function isSelectablePresetCommand(config: RemoteConfig, presetCommand: string): boolean {
+  const cmd = (presetCommand || '').trim();
+  if (!cmd) return true;
+  if (BUILTIN_PRESETS.some(p => p.value === cmd)) return true;
+  return (config.customPresets || []).some((p) => {
+    const base = (p.command || '').trim();
+    return cmd === base || cmd === `${base} ${p.autoFlag || ''}`.trim();
+  });
+}
+
+function bumpPresetUsageInConfig(config: RemoteConfig, presetCommand: string): boolean {
+  const key = (presetCommand || '').trim();
+  if (key && !isSelectablePresetCommand(config, key)) return false;
+  const usage = config.presetUsage || (config.presetUsage = {});
+  usage[key] = (usage[key] || 0) + 1;
+  const keys = Object.keys(usage);
+  if (keys.length > MAX_PRESET_USAGE_ENTRIES) {
+    // 一次性敲进下拉的临时命令会不断堆积，超出上限就淘汰用得最少的
+    const drop = keys.sort((a, b) => usage[a] - usage[b]).slice(0, keys.length - MAX_PRESET_USAGE_ENTRIES);
+    for (const stale of drop) delete usage[stale];
+  }
+  return true;
+}
+
 /**
  * 启动远程访问服务器，复用桌面端的 ptyManager
  * @param ptyManager 桌面端的终端管理器实例
@@ -372,6 +386,8 @@ export function startRemoteServer(
   onRemoteDestroy?: (id: string) => void,
   onServerStarted?: (info: { lanUrl: string; token: string; port: number }) => void,
   onSessionClosed?: (session: { title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; resumeSource?: any }) => void,
+  closedSessionsManager?: ClosedSessionsManager,
+  userDataPath?: string, // 新增参数：用户数据目录
 ): http.Server {
   // 缓存供 Bridge 事件使用
   cachedPtyManager = ptyManager;
@@ -417,6 +433,8 @@ export function startRemoteServer(
     // 的压缩帧协商不稳定，会导致连接立刻断开并进入重连循环。
     perMessageDeflate: false,
   });
+  // Token 轮换时要能立刻掐断仍在线的 SSE / WS，迫使手机端重新授权。
+  const sseClients = new Set<import('express').Response>();
   const wsClients = new Map<string, Set<WebSocket>>();
   ptyManager.setRemoteSubscriberCheck((id) => (wsClients.get(id)?.size ?? 0) > 0);
   type RemoteWsChunk = { data: string; sequence: number };
@@ -510,9 +528,6 @@ export function startRemoteServer(
         }
       }).catch(() => closeBrokenRemoteSocket(ws, state));
     }).catch(() => sendRawReplay(ws, state, session, preserveViewport));
-  };
-  (startRemoteServer as any)._pushResize = (id: string) => {
-    for (const client of wsClients.get(id) || []) sendSnapshot(client, id, true);
   };
   type AliveWebSocket = WebSocket & { isAlive?: boolean };
 
@@ -973,8 +988,10 @@ export function startRemoteServer(
         const nextWidth = view.getUint16(6);
         const nextHeight = view.getUint16(8);
         if (nextWidth !== width || nextHeight !== height) {
-          width = nextWidth; height = nextHeight;
-          geometryVersion = (geometryVersion + 1) >>> 0 || 1;
+          const envelope = { width, height, geometryVersion };
+          syncMediaEnvelopeSize(envelope, nextWidth, nextHeight);
+          width = envelope.width;
+          height = envelope.height;
         }
         frameId = (frameId + 1) >>> 0 || 1;
         const packet = encodeDvm2Frame({
@@ -1235,6 +1252,7 @@ export function startRemoteServer(
   // 微批合并：8ms 内的多次 onData 拼成一帧再 send，减少 ws 帧数与 JSON 包头开销。
   // 8ms 在人眼几乎察觉不到，却能把 npm install / 编译刷屏从几百帧压到几十帧。
   const pendingChunks = new Map<string, { data: string; sequence: number }[]>();
+  const pendingBytes = new Map<string, number>();
   const pendingTimers = new Map<string, NodeJS.Timeout>();
   const FLUSH_DELAY_MS = 8;
   const FLUSH_MAX_BYTES = 32768; // 累积超过 32KB 立即冲刷，避免长期积压
@@ -1269,6 +1287,7 @@ export function startRemoteServer(
   const flushChunks = (id: string) => {
     const data = pendingChunks.get(id);
     pendingChunks.delete(id);
+    pendingBytes.delete(id);
     const t = pendingTimers.get(id);
     if (t) { clearTimeout(t); pendingTimers.delete(id); }
     if (!data) return;
@@ -1301,13 +1320,80 @@ export function startRemoteServer(
     const merged = pendingChunks.get(id) || [];
     merged.push({ data, sequence });
     pendingChunks.set(id, merged);
-    if (merged.reduce((size, chunk) => size + chunk.data.length, 0) >= FLUSH_MAX_BYTES) {
+    const bytes = (pendingBytes.get(id) || 0) + data.length;
+    pendingBytes.set(id, bytes);
+    if (bytes >= FLUSH_MAX_BYTES) {
       flushChunks(id);
       return;
     }
     if (!pendingTimers.has(id)) {
       pendingTimers.set(id, setTimeout(() => flushChunks(id), FLUSH_DELAY_MS));
     }
+  };
+
+  const closeAllRemoteClients = (reason: string) => {
+    for (const client of [...sseClients]) {
+      try { client.end(); } catch { /* ignore */ }
+      sseClients.delete(client);
+    }
+    for (const client of wss.clients) {
+      try { client.close(4001, reason); } catch { /* ignore */ }
+    }
+    for (const client of androidWss.clients) {
+      try { client.close(4001, reason); } catch { /* ignore */ }
+    }
+    for (const client of androidVideoWss.clients) {
+      try { client.close(4001, reason); } catch { /* ignore */ }
+    }
+    for (const client of androidJpegWss.clients) {
+      try { client.close(4001, reason); } catch { /* ignore */ }
+    }
+  };
+
+  // 桌面端改 Token 后立刻写入运行中的 config，并踢掉仍握着旧凭证的连接。
+  (startRemoteServer as any)._updateAccessToken = (nextToken: string): { ok: true; token: string } | { ok: false; error: string } => {
+    const token = normalizeAccessToken(nextToken);
+    if (config.token === token) return { ok: true, token };
+    if (!isValidAccessToken(token)) {
+      return { ok: false, error: 'Token 需为 8–128 位可见字符（勿含空格）' };
+    }
+    config.token = token;
+    saveConfig(config);
+    closeAllRemoteClients('token rotated');
+    return { ok: true, token };
+  };
+
+  // 桌面端通过 IPC 写最近目录时要落到这份运行中的 config：只改配置文件的话，
+  // 手机端读到的还是服务启动时的旧列表，而服务端下一次持久化又会把桌面端刚写的内容覆盖掉。
+  (startRemoteServer as any)._addRecentCwd = (cwd: string) => {
+    const before = config.recentCwds.join('\n');
+    addRecentCwdInConfig(config, cwd);
+    if (config.recentCwds.join('\n') !== before) {
+      saveConfig(config);
+    }
+  };
+
+  (startRemoteServer as any)._bumpPresetUsage = (presetCommand: string) => {
+    if (!bumpPresetUsageInConfig(config, presetCommand)) return;
+    saveConfig(config);
+  };
+
+  (startRemoteServer as any)._getCustomPresetEnv = (presetCommand: string) => {
+    return resolvePresetEnv(config.customPresets, presetCommand);
+  };
+
+  // 自定义预设的名字只有这份运行中的 config 知道，注入后已关闭会话落盘才写得出正确显示名。
+  closedSessionsManager?.setDisplayNameResolver(
+    (presetCommand: string) => resolveSessionDisplayName(presetCommand, config.customPresets),
+  );
+
+  // 桌面端启动时回放整份目录池：逐条同步等于 20 次阻塞写盘，合并成一次。
+  (startRemoteServer as any)._syncRecentCwds = (cwds: string[]) => {
+    if (!Array.isArray(cwds) || cwds.length === 0) return;
+    const before = config.recentCwds.join('\n');
+    // 按“旧 -> 新”回放，因为每次都是插到队首，最终顺序才与桌面端一致
+    for (const cwd of cwds) addRecentCwdInConfig(config, cwd);
+    if (config.recentCwds.join('\n') !== before) saveConfig(config);
   };
 
   // ========== API 路由 ==========
@@ -1366,7 +1452,7 @@ export function startRemoteServer(
     const list = req.body;
     if (!Array.isArray(list)) { res.status(400).json({ error: '需要数组' }); return; }
     config.customPresets = list;
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+    saveConfig(config);
     res.json({ ok: true });
   });
 
@@ -1375,13 +1461,20 @@ export function startRemoteServer(
     res.json(getAvailableBuiltinPresets());
   });
 
+  // 预设使用次数，两端按它给新建会话下拉排序（用得多的靠前）
+  app.get('/api/preset-usage', (_req, res) => {
+    res.json({
+      items: Object.entries(config.presetUsage || {}).map(([command, count]) => ({ command, count })),
+    });
+  });
+
   app.post('/api/push/subscribe', (req, res) => {
     const subscription = req.body.subscription as webpush.PushSubscription;
     if (!subscription) { res.status(400).json({ error: '缺少 subscription' }); return; }
     const exists = config.pushSubscriptions.some(s => s.endpoint === subscription.endpoint);
     if (!exists) {
       config.pushSubscriptions.push(subscription);
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+      saveConfig(config);
     }
     res.json({ ok: true });
   });
@@ -1394,13 +1487,16 @@ export function startRemoteServer(
   }
 
   function mapSessionToApi(s: any) {
+    // 供应商推断要读 ~/.claude/settings.json 甚至 shell rc，只能在会话上算一次：
+    // 这个映射函数每 2s 会被每个 SSE 连接调用一遍。
+    if (!s.provider) s.provider = getCliProvider(s.presetCommand);
     return {
       id: s.id,
       title: s.title,
       cwd: s.cwd,
       presetCommand: s.presetCommand,
       displayName: resolveSessionDisplayName(s.presetCommand, config.customPresets),
-      provider: s.provider || getCliProvider(s.presetCommand),
+      provider: s.provider,
       status: getSessionStatus(s.id, s.ptyProcess),
       createdAt: s.createdAt || Date.now(),
     };
@@ -1450,6 +1546,7 @@ export function startRemoteServer(
     try {
       const items = fs.readdirSync(resolved.dirPath, { withFileTypes: true })
         .filter(entry => entry.name !== '.DS_Store')
+        .filter(entry => !['node_modules', '.git', '.hg', '.svn', '__pycache__'].includes(entry.name))
         .map(entry => ({
           name: entry.name,
           path: path.join(resolved.dirPath, entry.name),
@@ -1466,41 +1563,6 @@ export function startRemoteServer(
   });
 
   // ========== 手机端媒体文件预览（图片/视频/音频/PDF，流式 + Range） ==========
-  // 媒体扩展名 → { mime, kind }；kind 供前端分流渲染（image/video/audio/pdf）
-  const MEDIA_EXT_MAP: Record<string, { mime: string; kind: string }> = {
-    // 图片
-    '.jpg': { mime: 'image/jpeg', kind: 'image' },
-    '.jpeg': { mime: 'image/jpeg', kind: 'image' },
-    '.png': { mime: 'image/png', kind: 'image' },
-    '.gif': { mime: 'image/gif', kind: 'image' },
-    '.webp': { mime: 'image/webp', kind: 'image' },
-    '.bmp': { mime: 'image/bmp', kind: 'image' },
-    '.svg': { mime: 'image/svg+xml', kind: 'image' },
-    '.avif': { mime: 'image/avif', kind: 'image' },
-    '.heic': { mime: 'image/heic', kind: 'image' },   // 原生不可显示，下面转 JPEG
-    '.heif': { mime: 'image/heif', kind: 'image' },
-    // 视频
-    '.mp4': { mime: 'video/mp4', kind: 'video' },
-    '.m4v': { mime: 'video/mp4', kind: 'video' },
-    '.mov': { mime: 'video/quicktime', kind: 'video' },
-    '.webm': { mime: 'video/webm', kind: 'video' },
-    // 音频
-    '.mp3': { mime: 'audio/mpeg', kind: 'audio' },
-    '.m4a': { mime: 'audio/mp4', kind: 'audio' },
-    '.aac': { mime: 'audio/aac', kind: 'audio' },
-    '.wav': { mime: 'audio/wav', kind: 'audio' },
-    '.ogg': { mime: 'audio/ogg', kind: 'audio' },
-    '.flac': { mime: 'audio/flac', kind: 'audio' },
-    // 文档
-    '.pdf': { mime: 'application/pdf', kind: 'pdf' },
-  };
-  const MEDIA_EXTS = new Set(Object.keys(MEDIA_EXT_MAP));
-
-  function getMediaMeta(filePath: string) {
-    const ext = path.extname(filePath).toLowerCase();
-    return MEDIA_EXT_MAP[ext] || null;
-  }
-
   // 列出会话 cwd 内的媒体文件（非递归，避免扫到大目录树）
   app.get('/api/sessions/:id/media-list', (req, res) => {
     const session = ptyManager.getSession(req.params.id);
@@ -1600,10 +1662,10 @@ export function startRemoteServer(
     }
   });
 
-  // 最近工作目录（桌面端同步 + 运行中会话 cwd 去重合并）
+  // 最近工作目录（目录池 MRU 顺序，运行中会话的 cwd 兜底补在末尾）
   app.get('/api/recent-cwds', (_req, res) => {
     const fromSessions = ptyManager.getAllSessions().map(s => normalizeCwd(s.cwd)).filter(Boolean);
-    const merged = [...fromSessions, ...config.recentCwds];
+    const merged = [...config.recentCwds, ...fromSessions];
     const uniq: string[] = [];
     for (const p of merged) {
       if (p && !uniq.includes(p)) uniq.push(p);
@@ -1621,19 +1683,20 @@ export function startRemoteServer(
         targetCwd,
         presetCommand || '',
         typeof themeId === 'string' && themeId ? themeId : 'default',
-        providerEnv && typeof providerEnv === 'object' ? providerEnv : undefined,
+        mergeSessionEnv(config.customPresets, presetCommand || '', providerEnv),
       );
       const info = {
         id: session.id,
         title: session.title,
         themeId: session.themeId,
         cwd: session.cwd,
-        displayName: getDisplayName(session.presetCommand),
+        displayName: resolveSessionDisplayName(session.presetCommand, config.customPresets),
         cli: session.cliKind,
         resumeId: session.resumeId,
       };
       addRecentCwdInConfig(config, session.cwd);
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+      bumpPresetUsageInConfig(config, session.presetCommand || '');
+      saveConfig(config);
       onRemoteCreate?.(info);
       res.json(info);
     } catch (e: any) {
@@ -1722,6 +1785,153 @@ export function startRemoteServer(
     if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
     ptyManager.rename(req.params.id, title.trim());
     res.json({ ok: true });
+  });
+
+  function mapClosedSessionToApi(cs: import('./closed-sessions').ClosedSession) {
+    return {
+      id: cs.id,
+      title: cs.title,
+      cwd: cs.cwd,
+      presetCommand: cs.presetCommand,
+      resumeId: cs.resumeId,
+      resumeCommand: cs.resumeCommand,
+      displayName: cs.displayName || getDisplayName(cs.presetCommand),
+      closedAt: cs.closedAt,
+      state: cs.state || 'closed',
+    };
+  }
+
+  // 已关闭会话 — 可恢复的历史记录
+  app.get('/api/closed-sessions', (_req, res) => {
+    if (!closedSessionsManager) { res.json([]); return; }
+    const items = closedSessionsManager.list()
+      .sort((a, b) => b.closedAt - a.closedAt)
+      .map(mapClosedSessionToApi);
+    res.json(items);
+  });
+
+  app.post('/api/closed-sessions/:id/begin-restore', (req, res) => {
+    if (!closedSessionsManager) { res.status(503).json({ error: '服务不可用' }); return; }
+    const ok = closedSessionsManager.beginRestore(req.params.id);
+    if (!ok) { res.status(409).json({ error: '无法开始恢复' }); return; }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/closed-sessions/:id/cancel-restore', (req, res) => {
+    if (!closedSessionsManager) { res.status(503).json({ error: '服务不可用' }); return; }
+    const ok = closedSessionsManager.cancelRestore(req.params.id);
+    if (!ok) { res.status(409).json({ error: '无法取消恢复' }); return; }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/closed-sessions/:id/confirm-restore', async (req, res) => {
+    if (!closedSessionsManager) { res.status(503).json({ error: '服务不可用' }); return; }
+    const sessionId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : '';
+    if (!sessionId) { res.status(400).json({ error: '缺少 sessionId' }); return; }
+    const ok = await closedSessionsManager.confirmRestore(req.params.id, sessionId, ptyManager);
+    if (ok) closedSessionsManager.remove(req.params.id);
+    res.json({ ok });
+  });
+
+  app.delete('/api/closed-sessions/:id', (req, res) => {
+    if (!closedSessionsManager) { res.status(503).json({ error: '服务不可用' }); return; }
+    const items = closedSessionsManager.remove(req.params.id).map(mapClosedSessionToApi);
+    res.json({ ok: true, items });
+  });
+
+  app.delete('/api/closed-sessions', (_req, res) => {
+    if (!closedSessionsManager) { res.status(503).json({ error: '服务不可用' }); return; }
+    closedSessionsManager.clear();
+    res.json({ ok: true, items: [] });
+  });
+
+  // ========== 上下文导出 API ==========
+  const exportDir = userDataPath ? path.join(userDataPath, 'context-exports') : null;
+  
+  function ensureExportDirectory() {
+    if (!exportDir) return false;
+    if (!fs.existsSync(exportDir)) {
+      try {
+        fs.mkdirSync(exportDir, { recursive: true });
+        return true;
+      } catch (err) {
+        console.error('[RemoteServer] 无法创建立导出目录:', err);
+        return false;
+      }
+    }
+    return true;
+  }
+  
+  app.get('/api/context-exports/list', (_req, res) => {
+    if (!ensureExportDirectory()) {
+      res.json([]);
+      return;
+    }
+    
+    try {
+      // 这里可以安全使用 exportDir，因为 ensureExportDirectory() 已经确保它不为空
+      const files = fs.readdirSync(exportDir!).filter(f => f.endsWith('.json'));
+      const exports = files.map(filename => {
+        try {
+          const content = fs.readFileSync(path.join(exportDir!, filename), 'utf8');
+          const context = JSON.parse(content);
+          return {
+            filename,
+            title: context.title || '未命名',
+            sourceAgent: context.sourceAgent || 'unknown',
+            targetAgent: context.targetAgent || null,
+            createdAt: Number(context.createdAt) || 0,
+            messageCount: Array.isArray(context.contextHistory) ? context.contextHistory.length : 0,
+            cwd: context.cwd || '',
+          };
+        } catch (err) {
+          console.error('[RemoteServer] 读取导出文件失败:', filename, err);
+          return null;
+        }
+      }).filter(Boolean);
+      
+      res.json(exports.sort((a: any, b: any) => {
+        const aTime = (typeof a.createdAt === 'number') ? a.createdAt : 0;
+        const bTime = (typeof b.createdAt === 'number') ? b.createdAt : 0;
+        return bTime - aTime;
+      }));
+    } catch (err) {
+      res.status(500).json({ error: '列出导出失败：' + (err as Error).message });
+    }
+  });
+  
+  app.get('/api/context-exports/:filename', (req, res) => {
+    if (!exportDir) {
+      res.status(503).json({ error: '导出服务不可用' });
+      return;
+    }
+    
+    const filename = req.params.filename;
+    if (!filename || !filename.endsWith('.json')) {
+      res.status(400).json({ error: '无效的文件名' });
+      return;
+    }
+    
+    const filePath = path.join(exportDir!, filename);
+    
+    // 安全检查
+    if (!filePath.startsWith(exportDir! + path.sep) && filePath !== exportDir!) {
+      res.status(403).json({ error: '非法路径' });
+      return;
+    }
+    
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: '文件不存在' });
+      return;
+    }
+    
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      const context = JSON.parse(content);
+      res.json(context);
+    } catch (err) {
+      res.status(500).json({ error: '读取文件失败：' + (err as Error).message });
+    }
   });
 
   // 删除会话
@@ -2026,20 +2236,43 @@ export function startRemoteServer(
     res.json({ ok: true });
   });
 
-  // SSE 事件流
+  // SSE 事件流；Token 轮换时要能立刻掐断旧连接，迫使手机端重新授权。
   app.get('/api/events', (req, res) => {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
     });
+    sseClients.add(res);
+    // 内容没变就不推：手机端收到一次就会整列表重渲染，无条件的双事件等于每 2s 重建两次，
+    // 还会把用户正在滑开的会话卡片换成新节点、打断手势。存活性由 3s 心跳保证。
+    let lastSessionsPayload = '';
+    let lastClosedPayload = '';
     const sendSessions = () => {
-      const sessions = ptyManager.getAllSessions().map(s => mapSessionToApi(s));
-      res.write(`event: sessions\ndata: ${JSON.stringify(sessions)}\n\n`);
+      const sessions = JSON.stringify(ptyManager.getAllSessions().map(s => mapSessionToApi(s)));
+      if (sessions !== lastSessionsPayload) {
+        lastSessionsPayload = sessions;
+        res.write(`event: sessions\ndata: ${sessions}\n\n`);
+      }
+      if (!closedSessionsManager) return;
+      const closed = JSON.stringify(closedSessionsManager.list()
+        .sort((a, b) => b.closedAt - a.closedAt)
+        .map(mapClosedSessionToApi));
+      if (closed !== lastClosedPayload) {
+        lastClosedPayload = closed;
+        res.write(`event: closed-sessions\ndata: ${closed}\n\n`);
+      }
     };
     const heartbeat = setInterval(() => { res.write(': heartbeat\n\n'); }, 3000);
     const statusInterval = setInterval(sendSessions, 2000);
-    req.on('close', () => { clearInterval(heartbeat); clearInterval(statusInterval); });
+    sendSessions();
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      clearInterval(statusInterval);
+      sseClients.delete(res);
+    };
+    req.on('close', cleanup);
+    res.on('close', cleanup);
   });
 
   // ========== 推送通知 ==========
@@ -2051,7 +2284,7 @@ export function startRemoteServer(
       webpush.sendNotification(sub, payload).catch((err: any) => {
         if (err.statusCode === 410 || err.statusCode === 404) {
           config.pushSubscriptions = config.pushSubscriptions.filter(s => s.endpoint !== sub.endpoint);
-          fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+          saveConfig(config);
         }
       });
     }
@@ -2097,9 +2330,30 @@ export function startRemoteServer(
 }
 
 /** 推送 pty 原始数据给远程 WebSocket 客户端 */
-export function pushRawDataToRemote(id: string, data: string, sequence?: number, size?: { cols: number; rows: number }): void {
-  if (size) (startRemoteServer as any)._pushResize?.(id);
-  else (startRemoteServer as any)._pushRawData?.(id, data, sequence);
+export function pushRawDataToRemote(id: string, data: string, sequence?: number): void {
+  (startRemoteServer as any)._pushRawData?.(id, data, sequence);
+}
+
+/**
+ * 更新远程访问 Token（写入磁盘 + 运行中 config），并断开旧连接。
+ * 服务未启动时也允许改落盘配置，下次启动生效。
+ */
+export function updateRemoteAccessToken(
+  nextToken: string,
+): { ok: true; token: string } | { ok: false; error: string } {
+  const token = normalizeAccessToken(nextToken);
+  const live = (startRemoteServer as any)._updateAccessToken;
+  if (typeof live === 'function') {
+    return live(token);
+  }
+  const config = loadOrCreateConfig();
+  if (config.token === token) return { ok: true, token };
+  if (!isValidAccessToken(token)) {
+    return { ok: false, error: 'Token 需为 8–128 位可见字符（勿含空格）' };
+  }
+  config.token = token;
+  saveConfig(config);
+  return { ok: true, token };
 }
 
 /** 发送推送通知 */
@@ -2107,14 +2361,40 @@ export function sendRemotePush(title: string, body: string, sessionId: string): 
   (startRemoteServer as any)._sendPush?.(title, body, sessionId);
 }
 
+/** 桌面端创建会话时记录预设使用次数，两端下拉按同一份频率排序 */
+export function recordRemotePresetUsage(presetCommand: string): void {
+  (startRemoteServer as any)._bumpPresetUsage?.(presetCommand || '');
+}
+
+export function getCustomPresetEnv(presetCommand: string): Record<string, string> {
+  const live = (startRemoteServer as any)._getCustomPresetEnv;
+  if (typeof live === 'function') return live(presetCommand) || {};
+  const config = loadOrCreateConfig();
+  return resolvePresetEnv(config.customPresets, presetCommand);
+}
+
+/** 桌面端一次性回放整份最近目录（旧 -> 新），避免逐条写盘 */
+export function syncRemoteRecentCwds(cwds: string[]): void {
+  const list = (Array.isArray(cwds) ? cwds : []).map(normalizeCwd).filter(Boolean);
+  if (list.length === 0) return;
+  const live = (startRemoteServer as any)._syncRecentCwds;
+  if (typeof live === 'function') { live(list); return; }
+  const config = loadOrCreateConfig();
+  const prev = config.recentCwds.join('\n');
+  for (const cwd of list) addRecentCwdInConfig(config, cwd);
+  if (config.recentCwds.join('\n') !== prev) saveConfig(config);
+}
+
 /** 桌面端同步最近目录到远程配置（供手机端新建会话下拉使用） */
 export function addRemoteRecentCwd(cwd: string): void {
   const normalized = normalizeCwd(cwd);
   if (!normalized) return;
+  const live = (startRemoteServer as any)._addRecentCwd;
+  if (typeof live === 'function') { live(normalized); return; }
   const config = loadOrCreateConfig();
   const prev = config.recentCwds.join('\n');
   addRecentCwdInConfig(config, normalized);
   if (config.recentCwds.join('\n') !== prev) {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+    saveConfig(config);
   }
 }

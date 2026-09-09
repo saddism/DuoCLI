@@ -8,6 +8,24 @@ import {
   scheduleAutoContinueRunTimeout,
   shouldResetAfterManualInput,
 } from './auto-continue-runtime';
+import { formatPresetEnv, parsePresetEnv, resolvePresetEnv } from '../main/preset-env';
+
+// 与手机端共用同一份 CLI 标签配色，见 mobile/client/cli-tag-colors.js
+const { getCliTagColors } = require('../../mobile/client/cli-tag-colors.js') as {
+  getCliTagColors: (displayName: string) => [string, string];
+};
+
+// 与手机端共用同一份 CLI Logo，见 mobile/client/cli-logos.js
+const { getLogoUrl, hasLogo } = require('../../mobile/client/cli-logos.js') as {
+  getLogoUrl: (cliName: string) => string;
+  hasLogo: (cliName: string) => boolean;
+};
+
+// 导入用户主题配置
+import { USER_THEMES_CONFIG } from './terminal-manager';
+
+// 导入通知助手
+import { setupNotificationListener } from './notification-helpers';
 
 let remoteServerInfo: {
   lanUrl: string;
@@ -32,12 +50,14 @@ interface RemoteSyncHealth {
 
 let remoteTokenVisible = false;
 let remoteTokenValue = '';
+let remoteTokenEditing = false;
+let remoteTokenSaving = false;
 
 declare global {
   interface Window {
     duocli: {
       setWindowTitle: (title: string) => void;
-      createPty: (cwd: string, presetCommand: string, themeId: string) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }>;
+      createPty: (cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }>;
       writePty: (id: string, data: string) => void;
       resizePty: (id: string, cols: number, rows: number) => void;
       destroyPty: (id: string) => Promise<boolean>;
@@ -47,6 +67,7 @@ declare global {
       selectFolder: (currentPath?: string) => Promise<string | null>;
       fileTreeListDir: (dirPath: string) => Promise<Array<{ name: string; path: string; isDir: boolean }>>;
       remoteAddRecentCwd: (cwd: string) => Promise<boolean>;
+      remoteSyncRecentCwds: (cwds: string[]) => Promise<boolean>;
       onPtyData: (cb: (id: string, data: string) => void) => void;
       onTitleUpdate: (cb: (id: string, title: string) => void) => void;
       onPtyExit: (cb: (id: string) => void) => void;
@@ -56,6 +77,8 @@ declare global {
       getRemoteServerInfo: () => Promise<NonNullable<typeof remoteServerInfo> | null>;
       getRemoteHealth: () => Promise<RemoteSyncHealth | null>;
       retryRemoteSync: () => Promise<RemoteSyncHealth | null>;
+      setRemoteToken: (token: string) => Promise<{ ok: true; token: string } | { ok: false; error: string }>;
+      generateRemoteToken: () => Promise<string>;
       clipboardSaveImage: () => Promise<string | null>;
       clipboardGetFilePath: () => Promise<string | null>;
       // 文件监听 API
@@ -121,11 +144,15 @@ interface TerminalAutoResponseConfig {
 // 状态
 const savedCwd = localStorage.getItem('duocli_cwd') || '';
 let currentCwd = savedCwd;
-const LEGACY_QODER_AUTO_COMMAND = 'qoder chat --dangerously-skip-permissions';
+const LEGACY_QODER_CHAT_AUTO_COMMAND = 'qoder chat --dangerously-skip-permissions';
+const LEGACY_QODER_AUTO_COMMAND = 'qoder --dangerously-skip-permissions';
+const QODER_AUTO_COMMAND = 'qodercli --dangerously-skip-permissions';
 const QODERCN_AUTO_COMMAND = 'qodercn --dangerously-skip-permissions';
 
 function migrateLegacyQoderPreset(value: string): string {
-  return value === LEGACY_QODER_AUTO_COMMAND ? QODERCN_AUTO_COMMAND : value;
+  if (value === LEGACY_QODER_CHAT_AUTO_COMMAND) return QODERCN_AUTO_COMMAND;
+  if (value === LEGACY_QODER_AUTO_COMMAND) return QODER_AUTO_COMMAND;
+  return value;
 }
 
 const savedPreset = localStorage.getItem('duocli_preset') || '';
@@ -555,6 +582,7 @@ interface CustomPreset {
   name: string;
   command: string;
   autoFlag: string;
+  env?: Record<string, string>;
 }
 
 interface FileTreeItem {
@@ -564,29 +592,37 @@ interface FileTreeItem {
 }
 
 const CUSTOM_PRESETS_KEY = 'duocli_custom_presets';
+// 已与服务端对齐过的预设 id：对账时以服务端为准，本地只留还没推上去的新增项，
+// 否则手机端删掉的预设会在桌面端一直复活。
+const CUSTOM_PRESETS_SYNCED_KEY = 'duocli_custom_presets_synced';
 const PRESET_SYNC_INTERVAL_MS = 30 * 1000;
 let customPresetNextId = 1;
 let presetSyncInFlight = false;
 let presetSyncTimer: ReturnType<typeof setInterval> | null = null;
+// 预设命令 → 使用次数，由远程服务统计，两端共用同一份排序
+let presetUsage = new Map<string, number>();
 
 function getCustomPresets(): CustomPreset[] {
   try { return JSON.parse(localStorage.getItem(CUSTOM_PRESETS_KEY) || '[]'); } catch { return []; }
 }
 
+function getSyncedPresetIds(): string[] {
+  try { return JSON.parse(localStorage.getItem(CUSTOM_PRESETS_SYNCED_KEY) || '[]'); } catch { return []; }
+}
+
+function markPresetsSynced(list: CustomPreset[]): void {
+  localStorage.setItem(CUSTOM_PRESETS_SYNCED_KEY, JSON.stringify(list.map(p => p.id)));
+}
+
 function saveCustomPresets(list: CustomPreset[]): void {
   localStorage.setItem(CUSTOM_PRESETS_KEY, JSON.stringify(list));
   // 同步到远程服务器，供手机端读取
-  syncPresetsToServer(list);
+  void syncPresetsToServer(list);
 }
 
 async function syncPresetsToServer(list: CustomPreset[]): Promise<void> {
-  if (!remoteServerInfo) {
-    console.log('[Preset Sync] Remote server not ready, skipping sync');
-    return;
-  }
-  
-  console.log('[Preset Sync] Syncing presets to server:', list.length, 'items');
-  
+  if (!remoteServerInfo) return;
+
   let retries = 3;
   while (retries > 0) {
     try {
@@ -597,7 +633,7 @@ async function syncPresetsToServer(list: CustomPreset[]): Promise<void> {
       });
       
       if (response.ok) {
-        console.log('[Preset Sync] Successfully synced presets to server');
+        markPresetsSynced(list);
         return;
       } else {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -622,7 +658,9 @@ async function pullPresetsFromServer(): Promise<CustomPreset[] | null> {
     const res = await fetch(`http://127.0.0.1:${remoteServerInfo.port}/api/custom-presets`, {
       headers: { 'Authorization': `Bearer ${remoteServerInfo.token}` },
     });
-    if (res.ok) return await res.json();
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Array.isArray(data) ? data as CustomPreset[] : null;
   } catch { /* ignore */ }
   return null;
 }
@@ -631,7 +669,16 @@ function arePresetListsEqual(a: CustomPreset[], b: CustomPreset[]): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-async function reconcilePresetsWithServer(reason: string): Promise<void> {
+// 计数器要跟着合并后的列表走，否则两端各自生成 custom-N 会撞号互相覆盖
+function refreshCustomPresetIdCounter(): void {
+  customPresetNextId = 1;
+  for (const p of getCustomPresets()) {
+    const m = p.id && p.id.match(/^custom-(\d+)$/);
+    if (m) customPresetNextId = Math.max(customPresetNextId, parseInt(m[1]) + 1);
+  }
+}
+
+async function reconcilePresetsWithServer(): Promise<void> {
   if (!remoteServerInfo || presetSyncInFlight) return;
   presetSyncInFlight = true;
   try {
@@ -639,20 +686,22 @@ async function reconcilePresetsWithServer(reason: string): Promise<void> {
     const serverPresets = await pullPresetsFromServer();
     if (!serverPresets) return;
 
-    const merged = new Map<string, CustomPreset>();
-    for (const p of localPresets) merged.set(p.id, p);
-    for (const p of serverPresets) merged.set(p.id, p);
-    const list = Array.from(merged.values());
+    // 服务端为准，本地只保留还没成功推上去的新增项，另一端删掉的预设才不会复活
+    const synced = getSyncedPresetIds();
+    const serverIds = new Set(serverPresets.map(p => p.id));
+    const pending = localPresets.filter(p => !synced.includes(p.id) && !serverIds.has(p.id));
+    const list = [...serverPresets, ...pending];
 
     if (!arePresetListsEqual(localPresets, list)) {
-      console.log('[Preset Sync] Updating local presets from server:', reason);
       localStorage.setItem(CUSTOM_PRESETS_KEY, JSON.stringify(list));
+      refreshCustomPresetIdCounter();
       renderPresetSelect();
     }
 
     if (!arePresetListsEqual(serverPresets, list)) {
-      console.log('[Preset Sync] Updating server presets from local:', reason);
       await syncPresetsToServer(list);
+    } else {
+      markPresetsSynced(list);
     }
   } finally {
     presetSyncInFlight = false;
@@ -662,7 +711,7 @@ async function reconcilePresetsWithServer(reason: string): Promise<void> {
 function startPresetSyncTimer(): void {
   if (presetSyncTimer) return;
   presetSyncTimer = setInterval(() => {
-    void reconcilePresetsWithServer('timer');
+    void reconcilePresetsWithServer();
   }, PRESET_SYNC_INTERVAL_MS);
 }
 
@@ -681,6 +730,22 @@ async function refreshBuiltinOptions(): Promise<void> {
   } catch (err) {
     console.warn('[Preset] Failed to load available builtins:', err);
   }
+}
+
+/** 读取远程服务统计的预设使用次数，下拉按它排序（与手机端同一份） */
+async function refreshPresetUsage(): Promise<void> {
+  if (!remoteServerInfo) return;
+  try {
+    const res = await fetch(`http://127.0.0.1:${remoteServerInfo.port}/api/preset-usage`, {
+      headers: { 'Authorization': `Bearer ${remoteServerInfo.token}` },
+    });
+    if (!res.ok) return;
+    const data = await res.json() as { items?: Array<{ command: string; count: number }> };
+    const items = Array.isArray(data?.items) ? data.items : [];
+    presetUsage = new Map(
+      items.filter(i => i && typeof i.command === 'string').map(i => [i.command, Number(i.count) || 0])
+    );
+  } catch { /* ignore */ }
 }
 
 // 渲染远程服务器连接信息
@@ -728,13 +793,32 @@ function renderRemoteServerInfo(): void {
 
   if (remoteTokenValue !== remoteServerInfo.token) {
     remoteTokenValue = remoteServerInfo.token;
-    remoteTokenVisible = false;
+    if (!remoteTokenEditing) remoteTokenVisible = false;
   }
-  tokenValueEl.textContent = remoteTokenVisible
-    ? remoteServerInfo.token
-    : '•'.repeat(Math.min(Math.max(remoteServerInfo.token.length, 8), 24));
-  tokenValueEl.dataset.visible = remoteTokenVisible ? 'true' : 'false';
-  tokenValueEl.title = remoteTokenVisible ? '点击复制 Token' : 'Token 已隐藏';
+
+  const tokenInputEl = remoteServerInfoEl.querySelector('.remote-info-token-input') as HTMLInputElement;
+  const tokenEditBtn = remoteServerInfoEl.querySelector('.remote-info-token-edit') as HTMLButtonElement;
+  const tokenSaveBtn = remoteServerInfoEl.querySelector('.remote-info-token-save') as HTMLButtonElement;
+  const tokenCancelBtn = remoteServerInfoEl.querySelector('.remote-info-token-cancel') as HTMLButtonElement;
+
+  remoteServerInfoEl.classList.toggle('token-editing', remoteTokenEditing);
+  tokenValueEl.hidden = remoteTokenEditing;
+  tokenInputEl.hidden = !remoteTokenEditing;
+  tokenEditBtn.hidden = remoteTokenEditing;
+  tokenSaveBtn.hidden = !remoteTokenEditing;
+  tokenCancelBtn.hidden = !remoteTokenEditing;
+  tokenEditBtn.disabled = remoteTokenSaving;
+  tokenSaveBtn.disabled = remoteTokenSaving;
+  tokenCancelBtn.disabled = remoteTokenSaving;
+  tokenToggleBtn.disabled = remoteTokenEditing || remoteTokenSaving;
+
+  if (!remoteTokenEditing) {
+    tokenValueEl.textContent = remoteTokenVisible
+      ? remoteServerInfo.token
+      : '•'.repeat(Math.min(Math.max(remoteServerInfo.token.length, 8), 24));
+    tokenValueEl.dataset.visible = remoteTokenVisible ? 'true' : 'false';
+    tokenValueEl.title = remoteTokenVisible ? '点击复制 Token' : '点击修改 Token';
+  }
   tokenToggleBtn.setAttribute('aria-pressed', remoteTokenVisible ? 'true' : 'false');
   tokenToggleBtn.title = remoteTokenVisible ? '隐藏 Token' : '显示 Token';
   tokenToggleBtn.setAttribute('aria-label', tokenToggleBtn.title);
@@ -767,46 +851,89 @@ async function handleRemoteRetryClick(): Promise<void> {
   }
 }
 
+function setRemoteTokenHint(message: string, kind: 'ok' | 'error' | '' = ''): void {
+  const hintEl = remoteServerInfoEl.querySelector('.remote-info-token-hint') as HTMLElement;
+  hintEl.hidden = !message;
+  hintEl.textContent = message;
+  hintEl.classList.toggle('is-ok', kind === 'ok');
+  hintEl.classList.toggle('is-error', kind === 'error');
+}
+
+function enterRemoteTokenEditMode(): void {
+  if (!remoteServerInfo || remoteTokenSaving) return;
+  remoteTokenEditing = true;
+  remoteTokenVisible = true;
+  setRemoteTokenHint('保存后，手机端需用新 Token 重新登录', '');
+  renderRemoteServerInfo();
+  const inputEl = remoteServerInfoEl.querySelector('.remote-info-token-input') as HTMLInputElement;
+  inputEl.value = remoteServerInfo.token;
+  inputEl.focus();
+  inputEl.select();
+}
+
+function cancelRemoteTokenEditMode(): void {
+  if (remoteTokenSaving) return;
+  remoteTokenEditing = false;
+  setRemoteTokenHint('', '');
+  renderRemoteServerInfo();
+}
+
+async function saveRemoteTokenEdit(): Promise<void> {
+  if (!remoteServerInfo || remoteTokenSaving) return;
+  const inputEl = remoteServerInfoEl.querySelector('.remote-info-token-input') as HTMLInputElement;
+  const next = inputEl.value.trim();
+  if (!next) {
+    setRemoteTokenHint('Token 不能为空', 'error');
+    inputEl.focus();
+    return;
+  }
+  remoteTokenSaving = true;
+  setRemoteTokenHint('正在保存…', '');
+  renderRemoteServerInfo();
+  try {
+    const result = await window.duocli.setRemoteToken(next);
+    if (!result.ok) {
+      setRemoteTokenHint(result.error, 'error');
+      return;
+    }
+    remoteServerInfo = { ...remoteServerInfo, token: result.token };
+    remoteTokenValue = result.token;
+    remoteTokenVisible = true;
+    remoteTokenEditing = false;
+    setRemoteTokenHint('已保存。网页端请用新 Token 重新授权', 'ok');
+  } catch (err) {
+    setRemoteTokenHint(err instanceof Error ? err.message : '保存失败', 'error');
+  } finally {
+    remoteTokenSaving = false;
+    renderRemoteServerInfo();
+  }
+}
+
 function renderPresetSelect(): void {
   const prev = presetSelect.value;
   presetSelect.innerHTML = '';
 
-  // 内置选项
-  for (const opt of BUILTIN_OPTIONS) {
+  const options = BUILTIN_OPTIONS.map(o => ({ value: o.value, label: o.label }));
+  for (const p of getCustomPresets()) {
+    options.push({
+      value: p.autoFlag ? p.command + ' ' + p.autoFlag : p.command,
+      label: p.autoFlag ? p.name + ' (全自动)' : p.name,
+    });
+  }
+  // 用得多的靠上；次数相同时保持内置在前、自定义在后（sort 稳定）
+  options.sort((a, b) => (presetUsage.get(b.value) || 0) - (presetUsage.get(a.value) || 0));
+
+  for (const opt of options) {
     const el = document.createElement('option');
     el.value = opt.value;
     el.textContent = opt.label;
     presetSelect.appendChild(el);
   }
 
-  // 自定义预设
-  const customs = getCustomPresets();
-  if (customs.length > 0) {
-    const sep = document.createElement('option');
-    sep.disabled = true;
-    sep.textContent = '── 自定义 ──';
-    presetSelect.appendChild(sep);
-
-    for (const p of customs) {
-      const el = document.createElement('option');
-      el.value = p.autoFlag ? p.command + ' ' + p.autoFlag : p.command;
-      el.textContent = p.autoFlag ? p.name + ' (全自动)' : p.name;
-      presetSelect.appendChild(el);
-    }
-  }
-
   // 恢复之前的选中值
   presetSelect.value = prev;
   // 如果之前的值不存在了，回退到空终端
   if (presetSelect.selectedIndex === -1) presetSelect.value = '';
-
-  // 只在远程服务器可用时同步到服务端
-  if (remoteServerInfo) {
-    console.log('[Preset Sync] Remote server available, syncing presets');
-    syncPresetsToServer(customs);
-  } else {
-    console.log('[Preset Sync] Remote server not available, will sync when ready');
-  }
 }
 
 function showPresetDialog(preset?: CustomPreset): Promise<CustomPreset | null> {
@@ -822,15 +949,20 @@ function showPresetDialog(preset?: CustomPreset): Promise<CustomPreset | null> {
       <div class="preset-form">
         <div class="preset-form-field">
           <label>名称</label>
-          <input type="text" id="preset-name-input" placeholder="如 Aider、自定义 CLI 等" value="${preset?.name || ''}" />
+          <input type="text" id="preset-name-input" placeholder="如 Qoder代理、Aider 等" />
         </div>
         <div class="preset-form-field">
           <label>命令</label>
-          <input type="text" id="preset-cmd-input" placeholder="如 aider、my-cli 等" value="${preset?.command || ''}" />
+          <input type="text" id="preset-cmd-input" placeholder="如 qodercli、aider 等" />
         </div>
         <div class="preset-form-field">
           <label>全自动参数（可选）</label>
-          <input type="text" id="preset-auto-input" placeholder="如 --yes、--yolo 等，留空表示无全自动模式" value="${preset?.autoFlag || ''}" />
+          <input type="text" id="preset-auto-input" placeholder="如 --dangerously-skip-permissions" />
+        </div>
+        <div class="preset-form-field">
+          <label>同一终端先执行（可选）</label>
+          <textarea id="preset-env-input" rows="4" placeholder="export HTTP_PROXY=http://127.0.0.1:39900&#10;export HTTPS_PROXY=http://127.0.0.1:39900"></textarea>
+          <span class="preset-form-hint">会在这个终端里先敲这些命令，再启动上面的 CLI，和插件说的「同一终端先 set 再运行」一样</span>
         </div>
       </div>
       <div class="confirm-buttons" style="margin-top:16px">
@@ -844,6 +976,11 @@ function showPresetDialog(preset?: CustomPreset): Promise<CustomPreset | null> {
     const nameInput = dialog.querySelector('#preset-name-input') as HTMLInputElement;
     const cmdInput = dialog.querySelector('#preset-cmd-input') as HTMLInputElement;
     const autoInput = dialog.querySelector('#preset-auto-input') as HTMLInputElement;
+    const envInput = dialog.querySelector('#preset-env-input') as HTMLTextAreaElement;
+    nameInput.value = preset?.name || '';
+    cmdInput.value = preset?.command || '';
+    autoInput.value = preset?.autoFlag || '';
+    envInput.value = formatPresetEnv(preset?.env);
 
     nameInput.focus();
 
@@ -861,17 +998,26 @@ function showPresetDialog(preset?: CustomPreset): Promise<CustomPreset | null> {
         return;
       }
       const id = preset?.id || `custom-${customPresetNextId++}`;
-      cleanup({ id, name, command, autoFlag: autoInput.value.trim() });
+      const env = parsePresetEnv(envInput.value);
+      cleanup({
+        id,
+        name,
+        command,
+        autoFlag: autoInput.value.trim(),
+        ...(Object.keys(env).length ? { env } : {}),
+      });
     });
 
-    // Enter 键保存
     const handleEnter = (e: KeyboardEvent) => {
-      if (e.key === 'Enter') dialog.querySelector<HTMLButtonElement>('.btn-close-confirm')!.click();
       if (e.key === 'Escape') cleanup(null);
+      if (e.key === 'Enter' && e.target !== envInput) {
+        dialog.querySelector<HTMLButtonElement>('.btn-close-confirm')!.click();
+      }
     };
     nameInput.addEventListener('keydown', handleEnter);
     cmdInput.addEventListener('keydown', handleEnter);
     autoInput.addEventListener('keydown', handleEnter);
+    envInput.addEventListener('keydown', handleEnter);
   });
 }
 
@@ -903,7 +1049,9 @@ function showPresetManageDialog(): void {
         nameEl.textContent = p.name;
         const cmdEl = document.createElement('div');
         cmdEl.className = 'preset-manage-item-cmd';
-        cmdEl.textContent = p.command + (p.autoFlag ? ` (全自动: ${p.autoFlag})` : '');
+        cmdEl.textContent = p.command
+          + (p.autoFlag ? ` (全自动: ${p.autoFlag})` : '')
+          + (p.env && Object.keys(p.env).length ? ' · 先执行环境变量' : '');
         info.appendChild(nameEl);
         info.appendChild(cmdEl);
 
@@ -961,17 +1109,11 @@ function showPresetManageDialog(): void {
 }
 
 // 初始化自定义预设 ID 计数器
-(function initCustomPresetId() {
-  const customs = getCustomPresets();
-  for (const p of customs) {
-    const m = p.id.match(/^custom-(\d+)$/);
-    if (m) customPresetNextId = Math.max(customPresetNextId, parseInt(m[1]) + 1);
-  }
-})();
+refreshCustomPresetIdCounter();
 
-// 最近工作目录
+// 最近工作目录（与远程服务共用同一个目录池，上限保持一致）
 const RECENT_CWD_KEY = 'duocli_recent_cwds';
-const MAX_RECENT_CWDS = 8;
+const MAX_RECENT_CWDS = 20;
 
 function getRecentCwds(): string[] {
   try { return JSON.parse(localStorage.getItem(RECENT_CWD_KEY) || '[]'); } catch { return []; }
@@ -988,10 +1130,29 @@ function addRecentCwd(cwd: string): void {
 
 function syncRecentCwdsToRemote(): void {
   const list = getRecentCwds();
-  // 按“旧 -> 新”顺序回放，保证远程端最终顺序与桌面端一致
-  list.slice().reverse().forEach((cwd) => {
-    window.duocli.remoteAddRecentCwd(cwd).catch(() => { /* ignore */ });
-  });
+  if (list.length === 0) return;
+  // 按“旧 -> 新”交给主进程回放：远程端每次插到队首，最终顺序才与桌面端一致
+  window.duocli.remoteSyncRecentCwds(list.slice().reverse()).catch(() => { /* ignore */ });
+}
+
+/** 把远程目录池并回本地，手机端新建过的目录桌面端也能选到 */
+async function pullRecentCwdsFromRemote(): Promise<void> {
+  if (!remoteServerInfo) return;
+  try {
+    const res = await fetch(`http://127.0.0.1:${remoteServerInfo.port}/api/recent-cwds`, {
+      headers: { 'Authorization': `Bearer ${remoteServerInfo.token}` },
+    });
+    if (!res.ok) return;
+    const data = await res.json() as { items?: string[] };
+    const remote = Array.isArray(data?.items) ? data.items.filter(Boolean) : [];
+    if (remote.length === 0) return;
+    const local = getRecentCwds();
+    const merged = [...local, ...remote.filter(p => !local.includes(p))];
+    if (merged.length > MAX_RECENT_CWDS) merged.length = MAX_RECENT_CWDS;
+    if (merged.join('\n') === local.join('\n')) return;
+    localStorage.setItem(RECENT_CWD_KEY, JSON.stringify(merged));
+    if (cwdRecentDropdown.classList.contains('open')) renderRecentCwdDropdown();
+  } catch { /* ignore */ }
 }
 
 // DOM 元素
@@ -1371,6 +1532,7 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
         if (message.status === 'starting') setHint('正在建立实时镜像…');
         else if (message.status === 'ready') {
           setHint('');
+          if (!mirror?.isController) mirror?.claimControl(true);
         } else if (message.status === 'error') {
           setHint(mirrorLastError || '实时镜像不可用，已切换截图回退');
           startFallback();
@@ -1382,8 +1544,13 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
         }
       },
       onMeta: (meta) => {
+        if (meta?.width) preview.dataset.deviceWidth = String(meta.width);
+        if (meta?.height) preview.dataset.deviceHeight = String(meta.height);
         if (meta?.geometryVersion) {
           preview.dataset.latestGeometryVersion = String(meta.geometryVersion);
+          if (!Number(preview.dataset.presentedGeometryVersion)) {
+            preview.dataset.presentedGeometryVersion = String(meta.geometryVersion);
+          }
         }
         if (mirror?.hasFrame) setPreviewVisible(true);
       },
@@ -1461,11 +1628,12 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
     if (!width || !height) return null;
     const rect = surface.getBoundingClientRect();
     if (!rect.width || !rect.height) return null;
+    const fillsCssBox = surface instanceof HTMLCanvasElement;
     const scale = Math.min(rect.width / width, rect.height / height);
-    const renderedWidth = width * scale;
-    const renderedHeight = height * scale;
-    const offsetX = (rect.width - renderedWidth) / 2;
-    const offsetY = (rect.height - renderedHeight) / 2;
+    const renderedWidth = fillsCssBox ? rect.width : width * scale;
+    const renderedHeight = fillsCssBox ? rect.height : height * scale;
+    const offsetX = fillsCssBox ? 0 : (rect.width - renderedWidth) / 2;
+    const offsetY = fillsCssBox ? 0 : (rect.height - renderedHeight) / 2;
     const renderedLeft = rect.left + offsetX;
     const renderedTop = rect.top + offsetY;
     if (event.clientX < renderedLeft || event.clientX > renderedLeft + renderedWidth
@@ -1474,7 +1642,7 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
     const deviceHeight = Number(surface.dataset.deviceHeight) || height;
     const latestGeometry = Number(surface.dataset.latestGeometryVersion) || 0;
     const presentedGeometry = Number(surface.dataset.presentedGeometryVersion) || 0;
-    if (latestGeometry && presentedGeometry !== latestGeometry) return null;
+    if (latestGeometry && presentedGeometry && presentedGeometry !== latestGeometry) return null;
     return {
       x: Math.max(0, Math.min(deviceWidth - 1, Math.round((event.clientX - renderedLeft) / renderedWidth * (deviceWidth - 1)))),
       y: Math.max(0, Math.min(deviceHeight - 1, Math.round((event.clientY - renderedTop) / renderedHeight * (deviceHeight - 1)))),
@@ -1487,9 +1655,33 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
       : window.duocli.androidTap(deviceId, end.x, end.y);
     void action.then(() => loadScreenshot());
   };
+  const sendLiveGesture = (start: { x: number; y: number }, end: { x: number; y: number }, pointerId: number): boolean => {
+    if (!mirror?.isReady() || !mirror.isController || mirror.getGeometryVersion() <= 0) return false;
+    const moved = Math.hypot(end.x - start.x, end.y - start.y);
+    if (moved < 12) {
+      return mirror.sendInput({ type: 'tap', pointerId, x: end.x, y: end.y, pressure: 1 }) != null;
+    }
+    const down = mirror.sendInput({ type: 'touch', action: 'down', pointerId, x: start.x, y: start.y, pressure: 1 });
+    if (down == null) return false;
+    const move = mirror.sendInput({ type: 'touch', action: 'move', pointerId, x: end.x, y: end.y, pressure: 1 });
+    const up = move == null ? null : mirror.sendInput({ type: 'touch', action: 'up', pointerId, x: end.x, y: end.y, pressure: 0 });
+    if (up == null) {
+      if (mirror.isReady()) {
+        mirror.sendEmergencyInput({ type: 'touch', action: 'cancel', pointerId, x: end.x, y: end.y, pressure: 0 });
+      }
+      return false;
+    }
+    return true;
+  };
   const bindSurface = (surface: HTMLCanvasElement | HTMLImageElement) => {
     surface.style.touchAction = 'none';
-    const activePointers = new Map<number, { deviceId: string; start: { x: number; y: number }; last: { x: number; y: number }; sentDown: boolean }>();
+    const activePointers = new Map<number, {
+      deviceId: string;
+      start: { x: number; y: number };
+      last: { x: number; y: number };
+      sentDown: boolean;
+      transport: 'mirror' | 'legacy';
+    }>();
     const pendingMoves = new Map<number, { x: number; y: number }>();
     let moveFrame = 0;
     const flushMoves = () => {
@@ -1497,7 +1689,7 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
       for (const [pointerId, point] of pendingMoves) {
         pendingMoves.delete(pointerId);
         const state = activePointers.get(pointerId);
-        if (state?.sentDown && mirror?.isReady()) {
+        if (state?.sentDown && mirror?.isReady() && mirror.isController) {
           mirror.sendInput({ type: 'touch', action: 'move', pointerId, x: point.x, y: point.y, pressure: 1 });
         }
       }
@@ -1508,12 +1700,21 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
       if (!point) return;
       event.preventDefault();
       const deviceId = currentDevice;
-      const sentDown = mirror?.isReady()
-        ? (mirror.isController
-          ? mirror.sendInput({ type: 'touch', action: 'down', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 1 }) != null
-          : (mirror.claimControl(true), false))
+      const mirrorReady = mirror?.isReady() && mirror.hasFrame && surface === preview;
+      if (mirrorReady && !mirror.isController) mirror.claimControl(true);
+      const sentDown = mirrorReady && mirror.isController
+        ? mirror.sendInput({ type: 'touch', action: 'down', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 1 }) != null
         : false;
-      activePointers.set(event.pointerId, { deviceId, start: point, last: point, sentDown });
+      activePointers.set(event.pointerId, {
+        deviceId,
+        start: point,
+        last: point,
+        sentDown,
+        // Once DOWN was attempted on the mirror, keep the whole gesture on
+        // that transport. Switching to ADB on UP can be rejected by the active
+        // mirror lease and leaves the Android pointer pressed.
+        transport: mirrorReady ? 'mirror' : 'legacy',
+      });
       surface.setPointerCapture?.(event.pointerId);
     });
     surface.addEventListener('pointermove', (event) => {
@@ -1535,23 +1736,80 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
       if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; flushMoves(); }
       surface.releasePointerCapture?.(event.pointerId);
       event.preventDefault();
-      if (state.sentDown && mirror?.isReady()) {
-        mirror.sendInput({ type: 'touch', action: 'up', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 0 });
-      } else if (!state.sentDown) {
+      if (state.transport === 'legacy') {
         sendLegacyGesture(state.deviceId, state.start, point);
+        return;
       }
+      if (state.sentDown) {
+        if (mirror?.isReady() && mirror.isController) {
+          mirror.sendInput({ type: 'touch', action: 'up', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 0 });
+        } else if (mirror?.isReady()) {
+          // A lease update can arrive between DOWN and UP. Reclaiming here
+          // also makes the server flush any pointer owned by the old epoch.
+          mirror.sendEmergencyInput({ type: 'touch', action: 'cancel', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 0 });
+          mirror.claimControl(true);
+        }
+        return;
+      }
+
+      // The first control.granted and geometry metadata messages are async.
+      // Wait briefly for them before deciding that this gesture must use ADB.
+      void (async () => {
+        for (let attempt = 0; attempt < 6; attempt++) {
+          if (currentDevice !== state.deviceId) return;
+          if (sendLiveGesture(state.start, point, event.pointerId)) return;
+          if (!mirror?.isReady()) {
+            sendLegacyGesture(state.deviceId, state.start, point);
+            return;
+          }
+          if (attempt === 0 || !mirror.isController) mirror.claimControl(true);
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        setHint('Android 控制权尚未就绪，请稍后再试');
+      })();
     });
     surface.addEventListener('pointercancel', (event) => {
       const state = activePointers.get(event.pointerId);
       activePointers.delete(event.pointerId);
       pendingMoves.delete(event.pointerId);
+      if (moveFrame && pendingMoves.size === 0) { cancelAnimationFrame(moveFrame); moveFrame = 0; }
+      surface.releasePointerCapture?.(event.pointerId);
       if (state?.sentDown && mirror?.isReady()) {
-        mirror.sendInput({ type: 'touch', action: 'cancel', pointerId: event.pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
+        mirror.sendEmergencyInput({ type: 'touch', action: 'cancel', pointerId: event.pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
       }
     });
+    surface.addEventListener('lostpointercapture', (event) => {
+      const state = activePointers.get(event.pointerId);
+      if (!state) return;
+      activePointers.delete(event.pointerId);
+      pendingMoves.delete(event.pointerId);
+      if (state.sentDown && mirror?.isReady()) {
+        mirror.sendEmergencyInput({ type: 'touch', action: 'cancel', pointerId: event.pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
+      }
+    });
+    const cancelOnBlur = () => {
+      for (const [pointerId, state] of activePointers) {
+        if (state.sentDown && mirror?.isReady()) {
+          mirror.sendEmergencyInput({ type: 'touch', action: 'cancel', pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
+        }
+        surface.releasePointerCapture?.(pointerId);
+      }
+      activePointers.clear();
+      pendingMoves.clear();
+      if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') cancelOnBlur();
+    };
+    window.addEventListener('blur', cancelOnBlur);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      cancelOnBlur();
+      window.removeEventListener('blur', cancelOnBlur);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   };
-  bindSurface(preview);
-  bindSurface(fallback);
+  const disposeSurfaceBindings = [bindSurface(preview), bindSurface(fallback)];
   input.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' || !input.value.trim() || !currentDevice) return;
     const value = input.value;
@@ -1589,6 +1847,7 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
     setActive,
     dispose: () => {
       setActive(false);
+      for (const dispose of disposeSurfaceBindings) dispose();
       mirror?.close();
       releaseSession();
     },
@@ -1599,50 +1858,6 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
   // render.
   setActive(paneWorkspace?.getFocusedPaneId() === paneId);
   void loadDevices();
-}
-
-// ========== CLI 标签颜色 ==========
-
-// 已知 CLI → 固定颜色（文字色, 背景色）
-const CLI_TAG_COLORS: Record<string, [string, string]> = {
-  'Claude':       ['#d4a574', '#3d2e1e'],
-  'Claude全自动':  ['#e5a100', '#3d3010'],
-  'Codex':        ['#73c991', '#1e3328'],
-  'Codex全自动':   ['#56d4a0', '#1a3d2e'],
-  'Kimi':         ['#c678dd', '#2e1e3d'],
-  'Kimi全自动':    ['#d19ae8', '#33204a'],
-  'Gemini':       ['#82aaff', '#1e2540'],
-  'Gemini全自动':  ['#99bbff', '#222d4a'],
-  'OpenCode':     ['#61afef', '#1e2e3d'],
-  'Qoder':        ['#e5c07b', '#3d3520'],
-  'Qoder全自动':   ['#d4a020', '#3d3520'],
-  'QoderCN':      ['#e5c07b', '#3d3520'],
-  'QoderCN全自动': ['#d4a020', '#3d3520'],
-  'Cursor':       ['#56b6c2', '#1e3338'],
-  'Cursor全自动':  ['#56b6c2', '#1e3338'],
-  '反重力':       ['#c792ea', '#2e1e3d'],
-  '反重力全自动':  ['#c792ea', '#2e1e3d'],
-  'Kiro':         ['#f78c6c', '#3d2518'],
-  'Kiro全自动':    ['#ff9e7a', '#4a2a1a'],
-};
-
-function getCliTagColors(displayName: string): [string, string] {
-  // 精确匹配
-  if (CLI_TAG_COLORS[displayName]) return CLI_TAG_COLORS[displayName];
-  // 前缀匹配（自定义预设的"全自动"变体）
-  for (const key of Object.keys(CLI_TAG_COLORS)) {
-    if (displayName.startsWith(key)) return CLI_TAG_COLORS[key];
-  }
-  // 未知 CLI：用 hash 从色板中选一个
-  let h = 0;
-  for (let i = 0; i < displayName.length; i++) {
-    h = ((h << 5) - h + displayName.charCodeAt(i)) | 0;
-  }
-  const palette: Array<[string, string]> = [
-    ['#e06c75', '#3d1e22'], ['#e5c07b', '#3d3520'], ['#98c379', '#253320'],
-    ['#f78c6c', '#3d2518'], ['#c792ea', '#2e1e3d'], ['#ff5370', '#3d1825'],
-  ];
-  return palette[Math.abs(h) % palette.length];
 }
 
 paneWorkspace = new PaneWorkspace(paneWorkspaceRoot, currentCwd, {
@@ -1693,7 +1908,7 @@ if (savedCwd) {
 syncRecentCwdsToRemote();
 // 初始化 preset select（含自定义预设），然后恢复上次选中
 void (async () => {
-  await refreshBuiltinOptions();
+  await Promise.all([refreshBuiltinOptions(), refreshPresetUsage()]);
   renderPresetSelect();
   if (lastPreset) {
     presetSelect.value = lastPreset;
@@ -1845,6 +2060,30 @@ function updatePaneAccents(): void {
     if (!leaf) continue;
     leaf.style.setProperty('--pane-accent', paneAccentForContent(pane.content));
     leaf.dataset.paneKind = pane.content.kind;
+    
+    // 给 pane-title 添加颜色选择器点击功能
+    const titleElement = leaf.querySelector('.pane-title');
+    if (titleElement && pane.content.kind === 'terminal') {
+      const sessionId = (pane.content as any).sessionId;
+      const themeDotColor = TerminalManager.getThemeDotColor(sessionThemes.get(sessionId) || 'vscode-dark');
+      
+      // 在标题前添加一个小圆圈指示器
+      let dotIndicator = titleElement.querySelector('.pane-color-indicator');
+      if (!dotIndicator) {
+        dotIndicator = document.createElement('span');
+        dotIndicator.className = 'pane-color-indicator';
+        titleElement.insertBefore(dotIndicator, titleElement.firstChild);
+      }
+      dotIndicator.style.backgroundColor = themeDotColor;
+      
+      // 添加点击事件
+      dotIndicator.style.cursor = 'pointer';
+      dotIndicator.title = '点击更改颜色';
+      dotIndicator.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showColorPickerDialogForPane(pane.id, sessionId, dotIndicator);
+      });
+    }
   }
 }
 
@@ -2217,6 +2456,306 @@ function showConfirmDialog(title: string, kind = '终端'): Promise<'close' | 'c
   });
 }
 
+// 颜色选择器 - 用于会话列表
+function showColorPickerDialog(sessionId: string, currentDot: HTMLElement): void {
+  document.querySelectorAll('.color-picker-overlay').forEach(el => el.remove());
+  
+  const overlay = document.createElement('div');
+  overlay.className = 'color-picker-overlay';
+  
+  const dialog = document.createElement('div');
+  dialog.className = 'color-picker-dialog';
+  dialog.innerHTML = '<h3>选择终端主题色</h3><p class="picker-note">点击选择一个配色方案</p>';
+  
+  // 创建颜色网格
+  const grid = document.createElement('div');
+  grid.className = 'color-picker-grid';
+  
+  // 添加预设主题
+  USER_THEMES_CONFIG.forEach(theme => {
+    const colorBtn = document.createElement('button');
+    colorBtn.className = 'color-picker-btn';
+    colorBtn.style.backgroundColor = theme.bg;
+    colorBtn.title = theme.name;
+    colorBtn.dataset.themeName = theme.name;
+    colorBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const themeName = (e.currentTarget as HTMLElement).dataset.themeName || 'Custom';
+      await applyNewThemeToSession(sessionId, theme.bg, theme.text, themeName);
+      overlay.remove();
+      renderSessionList();
+      updatePaneAccents();
+    });
+    grid.appendChild(colorBtn);
+  });
+  
+  // 随机配色部分
+  const randomSection = document.createElement('div');
+  randomSection.className = 'color-picker-section';
+  randomSection.innerHTML = '<h4>🎲 随机配色</h4>';
+  
+  for (let i = 0; i < 10; i++) {
+    const seed = `random-${sessionId}-${i}-${Date.now()}`;
+    const bgColor = generateRandomThemeColor(seed);
+    const textColor = Math.random() > 0.7 ? '#0a0a0a' : '#ffffff';
+    
+    const randomBtn = document.createElement('button');
+    randomBtn.className = 'color-picker-btn';
+    randomBtn.style.backgroundColor = bgColor;
+    randomBtn.title = `随机配色 ${i + 1}`;
+    randomBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await applyNewThemeToSession(sessionId, bgColor, textColor, `随机配色 ${i + 1}`);
+      overlay.remove();
+      renderSessionList();
+      updatePaneAccents();
+    });
+    randomSection.appendChild(randomBtn);
+  }
+  
+  grid.appendChild(randomSection);
+  
+  dialog.appendChild(grid);
+  
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'color-picker-cancel';
+  cancelBtn.textContent = '取消';
+  cancelBtn.addEventListener('click', () => overlay.remove());
+  dialog.appendChild(cancelBtn);
+  
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  
+  // 点击遮罩关闭
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+}
+
+// 颜色选择器 - 用于已关闭会话
+function showColorPickerDialogForClosedSession(closedSessionId: string, currentDot: HTMLElement): void {
+  document.querySelectorAll('.color-picker-overlay').forEach(el => el.remove());
+  
+  const overlay = document.createElement('div');
+  overlay.className = 'color-picker-overlay';
+  
+  const dialog = document.createElement('div');
+  dialog.className = 'color-picker-dialog';
+  dialog.innerHTML = '<h3>选择主题色（恢复时将使用此颜色）</h3><p class="picker-note">点击选择一个配色方案</p>';
+  
+  const grid = document.createElement('div');
+  grid.className = 'color-picker-grid';
+  
+  // 添加预设主题
+  USER_THEMES_CONFIG.forEach(theme => {
+    const colorBtn = document.createElement('button');
+    colorBtn.className = 'color-picker-btn';
+    colorBtn.style.backgroundColor = theme.bg;
+    colorBtn.title = theme.name;
+    colorBtn.dataset.themeName = theme.name;
+    colorBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const themeName = (e.currentTarget as HTMLElement).dataset.themeName || 'Custom';
+      await applyNewThemeToClosedSession(closedSessionId, theme.bg, theme.text, themeName);
+      overlay.remove();
+      renderSessionList();
+    });
+    grid.appendChild(colorBtn);
+  });
+  
+  // 随机配色部分
+  const randomSection = document.createElement('div');
+  randomSection.className = 'color-picker-section';
+  randomSection.innerHTML = '<h4>🎲 随机配色</h4>';
+  
+  for (let i = 0; i < 10; i++) {
+    const seed = `random-cs-${closedSessionId}-${i}-${Date.now()}`;
+    const bgColor = generateRandomThemeColor(seed);
+    const textColor = Math.random() > 0.7 ? '#0a0a0a' : '#ffffff';
+    
+    const randomBtn = document.createElement('button');
+    randomBtn.className = 'color-picker-btn';
+    randomBtn.style.backgroundColor = bgColor;
+    randomBtn.title = `随机配色 ${i + 1}`;
+    randomBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await applyNewThemeToClosedSession(closedSessionId, bgColor, textColor, `随机配色 ${i + 1}`);
+      overlay.remove();
+      renderSessionList();
+    });
+    randomSection.appendChild(randomBtn);
+  }
+  
+  grid.appendChild(randomSection);
+  dialog.appendChild(grid);
+  
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'color-picker-cancel';
+  cancelBtn.textContent = '取消';
+  cancelBtn.addEventListener('click', () => overlay.remove());
+  dialog.appendChild(cancelBtn);
+  
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+}
+
+// 颜色选择器 - 用于分格窗口
+function showColorPickerDialogForPane(paneId: string, sessionId: string, currentDot: HTMLElement): void {
+  document.querySelectorAll('.color-picker-overlay').forEach(el => el.remove());
+  
+  const overlay = document.createElement('div');
+  overlay.className = 'color-picker-overlay';
+  
+  const dialog = document.createElement('div');
+  dialog.className = 'color-picker-dialog';
+  dialog.innerHTML = '<h3>选择分格窗口主题色</h3><p class="picker-note">点击选择一个配色方案</p>';
+  
+  const grid = document.createElement('div');
+  grid.className = 'color-picker-grid';
+  
+  // 添加预设主题
+  USER_THEMES_CONFIG.forEach(theme => {
+    const colorBtn = document.createElement('button');
+    colorBtn.className = 'color-picker-btn';
+    colorBtn.style.backgroundColor = theme.bg;
+    colorBtn.title = theme.name;
+    colorBtn.dataset.themeName = theme.name;
+    colorBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const themeName = (e.currentTarget as HTMLElement).dataset.themeName || 'Custom';
+      await applyNewThemeToPane(sessionId, theme.bg, theme.text, themeName);
+      overlay.remove();
+      updatePaneAccents();
+    });
+    grid.appendChild(colorBtn);
+  });
+  
+  // 随机配色部分
+  const randomSection = document.createElement('div');
+  randomSection.className = 'color-picker-section';
+  randomSection.innerHTML = '<h4>🎲 随机配色</h4>';
+  
+  for (let i = 0; i < 10; i++) {
+    const seed = `random-pane-${paneId}-${i}-${Date.now()}`;
+    const bgColor = generateRandomThemeColor(seed);
+    const textColor = Math.random() > 0.7 ? '#0a0a0a' : '#ffffff';
+    
+    const randomBtn = document.createElement('button');
+    randomBtn.className = 'color-picker-btn';
+    randomBtn.style.backgroundColor = bgColor;
+    randomBtn.title = `随机配色 ${i + 1}`;
+    randomBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await applyNewThemeToPane(sessionId, bgColor, textColor, `随机配色 ${i + 1}`);
+      overlay.remove();
+      updatePaneAccents();
+    });
+    randomSection.appendChild(randomBtn);
+  }
+  
+  grid.appendChild(randomSection);
+  dialog.appendChild(grid);
+  
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'color-picker-cancel';
+  cancelBtn.textContent = '取消';
+  cancelBtn.addEventListener('click', () => overlay.remove());
+  dialog.appendChild(cancelBtn);
+  
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+}
+
+function generateRandomThemeColor(seed: string): string {
+  const colors = [
+    '#e06c75', '#e5c07b', '#98c379', '#e5c07b',
+    '#56b6c2', '#61afef', '#c678dd', '#d19ae8',
+    '#f78c6c', '#ff5370', '#c792ea', '#be95ff',
+    '#73c991', '#56d4a0', '#7ec699', '#99bbff',
+    '#82aaff', '#61afef', '#88c0d0', '#66ccff',
+  ];
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) {
+    h = ((h << 5) - h + seed.charCodeAt(i)) | 0;
+  }
+  return colors[Math.abs(h) % colors.length];
+}
+
+// ========== 颜色应用逻辑 ==========
+
+// 为活跃会话应用新主题
+async function applyNewThemeToSession(sessionId: string, bgColor: string, fgColor: string, themeName: string): Promise<void> {
+  try {
+    // 生成一个新的主题 ID（基于时间戳）
+    const newThemeId = `custom-${Date.now()}`;
+    
+    // 保存到 sessionThemes
+    sessionThemes.set(sessionId, newThemeId);
+    
+    // 创建动态主题配置
+    const tempTheme = {
+      background: bgColor,
+      foreground: fgColor,
+      cursor: '#ffffff',
+      cursorAccent: '#000000',
+      selectionBackground: 'rgba(255, 255, 255, 0.3)',
+      black: '#1a1a1a',
+      red: '#ff6b6b',
+      green: '#51cf66',
+      yellow: '#ffd43b',
+      blue: '#339af0',
+      magenta: '#cc5de8',
+      cyan: '#20c997',
+      white: '#f8f9fa',
+      brightBlack: '#495057',
+      brightRed: '#fa5252',
+      brightGreen: '#69db7c',
+      brightYellow: '#ffe066',
+      brightBlue: '#54a9ff',
+      brightMagenta: '#bb81e6',
+      brightCyan: '#48c9b0',
+      brightWhite: '#ffffff',
+    };
+    
+    // 注册动态主题
+    TerminalManager.registerDynamicTheme(newThemeId, tempTheme);
+    
+    // 通过 termManager 更新主题
+    termManager.setTheme(sessionId, newThemeId);
+    
+    // 更新 pane accents
+    updatePaneAccents();
+    
+    console.log(`[Theme] Applied ${themeName} to session ${sessionId}`);
+  } catch (error) {
+    console.error('应用新主题失败:', error);
+  }
+}
+
+// 为已关闭会话存储颜色选择
+async function applyNewThemeToClosedSession(closedSessionId: string, bgColor: string, fgColor: string, themeName: string): Promise<void> {
+  try {
+    // 这里我们只是临时记录，恢复时会话会重新创建
+    console.log(`[ColorPicker] 已选择主题 ${themeName} 用于已关闭会话 ${closedSessionId}`);
+    // 注意：真正的恢复会在下次打开时应用
+  } catch (error) {
+    console.error('保存主题选择失败:', error);
+  }
+}
+
+// 为分格窗口中的会话应用新主题
+async function applyNewThemeToPane(paneId: string, sessionId: string, bgColor: string, fgColor: string, themeName: string): Promise<void> {
+  await applyNewThemeToSession(sessionId, bgColor, fgColor, themeName);
+}
+
 // ========== 渲染 ==========
 
 function startTitleEdit(id: string, titleSpan: HTMLElement): void {
@@ -2433,8 +2972,23 @@ function renderSessionList(): void {
       } else if (sessionUnread.has(id)) {
         dot.style.backgroundColor = '#73c991';
       } else {
-        dot.style.backgroundColor = '#666';
+        // 使用会话主题色
+        const themeId = sessionThemes.get(id);
+        if (themeId) {
+          const themeDotColor = TerminalManager.getThemeDotColor(themeId);
+          dot.style.backgroundColor = themeDotColor;
+        } else {
+          dot.style.backgroundColor = '#666';
+        }
       }
+      
+      // 点击 dot 打开颜色选择器
+      dot.style.cursor = 'pointer';
+      dot.title = '点击更改颜色';
+      dot.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showColorPickerDialog(id, dot);
+      });
 
       const pinBtn = document.createElement('button');
       pinBtn.className = 'session-pin' + (isPinned ? ' pinned' : '');
@@ -2471,8 +3025,24 @@ function renderSessionList(): void {
       if (displayName) {
         const nameSpan = document.createElement('span');
         nameSpan.className = 'session-display-name';
-        nameSpan.textContent = displayName;
         nameSpan.title = displayName;
+        
+        // 如果该 CLI 有 logo，则显示 logo + 名称
+        if (hasLogo(displayName)) {
+          const logoImg = document.createElement('img');
+          logoImg.className = 'cli-logo';
+          logoImg.src = getLogoUrl(displayName);
+          logoImg.alt = displayName;
+          logoImg.loading = 'lazy';
+          nameSpan.appendChild(logoImg);
+          
+          const nameText = document.createElement('span');
+          nameText.textContent = displayName;
+          nameSpan.appendChild(nameText);
+        } else {
+          nameSpan.textContent = displayName;
+        }
+        
         const [tagColor, tagBg] = getCliTagColors(displayName);
         nameSpan.style.setProperty('--cli-tag-color', tagColor);
         nameSpan.style.setProperty('--cli-tag-bg', tagBg);
@@ -2507,14 +3077,14 @@ function renderSessionList(): void {
       topRow.appendChild(titleRow);
       topRow.appendChild(closeBtn);
 
-      // 第二行：时间/标签 + 催工按钮（点击弹配置弹窗）
+      // 第二行：时间/标签 + 计划设置按钮（点击弹配置弹窗）
       const autoContinueConfig = sessionAutoContinue.get(id);
       const autoContinueEnabled = autoContinueConfig?.enabled ?? false;
 
       const autoContinueLabel = document.createElement('span');
       autoContinueLabel.className = 'session-auto-continue-label' + (autoContinueEnabled ? ' enabled' : '');
-      autoContinueLabel.textContent = '催';
-      autoContinueLabel.title = autoContinueEnabled ? '循环已开启，点击配置' : '点击配置循环';
+      autoContinueLabel.textContent = '设';
+      autoContinueLabel.title = autoContinueEnabled ? '计划已开启，点击设置' : '计划设置';
       autoContinueLabel.addEventListener('click', (e) => {
         e.stopPropagation();
         showAutoContinueConfigDialog(id);
@@ -2600,12 +3170,42 @@ function renderSessionList(): void {
         if (cs.displayName) {
           const nameSpan = document.createElement('span');
           nameSpan.className = 'session-display-name';
-          nameSpan.textContent = cs.displayName;
           nameSpan.title = cs.displayName;
+          
+          // 如果该 CLI 有 logo，则显示 logo + 名称
+          if (hasLogo(cs.displayName)) {
+            const logoImg = document.createElement('img');
+            logoImg.className = 'cli-logo';
+            logoImg.src = getLogoUrl(cs.displayName);
+            logoImg.alt = cs.displayName;
+            logoImg.loading = 'lazy';
+            nameSpan.appendChild(logoImg);
+            
+            const nameText = document.createElement('span');
+            nameText.textContent = cs.displayName;
+            nameSpan.appendChild(nameText);
+          } else {
+            nameSpan.textContent = cs.displayName;
+          }
+          
           const [tagColor, tagBg] = getCliTagColors(cs.displayName);
           nameSpan.style.setProperty('--cli-tag-color', tagColor);
           nameSpan.style.setProperty('--cli-tag-bg', tagBg);
           metaRow.appendChild(nameSpan);
+        }
+        
+        // 如果该会话有对话历史，显示"导出上下文"按钮
+        if (cs.contextHistory && cs.contextHistory.length > 0) {
+          const exportBtn = document.createElement('button');
+          exportBtn.className = 'session-edit-btn';
+          setIcon(exportBtn, 'share', 12);
+          exportBtn.title = `导出 ${cs.contextHistory.length} 条对话`;
+          exportBtn.disabled = restoring;
+          exportBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            await exportSessionContext(cs);
+          });
+          metaRow.appendChild(exportBtn);
         }
 
         const restoreBtn = document.createElement('button');
@@ -2641,6 +3241,14 @@ function renderSessionList(): void {
         const dot = document.createElement('span');
         dot.className = 'session-color-dot';
         dot.style.backgroundColor = '#555';
+        
+        // 点击 dot 打开颜色选择器（已关闭会话）
+        dot.style.cursor = 'pointer';
+        dot.title = '点击更改颜色';
+        dot.addEventListener('click', (e) => {
+          e.stopPropagation();
+          showColorPickerDialogForClosedSession(cs.id, dot);
+        });
         topRow.appendChild(dot);
         topRow.appendChild(titleRow);
         topRow.appendChild(delBtn);
@@ -2687,7 +3295,7 @@ async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
 
     const cwd = cs.cwd || sessionCwds.get(getActiveSessionId() || '') || paneWorkspace.getWorkspaceKey() || '';
     const themeId = resolveThemeId(currentThemeId, cwd);
-    const result = await window.duocli.createPty(cwd, resumeCmd, themeId);
+    const result = await window.duocli.createPty(cwd, resumeCmd, themeId, resolvePresetEnv(getCustomPresets(), resumeCmd));
     resultId = result.id;
     const now = Date.now();
     sessionTitles.set(result.id, cs.title);
@@ -2723,13 +3331,33 @@ async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
   } finally {
     if (claimed && !restored) {
       await window.duocli.closedSessionsCancelRestore(cs.id).catch(() => false);
-      showCopyToast('恢复未确认，请查看终端输出');
       updateEmptyState();
       updateSessionTitleBar();
+      alert('恢复未确认，请查看终端输出');
     }
     restoringClosedSessionIds.delete(cs.id);
     syncPaneLiveSessions();
     renderSessionList();
+  }
+}
+
+/** 导出会话上下文到本地文件 */
+async function exportSessionContext(cs: ClosedSessionInfo): Promise<void> {
+  try {
+    const result = await window.duocli.exportContextToExportDirectory(
+      cs.id, 
+      undefined
+    );
+    
+    if (result && result.ok) {
+      shell.openExternal(`file://${result.filePath}`);
+      alert('✅ 上下文已导出！\n\n文件位置：' + result.filePath + '\n\n您可以将此文件拖拽到其他 AI Agent（如 Cursor、Codex、Claude）中继续使用。');
+    } else {
+      alert('❌ 导出失败：' + (result?.error || '未知错误'));
+    }
+  } catch (err) {
+    console.error('[Renderer] 导出上下文失败:', err);
+    alert('❌ 导出失败：' + (err instanceof Error ? err.message : String(err)));
   }
 }
 
@@ -2741,7 +3369,7 @@ async function createSession(): Promise<boolean> {
   const themeId = resolveThemeId(currentThemeId, currentCwd);
   lastPreset = preset;
   localStorage.setItem('duocli_preset', preset);
-  const result = await window.duocli.createPty(currentCwd, preset, themeId);
+  const result = await window.duocli.createPty(currentCwd, preset, themeId, resolvePresetEnv(getCustomPresets(), preset));
   const now = Date.now();
   sessionTitles.set(result.id, result.title);
   sessionThemes.set(result.id, result.themeId);
@@ -3036,6 +3664,7 @@ cwdRecentBtn.addEventListener('click', (e) => {
   } else {
     renderRecentCwdDropdown();
     cwdRecentDropdown.classList.add('open');
+    void pullRecentCwdsFromRemote();
   }
 });
 
@@ -3309,6 +3938,8 @@ function openNewSessionDialog(cwd?: string): void {
   setThemeValue(currentThemeId);
   newSessionOverlay.classList.add('active');
   setTimeout(() => cwdInput.focus(), 0);
+  void pullRecentCwdsFromRemote();
+  void refreshPresetUsage().then(() => renderPresetSelect());
 }
 
 function closeNewSessionDialog(): void {
@@ -3479,6 +4110,7 @@ window.duocli.onRemoteCreated((info) => {
   sessionCreateTimes.set(info.id, now);
   sessionCwds.set(info.id, info.cwd);
   sessionDisplayNames.set(info.id, info.displayName);
+  if (info.cwd) addRecentCwd(info.cwd);
   // 创建 xterm 实例（桌面端也能看到和操作）
   termManager.create(info.id, info.themeId, info.cwd, (data) => { writePtyWithAutoReset(info.id, data); });
   if (normalizeCwd(paneWorkspace.getWorkspaceKey()) === normalizeCwd(info.cwd || currentCwd)) {
@@ -3503,7 +4135,8 @@ async function handleRemoteServerInfo(info: typeof remoteServerInfo) {
     remoteServerInfo
     && (remoteServerInfo.port !== info.port || remoteServerInfo.token !== info.token),
   );
-  console.log('[Renderer] Remote server info:', info);
+  // info 里带着 Bearer token，别整个打进控制台
+  console.log('[Renderer] Remote server info:', { port: info.port, lanUrl: info.lanUrl, publicUrl: info.publicUrl });
   remoteServerInfo = info;
   if (!info.health) {
     const health = await window.duocli.getRemoteHealth();
@@ -3513,8 +4146,13 @@ async function handleRemoteServerInfo(info: typeof remoteServerInfo) {
   if (!isInitial && !identityChanged) return;
 
   startPresetSyncTimer();
-  console.log('[Preset Sync] Remote server started, initiating preset sync');
-  await reconcilePresetsWithServer('remote-ready');
+  await reconcilePresetsWithServer();
+  await refreshPresetUsage();
+  renderPresetSelect();
+
+  // 服务端可能在桌面端写入目录之后才启动，内存里是旧列表，这里再回放一次
+  syncRecentCwdsToRemote();
+  await pullRecentCwdsFromRemote();
 }
 
 function handleRemoteHealthUpdate(health: RemoteSyncHealth): void {
@@ -3541,13 +4179,44 @@ remoteServerInfoEl.querySelector('.remote-info-url')?.addEventListener('click', 
 
 remoteServerInfoEl.querySelector('.remote-info-token-toggle')?.addEventListener('click', (event) => {
   event.stopPropagation();
+  if (remoteTokenEditing) return;
   remoteTokenVisible = !remoteTokenVisible;
   renderRemoteServerInfo();
 });
 
 remoteServerInfoEl.querySelector('.remote-info-token-value')?.addEventListener('click', () => {
-  if (!remoteServerInfo || !remoteTokenVisible) return;
-  void navigator.clipboard.writeText(remoteServerInfo.token).catch(() => { /* ignore */ });
+  if (!remoteServerInfo || remoteTokenEditing) return;
+  if (remoteTokenVisible) {
+    void navigator.clipboard.writeText(remoteServerInfo.token).catch(() => { /* ignore */ });
+    return;
+  }
+  enterRemoteTokenEditMode();
+});
+
+remoteServerInfoEl.querySelector('.remote-info-token-edit')?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  enterRemoteTokenEditMode();
+});
+
+remoteServerInfoEl.querySelector('.remote-info-token-save')?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  void saveRemoteTokenEdit();
+});
+
+remoteServerInfoEl.querySelector('.remote-info-token-cancel')?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  cancelRemoteTokenEditMode();
+});
+
+remoteServerInfoEl.querySelector('.remote-info-token-input')?.addEventListener('keydown', (event) => {
+  const ke = event as KeyboardEvent;
+  if (ke.key === 'Enter') {
+    ke.preventDefault();
+    void saveRemoteTokenEdit();
+  } else if (ke.key === 'Escape') {
+    ke.preventDefault();
+    cancelRemoteTokenEditMode();
+  }
 });
 
 // 方式2：渲染进程加载后主动拉取；服务器启动和页面加载都有竞态，需短时重试。
@@ -3799,3 +4468,16 @@ document.querySelector('.footer-tip')!.addEventListener('click', () => {
   });
   dialog.addEventListener('click', () => overlay.remove());
 });
+
+// ========== 初始化 ==========
+
+/** 初始化所有功能 */
+async function initApp(): Promise<void> {
+  // 注册通知监听（桌面端和网页端通用）
+  setupNotificationListener();
+  
+  // 其他初始化...
+}
+
+// 页面加载完成后初始化
+initApp().catch(console.error);

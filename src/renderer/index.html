@@ -76,11 +76,11 @@
     </div>
   </div>
 
-  <!-- 循环配置弹窗 -->
+  <!-- 计划设置弹窗 -->
   <div id="auto-continue-overlay" class="new-session-overlay">
     <div class="new-session-dialog" style="width: min(400px, calc(100vw - 40px));">
       <div class="new-session-header">
-        <h3>循环配置</h3>
+        <h3>计划设置</h3>
         <button id="auto-continue-dialog-close" class="new-session-close" title="关闭">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
         </button>
@@ -104,9 +104,9 @@
         </section>
 
         <section class="ac-config-group">
-          <div class="ac-config-group-title">循环与发送</div>
+          <div class="ac-config-group-title">计划与发送</div>
           <div class="ac-config-grid">
-            <label class="ac-config-field">循环间隔（分钟）
+            <label class="ac-config-field">计划间隔（分钟）
               <input id="auto-continue-interval" type="number" min="1" placeholder="分钟" />
             </label>
             <label class="ac-config-field">命令间隔（秒）
@@ -134,7 +134,7 @@
       </div>
       <div class="confirm-buttons" style="margin-top: 12px;">
         <button id="auto-continue-cancel" class="btn-cancel">取消</button>
-        <button id="auto-continue-stop" class="btn-close-confirm" style="display:none;">关闭循环</button>
+        <button id="auto-continue-stop" class="btn-close-confirm" style="display:none;">关闭计划</button>
         <button id="auto-continue-save" class="toolbar-btn">保存并开启</button>
       </div>
     </div>
@@ -234,7 +234,8 @@
         <div class="remote-info-url" title="点击复制公网或局域网地址"></div>
         <div class="remote-info-token-row">
           <span class="remote-info-token-label">Token:</span>
-          <span class="remote-info-token-value"></span>
+          <span class="remote-info-token-value" tabindex="0" role="button"></span>
+          <input class="remote-info-token-input" type="text" maxlength="128" spellcheck="false" autocomplete="off" hidden />
           <button type="button" class="remote-info-token-toggle" title="显示 Token" aria-label="显示 Token">
             <svg class="remote-info-token-eye-open" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
@@ -246,7 +247,11 @@
               <line x1="1" y1="1" x2="23" y2="23"></line>
             </svg>
           </button>
+          <button type="button" class="remote-info-token-edit" title="修改 Token" aria-label="修改 Token">改</button>
+          <button type="button" class="remote-info-token-save" title="保存 Token" aria-label="保存 Token" hidden>存</button>
+          <button type="button" class="remote-info-token-cancel" title="取消" aria-label="取消修改" hidden>取消</button>
         </div>
+        <div class="remote-info-token-hint" hidden></div>
       </div>
       <div id="sidebar-tabs">
         <button class="sidebar-tab active" data-tab="sessions">

@@ -2,9 +2,11 @@ import { app, BrowserWindow, ipcMain, dialog, clipboard, nativeImage, shell, glo
 import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import { Notification } from 'electron';
 import { PtyManager, getDisplayName } from './pty-manager';
+import { getCliProvider, providerFromBaseUrl } from './cli-provider';
 import { AIConfigManager } from './ai-config';
-import { startRemoteServer, pushRawDataToRemote, sendRemotePush, addRemoteRecentCwd } from './remote-server';
+import { startRemoteServer, pushRawDataToRemote, sendRemotePush, addRemoteRecentCwd, syncRemoteRecentCwds, recordRemotePresetUsage, getCustomPresetEnv, updateRemoteAccessToken, generateAccessToken } from './remote-server';
 import { CloudflaredManager } from './cloudflared-manager';
 import { RemoteSyncHealth, RemoteSyncMonitor } from './remote-sync-monitor';
 import {
@@ -12,9 +14,12 @@ import {
   normalizeTerminalAutoResponseConfig,
   TerminalAutoResponseConfig,
 } from './terminal-auto-response';
-import { getAvailableBuiltinPresets } from './cli-detect';
-import { buildResumeCommand, evaluateRestoreProgress, identifyCli, isResumeCommandCompatible, ResumeCapture } from './session-resume';
+import { getAvailableBuiltinPresets, prewarmCliDetection } from './cli-detect';
+import { ResumeCapture } from './session-resume';
+import { ClosedSessionsManager, ContextHistoryEntry } from './closed-sessions';
 import { parseAndroidDevices, runAdb } from './android-devices';
+import { extractContextFromChunks } from './context-capture';
+import { exportSessionContext, writeExportToFile } from './context-export';
 
 // macOS: 设置为普通应用模式，显示在 Dock 和 Command+Tab 切换器中
 if (process.platform === 'darwin') {
@@ -43,6 +48,8 @@ const IMESSAGE_SERVICE = ((process.env.DUOCLI_IMESSAGE_SERVICE || 'iMessage').tr
   : 'iMessage';
 
 const sessionOutputTail: Map<string, string> = new Map();
+/** 用于累积上下文捕获的原始输出 */
+const sessionContextBuffer: Map<string, string> = new Map();
 
 const DESKTOP_PREVIEW_EXTENSIONS = new Set([
   '.md', '.markdown', '.txt', '.log', '.json', '.jsonl', '.yaml', '.yml', '.toml',
@@ -59,92 +66,18 @@ const DESKTOP_MEDIA_TYPES: Record<string, string> = {
 const DESKTOP_MAX_PREVIEW_BYTES = 2 * 1024 * 1024;
 
 // ========== 已关闭会话持久化 ==========
-interface ClosedSession {
-  id: string;
+let closedSessionsManager: ClosedSessionsManager;
+
+function addClosedSession(session: {
   title: string;
   cwd: string;
   presetCommand: string;
   resumeId: string;
   resumeCommand: string;
-  displayName: string;
-  closedAt: number;
-  cli?: string;
   resumeSource?: ResumeCapture['source'];
-  state?: 'closed' | 'restoring';
-  restoreStartedAt?: number;
-}
-const CLOSED_SESSIONS_FILE = path.join(app.getPath('userData'), 'closed-sessions.json');
-const MAX_CLOSED_SESSIONS = 20;
-
-function loadClosedSessions(options?: { resetRestoring?: boolean }): ClosedSession[] {
-  try {
-    const raw = fs.readFileSync(CLOSED_SESSIONS_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    // Migrate records written by older DuoCLI versions whose resume command
-    // was blank (or relied on the invalid generic “preset --resume” fallback).
-    return parsed.map((value: any) => {
-      const session = value as ClosedSession;
-      if (session.resumeId && (!isResumeCommandCompatible(session.presetCommand || '', session.resumeCommand || '') || (session.resumeCommand || '').includes('undefined') || /[\r\n]/.test(session.resumeCommand || ''))) {
-        const command = buildResumeCommand(session.presetCommand || '', session.resumeId);
-        // Unknown CLIs are intentionally left non-restorable rather than
-        // carrying forward the old generic “preset --resume” guess.
-        session.resumeCommand = command;
-      }
-      session.cli = session.cli || identifyCli(session.presetCommand || '');
-      if (options?.resetRestoring) {
-        // Only on app startup: clear stale restoring flags from a crashed run.
-        session.state = 'closed';
-        delete session.restoreStartedAt;
-      } else {
-        session.state = session.state || 'closed';
-      }
-      return session;
-    }).filter((session: ClosedSession) => !!session.resumeId);
-  } catch { return []; }
-}
-
-function resetStaleClosedSessionRestores(): void {
-  const list = loadClosedSessions({ resetRestoring: true });
-  saveClosedSessions(list);
-}
-
-function saveClosedSessions(sessions: ClosedSession[]): ClosedSession[] {
-  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  const filtered = sessions.filter(s => s.closedAt > cutoff).slice(-MAX_CLOSED_SESSIONS);
-  const serialized = JSON.stringify(filtered, null, 2);
-  try {
-    fs.mkdirSync(path.dirname(CLOSED_SESSIONS_FILE), { recursive: true });
-    const temp = `${CLOSED_SESSIONS_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, serialized);
-    fs.renameSync(temp, CLOSED_SESSIONS_FILE);
-  } catch {
-    // Keep the old direct-write fallback for unusual read-only/userData setups.
-    try { fs.writeFileSync(CLOSED_SESSIONS_FILE, serialized); } catch { /* ignore */ }
-  }
-  return filtered;
-}
-
-function addClosedSession(session: { title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; resumeSource?: ResumeCapture['source'] }): void {
-  const list = loadClosedSessions();
-  const cli = identifyCli(session.presetCommand);
-  const duplicateIndex = list.findIndex(item => item.resumeId === session.resumeId && (item.cli || identifyCli(item.presetCommand)) === cli);
-  const entry: ClosedSession = {
-    id: duplicateIndex >= 0 ? list[duplicateIndex].id : `closed-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    title: session.title,
-    cwd: session.cwd,
-    presetCommand: session.presetCommand,
-    resumeId: session.resumeId,
-    resumeCommand: session.resumeCommand || buildResumeCommand(session.presetCommand, session.resumeId),
-    displayName: getDisplayName(session.presetCommand),
-    closedAt: Date.now(),
-    cli,
-    resumeSource: session.resumeSource,
-    state: 'closed',
-  };
-  if (duplicateIndex >= 0) list[duplicateIndex] = entry;
-  else list.push(entry);
-  const saved = saveClosedSessions(list);
+  contextHistory?: ContextHistoryEntry[];
+}): void {
+  const saved = closedSessionsManager.add(session);
   safeSend('closed-sessions:update', saved);
 }
 
@@ -224,124 +157,6 @@ function loadEditorPreference(): string | null {
   } catch { return null; }
 }
 
-// ========== CLI 模型提供商检测 ==========
-
-// 根据 preset 命令获取实际使用的模型提供商
-function getCliProvider(presetCommand: string): string | null {
-  const home = os.homedir();
-
-  // 判断是哪个 CLI
-  if (presetCommand.startsWith('claude')) {
-    // 读取 Claude 配置
-    const settingsPath = path.join(home, '.claude', 'settings.json');
-    try {
-      if (fs.existsSync(settingsPath)) {
-        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
-        const env = settings.env || {};
-        const baseUrl = env.ANTHROPIC_BASE_URL || '';
-
-        // 根据 baseUrl 判断模型提供商
-        if (baseUrl.includes('minimaxi')) return 'MiniMax';
-        if (baseUrl.includes('deepseek')) return 'DeepSeek';
-        if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) return 'GLM';
-        if (baseUrl.includes('cloudflare')) return 'Cloudflare';
-        if (baseUrl.includes('anthropic') || !baseUrl) return 'Anthropic';
-
-        // 如果有自定义 baseUrl，尝试提取域名
-        if (baseUrl) {
-          try {
-            const url = new URL(baseUrl);
-            return url.hostname.replace(/^api\./, '').split('.')[0].toUpperCase();
-          } catch { /* ignore */ }
-        }
-      }
-    } catch { /* ignore */ }
-
-    // 尝试从 shell 环境变量读取
-    try {
-      const rcFiles = [path.join(home, '.zshrc'), path.join(home, '.bashrc')];
-      for (const rcFile of rcFiles) {
-        if (!fs.existsSync(rcFile)) continue;
-        const content = fs.readFileSync(rcFile, 'utf-8');
-        const vars = parseShellExports(content);
-        const baseUrl = vars.get('ANTHROPIC_BASE_URL') || '';
-        if (baseUrl.includes('minimaxi')) return 'MiniMax';
-        if (baseUrl.includes('deepseek')) return 'DeepSeek';
-        if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) return 'GLM';
-      }
-    } catch { /* ignore */ }
-
-    return 'Anthropic';
-  }
-
-  if (presetCommand.startsWith('codex')) {
-    // Codex 使用 OpenAI 兼容 API
-    return 'OpenAI';
-  }
-
-  if (presetCommand.startsWith('kimi')) {
-    // Kimi 使用月之暗面 API
-    return 'Moonshot';
-  }
-
-  if (presetCommand.startsWith('gemini')) {
-    return 'Google';
-  }
-
-  if (presetCommand.startsWith('opencode')) {
-    // OpenCode 可能使用多种后端
-    const cfgPath = path.join(home, '.config', 'opencode', 'opencode.json');
-    try {
-      if (fs.existsSync(cfgPath)) {
-        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-        const provider = cfg.provider || {};
-        if (provider.anthropic) return 'Anthropic';
-        if (provider.openai) return 'OpenAI';
-        if (provider.google) return 'Google';
-      }
-    } catch { /* ignore */ }
-    return 'OpenCode';
-  }
-
-  if (presetCommand.startsWith('qoder')) {
-    return 'Qoder';
-  }
-
-  if (presetCommand.startsWith('devin')) {
-    return 'Devin';
-  }
-
-  if (presetCommand.startsWith('kiro-cli')) {
-    return 'Kiro';
-  }
-
-  if (presetCommand.startsWith('agent') || presetCommand.includes('cursor')) {
-    // Cursor agent
-    return 'Cursor';
-  }
-
-  if (presetCommand.startsWith('agy')) {
-    return 'Antigravity';
-  }
-
-  // 默认返回空
-  return null;
-}
-
-// 解析 shell 导出语句
-function parseShellExports(content: string): Map<string, string> {
-  const vars = new Map<string, string>();
-  for (const line of content.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('#')) continue;
-    const match = trimmed.match(/^export\s+([A-Z_][A-Z0-9_]*)=["']?([^"'\n]+?)["']?\s*$/);
-    if (match) {
-      vars.set(match[1], match[2]);
-    }
-  }
-  return vars;
-}
-
 let mainWindow: BrowserWindow | null = null;
 let ptyManager: PtyManager;
 const aiConfigManager = new AIConfigManager();
@@ -408,6 +223,8 @@ function restartRemoteAccessServer(): void {
       onRemoteServerStarted(info);
     },
     (session) => addClosedSession(session),
+    closedSessionsManager,
+    app.getPath('userData'), // 传入 userData 路径供上下文导出使用
   );
 }
 
@@ -539,9 +356,89 @@ function sendIMessageNotification(message: string): void {
   p.unref();
 }
 
-function sendUserNotification(id: string, title: string, body: string): void {
+function sendUserNotification(id: string, title: string, body: string, sound?: boolean): void {
+  // 发送远程推送
   sendRemotePush(title, body, id);
+  
+  // 发送 iMessage（macOS）
   sendIMessageNotification(`[DuoCLI] ${title}：${body}`);
+  
+  // 播放提示音（如果启用）
+  if (sound !== false) {
+    playNotifySound();
+  }
+  
+  // 创建桌面端系统通知（Electron）
+  createDesktopNotification(title, body);
+  
+  // 同时发送给前端渲染进程
+  safeSend('notification', title, body, id);
+}
+
+// 创建桌面端系统通知（Electron Notification API）
+function createDesktopNotification(title: string, body: string): void {
+  if (!BrowserWindow.getAllWindows().length) return;
+  
+  const notification = new Notification({
+    title: title,
+    body: body,
+    icon: path.join(__dirname, '../../build/icon.png'), // 使用应用图标
+    silent: false, // 静音时会播放声音
+    urgency: 'normal', // 正常优先级
+  });
+  
+  notification.on('click', () => {
+    // 点击通知时聚焦主窗口
+    const window = BrowserWindow.getAllWindows()[0];
+    if (window) {
+      window.focus();
+      window.show();
+    }
+  });
+  
+  notification.show();
+}
+
+// 播放通知音效
+function playNotifySound(): void {
+  try {
+    // Electron 环境下使用 AudioContext
+    const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    
+    // 创建一个悦耳的完成音效（双音调）
+    const now = audioCtx.currentTime;
+    const oscillator1 = audioCtx.createOscillator();
+    const gainNode1 = audioCtx.createGain();
+    
+    oscillator1.type = 'sine';
+    oscillator1.frequency.setValueAtTime(880, now); // A5
+    gainNode1.gain.setValueAtTime(0.3, now);
+    gainNode1.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
+    
+    oscillator1.connect(gainNode1);
+    gainNode1.connect(audioCtx.destination);
+    
+    oscillator1.start(now);
+    oscillator1.stop(now + 0.1);
+    
+    // 第二个音调
+    const oscillator2 = audioCtx.createOscillator();
+    const gainNode2 = audioCtx.createGain();
+    
+    oscillator2.type = 'sine';
+    oscillator2.frequency.setValueAtTime(1100, now + 0.1); // A#5
+    gainNode2.gain.setValueAtTime(0.3, now + 0.1);
+    gainNode2.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+    
+    oscillator2.connect(gainNode2);
+    gainNode2.connect(audioCtx.destination);
+    
+    oscillator2.start(now + 0.1);
+    oscillator2.stop(now + 0.3);
+    
+  } catch (error) {
+    console.warn('播放通知音效失败:', error);
+  }
 }
 
 function maybeNotifyAttention(id: string, data: string): void {
@@ -588,6 +485,11 @@ function setupPtyManager(): void {
   ptyManager = new PtyManager({
     onData: (id, data) => {
       safeSend('pty:data', id, data);
+      
+      // ===== 累积上下文输出用于捕获 =====
+      const existing = sessionContextBuffer.get(id) || '';
+      sessionContextBuffer.set(id, existing + data);
+      
       maybeNotifyAttention(id, data);
     },
     onRawData: (id, data, sequence) => {
@@ -617,14 +519,19 @@ function setupPtyManager(): void {
       if (!sessionUserClosed.has(id)) {
         const title = session?.title || '终端';
         sendUserNotification(id, '会话已结束', title);
+        
+        // 发送给前端渲染进程
+        safeSend('pty:exit', id);
+        safeSend('notification', '会话已结束', `${title} 已退出`);
+      } else {
+        // 用户主动关闭的会话，只发送 exit 事件
+        safeSend('pty:exit', id);
       }
       sessionUserClosed.delete(id);
       sessionOutputTail.delete(id);
       sessionLastInputAt.delete(id);
       sessionArmedForNotify.delete(id);
       sessionLastNotifyAt.delete(id);
-
-      safeSend('pty:exit', id);
     },
     onPasteInput: (id, cwd) => {
       sessionLastInputAt.set(id, Date.now());
@@ -644,27 +551,21 @@ function registerIPC(): void {
 
   // 创建终端
   ipcMain.handle('pty:create', (_e, cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) => {
-    const session = ptyManager.create(cwd, presetCommand, themeId, providerEnv);
-    // 如果有 providerEnv，根据 baseUrl 推断 provider 名称
-    let provider: string | null = null;
-    if (providerEnv && providerEnv.ANTHROPIC_BASE_URL) {
-      const baseUrl = providerEnv.ANTHROPIC_BASE_URL;
-      if (baseUrl.includes('minimaxi')) provider = 'MiniMax';
-      else if (baseUrl.includes('deepseek')) provider = 'DeepSeek';
-      else if (baseUrl.includes('zhipu') || baseUrl.includes('bigmodel')) provider = 'GLM';
-      else if (baseUrl.includes('anthropic') && !baseUrl.includes('minimaxi')) provider = 'Anthropic';
-      else {
-        // 尝试从域名提取
-        try {
-          const url = new URL(baseUrl);
-          provider = url.hostname.replace(/^(api|code)\./, '').split('.')[0];
-          // 首字母大写
-          provider = provider.charAt(0).toUpperCase() + provider.slice(1);
-        } catch { provider = 'Custom'; }
-      }
-    } else {
-      provider = getCliProvider(presetCommand);
-    }
+    const extra = providerEnv && typeof providerEnv === 'object' ? providerEnv : {};
+    const env = { ...getCustomPresetEnv(presetCommand), ...extra };
+    const session = ptyManager.create(
+      cwd,
+      presetCommand,
+      themeId,
+      Object.keys(env).length ? env : undefined,
+    );
+    // 统计失败不能连带让 ipcMain.handle reject：渲染端拿不到会话 id，PTY 就成了孤儿。
+    try {
+      recordRemotePresetUsage(presetCommand);
+    } catch { /* ignore */ }
+    const provider = providerEnv?.ANTHROPIC_BASE_URL
+      ? (providerFromBaseUrl(providerEnv.ANTHROPIC_BASE_URL) || 'Custom')
+      : getCliProvider(presetCommand);
     (session as any).provider = provider;
     return {
       id: session.id,
@@ -698,6 +599,26 @@ function registerIPC(): void {
     sessionUserClosed.add(id);
     const beforeClose = ptyManager.getSession(id);
     const capture = await ptyManager.close(id);
+    
+    // ===== 捕获对话历史用于跨 Agent 上下文转移 =====
+    let contextHistory: ContextHistoryEntry[] | undefined;
+    const buffer = sessionContextBuffer.get(id);
+    if (buffer && buffer.length > 0) {
+      try {
+        const chunks = buffer.split('\n').filter(Boolean);
+        const cliKind = beforeClose?.cliKind || 'unknown';
+        const result = extractContextFromChunks(chunks, cliKind);
+        if (result.hasContent) {
+          contextHistory = result.history;
+          console.log(`[ContextCapture] 会话 ${id} 捕获到 ${contextHistory.length} 条对话`);
+        }
+      } catch (err) {
+        console.error('[ContextCapture] 提取失败:', err);
+      } finally {
+        sessionContextBuffer.delete(id);
+      }
+    }
+    
     if (beforeClose?.resumeId) {
       addClosedSession({
         title: beforeClose.title,
@@ -706,6 +627,7 @@ function registerIPC(): void {
         resumeId: beforeClose.resumeId,
         resumeCommand: beforeClose.resumeCommand || '',
         resumeSource: beforeClose.resumeSource || undefined,
+        contextHistory,
       });
     } else if (capture?.sessionId) {
       // `close` normally leaves the session object available until destroy;
@@ -717,6 +639,7 @@ function registerIPC(): void {
         resumeId: capture.sessionId,
         resumeCommand: capture.resumeCommand,
         resumeSource: capture.source,
+        contextHistory,
       });
     }
     sessionOutputTail.delete(id);
@@ -751,74 +674,23 @@ function registerIPC(): void {
   });
 
   // ========== 已关闭会话 IPC ==========
-  ipcMain.handle('closed-sessions:list', () => loadClosedSessions());
+  ipcMain.handle('closed-sessions:list', () => closedSessionsManager.list());
   ipcMain.handle('closed-sessions:begin-restore', (_e, closedId: string) => {
-    const restoreList = loadClosedSessions();
-    const closed = restoreList.find(item => item.id === closedId);
-    // Claim before creating a PTY so duplicate clicks cannot launch another
-    // provider process for the same closed record.
-    if (!closed || closed.state === 'restoring') return false;
-    closed.state = 'restoring';
-    closed.restoreStartedAt = Date.now();
-    const saved = saveClosedSessions(restoreList);
-    safeSend('closed-sessions:update', saved);
-    return saved.some(item => item.id === closedId && item.state === 'restoring');
+    return closedSessionsManager.beginRestore(closedId);
   });
   ipcMain.handle('closed-sessions:cancel-restore', (_e, closedId: string) => {
-    const restoreList = loadClosedSessions();
-    const closed = restoreList.find(item => item.id === closedId);
-    if (!closed || closed.state !== 'restoring') return false;
-    closed.state = 'closed';
-    delete closed.restoreStartedAt;
-    const saved = saveClosedSessions(restoreList);
-    safeSend('closed-sessions:update', saved);
-    return true;
+    return closedSessionsManager.cancelRestore(closedId);
   });
   ipcMain.handle('closed-sessions:remove', (_e, id: string) => {
-    const sessions = loadClosedSessions().filter(s => s.id !== id);
-    saveClosedSessions(sessions);
-    return sessions;
+    return closedSessionsManager.remove(id);
   });
   ipcMain.handle('closed-sessions:clear', () => {
-    saveClosedSessions([]);
-    return [];
+    return closedSessionsManager.clear();
   });
   ipcMain.handle('closed-sessions:confirm-restore', async (_e, closedId: string, sessionId: string) => {
-    const restoreList = loadClosedSessions();
-    const closed = restoreList.find(item => item.id === closedId);
-    if (!closed || closed.state !== 'restoring') return false;
-    const markRestoreFailed = (): void => {
-      const current = loadClosedSessions();
-      const remaining = current.map(item => item.id === closedId ? { ...item, state: 'closed' as const, restoreStartedAt: undefined } : item);
-      saveClosedSessions(remaining);
-      safeSend('closed-sessions:update', remaining);
-    };
-    const failRestore = (): false => {
-      // Keep the PTY alive so the user can read provider errors in the pane.
-      markRestoreFailed();
-      return false;
-    };
-    // Watch for an explicit provider error after the command echo. Do not treat
-    // “any output after 300ms” as success, and do not kill a slow CLI on timeout.
-    const deadline = Date.now() + 15_000;
-    while (Date.now() < deadline) {
-      const session = ptyManager.getSession(sessionId);
-      if (!session) {
-        markRestoreFailed();
-        return false;
-      }
-      if (session.resumeId && closed.resumeId && session.resumeId !== closed.resumeId) {
-        return failRestore();
-      }
-      const verdict = evaluateRestoreProgress(ptyManager.getLaunchStatus(sessionId), Date.now());
-      if (verdict === 'failure') return failRestore();
-      if (verdict === 'success') return true;
-      await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
-    }
-    // A live PTY is not proof that the provider accepted the resume command.
-    // Keep the closed record available for another attempt and leave the pane
-    // open so the user can inspect a slow or failed provider launch.
-    return failRestore();
+    const ok = await closedSessionsManager.confirmRestore(closedId, sessionId, ptyManager);
+    if (ok) closedSessionsManager.remove(closedId);
+    return ok;
   });
 
   // 选择工作目录
@@ -862,6 +734,11 @@ function registerIPC(): void {
 
   ipcMain.handle('remote:add-recent-cwd', (_e, cwd: string) => {
     try { addRemoteRecentCwd(cwd); } catch { /* ignore */ }
+    return true;
+  });
+
+  ipcMain.handle('remote:sync-recent-cwds', (_e, cwds: string[]) => {
+    try { syncRemoteRecentCwds(cwds); } catch { /* ignore */ }
     return true;
   });
 
@@ -1310,6 +1187,16 @@ function registerIPC(): void {
     if (health) mergeRemoteHealthIntoCache(health);
     return health;
   });
+  ipcMain.handle('remote:set-token', (_e, nextToken: unknown) => {
+    const result = updateRemoteAccessToken(String(nextToken ?? ''));
+    if (!result.ok) return result;
+    if (cachedRemoteServerInfo) {
+      cachedRemoteServerInfo = { ...cachedRemoteServerInfo, token: result.token };
+      safeSend('remote:server-info', cachedRemoteServerInfo);
+    }
+    return result;
+  });
+  ipcMain.handle('remote:generate-token', () => generateAccessToken());
 
   // ========== 催工配置中转 IPC ==========
   // main 进程作为中转：remote-server API → renderer 的 sessionAutoContinue
@@ -1356,8 +1243,11 @@ function registerIPC(): void {
 }
 
 app.whenReady().then(async () => {
+  closedSessionsManager = new ClosedSessionsManager(app.getPath('userData'));
+  closedSessionsManager.onUpdate((sessions) => safeSend('closed-sessions:update', sessions));
+  closedSessionsManager.resetStaleRestores();
+
   setupPtyManager();
-  resetStaleClosedSessionRestores();
 
   // macOS Dock 图标 — 在窗口创建前设置
   const appIcon = loadAppIcon();
@@ -1381,6 +1271,9 @@ app.whenReady().then(async () => {
   // 启动远程访问服务器（手机端）
   restartRemoteAccessServer();
   remoteSyncMonitor.start();
+
+  // CLI 探测是同步的，趁启动空闲先把缓存填上，别留给第一个请求去扛
+  prewarmCliDetection();
 
   // AI 配置已保存在偏好文件中，无需额外恢复
 
