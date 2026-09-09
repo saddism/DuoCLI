@@ -1280,7 +1280,8 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  app.quit();
+  // 关窗口不退出进程：远程服务（9800）和 Cloudflare 源站依赖本进程常驻。
+  // 真正退出请用 Cmd+Q / 菜单退出（走 before-quit 清理）。
 });
 
 app.on('activate', () => {
