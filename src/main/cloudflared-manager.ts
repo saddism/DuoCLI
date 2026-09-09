@@ -30,7 +30,9 @@ export class CloudflaredManager {
 
   getStatus(): CloudflaredStatus {
     const installed = Boolean(this.resolveBinary());
-    const running = this.isRunning();
+    // 没装 cloudflared 就不可能有本应用启动的隧道在跑；
+    // isRunning 的兜底是 fork 一次 /bin/ps 扫全进程表，别为不可能的结果付这个代价。
+    const running = installed && this.isRunning();
     const config = this.readConfig();
     const publicUrl = config.hostname ? `https://${config.hostname}` : '';
     const configReady = this.isConfigReady(config.raw);
@@ -54,20 +56,19 @@ export class CloudflaredManager {
    * force=true 时会先停掉所有 DuoCLI 相关 cloudflared 再启动。
    */
   reconcileTunnel(force = false): CloudflaredStatus {
-    if (force) {
-      this.killAllDuocliTunnels();
-      return this.start();
-    }
     const status = this.getStatus();
-    if (status.running) return status;
-    this.killAllDuocliTunnels();
+    if (!force && status.running) return status;
+    // force 时也只停本进程子进程，保留 LaunchAgent 系统隧道
+    this.stopOwnedProcess();
+    if (this.isRunning()) return this.getStatus();
     return this.start();
   }
 
   start(): CloudflaredStatus {
-    // 启动前清理：杀掉旧实例残留的 cloudflared 进程
-    // 注意：9800 端口由 remote-server 启动前自行清理，此处不应再碰，否则会杀掉当前 Electron 进程
-    this.killAllDuocliTunnels();
+    // 系统 LaunchAgent（~/.config/duocli-tunnel）已在跑时不要杀了重拉，
+    // 否则会和 KeepAlive 互殴，还可能短暂把公网隧道掐断。
+    // 注意：9800 由 remote-server 自行清理，这里绝不能动端口占用者。
+    if (this.isRunning()) return this.getStatus();
 
     const bin = this.resolveBinary();
     if (!bin) return this.getStatus();
@@ -91,7 +92,6 @@ export class CloudflaredManager {
         message: `Cloudflare 配置未完成，请填写本机私有配置: ${this.configPath}`,
       };
     }
-    if (this.isRunning()) return this.getStatus();
 
     fs.mkdirSync(path.dirname(this.logPath), { recursive: true });
     const out = fs.openSync(this.logPath, 'a');
@@ -108,16 +108,14 @@ export class CloudflaredManager {
   }
 
   stopOwnedProcess(): void {
+    // 只停本进程拉起的子进程，不要动 LaunchAgent 守护的系统隧道。
     if (!this.child || this.child.killed) return;
-    // 杀掉整个进程组（cloudflared 可能 spawn 子进程）
     if (this.child.pid) {
       try { process.kill(-this.child.pid, 'SIGKILL'); } catch { /* ignore */ }
       try { process.kill(this.child.pid, 'SIGKILL'); } catch { /* ignore */ }
     }
     try { this.child.kill('SIGKILL'); } catch { /* ignore */ }
     this.child = null;
-    // 确保残留的 cloudflared 进程也被清理
-    this.killAllDuocliTunnels();
   }
 
   /** Exported for tests: any cloudflared tunnel launched for DuoCLI. */
