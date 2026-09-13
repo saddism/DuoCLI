@@ -608,6 +608,8 @@ async function main() {
   check('Option + ↑ 只发送组合键序列',
     receivedInputs.length === 1 && receivedInputs[0] === '\x1b[1;3A',
     `received=${JSON.stringify(receivedInputs)}`);
+  const lastShortcutId = await page.evaluate(() => document.getElementById('shortcut-bar').lastElementChild?.id);
+  check('Option + ↑ 位于快捷键栏最后', lastShortcutId === 'option-up-key', `last=${lastShortcutId}`);
 
   // ===== Test 7: 发送后输入框清空且只发一次 =====
   receivedInputs.length = 0;
