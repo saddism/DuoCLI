@@ -1,6 +1,6 @@
 {
   "name": "duocli",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "轻量级支持 Claude Code、Codex、Zcode、Kimi、Antigravity、Cursor 等 10+ 主流 CLI 编程工具；手机远程开发、远程操控，局域网与互联网连接 | Lightweight multi-CLI terminal — Claude Code, Codex, Zcode, Kimi, Antigravity, Cursor & more. Mobile remote dev & control over LAN or Internet",
   "main": "dist/main/index.js",
   "scripts": {
@@ -14,7 +14,7 @@
     "restart:latest": "bash scripts/restart-latest.sh",
     "rebuild": "electron-rebuild",
     "test:unit": "npm run build:main && node --test \"mobile/client/*.test.cjs\" \"tests/*.test.mjs\" tests/mobile-page-visibility.test.js",
-    "test:e2e": "node tests/e2e/mobile.e2e.mjs && node tests/e2e/desktop-copy.e2e.mjs && node tests/e2e/desktop-scroll.e2e.mjs && node tests/e2e/mobile-remote.e2e.mjs",
+    "test:e2e": "node tests/e2e/mobile.e2e.mjs && node tests/e2e/desktop-copy.e2e.mjs && node tests/e2e/desktop-scroll.e2e.mjs && node tests/e2e/mobile-remote.e2e.mjs && node tests/e2e/quick-commands.e2e.mjs",
     "test": "npm run test:unit && npm run test:e2e",
     "build": "npm run build:ts && npm run copy:html && electron-builder",
     "build:mac": "npm run build:ts && npm run copy:html && electron-builder --mac",

@@ -22,6 +22,28 @@
     return 'avc1.42E01E';
   }
 
+  function normalizeAndroidControlInput(input) {
+    if (!input || typeof input !== 'object') return null;
+    const type = input.type || (input.text !== undefined ? 'text' : 'touch');
+    const next = { ...input, type };
+    if (type === 'touch' || type === 'tap' || type === 'scroll') {
+      const x = Math.round(Number(next.x));
+      const y = Math.round(Number(next.y));
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      next.x = x;
+      next.y = y;
+      if (next.pointerId !== undefined) {
+        const pointerId = Math.trunc(Number(next.pointerId));
+        next.pointerId = Number.isSafeInteger(pointerId) ? Math.max(0, pointerId) : 0;
+      }
+      if (next.pressure !== undefined) {
+        const pressure = Number(next.pressure);
+        next.pressure = Number.isFinite(pressure) ? Math.max(0, Math.min(1, pressure)) : (next.action === 'up' || next.action === 'cancel' ? 0 : 1);
+      }
+    }
+    return next;
+  }
+
   class AndroidMirrorClient {
     constructor(options) {
       this.getToken = options.getToken || (() => '');
@@ -89,6 +111,8 @@
 
     close() {
       this.connectionGeneration++;
+      if (this.leaseTimer) clearInterval(this.leaseTimer);
+      this.leaseTimer = null;
       this.shouldReconnect = false;
       this.clearReconnectTimer();
       this.clearResubscribeTimer();
@@ -155,11 +179,13 @@
     sendInput(input, allowWithoutController = false) {
       if (!this.isReady() || (!this.isController && !allowWithoutController)) return null;
       if (this.protocolVersion === 2 && this.geometryVersion <= 0) return null;
+      const normalized = normalizeAndroidControlInput(input);
+      if (!normalized) return null;
       const sequence = ++this.sequence;
       try {
         this.socket.send(JSON.stringify(this.protocolVersion === 2
-          ? { v: 2, type: 'control.input', deviceId: this.deviceId, seq: sequence, controlEpoch: this.controlEpoch, geometryVersion: this.geometryVersion, input }
-          : { type: 'android:input', deviceId: this.deviceId, sequence, input }));
+          ? { v: 2, type: 'control.input', deviceId: this.deviceId, seq: sequence, controlEpoch: this.controlEpoch, geometryVersion: this.geometryVersion, input: normalized }
+          : { type: 'android:input', deviceId: this.deviceId, sequence, input: normalized }));
         return sequence;
       } catch (error) {
         this.onError(error);
@@ -258,6 +284,10 @@
         this.feedbackTimer = null;
         this.connectionGeneration++;
         this.socket = null;
+        this.isController = false;
+        for (const pending of this.pendingAcks.values()) pending.reject(new Error('Android 控制连接已断开，输入结果未知'));
+        this.pendingAcks.clear();
+        this.recentAcks.clear();
         this.closeDecoder();
         this.decoderErrorReported = false;
         this.lastStatus = 'disconnected';
@@ -278,9 +308,16 @@
         } else if (message.type === 'control.ack') {
           message = { ...message, type: 'android:ack', sequence: message.seq, ok: message.status === 'ok' };
         } else if (message.type === 'control.owner') {
-          message = { ...message, type: 'android:control-owner', controller: Boolean(message.isController), owner: message.ownerClientId };
+          message = { ...message, type: 'android:control-owner', controller: Boolean(message.isController), owner: message.ownerClientId, challenged: Boolean(message.challenged) };
         } else if (message.type === 'control.granted') {
           message = { ...message, type: 'android:control-owner', status: 'control-owner', controller: Boolean(message.isController) };
+        } else if (message.type === 'android:control-challenge' || message.type === 'control.challenge') {
+          // Server arbitration: another client wants the lease while this
+          // client holds active pointers. Keep pressing; any new input renews
+          // the lease. No-op for the client side, surfaced for UI hints only.
+          message = { ...message, type: 'android:control-challenge' };
+          this.onStatus({ type: 'android:control-challenge', deviceId: this.deviceId, challenger: message.challenger, controlEpoch: this.controlEpoch });
+          return;
         }
         if (Number.isSafeInteger(message.controlEpoch) && message.controlEpoch > 0) this.controlEpoch = message.controlEpoch;
         if (message.type === 'android:status') {

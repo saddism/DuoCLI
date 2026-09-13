@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
+import { stripLeadingEnvAssignments } from './dsh-host';
 
 /** The CLI family is deliberately kept separate from the display/provider name. */
 export type CliKind =
@@ -16,6 +17,7 @@ export type CliKind =
   | 'kiro'
   | 'cursor'
   | 'agy'
+  | 'dsh'
   | 'unknown';
 
 export interface ResumeCapture {
@@ -29,7 +31,7 @@ const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const SESSION_ID = `[A-Za-z0-9_:.~-]+`;
 
 export function identifyCli(presetCommand: string): CliKind {
-  const first = (presetCommand.trim().match(/^(?:env\s+)?(?:[A-Za-z_][\w.-]*[\/])?([^\s]+)/)?.[1] || '');
+  const first = (stripLeadingEnvAssignments(presetCommand).match(/^(?:[A-Za-z_][\w.-]*[\/])?([^\s]+)/)?.[1] || '');
   const bin = path.basename(first).toLowerCase();
   if (bin === 'claude') return 'claude';
   if (bin === 'codex') return 'codex';
@@ -42,6 +44,7 @@ export function identifyCli(presetCommand: string): CliKind {
   if (bin === 'kiro-cli' || bin === 'kiro') return 'kiro';
   if (bin === 'agent' || bin === 'cursor-agent') return 'cursor';
   if (bin === 'agy' || bin === 'antigravity') return 'agy';
+  if (bin === 'dsh' || bin === 'dsh-tui' || bin === 'dst') return 'dsh';
   return 'unknown';
 }
 
@@ -60,7 +63,7 @@ function hasOption(command: string, names: string[]): boolean {
  */
 export function preassignSessionId(presetCommand: string, id: string): { command: string; capture: ResumeCapture | null } {
   const cli = identifyCli(presetCommand);
-  if (!id || cli === 'unknown' || cli === 'codex' || cli === 'devin' || cli === 'kimi' || cli === 'opencode' || cli === 'kiro' || cli === 'agy') {
+  if (!id || cli === 'unknown' || cli === 'codex' || cli === 'devin' || cli === 'kimi' || cli === 'opencode' || cli === 'kiro' || cli === 'agy' || cli === 'dsh') {
     return { command: presetCommand, capture: null };
   }
   const alreadyConfigured = cli === 'claude'
@@ -108,6 +111,7 @@ export function buildResumeCommand(presetCommand: string, sessionId: string): st
     case 'kiro': return `${base} --resume-id ${id}`.trim();
     case 'cursor': return `${base} --resume=${id}`.trim();
     case 'agy': return `${base} --conversation ${id}`.trim();
+    case 'dsh': return `${base} --resume ${id}`.trim();
     default: return '';
   }
 }
@@ -128,6 +132,7 @@ export function isResumeCommandCompatible(presetCommand: string, command: string
     case 'kiro': return /--resume-id(?:=|\s)/i.test(value);
     case 'cursor': return /\bagent\b[^\n]*--resume(?:=|\s)/i.test(value);
     case 'agy': return /\bagy\b[^\n]*--conversation(?:=|\s)/i.test(value);
+    case 'dsh': return /\bdsh(?:-tui)?\b[^\n]*(?:--session|--resume)(?:=|\s)/i.test(value);
     default: return false;
   }
 }
@@ -167,6 +172,7 @@ export function parseResumeCommandLine(command: string): ResumeCapture | null {
     kiro: /(?:^|\s)--resume-id(?:=|\s+)'?([A-Za-z0-9_-]+)'?/i,
     cursor: /(?:^|\s)--resume(?:=|\s+)'?([A-Za-z0-9_-]+)'?/i,
     agy: /(?:^|\s)--conversation(?:=|\s+)'?([A-Za-z0-9_-]+)'?/i,
+    dsh: /(?:^|\s)(?:--session|--resume)(?:=|\s+)'?([A-Za-z0-9_-]+)'?/i,
   };
   const match = patterns[cli]?.exec(command);
   if (!match) return null;
@@ -189,6 +195,7 @@ const RESUME_OUTPUT_PATTERNS: (readonly [CliKind, RegExp])[] = [
   ['kiro', /\bkiro(?:-cli)?(?:\s+chat)?\s+--resume-id(?:=|\s+)([A-Za-z0-9_-]+)/i],
   ['cursor', /\bagent\s+--resume(?:=|\s+)([A-Za-z0-9_-]+)/i],
   ['agy', /\bagy\s+--conversation(?:=|\s+)([A-Za-z0-9_-]+)/i],
+  ['dsh', /\bdsh-tui\s+(?:--session|--resume)(?:=|\s+)([A-Za-z0-9_-]+)/i],
 ];
 
 // JSON event formats emitted by the headless and streaming modes.

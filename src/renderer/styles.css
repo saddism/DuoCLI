@@ -350,10 +350,12 @@ html, body {
 .theme-dot {
   width: 9px;
   height: 9px;
-  border-radius: 50%;
+  border-radius: 2px;
   flex-shrink: 0;
   display: inline-block;
-  box-shadow: 0 0 4px rgba(0, 0, 0, 0.4);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.28),
+    0 0 0 2px rgba(0, 0, 0, 0.22);
 }
 
 .toolbar-btn {
@@ -897,22 +899,6 @@ html, body {
   user-select: none;
 }
 
-.pane-header::before {
-  content: '';
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--pane-accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--pane-accent) 35%, transparent);
-  flex-shrink: 0;
-  opacity: 0.72;
-}
-
-.pane-leaf.pane-leaf-focused .pane-header::before {
-  opacity: 1;
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--pane-accent) 55%, transparent), 0 0 10px color-mix(in srgb, var(--pane-accent) 55%, transparent);
-}
-
 .pane-leaf.pane-leaf-focused .pane-header {
   background: linear-gradient(
     180deg,
@@ -930,6 +916,43 @@ html, body {
 
 .pane-header:active {
   cursor: grabbing;
+}
+
+.pane-kind-icon {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--pane-accent, var(--text-secondary));
+  opacity: 0.92;
+}
+
+.pane-kind-icon .ui-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.pane-leaf.pane-leaf-focused .pane-kind-icon {
+  opacity: 1;
+}
+
+.pane-leaf.pane-leaf-dragging {
+  opacity: 0.55;
+}
+
+.pane-leaf.pane-leaf-drop-target {
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--accent) 78%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.pane-leaf.pane-leaf-drop-target .pane-header {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg-secondary));
+  color: var(--text-primary);
 }
 
 .pane-title {
@@ -1660,11 +1683,13 @@ html, body {
 .session-color-dot {
   width: 10px;
   height: 10px;
-  border-radius: 50%;
+  border-radius: 2px;
   flex-shrink: 0;
   cursor: pointer;
   position: relative;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.28),
+    0 0 0 2px rgba(0, 0, 0, 0.25);
   transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 
@@ -1675,18 +1700,22 @@ html, body {
 }
 
 .session-color-dot:hover {
-  transform: scale(1.25);
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.35);
+  transform: scale(1.18);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.45),
+    0 0 0 2px rgba(0, 0, 0, 0.35);
 }
 
 .pane-color-indicator {
   width: 10px;
   height: 10px;
-  border-radius: 50%;
+  border-radius: 2px;
   flex-shrink: 0;
   display: inline-block;
   cursor: pointer;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.3),
+    0 0 0 2px rgba(0, 0, 0, 0.28);
 }
 
 .session-info {
@@ -3032,12 +3061,14 @@ textarea:focus-visible,
 .color-picker-btn {
   width: 100%;
   aspect-ratio: 1;
-  border: none;
-  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 6px;
   cursor: pointer;
   transition: all 0.15s ease;
   position: relative;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 0, 0, 0.22),
+    0 2px 4px rgba(0, 0, 0, 0.2);
 }
 
 .color-picker-btn:hover {
@@ -3222,3 +3253,18 @@ textarea:focus-visible,
     margin-right: 6px;
   }
 }
+
+/* Every terminal keeps its own draft; quick commands come from the shared host. */
+.pane-body > .terminal-container,
+.terminal-container.active { display: flex; flex-direction: column; }
+.terminal-surface { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+.terminal-composer { flex: none; padding: 8px 2px 2px; border-top: 1px solid var(--border-color, #333); }
+.terminal-compose-row { display: flex; gap: 8px; }
+.terminal-compose-row textarea { flex: 1; min-width: 0; resize: none; padding: 8px; color: var(--text-primary, #ddd); background: var(--bg-primary, #1e1e1e); border: 1px solid var(--border-color, #444); border-radius: 6px; font: inherit; }
+.terminal-composer button { color: var(--text-primary, #ddd); background: var(--bg-secondary, #292929); border: 1px solid var(--border-color, #444); border-radius: 5px; padding: 5px 9px; cursor: pointer; }
+.desktop-quick-commands { display: flex; gap: 6px; overflow-x: auto; padding-top: 7px; }
+.desktop-quick-commands button { flex-shrink: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.quick-command-editor:not([hidden]) { display: flex; gap: 6px; padding-top: 6px; }
+.quick-command-editor input { flex: 1; min-width: 0; }
+.compose-status:empty { display: none; }
+.compose-status { color: var(--danger, #e06c75); font-size: 12px; padding-top: 4px; }

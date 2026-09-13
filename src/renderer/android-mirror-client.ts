@@ -325,9 +325,12 @@ export class AndroidMirrorClient {
       } else if (message.type === 'control.ack') {
         message = { ...message, type: 'android:ack', sequence: message.seq, ok: message.status === 'ok' };
       } else if (message.type === 'control.owner') {
-        message = { ...message, type: 'android:control-owner', controller: Boolean(message.isController), owner: message.ownerClientId };
+        message = { ...message, type: 'android:control-owner', controller: Boolean(message.isController), owner: message.ownerClientId, challenged: Boolean(message.challenged) };
       } else if (message.type === 'control.granted') {
         message = { ...message, type: 'android:control-owner', status: 'control-owner', controller: Boolean(message.isController) };
+      } else if (message.type === 'android:control-challenge' || message.type === 'control.challenge') {
+        this.onStatus({ type: 'android:control-challenge', deviceId: this.deviceId, controlEpoch: this.controlEpoch });
+        return;
       }
       if (Number.isSafeInteger(message.controlEpoch) && message.controlEpoch > 0) this.controlEpoch = message.controlEpoch;
       if (message.type === 'android:status') {

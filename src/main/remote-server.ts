@@ -1,4 +1,6 @@
 import express from 'express';
+import { quickCommands } from './quick-commands';
+import { sendFileDownload } from './file-download';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
@@ -220,11 +222,18 @@ const MAX_RECENT_CWDS = 20;
 const MAX_PRESET_USAGE_ENTRIES = 100;
 const MAX_PREVIEW_BYTES = 1024 * 1024;
 export const PREVIEW_EXTENSIONS = new Set([
-  '.md', '.markdown', '.txt', '.log', '.json', '.jsonl', '.yaml', '.yml', '.toml',
-  '.xml', '.csv', '.tsv', '.ini', '.conf', '.config', '.properties',
-  '.js', '.jsx', '.ts', '.tsx', '.vue', '.css', '.scss', '.less', '.html', '.htm',
-  '.py', '.pyw', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.cc', '.cpp', '.h',
-  '.hpp', '.sh', '.bash', '.zsh', '.fish', '.sql', '.nvue', '.wxml', '.wxss',
+  '.md', '.mdx', '.markdown', '.txt', '.log', '.rtf',
+  '.ipynb', '.tex', '.bib', '.rst', '.adoc', '.diff', '.patch', '.srt', '.vtt', '.graphql', '.gql', '.proto',
+  '.json', '.jsonc', '.jsonl', '.yaml', '.yml', '.toml', '.xml', '.csv', '.tsv',
+  '.ini', '.conf', '.cfg', '.config', '.properties', '.env', '.lock', '.map',
+  '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts',
+  '.vue', '.svelte', '.astro', '.nvue', '.wxml', '.wxss',
+  '.css', '.scss', '.sass', '.less', '.html', '.htm', '.xhtml',
+  '.py', '.pyw', '.pyi', '.go', '.rs', '.java', '.kt', '.kts', '.swift',
+  '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh', '.hxx', '.cs',
+  '.rb', '.php', '.pl', '.pm', '.r', '.lua', '.dart', '.scala', '.clj',
+  '.ex', '.exs', '.erl', '.hs', '.mm', '.m', '.sql', '.gradle',
+  '.sh', '.bash', '.zsh', '.fish', '.bat', '.cmd', '.ps1', '.psm1',
 ]);
 
 // 媒体扩展名 → { mime, kind }；kind 供手机端分流渲染（image/video/audio/pdf），
@@ -241,11 +250,13 @@ export const MEDIA_EXT_MAP: Record<string, { mime: string; kind: string }> = {
   '.avif': { mime: 'image/avif', kind: 'image' },
   '.heic': { mime: 'image/heic', kind: 'image' },   // 原生不可显示，下面转 JPEG
   '.heif': { mime: 'image/heif', kind: 'image' },
+  '.ico': { mime: 'image/x-icon', kind: 'image' },
   // 视频
   '.mp4': { mime: 'video/mp4', kind: 'video' },
   '.m4v': { mime: 'video/mp4', kind: 'video' },
   '.mov': { mime: 'video/quicktime', kind: 'video' },
   '.webm': { mime: 'video/webm', kind: 'video' },
+  '.mkv': { mime: 'video/x-matroska', kind: 'video' },
   // 音频
   '.mp3': { mime: 'audio/mpeg', kind: 'audio' },
   '.m4a': { mime: 'audio/mp4', kind: 'audio' },
@@ -424,6 +435,15 @@ export function startRemoteServer(
   }
 
   app.use('/api', authMiddleware);
+  app.get('/api/quick-commands', (_req, res) => {
+    try { res.json(quickCommands.read()); }
+    catch { res.status(500).json({ error: '快捷命令读取失败' }); }
+  });
+  app.post('/api/quick-commands', (req, res) => {
+    try { res.json(quickCommands.update(req.body)); }
+    catch (error: any) { res.status(400).json({ error: error.message || '快捷命令保存失败' }); }
+  });
+
 
   // ========== WebSocket ==========
 
@@ -1508,6 +1528,12 @@ export function startRemoteServer(
     res.json(sessions);
   });
 
+  app.get('/api/sessions/:id/file-download', (req, res) => {
+    const session = ptyManager.getSession(req.params.id);
+    if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
+    sendFileDownload(session.cwd, String(req.query.path || ''), res);
+  });
+
   // 手机端只读预览会话 cwd 内的文本文件
   app.get('/api/sessions/:id/file-preview', (req, res) => {
     const session = ptyManager.getSession(req.params.id);
@@ -2190,6 +2216,22 @@ export function startRemoteServer(
     }
   });
 
+  const ANDROID_NAV_KEYCODES: Record<string, number> = { back: 4, home: 3, recents: 187 };
+
+  app.post('/api/android/key', async (req, res) => {
+    try {
+      const deviceId = typeof req.body.deviceId === 'string' ? req.body.deviceId.trim() : '';
+      const key = typeof req.body.key === 'string' ? req.body.key.trim() : '';
+      const keyCode = ANDROID_NAV_KEYCODES[key];
+      if (!deviceId || !keyCode) { res.status(400).json({ error: '参数错误' }); return; }
+      if (!legacyControlAllowed(req, res, deviceId)) return;
+      await runAdb(['-s', deviceId, 'shell', 'input', 'keyevent', String(keyCode)]);
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ error: '按键失败: ' + (e.message || e) });
+    }
+  });
+
   app.post('/api/android/input-text', async (req, res) => {
     try {
       const deviceId = typeof req.body.deviceId === 'string' ? req.body.deviceId.trim() : '';
@@ -2248,7 +2290,16 @@ export function startRemoteServer(
     // 还会把用户正在滑开的会话卡片换成新节点、打断手势。存活性由 3s 心跳保证。
     let lastSessionsPayload = '';
     let lastClosedPayload = '';
+    let lastQuickCommandsPayload = '';
     const sendSessions = () => {
+      try {
+        const payload = JSON.stringify(quickCommands.read());
+        if (payload !== lastQuickCommandsPayload) {
+          lastQuickCommandsPayload = payload;
+          res.write(`event: quick-commands\ndata: ${payload}\n\n`);
+        }
+      } catch { /* Keep the stream alive if configuration cannot be read. */ }
+
       const sessions = JSON.stringify(ptyManager.getAllSessions().map(s => mapSessionToApi(s)));
       if (sessions !== lastSessionsPayload) {
         lastSessionsPayload = sessions;

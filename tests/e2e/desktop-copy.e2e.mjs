@@ -27,8 +27,8 @@ function check(name, ok, detail = '') {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const HTML = `<!doctype html><html><head><meta charset="utf-8">
-<link rel="stylesheet" href="/xterm.css">
-<style>html,body{margin:0;height:100%;background:#1e1e1e}#area{width:820px;height:420px}</style>
+<link rel="stylesheet" href="/xterm.css"><link rel="stylesheet" href="/styles.css">
+<style>html,body{margin:0;height:100%;background:#1e1e1e}#area{position:relative;width:820px;height:420px}</style>
 </head><body><div id="area"></div><script src="/bundle.js"></script></body></html>`;
 
 const server = http.createServer((req, res) => {
@@ -39,6 +39,9 @@ const server = http.createServer((req, res) => {
   if (p === '/bundle.js') {
     res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
     res.end(fs.readFileSync(path.join(TMP, 'bundle.js'))); return;
+  }
+  if (p === '/styles.css') {
+    res.setHeader('Content-Type', 'text/css'); res.end(fs.readFileSync(path.join(ROOT, 'src/renderer/styles.css'))); return;
   }
   if (p === '/xterm.css') {
     res.setHeader('Content-Type', 'text/css; charset=utf-8');
@@ -80,6 +83,7 @@ async function main() {
     const area = document.getElementById('area');
     const mgr = new DuoTerminal.TerminalManager(area);
     mgr.create('t1', 'vscode-dark', '/tmp/proj', () => {});
+    mgr.mountTo('t1', area);
     const inst = mgr.instances.get('t1');
     window.__t = inst.terminal;
     window.__c = inst.container;
@@ -188,6 +192,48 @@ async function main() {
     opened.length === 1 && opened[0] === '/tmp/proj/src/My File.ts',
     `opened=${JSON.stringify(opened)}`,
   );
+
+  for (const filePath of [
+    'work/material-audit-v1/海南中央半岛别墅预算02/image130.png',
+    'output/预算02-建模可用信息-20260912.md',
+  ]) {
+    const point = await page.evaluate(async filePath => {
+      const t = window.__t;
+      t.reset();
+      t.resize(100, 20);
+      window.__opened.length = 0;
+      await new Promise(resolve => t.write(`  └ ${filePath}`, resolve));
+      const rect = t.element.querySelector('.xterm-screen').getBoundingClientRect();
+      return { x: rect.left + 10.5 * rect.width / t.cols, y: rect.top + 0.5 * rect.height / t.rows };
+    }, filePath);
+    await page.mouse.move(point.x, point.y);
+    await sleep(250);
+    await page.mouse.click(point.x, point.y);
+    await sleep(100);
+    const opened = await page.evaluate(() => window.__opened.slice());
+    check('截图中的中文文件路径可点击', opened[0] === `/tmp/proj/${filePath}`, JSON.stringify(opened));
+  }
+
+  await browser.defaultBrowserContext().overridePermissions(ORIGIN, ['clipboard-read', 'clipboard-write', 'clipboard-sanitized-write']);
+  await page.evaluate(async () => {
+    const t = window.__t;
+    t.reset();
+    await new Promise(resolve => t.write(
+      Array.from({ length: 100 }, (_, i) => `history ${i}\r\n`).join('') + 'COPY-LATEST', resolve));
+    t.focus();
+  });
+  await page.keyboard.down('Shift');
+  for (let i = 0; i < 6; i++) await page.keyboard.press('ArrowLeft');
+  await page.keyboard.up('Shift');
+  const selected = await page.evaluate(() => window.__t.getSelection());
+  check('键盘选区：存在滚动历史时选中当前光标旁的文本', selected === 'LATEST', `selected=${JSON.stringify(selected)}`);
+  await page.evaluate(() => navigator.clipboard.writeText('before-copy'));
+  await page.keyboard.down('Meta');
+  await page.keyboard.press('c');
+  await page.keyboard.up('Meta');
+  await sleep(150);
+  const copiedByShortcut = await page.evaluate(() => navigator.clipboard.readText());
+  check('Command+C：将终端选区写入剪贴板', copiedByShortcut === 'LATEST', `copied=${JSON.stringify(copiedByShortcut)}`);
 
   await browser.close();
   server.close();

@@ -92,6 +92,7 @@ export function getCliProvider(presetCommand: string): string | null {
   if (presetCommand.startsWith('kiro-cli')) return 'Kiro';
   if (presetCommand.startsWith('agent') || presetCommand.includes('cursor')) return 'Cursor';
   if (presetCommand.startsWith('agy')) return 'Antigravity';
+  if (/\bdsh(?:-tui)?\b/i.test(presetCommand)) return 'DeepSeek';
 
   return null;
 }

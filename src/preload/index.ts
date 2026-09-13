@@ -22,6 +22,10 @@ export interface RemoteServerInfoPayload {
 }
 
 contextBridge.exposeInMainWorld('duocli', {
+  getQuickCommands: () => ipcRenderer.invoke('quick-commands:get'),
+  updateQuickCommands: (operation: { action: string; command?: string; commands?: string[] }) => ipcRenderer.invoke('quick-commands:update', operation),
+  submitPty: (id: string, submissionId: string, text: string) => ipcRenderer.invoke('pty:submit', id, submissionId, text),
+
   // 设置窗口标题
   setWindowTitle: (title: string) => ipcRenderer.send('window:set-title', title),
   onCloseCurrentSession: (cb: () => void) =>
@@ -144,6 +148,13 @@ contextBridge.exposeInMainWorld('duocli', {
     ipcRenderer.send('session:sync-status', statuses),
 
   // 催工配置：供 main 进程从 renderer 读写
+  autoContinueManaged: true,
+  getAutoContinueConfigs: () => ipcRenderer.invoke('auto-continue:get-all') as Promise<{
+    configs: Record<string, any>;
+    persisted: boolean;
+  }>,
+  syncAutoContinueConfigs: (configs: Record<string, any>) =>
+    ipcRenderer.send('auto-continue:sync', configs),
   onGetAutoContinueConfig: (cb: (sessionId: string) => void) =>
     ipcRenderer.on('auto-continue:get', (_e, sessionId) => cb(sessionId)),
   sendAutoContinueConfig: (sessionId: string, config: any) =>
@@ -170,4 +181,6 @@ contextBridge.exposeInMainWorld('duocli', {
   // ========== 通知功能 ==========
   onNotification: (cb: (title: string, body: string, sessionId?: string) => void) =>
     ipcRenderer.on('notification', (_e, title, body, sessionId) => cb(title, body, sessionId)),
+  onNotificationOpen: (cb: (sessionId: string) => void) =>
+    ipcRenderer.on('notification:open-session', (_e, sessionId) => cb(sessionId)),
 });

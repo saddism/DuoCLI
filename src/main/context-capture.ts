@@ -84,6 +84,12 @@ const CLI_PATTERNS: Record<CliKind, CLIPatterns> = {
     user: /(?:^|\n)>?\s*(?:User:|用户：)?\s*(.*)/gmi,
     assistant: /(?:^|\n)(?:Assistant:|助手：|AI:)?\s*(.*)/gmi,
   },
+
+  // DSH / dsh-tui
+  dsh: {
+    user: /(?:^|\n)(?::w|>>>|User:)\s+(.*)/gmi,
+    assistant: /(?:^|\n)(?!>>>|:w)[^\n]+/gm,
+  },
   
   // Devin:
   devin: {

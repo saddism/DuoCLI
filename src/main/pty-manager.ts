@@ -22,6 +22,7 @@ import {
   resolveSessionId,
 } from './session-resume';
 import { buildLaunchWrite, normalizePresetEnv } from './preset-env';
+import { stripLeadingEnvAssignments } from './dsh-host';
 
 export interface PtySession {
   id: string;
@@ -133,6 +134,7 @@ const PRESET_DISPLAY_NAMES: Record<string, string> = {
   'kiro-cli chat --trust-all-tools': 'Kiro全自动',
   'agent --force --approve-mcps': 'Cursor全自动',
   'agy --dangerously-skip-permissions': 'Antigravity全自动',
+  'dsh-tui': 'DSH',
 };
 
 const CLI_BASE_DISPLAY_NAMES: Record<CliKind, string> = {
@@ -147,6 +149,7 @@ const CLI_BASE_DISPLAY_NAMES: Record<CliKind, string> = {
   kiro: 'Kiro',
   cursor: 'Cursor',
   agy: 'Antigravity',
+  dsh: 'DSH',
   unknown: '',
 };
 
@@ -336,6 +339,10 @@ export class PtyManager {
       const preassigned = preassignSessionId(presetCommand, crypto.randomUUID());
       launchCommand = preassigned.command;
       initialResume = preassigned.capture;
+    }
+    if (cliKind === 'dsh') {
+      // 新版 dsh-tui 是 DSH profile 插件，自己 boot harness，不要再塞 DSH_URL / HTTP 启动器。
+      launchCommand = stripLeadingEnvAssignments(launchCommand);
     }
     const shell = process.platform === 'win32'
       ? (process.env.COMSPEC || 'cmd.exe')
@@ -597,7 +604,7 @@ export class PtyManager {
     session.ptyProcess.write(data);
   }
 
-  submit(id: string, submissionId: string, text: string): Promise<void> {
+  submit(id: string, submissionId: string, text: string, enterDelayMs = 50): Promise<void> {
     const session = this.sessions.get(id);
     if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
     const existing = session.submissions.get(submissionId);
@@ -609,7 +616,7 @@ export class PtyManager {
       const normalized = text.replace(/\r\n?/g, '\n');
       this.write(id, bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized, 'mobile');
       // TUI 输入状态需要完成一次更新；回车不能与粘贴被识别成同一次 paste。
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(120_000, enterDelayMs))));
       if (this.sessions.get(id) !== session) throw new Error('会话已结束');
       this.write(id, '\r', 'mobile');
     });

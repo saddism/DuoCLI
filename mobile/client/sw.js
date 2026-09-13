@@ -1,6 +1,6 @@
 // DuoCLI Mobile - Service Worker
 
-const CACHE_NAME = 'duocli-v18';
+const CACHE_NAME = 'duocli-v44';
 const ASSETS = [
   '/',
   '/index.html',
@@ -12,6 +12,7 @@ const ASSETS = [
   '/addon-unicode11.js',
   '/android-mirror-client.js',
   '/android-pointer-helpers.js',
+  '/android-nav-keys.js',
   '/file-preview-helpers.js',
   '/terminal-scroll-helpers.js',
   '/spinner-interceptor.js',
@@ -104,16 +105,20 @@ self.addEventListener('push', e => {
 // 点击通知 → 打开应用
 self.addEventListener('notificationclick', e => {
   e.notification.close();
+  const sessionId = e.notification.data?.sessionId;
   e.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
       // 如果已有窗口，聚焦
       for (const client of clients) {
         if (client.url.includes(self.location.origin)) {
-          return client.focus();
+          return client.focus().then(() => {
+            if (sessionId) client.postMessage({ type: 'open-session', sessionId });
+          });
         }
       }
       // 否则打开新窗口
-      return self.clients.openWindow('/');
+      const query = sessionId ? `?session=${encodeURIComponent(sessionId)}` : '';
+      return self.clients.openWindow(`/${query}`);
     })
   );
 });

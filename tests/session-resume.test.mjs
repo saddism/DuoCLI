@@ -27,6 +27,8 @@ test('identifies all built-in CLI families', () => {
     ['kiro-cli chat --trust-all-tools', 'kiro'],
     ['agent --force --approve-mcps', 'cursor'],
     ['agy --dangerously-skip-permissions', 'agy'],
+    ['dsh-tui', 'dsh'],
+    ['DSH_URL=http://127.0.0.1:58084 dsh-tui', 'dsh'],
   ];
   for (const [command, expected] of cases) assert.equal(identifyCli(command), expected);
 });
@@ -41,6 +43,7 @@ test('builds provider-specific resume commands', () => {
   assert.equal(buildResumeCommand('opencode --session=ses_old --verbose', 'ses_abc'), 'opencode --verbose -s ses_abc');
   assert.equal(buildResumeCommand('agent --force --approve-mcps', id), `agent --force --approve-mcps --resume=${id}`);
   assert.equal(buildResumeCommand('agy --dangerously-skip-permissions', id), `agy --dangerously-skip-permissions --conversation ${id}`);
+  assert.equal(buildResumeCommand('dsh-tui', 'session-abc'), 'dsh-tui --resume session-abc');
 });
 
 test('preassigns IDs only for CLIs that support it', () => {

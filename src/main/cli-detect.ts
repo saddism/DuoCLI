@@ -2,6 +2,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { stripLeadingEnvAssignments } from './dsh-host';
 
 export interface BuiltinPreset {
   value: string;
@@ -22,6 +23,7 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
   { value: 'kiro-cli chat --trust-all-tools', label: 'Kiro (全自动)' },
   { value: 'agent --force --approve-mcps', label: 'Cursor (全自动)' },
   { value: 'agy --dangerously-skip-permissions', label: 'Antigravity (全自动)' },
+  { value: 'dsh-tui', label: 'DSH' },
 ];
 
 const existsCache = new Map<string, boolean>();
@@ -80,7 +82,7 @@ export function commandExists(bin: string): boolean {
 }
 
 export function extractCommandBin(presetCommand: string): string {
-  const trimmed = presetCommand.trim();
+  const trimmed = stripLeadingEnvAssignments(presetCommand);
   if (!trimmed) return '';
   return trimmed.split(/\s+/)[0] || '';
 }

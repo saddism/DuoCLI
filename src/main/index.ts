@@ -1,3 +1,4 @@
+import { quickCommands } from './quick-commands';
 import { app, BrowserWindow, ipcMain, dialog, clipboard, nativeImage, shell, globalShortcut } from 'electron';
 import { spawn } from 'child_process';
 import * as path from 'path';
@@ -17,6 +18,7 @@ import {
 import { getAvailableBuiltinPresets, prewarmCliDetection } from './cli-detect';
 import { ResumeCapture } from './session-resume';
 import { ClosedSessionsManager, ContextHistoryEntry } from './closed-sessions';
+import { AutoContinueManager } from './auto-continue-manager';
 import { parseAndroidDevices, runAdb } from './android-devices';
 import { extractContextFromChunks } from './context-capture';
 import { exportSessionContext, writeExportToFile } from './context-export';
@@ -50,6 +52,16 @@ const IMESSAGE_SERVICE = ((process.env.DUOCLI_IMESSAGE_SERVICE || 'iMessage').tr
 const sessionOutputTail: Map<string, string> = new Map();
 /** 用于累积上下文捕获的原始输出 */
 const sessionContextBuffer: Map<string, string> = new Map();
+const MAX_CONTEXT_BUFFER_CHARS = 2 * 1024 * 1024;
+
+function appendSessionContext(id: string, data: string): void {
+  if (!data) return;
+  const previous = sessionContextBuffer.get(id) || '';
+  const merged = previous + data;
+  sessionContextBuffer.set(id, merged.length > MAX_CONTEXT_BUFFER_CHARS
+    ? merged.slice(-MAX_CONTEXT_BUFFER_CHARS)
+    : merged);
+}
 
 const DESKTOP_PREVIEW_EXTENSIONS = new Set([
   '.md', '.markdown', '.txt', '.log', '.json', '.jsonl', '.yaml', '.yml', '.toml',
@@ -169,6 +181,7 @@ let cachedRemoteServerInfo: any = null;
 let remoteServer: ReturnType<typeof startRemoteServer> | null = null;
 let remoteSyncMonitor: RemoteSyncMonitor | null = null;
 let remoteServerRestarting = false;
+let autoContinueManager: AutoContinueManager | null = null;
 
 function publishRemoteServerInfo(
   info: { lanUrl: string; token: string; port: number },
@@ -284,6 +297,7 @@ function createWindow(appIcon?: Electron.NativeImage): void {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   });
 
@@ -366,14 +380,14 @@ function sendUserNotification(id: string, title: string, body: string, sound?: b
   }
   
   // 创建桌面端系统通知（Electron）
-  createDesktopNotification(title, body);
+  createDesktopNotification(title, body, id);
   
   // 同时发送给前端渲染进程
   safeSend('notification', title, body, id);
 }
 
 // 创建桌面端系统通知（Electron Notification API）
-function createDesktopNotification(title: string, body: string): void {
+function createDesktopNotification(title: string, body: string, sessionId?: string): void {
   if (!BrowserWindow.getAllWindows().length) return;
   
   const notification = new Notification({
@@ -390,6 +404,7 @@ function createDesktopNotification(title: string, body: string): void {
     if (window) {
       window.focus();
       window.show();
+      if (sessionId) window.webContents.send('notification:open-session', sessionId);
     }
   });
   
@@ -482,10 +497,10 @@ function setupPtyManager(): void {
   ptyManager = new PtyManager({
     onData: (id, data) => {
       safeSend('pty:data', id, data);
+      autoContinueManager?.observeOutput(id, data);
       
       // ===== 累积上下文输出用于捕获 =====
-      const existing = sessionContextBuffer.get(id) || '';
-      sessionContextBuffer.set(id, existing + data);
+      appendSessionContext(id, data);
       
       maybeNotifyAttention(id, data);
     },
@@ -496,6 +511,7 @@ function setupPtyManager(): void {
       safeSend('pty:title-update', id, title);
     },
     onExit: (id) => {
+      autoContinueManager?.remove(id);
       // 兜底：从 buffer 中提取 resume ID
       ptyManager.captureResumeFromBuffer(id);
 
@@ -529,10 +545,12 @@ function setupPtyManager(): void {
       sessionLastInputAt.delete(id);
       sessionArmedForNotify.delete(id);
       sessionLastNotifyAt.delete(id);
+      sessionContextBuffer.delete(id);
     },
     onPasteInput: (id, cwd) => {
       sessionLastInputAt.set(id, Date.now());
       sessionArmedForNotify.add(id);
+      autoContinueManager?.noteManualInput(id);
     },
   },
   () => loadAiPreferenceData().manualConfig || null,
@@ -574,6 +592,13 @@ function registerIPC(): void {
       cli: session.cliKind,
       resumeId: session.resumeId,
     };
+  });
+
+  ipcMain.handle('quick-commands:get', () => quickCommands.read());
+  ipcMain.handle('quick-commands:update', (_e, operation) => quickCommands.update(operation));
+  ipcMain.handle('pty:submit', (_e, id: string, submissionId: string, text: string) => {
+    if (typeof text !== 'string' || text.length > 100000 || typeof submissionId !== 'string') throw new Error('无效消息');
+    return ptyManager.submit(id, submissionId, text);
   });
 
   // 写入数据
@@ -1195,13 +1220,19 @@ function registerIPC(): void {
   });
   ipcMain.handle('remote:generate-token', () => generateAccessToken());
 
-  // ========== 催工配置中转 IPC ==========
-  // main 进程作为中转：remote-server API → renderer 的 sessionAutoContinue
+  // ========== 催工配置 IPC ==========
+  // 配置与调度由 main 进程负责，renderer 只负责设置和展示；这样重载页面、隐藏窗口
+  // 或渲染进程暂时崩溃时，计划仍然可以继续执行。
+  ipcMain.handle('auto-continue:get-all', () => ({
+    configs: autoContinueManager?.list() || {},
+    persisted: autoContinueManager?.hasPersistedState() || false,
+  }));
+  ipcMain.on('auto-continue:sync', (_e, configs: unknown) => {
+    autoContinueManager?.syncAll(configs);
+  });
 
-  // 存放 pending 的 get 请求回调
+  // 兼容旧版 renderer：manager 尚未就绪时仍保留一次性的 IPC 中转。
   const autoContinuePendingGets = new Map<string, (config: any) => void>();
-
-  // renderer 回复配置
   ipcMain.on('auto-continue:config-reply', (_e, sessionId: string, config: any) => {
     const resolve = autoContinuePendingGets.get(sessionId);
     if (resolve) {
@@ -1210,23 +1241,28 @@ function registerIPC(): void {
     }
   });
 
-  // 供 remote-server 调用：读取催工配置
+  const getAutoContinueFromRenderer = (sessionId: string): Promise<any> => new Promise((resolve) => {
+    autoContinuePendingGets.set(sessionId, resolve);
+    safeSend('auto-continue:get', sessionId);
+    setTimeout(() => {
+      if (autoContinuePendingGets.has(sessionId)) {
+        autoContinuePendingGets.delete(sessionId);
+        resolve(null);
+      }
+    }, 2000);
+  });
+
   (global as any).__getAutoContinueConfig = (sessionId: string): Promise<any> => {
-    return new Promise((resolve) => {
-      autoContinuePendingGets.set(sessionId, resolve);
-      safeSend('auto-continue:get', sessionId);
-      // 超时兜底
-      setTimeout(() => {
-        if (autoContinuePendingGets.has(sessionId)) {
-          autoContinuePendingGets.delete(sessionId);
-          resolve(null);
-        }
-      }, 2000);
-    });
+    if (autoContinueManager) return Promise.resolve(autoContinueManager.get(sessionId));
+    return getAutoContinueFromRenderer(sessionId);
   };
 
-  // 供 remote-server 调用：写入催工配置
   (global as any).__setAutoContinueConfig = (sessionId: string, config: any): void => {
+    if (autoContinueManager) {
+      const normalized = autoContinueManager.set(sessionId, config);
+      safeSend('auto-continue:set', sessionId, normalized);
+      return;
+    }
     safeSend('auto-continue:set', sessionId, config);
   };
 
@@ -1245,6 +1281,10 @@ app.whenReady().then(async () => {
   closedSessionsManager.resetStaleRestores();
 
   setupPtyManager();
+  autoContinueManager = new AutoContinueManager(
+    ptyManager,
+    path.join(app.getPath('userData'), 'auto-continue.json'),
+  );
 
   // macOS Dock 图标 — 在窗口创建前设置
   const appIcon = loadAppIcon();
@@ -1294,6 +1334,8 @@ app.on('activate', () => {
 
 function cleanupForQuit(): void {
   globalShortcut.unregisterAll();
+  autoContinueManager?.stop();
+  autoContinueManager = null;
   remoteSyncMonitor?.stop();
   remoteSyncMonitor = null;
   remoteServer?.close();

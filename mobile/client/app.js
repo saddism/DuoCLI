@@ -5,10 +5,24 @@ const API = location.origin;
 // 从 URL 参数读取 token（支持带 token 直接访问）
 const urlParams = new URLSearchParams(location.search);
 const urlToken = urlParams.get('token');
+const urlCloudOrigin = urlParams.get('cloud');
+let pendingSessionToOpen = urlParams.get('session');
 if (urlToken) {
   localStorage.setItem('duocli_token', urlToken);
-  // 清除 URL 参数，避免暴露 token
-  history.replaceState({}, '', location.pathname);
+}
+if (urlCloudOrigin) {
+  try {
+    const parsedCloudOrigin = new URL(urlCloudOrigin);
+    if (parsedCloudOrigin.protocol === 'http:' || parsedCloudOrigin.protocol === 'https:') {
+      localStorage.setItem('duocli_cloud_url', parsedCloudOrigin.origin);
+    }
+  } catch { /* ignore an invalid handoff origin */ }
+}
+if (urlToken || urlCloudOrigin || pendingSessionToOpen) {
+  // 清除 URL 参数，避免暴露 token 或连接交接信息
+  history.replaceState({ duocliRoot: true }, '', location.pathname);
+} else if (!history.state?.duocliRoot && !history.state?.duocliSession) {
+  history.replaceState({ duocliRoot: true }, '', location.pathname);
 }
 let token = localStorage.getItem('duocli_token') || '';
 let currentSessionId = null;
@@ -35,7 +49,7 @@ let currentDevicePanel = 'device';
 let devicePanelReturnPage = 'main-page';
 let activeSessionsCache = [];
 let closedSessions = [];
-let closedSessionsCollapsed = false;
+let closedSessionsCollapsed = true;
 const restoringClosedSessionIds = new Set();
 
 // xterm.js 相关
@@ -49,6 +63,7 @@ let wsConnectTimeoutTimer = null;
 let wsLastPongAt = 0;
 let wsReplayRetryTimer = null;
 let wsReplayRetryCount = 0;
+let wsConnectionGeneration = 0;
 let terminalInputReady = false;
 let composerSubmission = null;
 let copyToastTimer = null;
@@ -67,7 +82,77 @@ let sseReconnectAttempt = 0;
 const WEAK_NETWORK_STORAGE_KEY = 'duocli_weak_network_mode';
 const MOBILE_LAST_CWD_KEY = 'duocli_mobile_last_cwd';
 const MOBILE_LAST_PRESET_KEY = 'duocli_mobile_last_preset';
+const MOBILE_DRAFTS_KEY = 'duocli_mobile_drafts_v1';
+const MOBILE_PENDING_SUBMISSIONS_KEY = 'duocli_mobile_pending_submissions_v1';
 let weakNetworkMode = localStorage.getItem(WEAK_NETWORK_STORAGE_KEY) === '1';
+const mobileDrafts = new Map();
+const mobilePendingSubmissions = new Map();
+
+function loadMobileDrafts() {
+  try {
+    const value = JSON.parse(localStorage.getItem(MOBILE_DRAFTS_KEY) || '{}');
+    if (!value || typeof value !== 'object') return;
+    for (const [sessionId, text] of Object.entries(value)) {
+      if (typeof text === 'string' && text.length <= 200_000) mobileDrafts.set(sessionId, text);
+    }
+  } catch { /* ignore malformed local state */ }
+}
+
+function saveMobileDrafts() {
+  try {
+    const value = Object.fromEntries([...mobileDrafts].filter(([, text]) => text));
+    localStorage.setItem(MOBILE_DRAFTS_KEY, JSON.stringify(value));
+  } catch { /* storage can be unavailable in private browsing */ }
+}
+
+function saveMobileDraft(sessionId, text) {
+  if (!sessionId) return;
+  const normalized = String(text || '');
+  if (normalized) mobileDrafts.set(sessionId, normalized);
+  else mobileDrafts.delete(sessionId);
+  saveMobileDrafts();
+}
+
+function removeMobileDraft(sessionId) {
+  if (!sessionId) return;
+  mobileDrafts.delete(sessionId);
+  saveMobileDrafts();
+}
+
+function saveCurrentMobileDraft() {
+  if (currentSessionId && $('msg-input')) saveMobileDraft(currentSessionId, $('msg-input').value);
+}
+
+function restoreMobileDraft(sessionId) {
+  const input = $('msg-input');
+  if (!input) return;
+  input.value = mobileDrafts.get(sessionId) || '';
+}
+
+function loadMobilePendingSubmissions() {
+  try {
+    const value = JSON.parse(localStorage.getItem(MOBILE_PENDING_SUBMISSIONS_KEY) || '{}');
+    if (!value || typeof value !== 'object') return;
+    for (const [id, item] of Object.entries(value)) {
+      if (!item || typeof item !== 'object' || typeof item.sessionId !== 'string'
+          || typeof item.text !== 'string' || item.text.length > 200_000) continue;
+      mobilePendingSubmissions.set(item.sessionId, {
+        id: typeof item.id === 'string' ? item.id : id,
+        sessionId: item.sessionId,
+        text: item.text,
+      });
+    }
+  } catch { /* ignore malformed local state */ }
+}
+
+function saveMobilePendingSubmissions() {
+  try {
+    localStorage.setItem(MOBILE_PENDING_SUBMISSIONS_KEY, JSON.stringify(Object.fromEntries(mobilePendingSubmissions)));
+  } catch { /* ignore */ }
+}
+
+loadMobileDrafts();
+loadMobilePendingSubmissions();
 const terminalScrollHelpers = globalThis.DuoTerminalScrollHelpers || {
   isAtBottom(viewportY, baseY) { return viewportY >= baseY; },
   shouldFollowOutput(wasAtBottom, touchActive, startInteraction, currentInteraction) {
@@ -241,7 +326,12 @@ function hideTerminalLoading() {
 
 function showTerminalLoading() {
   const el = $('terminal-loading');
-  if (el) el.classList.remove('hidden');
+  if (!el) return;
+  el.classList.remove('hidden');
+  const label = el.querySelector('span');
+  if (label) label.textContent = '终端连接中…';
+  const spinner = el.querySelector('.loading-spinner');
+  if (spinner) spinner.style.display = '';
 }
 
 function isTerminalInputReady() {
@@ -283,17 +373,25 @@ function api(path, opts = {}) {
   const timeoutMs = opts.timeout != null
     ? opts.timeout
     : (weakNetworkMode ? 25000 : 12000);
-  let signal = opts.signal;
+  const controller = new AbortController();
+  const externalSignal = opts.signal;
   let timer = null;
-  if (timeoutMs > 0 && !signal) {
-    const ctrl = new AbortController();
-    signal = ctrl.signal;
-    timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let timedOut = false;
+  let onAbort = null;
+  if (externalSignal) {
+    onAbort = () => controller.abort();
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener('abort', onAbort, { once: true });
   }
-  const cleanup = () => { if (timer) { clearTimeout(timer); timer = null; } };
-  return fetch(`${API}${path}`, { ...opts, headers, signal })
+  if (timeoutMs > 0) timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  const cleanup = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (externalSignal && onAbort) externalSignal.removeEventListener('abort', onAbort);
+  };
+  const request = { ...opts, headers, signal: controller.signal };
+  delete request.timeout;
+  return fetch(`${API}${path}`, request)
     .then(async r => {
-      cleanup();
       if (r.status === 401) { logout(); throw new Error('未授权'); }
       let data = {};
       try {
@@ -310,14 +408,14 @@ function api(path, opts = {}) {
       return data;
     })
     .catch((err) => {
-      cleanup();
-      if (err && err.name === 'AbortError') {
+      if (err && err.name === 'AbortError' && timedOut) {
         const e = new Error('请求超时，请检查网络');
         e.code = 'TIMEOUT';
         throw e;
       }
       throw err;
-    });
+    })
+    .finally(cleanup);
 }
 
 function isComputerPointer() {
@@ -328,6 +426,14 @@ function supportsLandscapePanels() {
   return isComputerPointer() || window.matchMedia('(orientation: landscape)').matches;
 }
 
+function supportsLandscapeWorkspace() {
+  return supportsLandscapePanels()
+    && window.matchMedia('(min-width: 720px)').matches
+    && window.matchMedia('(orientation: landscape)').matches;
+}
+
+let landscapeSessionsCollapsed = false;
+
 function syncLandscapePanelButtons() {
   const sessionsOpen = $('main-page').classList.contains('landscape-drawer-open');
   const deviceOpen = $('device-page').classList.contains('landscape-drawer-open');
@@ -337,7 +443,7 @@ function syncLandscapePanelButtons() {
   });
   document.querySelectorAll('.landscape-device-toggle').forEach(button => {
     button.setAttribute('aria-expanded', String(deviceOpen));
-    button.title = deviceOpen ? '收起手机侧栏' : '展开手机侧栏';
+    button.title = deviceOpen ? '收起手机侧栏' : '拉入手机界面';
   });
 }
 
@@ -345,6 +451,58 @@ function scheduleLandscapeWorkspaceResize() {
   if (!$('detail-page').classList.contains('active')) return;
   requestAnimationFrame(scheduleTerminalResize);
   setTimeout(scheduleTerminalResize, 180);
+}
+
+function applyLandscapeWorkspaceChrome() {
+  const workspace = supportsLandscapeWorkspace() && $('detail-page').classList.contains('active');
+  document.body.classList.toggle('landscape-workspace', workspace);
+  if (!workspace) {
+    if (!supportsLandscapePanels()) closeLandscapePanels();
+    else syncLandscapePanelButtons();
+    return;
+  }
+  const sessionsOpen = !landscapeSessionsCollapsed;
+  $('main-page').classList.toggle('landscape-drawer-open', sessionsOpen);
+  document.body.classList.toggle('landscape-sessions-open', sessionsOpen);
+  if (sessionsOpen) closeSwipedSessionCard();
+  syncLandscapePanelButtons();
+  if (sessionsOpen && !sseSource) startSSE();
+  scheduleLandscapeWorkspaceResize();
+}
+
+function syncCurrentSessionCard() {
+  document.querySelectorAll('.session-card[data-id]').forEach((card) => {
+    card.classList.toggle('is-current', card.dataset.id === currentSessionId);
+  });
+}
+
+function showLandscapeEmptyTerminal() {
+  currentSessionId = null;
+  closeTerminal();
+  setTerminalInputReady(false);
+  if ($('detail-name')) $('detail-name').textContent = '未选择会话';
+  if ($('detail-status')) $('detail-status').className = 'status-dot inactive';
+  const loading = $('terminal-loading');
+  if (!loading) return;
+  loading.classList.remove('hidden');
+  const label = loading.querySelector('span');
+  if (label) label.textContent = '左侧选择会话，或点击 + 新建';
+  const spinner = loading.querySelector('.loading-spinner');
+  if (spinner) spinner.style.display = 'none';
+}
+
+function leaveToSessionList(excludeId) {
+  if (supportsLandscapeWorkspace()) {
+    landscapeSessionsCollapsed = false;
+    showPage('detail-page');
+    const next = activeSessionsCache.find(session => session?.id && session.id !== excludeId)?.id || null;
+    if (next) void openSession(next);
+    else showLandscapeEmptyTerminal();
+    void refreshSessions();
+    return;
+  }
+  showPage('main-page');
+  void refreshSessions();
 }
 
 function closeLandscapePanels() {
@@ -357,6 +515,12 @@ function closeLandscapePanels() {
 
 async function toggleLandscapeSessionsPanel() {
   if (!supportsLandscapePanels()) return;
+  if (supportsLandscapeWorkspace() && $('detail-page').classList.contains('active')) {
+    landscapeSessionsCollapsed = !landscapeSessionsCollapsed;
+    applyLandscapeWorkspaceChrome();
+    if (!landscapeSessionsCollapsed) await refreshSessions();
+    return;
+  }
   const opening = !$('main-page').classList.contains('landscape-drawer-open');
   $('main-page').classList.toggle('landscape-drawer-open', opening);
   document.body.classList.toggle('landscape-sessions-open', opening);
@@ -414,12 +578,20 @@ function openDevicePanel(panel = 'device') {
 }
 
 function showPage(id) {
+  if (id === 'main-page' && supportsLandscapeWorkspace() && token) {
+    id = 'detail-page';
+    landscapeSessionsCollapsed = false;
+  }
   if (id === 'main-page' || id === 'login-page') stopAndroidMirror();
   if (id !== 'detail-page') closeLandscapePanels();
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   $(id).classList.add('active');
+  if (id !== 'main-page') closeSwipedSessionCard();
   if (id !== 'detail-page') {
     hideWeakNetworkPrompt();
+    document.body.classList.remove('landscape-workspace');
+  } else {
+    applyLandscapeWorkspaceChrome();
   }
 }
 
@@ -564,6 +736,43 @@ function insertPathToTerminal(filePath) {
   sendInputWithHexEnter(`${quotePathForShell(filePath)} `);
 }
 
+function confirmMobileAction(message, options = {}) {
+  return new Promise((resolve) => {
+    document.getElementById('mobile-confirm-dialog')?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'mobile-confirm-dialog';
+    overlay.className = 'modal active';
+    overlay.style.zIndex = '13000';
+    const confirmLabel = options.confirmLabel || '关闭';
+    const cancelLabel = options.cancelLabel || '取消';
+    overlay.innerHTML = `
+      <div class="modal-content" role="dialog" aria-modal="true">
+        <h3>${options.title || '确认'}</h3>
+        <p class="confirm-mobile-message"></p>
+        <div class="modal-actions">
+          <button type="button" class="btn-secondary" data-confirm="no">${cancelLabel}</button>
+          <button type="button" class="btn-danger" data-confirm="yes">${confirmLabel}</button>
+        </div>
+      </div>`;
+    overlay.querySelector('.confirm-mobile-message').textContent = String(message || '');
+    const finish = (ok) => {
+      overlay.remove();
+      resolve(ok);
+    };
+    overlay.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-confirm]');
+      if (button) {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(button.getAttribute('data-confirm') === 'yes');
+        return;
+      }
+      if (event.target === overlay) finish(false);
+    });
+    document.body.appendChild(overlay);
+  });
+}
+
 function showMobileContextMenu(clientX, clientY, items) {
   document.querySelectorAll('.mobile-context-menu').forEach((node) => node.remove());
   const menu = document.createElement('div');
@@ -655,7 +864,7 @@ function jumpTerminalToLatest() {
   isUserScrolling = false;
   resetScrollAccum();
   setTerminalUnreadOutput(false);
-  programmaticScrollUntil = Date.now() + 50;
+  programmaticScrollUntil = Date.now() + 250;
   // xterm 的公开 Terminal.scrollToBottom() 不接收参数，传入 false 也会被
   // 丢掉；启用平滑滚动时它会沿着整个 scrollback 播放动画。内核方法的
   // 第二个参数才是“立即滚动”，同时把选项固定为 0 兼容不同 xterm 版本。
@@ -732,8 +941,12 @@ function restoreTerminalSnapshot(msg) {
   terminalWriteQueue = terminalWriteQueue.then(() => new Promise(resolve => {
     if (term !== activeTerm) { resolve(); return; }
     const recreateViewport = pendingRecreateViewport;
-    const follow = recreateViewport == null && !isUserScrolling;
-    const viewport = recreateViewport ?? activeTerm.buffer.active.viewportY;
+    // 切换会话/首次回放必须跟尾。断线重连、iOS 重建终端及尺寸确认快照
+    // 都要恢复用户明确停留的历史位置。
+    const preservedViewport = recreateViewport
+      ?? (msg.preserveViewport && isUserScrolling ? activeTerm.buffer.active.viewportY : null);
+    const follow = preservedViewport == null;
+    const viewport = preservedViewport ?? activeTerm.buffer.active.viewportY;
     const revision = terminalScrollInteractionRevision;
     terminalOutputWriteCount++;
     activeTerm.reset();
@@ -748,15 +961,6 @@ function restoreTerminalSnapshot(msg) {
     activeTerm.write(msg.data || '', () => {
       if (term === activeTerm) {
         terminalOutputWriteCount--;
-        if (revision === terminalScrollInteractionRevision && !terminalTouchActive) {
-          if (follow) jumpTerminalToLatest();
-          else {
-            activeTerm.scrollToLine(Math.min(viewport, activeTerm.buffer.active.baseY));
-            isUserScrolling = true;
-            setTerminalUnreadOutput(!isAtBottom());
-          }
-          if (recreateViewport != null) pendingRecreateViewport = null;
-        }
         scheduleMobileLinkHighlights();
         if (msg.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
             && msg.cols >= 2 && msg.rows > 0) {
@@ -767,6 +971,19 @@ function restoreTerminalSnapshot(msg) {
           lastSentRows = msg.rows;
         } else {
           syncTerminalToViewport();
+        }
+        if (revision === terminalScrollInteractionRevision && !terminalTouchActive) {
+          if (follow) {
+            jumpTerminalToLatest();
+            requestAnimationFrame(() => {
+              if (term === activeTerm) jumpTerminalToLatest();
+            });
+          } else {
+            activeTerm.scrollToLine(Math.min(viewport, activeTerm.buffer.active.baseY));
+            isUserScrolling = true;
+            setTerminalUnreadOutput(!isAtBottom());
+          }
+          if (recreateViewport != null) pendingRecreateViewport = null;
         }
         if (hasReplayBody) hideTerminalLoading();
       }
@@ -1044,6 +1261,7 @@ function getUnwrappedSelection() {
 // ========== 登录 ==========
 
 function logout() {
+  saveCurrentMobileDraft();
   token = '';
   localStorage.removeItem('duocli_token');
   terminalOpenRequest++;
@@ -1073,6 +1291,7 @@ const LanSwitcher = (() => {
   const STORAGE_LAST_LAN_IP = 'duocli_last_lan_ip'; // 上次成功用过的 LAN IP
 
   let probeTimer = null;
+  let switching = false;
 
   function isPrivateIp(host) {
     return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host);
@@ -1111,9 +1330,12 @@ const LanSwitcher = (() => {
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
-      const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
-      clearTimeout(t);
-      return res.ok;
+      try {
+        const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+        return res.ok;
+      } finally {
+        clearTimeout(t);
+      }
     } catch {
       return false;
     }
@@ -1145,16 +1367,22 @@ const LanSwitcher = (() => {
     localStorage.setItem(STORAGE_CLOUD_URL, location.origin);
     localStorage.setItem(STORAGE_LAST_LAN_IP, ip);
     showCopyToast(`已切到局域网 ${ip}:${port}`);
-    setTimeout(() => location.replace(`http://${ip}:${port}/?token=${encodeURIComponent(token)}`), 200);
+    const handoff = new URL(`http://${ip}:${port}/`);
+    handoff.searchParams.set('token', token);
+    handoff.searchParams.set('cloud', location.origin);
+    setTimeout(() => location.replace(handoff.toString()), 200);
   }
 
   // LAN → CF：用户点 或 自检失败（需曾通过公网入口访问过，才会写入 STORAGE_CLOUD_URL）
   function switchToCloud(auto) {
+    if (switching) return;
     const cloudUrl = localStorage.getItem(STORAGE_CLOUD_URL);
     if (!cloudUrl) {
       if (!auto) showCopyToast('暂无云端地址，请先用公网链接打开一次');
       return;
     }
+    switching = true;
+    stop();
     showCopyToast(auto ? '局域网失联，回到云端…' : '切到云端…');
     setTimeout(() => location.replace(`${cloudUrl}/?token=${encodeURIComponent(token)}`), 200);
   }
@@ -1202,13 +1430,19 @@ const LanSwitcher = (() => {
 $('login-btn').onclick = async () => {
   const t = $('token-input').value.trim();
   if (!t) return;
+  let timeout = null;
   try {
+    const controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), 8000);
     const res = await fetch(`${API}/api/auth`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: t }),
+      signal: controller.signal,
     });
-    const data = await res.json();
+    clearTimeout(timeout);
+    timeout = null;
+    const data = await res.json().catch(() => ({}));
     if (data.ok) {
       token = t;
       localStorage.setItem('duocli_token', t);
@@ -1218,7 +1452,8 @@ $('login-btn').onclick = async () => {
       $('login-error').textContent = 'Token 错误';
     }
   } catch (e) {
-    $('login-error').textContent = '连接失败: ' + e.message;
+    if (timeout) clearTimeout(timeout);
+    $('login-error').textContent = e.name === 'AbortError' ? '连接超时，请检查网络' : '连接失败: ' + e.message;
   }
 };
 
@@ -1273,19 +1508,43 @@ function writeSurfaceGeometry(surface, source, geometry) {
   if (geometry.presented) surface.dataset[`${source}PresentedGeometry`] = String(geometry.presented);
 }
 
-function imgToDevice(surface, clientX, clientY) {
-  const { width, height } = mirrorSurfaceSize(surface);
+function imgToDevice(surface, clientX, clientY, clampToEdge = false, controlSize = null) {
+  let { width, height } = mirrorSurfaceSize(surface);
+  if ((!width || !height) && controlSize?.width && controlSize?.height) {
+    width = controlSize.width;
+    height = controlSize.height;
+  }
+  // A JPEG/image may be displayed while the scrcpy control socket is healthy
+  // (for example, browsers without WebCodecs). Map into that socket's encoded
+  // dimensions, but reject a stale picture from the other screen orientation.
+  if (controlSize && (!width || !height
+    || Math.abs((width / height) / (controlSize.width / controlSize.height) - 1) > 0.02)) return null;
   const geometry = readSurfaceGeometry(surface, geometrySourceForSurface(surface));
   const physical = readSurfaceGeometry(surface, 'fallback');
+  const objectFit = (() => {
+    try { return String(getComputedStyle(surface).objectFit || '').toLowerCase(); }
+    catch { return ''; }
+  })();
+  const fillsCssBox = surface instanceof HTMLCanvasElement
+    && objectFit !== 'contain' && objectFit !== 'cover' && objectFit !== 'scale-down';
+  let rect = { left: 0, top: 0, width: 0, height: 0 };
+  try { rect = surface.getBoundingClientRect(); } catch { /* layout not ready */ }
+  if ((!rect.width || !rect.height) && typeof surface.closest === 'function') {
+    const screen = surface.closest('.android-screen');
+    if (screen && screen !== surface) {
+      try { rect = screen.getBoundingClientRect(); } catch { /* keep empty */ }
+    }
+  }
   const options = {
     clientX,
     clientY,
-    rect: surface.getBoundingClientRect(),
+    clampToEdge,
+    rect,
     contentWidth: width,
     contentHeight: height,
-    fillsCssBox: surface instanceof HTMLCanvasElement,
-    deviceWidth: geometry.deviceWidth || width,
-    deviceHeight: geometry.deviceHeight || height,
+    fillsCssBox,
+    deviceWidth: controlSize?.width || geometry.deviceWidth || width,
+    deviceHeight: controlSize?.height || geometry.deviceHeight || height,
     latestGeometry: geometry.latest,
     presentedGeometry: geometry.presented,
     physicalWidth: physical.deviceWidth,
@@ -1293,23 +1552,33 @@ function imgToDevice(surface, clientX, clientY) {
   };
   const helpers = globalThis.DuoAndroidPointerHelpers;
   if (typeof helpers?.mapClientPointToDevice === 'function') {
-    return helpers.mapClientPointToDevice(options);
+    const mapped = helpers.mapClientPointToDevice(options);
+    if (!mapped && typeof setDeviceHint === 'function') {
+      // Distinguish a miss outside the letterbox (normal) from a geometry
+      // frame mismatch (fixable): the latter would silently eat every tap.
+      if (options.latestGeometry && options.presentedGeometry
+        && options.presentedGeometry !== options.latestGeometry) {
+        setDeviceHint('画面几何正在切换，请稍候重试', false);
+      }
+    }
+    return mapped;
   }
-  const rect = options.rect;
-  if (!rect.width || !rect.height || !width || !height) return null;
+  const box = options.rect;
+  if (!box.width || !box.height || !width || !height) return null;
   const displayed = options.fillsCssBox
-    ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+    ? { left: box.left, top: box.top, width: box.width, height: box.height }
     : (() => {
-      const scale = Math.min(rect.width / width, rect.height / height);
+      const scale = Math.min(box.width / width, box.height / height);
       return {
-        left: rect.left + (rect.width - width * scale) / 2,
-        top: rect.top + (rect.height - height * scale) / 2,
+        left: box.left + (box.width - width * scale) / 2,
+        top: box.top + (box.height - height * scale) / 2,
         width: width * scale,
         height: height * scale,
       };
     })();
-  if (clientX < displayed.left || clientX > displayed.left + displayed.width
-    || clientY < displayed.top || clientY > displayed.top + displayed.height) return null;
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return null;
+  if (!clampToEdge && (clientX < displayed.left || clientX > displayed.left + displayed.width
+    || clientY < displayed.top || clientY > displayed.top + displayed.height)) return null;
   if (options.latestGeometry && options.presentedGeometry
     && options.presentedGeometry !== options.latestGeometry) return null;
   const relativeX = (clientX - displayed.left) / displayed.width;
@@ -1327,6 +1596,14 @@ function imgToDevice(surface, clientX, clientY) {
 
 function fitAndroidSurface(surface, parent) {
   if (!surface || !parent || surface.hidden || surface.style.display === 'none') return;
+  if (parent.classList?.contains('android-screen') || surface.closest?.('.android-screen')) {
+    surface.style.width = '100%';
+    surface.style.height = '100%';
+    surface.style.maxWidth = '100%';
+    surface.style.maxHeight = '100%';
+    surface.style.objectFit = 'contain';
+    return;
+  }
   const { width, height } = mirrorSurfaceSize(surface);
   const contain = globalThis.DuoAndroidPointerHelpers?.containCssSize
     || function (availW, availH, contentW, contentH) {
@@ -1343,7 +1620,7 @@ function fitAndroidSurface(surface, parent) {
 }
 
 function fitAndroidSurfaces() {
-  const previewParent = $('device-preview-wrap');
+  const previewParent = $('device-screen') || $('device-preview-wrap');
   const fullscreenParent = $('fullscreen-screen') || $('fullscreen-overlay');
   fitAndroidSurface($('device-video'), previewParent);
   fitAndroidSurface($('device-preview'), previewParent);
@@ -1534,10 +1811,13 @@ function ensureAndroidMirror() {
       setAndroidStreamStatus(message.status);
       if (message.error) androidMirrorLastError = String(message.error);
       if (message.status === 'ready') androidMirrorLastError = '';
-      if (message.status === 'starting') setDeviceHint('正在建立 Android 实时镜像…', false);
+      if (message.status === 'starting') setDeviceHint('', false);
       else if (message.status === 'ready') {
-        setDeviceHint('Android 实时镜像已连接', false);
-        if (!androidMirror?.isController) androidMirror?.claimControl?.(true);
+        setDeviceHint('', false);
+        // Do NOT auto-claim here: both endpoints receive 'ready'. Claiming on
+        // both sides is what arms the lease tug-of-war that silently eats
+        // taps. Ownership is claimed when the user actually interacts, or
+        // when opening the fullscreen control view.
       } else if (message.status === 'error') {
         const detail = androidMirrorLastError || '实时镜像不可用';
         setDeviceHint(`${detail}，已切换截图回退（可全屏操控）`, false);
@@ -1549,7 +1829,9 @@ function ensureAndroidMirror() {
       } else if (message.status === 'control-owner' && message.controller === false) {
         setDeviceHint('设备正在由其他客户端控制，点此全屏可抢占', false);
       } else if (message.status === 'control-owner' && message.controller === true) {
-        setDeviceHint('Android 实时镜像已连接', false);
+        setDeviceHint('', false);
+      } else if (message.type === 'android:control-challenge') {
+        setDeviceHint('其他端点正在请求控制权；继续滑动即可保持控制', false);
       }
     },
     onMeta: (meta) => {
@@ -1646,25 +1928,19 @@ function stopAndroidMirror() {
   setAndroidStreamStatus('stopped');
 }
 
-function legacyAndroidGesture(deviceId, start, end) {
+function legacyAndroidGesture(deviceId, start, end, duration = 300) {
   if (!deviceId || !start || !end) return;
   // ADB injects physical device pixels, which differ from the scrcpy control
   // space whenever a live mirror owns the surface.
   const from = { x: start.deviceX ?? start.x, y: start.deviceY ?? start.y };
   const to = { x: end.deviceX ?? end.x, y: end.deviceY ?? end.y };
   const moved = Math.hypot(to.x - from.x, to.y - from.y);
-  const session = androidMediaSessions.get(String(deviceId));
-  const controlEpoch = androidMirrorDevice === String(deviceId) && Number.isSafeInteger(androidMirror?.controlEpoch)
-    ? androidMirror.controlEpoch
-    : undefined;
-  const lease = {
-    ...(session?.clientId ? { clientId: session.clientId } : {}),
-    ...(controlEpoch !== undefined ? { controlEpoch } : {}),
-  };
-  const body = moved >= 12
-    ? { deviceId, x1: from.x, y1: from.y, x2: to.x, y2: to.y, duration: 300, ...lease }
+  const lease = androidControlLease(deviceId);
+  const isSwipe = moved >= 12 || duration >= 500;
+  const body = isSwipe
+    ? { deviceId, x1: from.x, y1: from.y, x2: to.x, y2: to.y, duration, ...lease }
     : { deviceId, x: to.x, y: to.y, ...lease };
-  const endpoint = moved >= 12 ? '/api/android/swipe' : '/api/android/tap';
+  const endpoint = isSwipe ? '/api/android/swipe' : '/api/android/tap';
   fetch(`${API}${endpoint}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
@@ -1676,172 +1952,269 @@ function legacyAndroidGesture(deviceId, start, end) {
   }).catch(() => setDeviceHint('操控失败：无法连接桌面端'));
 }
 
-// Keep a gesture on the live control channel once its pointer went down there.
-// Falling back to the HTTP/ADB path after a control lease change can be rejected
-// by the server, and sending only DOWN without a matching UP leaves Android in a
-// pressed state so the next gesture appears to do nothing.
-function sendLiveAndroidGesture(start, end, pointerId) {
-  if (!androidMirror?.isReady() || !androidMirror.isController || androidMirror.geometryVersion <= 0) return false;
-  const moved = Math.hypot(end.x - start.x, end.y - start.y);
-  if (moved < 12) {
-    return androidMirror.sendInput({ type: 'tap', pointerId, x: end.x, y: end.y, pressure: 1 }) != null;
-  }
-  const down = androidMirror.sendInput({ type: 'touch', action: 'down', pointerId, x: start.x, y: start.y, pressure: 1 });
-  if (down == null) return false;
-  const move = androidMirror.sendInput({ type: 'touch', action: 'move', pointerId, x: end.x, y: end.y, pressure: 1 });
-  const up = move == null ? null : androidMirror.sendInput({ type: 'touch', action: 'up', pointerId, x: end.x, y: end.y, pressure: 0 });
-    if (up == null) {
-    // If the queue accepted DOWN but a later write failed, try to release it
-    // immediately. The server also cleans active pointers on lease/socket loss.
-    if (androidMirror.isReady()) {
-      (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId, x: end.x, y: end.y, pressure: 0 });
-    }
-    return false;
-  }
-  return true;
+function androidControlLease(deviceId) {
+  const session = androidMediaSessions.get(String(deviceId));
+  const controlEpoch = androidMirrorDevice === String(deviceId) && Number.isSafeInteger(androidMirror?.controlEpoch)
+    ? androidMirror.controlEpoch
+    : undefined;
+  return {
+    ...(session?.clientId ? { clientId: session.clientId } : {}),
+    ...(controlEpoch !== undefined ? { controlEpoch } : {}),
+  };
 }
 
-function bindAndroidPointerSurface(surface, alwaysControl) {
-  if (!surface || surface.dataset.androidPointerBound) return;
-  surface.dataset.androidPointerBound = '1';
-  surface.style.touchAction = 'none';
-  const active = new Map();
-  const pendingMoves = new Map();
-  let moveFrame = 0;
-  const flushMoves = () => {
-    moveFrame = 0;
-    for (const [pointerId, value] of pendingMoves) {
-      pendingMoves.delete(pointerId);
-      const state = active.get(pointerId);
-      // A screenshot/fallback gesture may span the moment the live socket
-      // becomes ready. Do not inject a lone MOVE into scrcpy without the
-      // matching DOWN; the gesture remains on the legacy path instead.
-      if (state?.sentDown && androidMirror?.isReady() && androidMirror.isController) androidMirror.sendInput({
-        type: 'touch', action: 'move', pointerId, x: value.x, y: value.y, pressure: 1,
-      });
-    }
-  };
-  const scheduleMoveFlush = () => {
-    if (!moveFrame) moveFrame = requestAnimationFrame(flushMoves);
-  };
-  surface.addEventListener('pointerdown', (event) => {
-    // A ready socket can still be waiting for its first decoded frame while a
-    // JPEG/ADB fallback is the surface the user is actually touching. Keep that
-    // gesture on the fallback until the live canvas has a presented frame;
-    // otherwise physical fallback coordinates are sent as encoded live ones.
-    const mirrorReady = androidMirror?.isReady() && androidMirror.hasFrame
-      && surface instanceof HTMLCanvasElement;
-    const canControl = alwaysControl || remoteTapEnabled || !mirrorReady;
-    if (!canControl || (event.pointerType === 'mouse' && event.button !== 0)) return;
-    const deviceId = androidMirrorDevice || $('device-select')?.value;
-    const point = imgToDevice(surface, event.clientX, event.clientY);
-    if (!deviceId || !point) return;
-    event.preventDefault();
-    if (mirrorReady && !androidMirror.isController) {
+async function sendAndroidNavKey(name) {
+  const inputs = globalThis.DuoAndroidNavKeys?.buildAndroidNavKeyInputs?.(name) || [];
+  if (!inputs.length) return;
+  const deviceId = androidMirrorDevice || $('device-select')?.value;
+  if (!deviceId) {
+    showCopyToast('请先选择设备');
+    return;
+  }
+  if (androidMirror?.isReady()) {
+    if (!androidMirror.isController) {
       androidMirror.claimControl?.(true);
       setDeviceHint('正在申请 Android 控制权…', false);
     }
-    const sentDown = mirrorReady && androidMirror.isController && androidMirror.geometryVersion > 0
-      && androidMirror.sendInput({ type: 'touch', action: 'down', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 1 }) != null;
-    active.set(event.pointerId, {
-      deviceId,
-      start: point,
-      last: point,
-      sentDown,
-      transport: mirrorReady ? 'mirror' : 'legacy',
+    const sequences = [];
+    for (const input of inputs) {
+      const sequence = androidMirror.sendInput(input);
+      if (sequence == null) break;
+      sequences.push(sequence);
+    }
+    if (sequences.length === inputs.length) {
+      try {
+        for (const sequence of sequences) {
+          const ack = await androidMirror.waitForAck(sequence);
+          if (ack?.ok === false) throw new Error(ack.error || '设备未接受按键');
+        }
+      } catch (error) {
+        setDeviceHint(error?.message || '按键回执超时，请重试', false);
+      }
+      return;
+    }
+  }
+  const response = await fetch(`${API}/api/android/key`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify({ deviceId, key: name, ...androidControlLease(deviceId) }),
+  }).catch(() => {});
+  if (!response?.ok) {
+    const payload = await response?.json?.().catch(() => ({}));
+    setDeviceHint(payload?.error || '按键发送失败，请重试', false);
+  }
+}
+
+function surfaceHasBox(surface) {
+  if (!surface || surface.hidden || surface.style?.display === 'none') return false;
+  try {
+    const rect = surface.getBoundingClientRect();
+    return rect.width > 1 && rect.height > 1;
+  } catch {
+    return true;
+  }
+}
+
+function visibleAndroidSurface(screen) {
+  if (!screen) return null;
+  const canvas = screen.querySelector('canvas');
+  const image = screen.querySelector('img');
+  if (canvas && !canvas.hidden && surfaceHasBox(canvas)) return canvas;
+  if (image && image.style.display !== 'none' && (image.currentSrc || image.src) && surfaceHasBox(image)) return image;
+  if (canvas && !canvas.hidden) return canvas;
+  if (image && image.style.display !== 'none' && (image.currentSrc || image.src)) return image;
+  return canvas || image || screen;
+}
+
+// Keep each gesture tied to the connection, geometry and lease that accepted
+// its DOWN. Buffer timestamped events while claiming control so a first drag
+// or long press retains its path and duration instead of becoming a tap.
+function bindAndroidPointerSurface(target, alwaysControl) {
+  if (!target || target.dataset.androidPointerBound) return;
+  target.dataset.androidPointerBound = '1';
+  target.style.touchAction = 'none';
+  const resolveSurface = () => (
+    target.classList?.contains('android-screen') ? (visibleAndroidSurface(target) || target) : target
+  );
+  const active = new Map();
+  let timer = 0;
+  const sameConnection = state => androidMirror === state.mirror
+    && androidMirrorDevice === state.deviceId
+    && state.mirror?.connectionGeneration === state.connectionGeneration;
+  const sameLease = state => sameConnection(state)
+    && state.mirror.controlEpoch === state.epoch;
+  const releaseCapture = (pointerId, state) => {
+    const captureEl = state?.captureEl || target;
+    try {
+      if (captureEl.hasPointerCapture?.(pointerId)) captureEl.releasePointerCapture(pointerId);
+    } catch { /* capture element may already be detached */ }
+  };
+  const cancel = (pointerId, state, message) => {
+    active.delete(pointerId);
+    if (state.sentDown && sameLease(state) && state.mirror.isReady()) {
+      state.mirror.sendEmergencyInput({
+        type: 'touch', action: 'cancel', pointerId,
+        x: state.sentPoint.x, y: state.sentPoint.y, pressure: 0,
+      });
+    }
+    releaseCapture(pointerId, state);
+    if (message) setDeviceHint(message, false);
+  };
+  const send = (pointerId, state, action, point) => {
+    const sequence = state.mirror.sendInput({
+      type: 'touch', action, pointerId, x: point.x, y: point.y,
+      pressure: action === 'up' ? 0 : 1,
     });
-    surface.setPointerCapture?.(event.pointerId);
-  });
-  surface.addEventListener('pointermove', (event) => {
+    if (sequence == null) return false;
+    state.sentPoint = point;
+    // A successful WebSocket write is not confirmation of device injection.
+    if (action === 'down' || action === 'up') {
+      state.mirror.waitForAck(sequence).then(ack => {
+        if (ack.ok !== false) return;
+        if (active.get(pointerId) === state || !active.has(pointerId)) cancel(pointerId, state);
+        if (sameConnection(state)) setDeviceHint(ack.error || 'Android 未接受触摸，请重试', false);
+      }).catch(error => {
+        if (active.get(pointerId) === state || !active.has(pointerId)) cancel(pointerId, state);
+        if (sameConnection(state)) setDeviceHint(error.message || '触摸回执超时，请重试', false);
+      });
+    }
+    return true;
+  };
+  const pump = () => {
+    if (timer) clearTimeout(timer);
+    timer = 0;
+    const now = performance.now();
+    for (const [pointerId, state] of active) {
+      if (state.transport !== 'mirror') continue;
+      if (!sameConnection(state) || !state.mirror.isReady()
+        || state.mirror.geometryVersion !== state.geometryVersion
+        || (state.sentDown && (!sameLease(state) || !state.mirror.isController))) {
+        cancel(pointerId, state, '连接或画面已变化，请重新触摸');
+        continue;
+      }
+      if (!state.sentDown) {
+        if (!state.mirror.isController) {
+          // The server allows 1500 ms for an active owner's response. Leave
+          // time for the claim and grant to cross the mobile network as well.
+          if (now - state.startedAt >= 3000) cancel(pointerId, state, '未取得 Android 控制权，请重试');
+          continue;
+        }
+        state.epoch = state.mirror.controlEpoch;
+        if (!send(pointerId, state, 'down', state.start)) {
+          cancel(pointerId, state, '触摸发送失败，请重试');
+          continue;
+        }
+        state.sentDown = true;
+        state.sentAt = now;
+      }
+      while (state.events.length && state.events[0].at <= now - state.sentAt) {
+        const event = state.events.shift();
+        if (!send(pointerId, state, event.action, event.point)) {
+          cancel(pointerId, state, '触摸发送失败，请重试');
+          break;
+        }
+        if (event.action === 'up') active.delete(pointerId);
+      }
+    }
+    if ([...active.values()].some(state => state.transport === 'mirror')) timer = setTimeout(pump, 16);
+  };
+  const queue = (state, action, point) => {
+    const at = performance.now() - state.startedAt;
+    const previous = state.events[state.events.length - 1];
+    // Limit MOVE traffic to one sample per display frame, preserving the last
+    // sample before UP and the timing of a hold before a drag.
+    if (action === 'move' && previous?.action === 'move' && at - previous.at < 16) {
+      previous.point = point;
+    } else {
+      state.events.push({ action, point, at });
+    }
+  };
+  const pointerOpts = { capture: true, passive: false };
+  target.addEventListener('contextmenu', event => event.preventDefault(), pointerOpts);
+  target.addEventListener('dragstart', event => event.preventDefault(), pointerOpts);
+  target.addEventListener('pointerdown', event => {
+    const mirrorReady = androidMirror?.isReady() && androidMirror.geometryVersion > 0
+      && androidMirror.width > 0 && androidMirror.height > 0;
+    if (!(alwaysControl || remoteTapEnabled || !mirrorReady)
+      || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    const deviceId = androidMirrorDevice || $('device-select')?.value;
+    const controlSize = mirrorReady ? { width: androidMirror.width, height: androidMirror.height } : null;
+    const mapSurface = resolveSurface();
+    const point = imgToDevice(mapSurface, event.clientX, event.clientY, false, controlSize)
+      || (mapSurface !== target ? imgToDevice(target, event.clientX, event.clientY, false, controlSize) : null);
+    if (!deviceId || !point) return;
+    event.preventDefault();
+    const previous = active.get(event.pointerId);
+    if (previous) cancel(event.pointerId, previous);
+    const hit = event.target;
+    let captureEl = target;
+    if (hit && hit !== target && typeof hit.setPointerCapture === 'function'
+      && (typeof target.contains !== 'function' || target.contains(hit))) {
+      captureEl = hit;
+    }
+    const state = {
+      deviceId, start: point, last: point, sentPoint: point, events: [],
+      controlSize, mapSurface, captureEl,
+      startedAt: performance.now(), sentDown: false, ended: false,
+      transport: mirrorReady ? 'mirror' : 'legacy', mirror: androidMirror,
+      connectionGeneration: androidMirror?.connectionGeneration,
+      geometryVersion: androidMirror?.geometryVersion,
+    };
+    active.set(event.pointerId, state);
+    try { captureEl.setPointerCapture?.(event.pointerId); } catch { /* ignore */ }
+    if (androidMirror?.isReady() && !androidMirror.isController) {
+      androidMirror.claimControl?.(true);
+      setDeviceHint('正在申请 Android 控制权…', false);
+    }
+    pump();
+  }, pointerOpts);
+  target.addEventListener('pointermove', event => {
     const state = active.get(event.pointerId);
-    if (!state) return;
-    const point = imgToDevice(surface, event.clientX, event.clientY);
+    if (!state || state.ended) return;
+    const point = imgToDevice(state.mapSurface || resolveSurface(), event.clientX, event.clientY, true, state.controlSize);
     if (!point) return;
     event.preventDefault();
     state.last = point;
-    pendingMoves.set(event.pointerId, point);
-    scheduleMoveFlush();
-  });
-  surface.addEventListener('pointerup', (event) => {
+    if (state.transport === 'mirror') queue(state, 'move', point);
+  }, pointerOpts);
+  target.addEventListener('pointerup', event => {
     const state = active.get(event.pointerId);
-    if (!state) return;
-    const point = imgToDevice(surface, event.clientX, event.clientY) || state.last;
-    active.delete(event.pointerId);
-    pendingMoves.delete(event.pointerId);
-    if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; flushMoves(); }
-    surface.releasePointerCapture?.(event.pointerId);
+    if (!state || state.ended) return;
     event.preventDefault();
+    state.ended = true;
+    const point = imgToDevice(state.mapSurface || resolveSurface(), event.clientX, event.clientY, true, state.controlSize) || state.last;
+    releaseCapture(event.pointerId, state);
     if (state.transport === 'legacy') {
-      legacyAndroidGesture(state.deviceId, state.start, point);
-      return;
-    }
-    if (state.sentDown) {
-      // Do not silently switch transports after DOWN. If the socket is briefly
-      // unavailable, the server's lease/socket cleanup releases the pointer.
-      if (androidMirror?.isReady() && androidMirror.isController) {
-        androidMirror.sendInput({ type: 'touch', action: 'up', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 0 });
-      } else if (androidMirror?.isReady()) {
-        // Reclaiming also asks the server to flush a pointer whose DOWN was
-        // accepted just before the lease changed.
-        (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 0 });
-        androidMirror.claimControl?.(true);
+      active.delete(event.pointerId);
+      if ((androidMirrorDevice || $('device-select')?.value) === state.deviceId) {
+        legacyAndroidGesture(state.deviceId, state.start, point, performance.now() - state.startedAt);
       }
       return;
     }
-
-    // Control ownership and the first geometry frame arrive asynchronously.
-    // Give the claim a short window to complete so the first tap after connect
-    // is not discarded and does not hit a lease-protected legacy endpoint.
-    void (async () => {
-      for (let attempt = 0; attempt < 6; attempt++) {
-        if (androidMirrorDevice !== state.deviceId) return;
-        if (sendLiveAndroidGesture(state.start, point, event.pointerId)) return;
-        if (!androidMirror?.isReady()) {
-          legacyAndroidGesture(state.deviceId, state.start, point);
-          return;
-        }
-        if (attempt === 0 || !androidMirror.isController) androidMirror.claimControl?.(true);
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-      setDeviceHint('Android 控制权尚未就绪，请稍后再试', false);
-    })();
-  });
-  surface.addEventListener('pointercancel', (event) => {
+    // UP can arrive before the scheduled MOVE, or contain a newer position.
+    // Deliver that final position as MOVE before releasing the contact.
+    if (point.x !== state.last.x || point.y !== state.last.y) queue(state, 'move', point);
+    queue(state, 'up', point);
+    pump();
+  }, pointerOpts);
+  target.addEventListener('pointercancel', event => {
     const state = active.get(event.pointerId);
-    active.delete(event.pointerId);
-    pendingMoves.delete(event.pointerId);
-    if (moveFrame && pendingMoves.size === 0) { cancelAnimationFrame(moveFrame); moveFrame = 0; }
-    surface.releasePointerCapture?.(event.pointerId);
-    if (state?.sentDown && androidMirror?.isReady()) {
-      (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId: event.pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
-    }
-  });
-  // A few mobile browsers report lost pointer capture without a subsequent
-  // pointerup/pointercancel when the page is backgrounded or its viewport
-  // changes. Treat it as a cancel so a stuck DOWN cannot poison later input.
-  surface.addEventListener('lostpointercapture', (event) => {
+    if (state) cancel(event.pointerId, state);
+  }, pointerOpts);
+  target.addEventListener('lostpointercapture', event => {
     const state = active.get(event.pointerId);
-    if (!state) return;
-    active.delete(event.pointerId);
-    pendingMoves.delete(event.pointerId);
-    if (state.sentDown && androidMirror?.isReady()) {
-      (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId: event.pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
-    }
+    if (!state || state.ended) return;
+    if (state.captureEl && state.captureEl !== target && event.target === target) return;
+    cancel(event.pointerId, state);
   });
-  const cancelOnBlur = () => {
-    for (const [pointerId, state] of active) {
-      if (state.sentDown && androidMirror?.isReady()) {
-        (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
-      }
-      surface.releasePointerCapture?.(pointerId);
-    }
-    active.clear();
-    pendingMoves.clear();
-    if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; }
+  const cancelAll = () => {
+    for (const [pointerId, state] of active) cancel(pointerId, state);
+    if (timer) clearTimeout(timer);
+    timer = 0;
   };
-  window.addEventListener('blur', cancelOnBlur);
+  window.addEventListener('blur', cancelAll);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') cancelOnBlur();
+    if (document.visibilityState === 'hidden') cancelAll();
   });
 }
 
@@ -1892,7 +2265,10 @@ function openAndroidFullscreen() {
   setAndroidVideoVisible(live);
   remoteTapEnabled = true;
   androidMirror?.claimControl?.(true);
-  requestAnimationFrame(fitAndroidSurfaces);
+  requestAnimationFrame(() => {
+    fitAndroidSurfaces();
+    requestAnimationFrame(fitAndroidSurfaces);
+  });
   if (live || fallbackSrc) showCopyToast('拖动操控 · 输入文字');
 }
 
@@ -1906,7 +2282,6 @@ async function showPhoneControl() {
   const deviceId = $('device-select')?.value;
   if (deviceId) startAndroidMirror(deviceId);
   remoteTapEnabled = true;
-  openAndroidFullscreen();
 }
 
 function initDevicePage() {
@@ -2001,33 +2376,39 @@ function initDevicePage() {
       showCopyToast('已发送（截图回退）');
     } else showCopyToast('文字发送失败，请重试');
   };
-  $('fullscreen-text-btn').onclick = () => {
+  const openDeviceTextInput = () => {
     $('fullscreen-text-input').value = '';
     $('input-text-modal').classList.add('active');
     setTimeout(() => $('fullscreen-text-input').focus(), 100);
   };
+  document.querySelectorAll('.android-text-btn').forEach((btn) => {
+    if (btn.dataset.bound) return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', openDeviceTextInput);
+  });
   $('input-text-close').onclick = () => $('input-text-modal').classList.remove('active');
   $('fullscreen-text-send').onclick = sendTextToDevice;
   $('fullscreen-text-input').addEventListener('keydown', e => { if (e.key === 'Enter') void sendTextToDevice(); });
 
   $('device-fullscreen-btn').onclick = openAndroidFullscreen;
 
+  document.querySelectorAll('.android-nav-keys').forEach((nav) => {
+    if (nav.dataset.bound) return;
+    nav.dataset.bound = '1';
+    nav.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const button = event.target.closest('[data-android-key]');
+      if (button) void sendAndroidNavKey(button.getAttribute('data-android-key'));
+    });
+  });
+
   // Persistent mirror input: send down/move/up immediately over the control
   // channel. The old image-only touch handlers are intentionally not kept;
   // they made a swipe arrive only after the gesture had already ended.
   const deviceVideo = $('device-video');
   const devicePreview = $('device-preview');
-  const fullscreenVideo = $('fullscreen-video');
-  const fullscreenPreview = $('fullscreen-preview');
-  bindAndroidPointerSurface(deviceVideo, true);
-  bindAndroidPointerSurface(devicePreview, true);
-  bindAndroidPointerSurface(fullscreenVideo, true);
-  bindAndroidPointerSurface(fullscreenPreview, true);
-  [deviceVideo, devicePreview].forEach((surface) => {
-    surface?.addEventListener('click', () => {
-      if ($('fullscreen-overlay')?.style.display === 'none') openAndroidFullscreen();
-    });
-  });
+  bindAndroidPointerSurface($('device-screen'), true);
+  bindAndroidPointerSurface($('fullscreen-screen'), true);
 
   const syncRemoteTapUi = () => {
     const button = $('device-tap-toggle');
@@ -2035,7 +2416,7 @@ function initDevicePage() {
       button.textContent = remoteTapEnabled ? '远程点击 · 已开' : '远程点击 · 已关';
       button.setAttribute('aria-pressed', String(remoteTapEnabled));
     }
-    [deviceVideo, devicePreview].forEach((surface) => {
+    [deviceVideo, devicePreview, $('device-screen'), $('fullscreen-screen')].forEach((surface) => {
       if (surface) surface.style.cursor = remoteTapEnabled ? 'crosshair' : 'default';
     });
   };
@@ -2043,9 +2424,13 @@ function initDevicePage() {
   if (!$('device-preview-wrap')?.dataset.fitObserved) {
     const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => fitAndroidSurfaces()) : null;
     const previewWrap = $('device-preview-wrap');
-    const fullscreenScreen = $('fullscreen-screen') || $('fullscreen-overlay');
+    const deviceScreen = $('device-screen');
+    const fullscreenScreen = $('fullscreen-screen');
+    const overlay = $('fullscreen-overlay');
     if (previewWrap) observer?.observe(previewWrap);
+    if (deviceScreen) observer?.observe(deviceScreen);
     if (fullscreenScreen) observer?.observe(fullscreenScreen);
+    if (overlay) observer?.observe(overlay);
     if (previewWrap) previewWrap.dataset.fitObserved = '1';
   }
 
@@ -2077,7 +2462,7 @@ function setDeviceHint(msg, notify = Boolean(msg)) {
 }
 
 async function refreshAndroidDevices() {
-  setDeviceHint('正在加载设备...');
+  setDeviceHint('正在加载设备...', false);
   const sel = $('device-select');
   sel.disabled = true;
   try {
@@ -2167,8 +2552,8 @@ async function refreshAndroidScreenshot(quality, scale, fallback = false) {
       surfacesLoaded++;
       if (surfacesLoaded >= 2 && previousUrl) URL.revokeObjectURL(previousUrl);
     };
-    img.onload = releasePrevious;
-    fullscreen.onload = releasePrevious;
+    img.onload = () => { releasePrevious(); fitAndroidSurfaces(); };
+    fullscreen.onload = () => { releasePrevious(); fitAndroidSurfaces(); };
     img.src = nextUrl;
     fullscreen.src = nextUrl;
     if (fallback && !androidMirror?.hasFrame) setAndroidVideoVisible(false);
@@ -2176,7 +2561,7 @@ async function refreshAndroidScreenshot(quality, scale, fallback = false) {
       setDeviceHint(androidMirrorLastError
         ? `${androidMirrorLastError}，截图模式可操控`
         : '截图模式可操控（实时镜像重连中）', false);
-    } else if (!fallback) setDeviceHint('截图更新于 ' + new Date().toLocaleTimeString());
+    }
   } catch (e) {
     if (e?.name === 'AbortError') return;
     if (!fallback) setDeviceHint('截图失败: ' + (e.message || e));
@@ -2190,7 +2575,6 @@ async function refreshAndroidScreenshot(quality, scale, fallback = false) {
 // ========== 主页面 ==========
 
 async function enterMain() {
-  showPage('main-page');
   initDevicePage();
   await refreshSessions();
   await Promise.all([
@@ -2204,6 +2588,18 @@ async function enterMain() {
   subscribePush();
   // 启动局域网探测（CF 模式提示切换；LAN 模式监控失联回退）
   LanSwitcher.start();
+  const pending = pendingSessionToOpen;
+  pendingSessionToOpen = null;
+  if (supportsLandscapeWorkspace()) {
+    landscapeSessionsCollapsed = false;
+    const sessionId = pending || activeSessionsCache[0]?.id || null;
+    showPage('detail-page');
+    if (sessionId) void openSession(sessionId);
+    else showLandscapeEmptyTerminal();
+    return;
+  }
+  showPage('main-page');
+  if (pending) setTimeout(() => openSession(pending), 0);
 }
 
 async function refreshSessions() {
@@ -2352,21 +2748,71 @@ async function refreshRecentCwdOptions() {
   }
 }
 
-// ========== 会话卡片左滑关闭 ==========
+// ========== 会话置顶（手机端本地持久化） ==========
 
-const SESSION_SWIPE_REVEAL = 84;
-// Touch jitter while a finger is settling on a card should stay a tap (or a
-// vertical list scroll). Wait for a deliberate horizontal travel before the
-// card starts exposing the action underneath it.
-const SESSION_SWIPE_TRIGGER = 28;
-const SESSION_SWIPE_DIRECTION_RATIO = 1.25;
-// 记住 id 而不是节点：SSE 随时会重渲染列表，滑动状态要跟着新节点恢复。
+const PINNED_SESSIONS_KEY = 'duocli_mobile_pinned_sessions';
+const pinnedSessionIds = new Set(loadPinnedSessionIds());
+
+function loadPinnedSessionIds() {
+  try {
+    const raw = localStorage.getItem(PINNED_SESSIONS_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list.filter((id) => typeof id === 'string' && id) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePinnedSessionIds() {
+  try {
+    localStorage.setItem(PINNED_SESSIONS_KEY, JSON.stringify([...pinnedSessionIds]));
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+function isSessionPinned(id) {
+  return pinnedSessionIds.has(id);
+}
+
+function toggleSessionPin(id) {
+  if (!id) return false;
+  if (pinnedSessionIds.has(id)) pinnedSessionIds.delete(id);
+  else pinnedSessionIds.add(id);
+  savePinnedSessionIds();
+  return pinnedSessionIds.has(id);
+}
+
+function prunePinnedSessions(liveIds) {
+  const live = new Set(liveIds);
+  let changed = false;
+  for (const id of [...pinnedSessionIds]) {
+    if (!live.has(id)) {
+      pinnedSessionIds.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) savePinnedSessionIds();
+}
+
+// ========== 会话卡片左滑：置顶 + 关闭 ==========
+
+const SESSION_SWIPE_PIN_WIDTH = 72;
+const SESSION_SWIPE_CLOSE_WIDTH = 84;
+const SESSION_SWIPE_REVEAL = SESSION_SWIPE_PIN_WIDTH + SESSION_SWIPE_CLOSE_WIDTH;
+// 列表惯性滚动、手指抖动都不该露出操作区。只有明显的水平左滑才算。
+const SESSION_SWIPE_TRIGGER = 72;
+const SESSION_SWIPE_DIRECTION_RATIO = 2.4;
+const SESSION_SWIPE_OPEN = 72;
+const SESSION_SWIPE_SCROLL_GUARD_MS = 160;
 let swipedSessionId = null;
 let sessionCloseInProgress = false;
+let sessionListScrollAt = 0;
 
 function setSessionCardSwipe(card, offset, instant = false) {
   const body = card.querySelector('.session-card-body');
   if (!body) return;
+  const revealed = offset <= -8;
   if (instant) {
     body.style.transition = 'none';
     body.style.transform = offset ? `translateX(${offset}px)` : '';
@@ -2375,8 +2821,11 @@ function setSessionCardSwipe(card, offset, instant = false) {
   } else {
     body.style.transform = offset ? `translateX(${offset}px)` : '';
   }
-  card.classList.toggle('swiped', offset !== 0);
-  card.querySelector('.session-close-action')?.toggleAttribute('aria-hidden', offset === 0);
+  // 只有真正露出操作区才挂 swiped，避免残余位移也把按钮画出来
+  card.classList.toggle('swiped', revealed);
+  card.querySelectorAll('.session-card-actions button').forEach((btn) => {
+    btn.toggleAttribute('aria-hidden', !revealed);
+  });
 }
 
 function closeSessionCardSwipe(card) {
@@ -2397,16 +2846,38 @@ function closeSwipedSessionCard() {
   else swipedSessionId = null;
 }
 
-async function closeSessionFromList(id, title) {
+async function closeSessionFromList(id, title, options = {}) {
   if (sessionCloseInProgress) return;
-  if (!confirm(`确定关闭对话「${title}」吗？`)) return;
   sessionCloseInProgress = true;
   try {
+    if (!options.skipConfirm) {
+      const ok = await confirmMobileAction(`确定关闭对话「${title}」吗？`, { title: '关闭对话' });
+      if (!ok) return;
+    }
     await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    pinnedSessionIds.delete(id);
+    savePinnedSessionIds();
     swipedSessionId = null;
+    removeMobileDraft(id);
+    const pending = mobilePendingSubmissions.get(id);
+    if (pending) {
+      mobilePendingSubmissions.delete(id);
+      saveMobilePendingSubmissions();
+    }
+    activeSessionsCache = activeSessionsCache.filter(session => session.id !== id);
+    if (currentSessionId === id) {
+      terminalOpenRequest++;
+      currentSessionId = null;
+      history.replaceState({ duocliRoot: true }, '', location.pathname);
+      closeTerminal();
+      leaveToSessionList(id);
+    } else {
+      renderSessionList();
+    }
     await refreshSessions();
   } catch (e) {
-    alert('关闭失败: ' + (e.message || e));
+    showCopyToast('关闭失败: ' + (e.message || e));
+    await refreshSessions();
   } finally {
     sessionCloseInProgress = false;
   }
@@ -2420,9 +2891,25 @@ function bindSessionCard(card) {
   let offset = 0;
   let swiping = false;
   let dragged = false;
+  let axis = '';
+
+  const actions = card.querySelector('.session-card-actions');
+  const closeBtn = card.querySelector('.session-close-action');
+  const pinBtn = card.querySelector('.session-pin-action');
+  const isActionTarget = (target) =>
+    !!(actions && target && (target === actions || (typeof target.closest === 'function' && actions.contains(target))));
 
   card.addEventListener('touchstart', (e) => {
     if (e.touches.length !== 1) return;
+    // 点置顶/关闭按钮时不要走左滑手势逻辑
+    if (isActionTarget(e.target)) {
+      axis = 'action';
+      return;
+    }
+    if (Date.now() - sessionListScrollAt < SESSION_SWIPE_SCROLL_GUARD_MS) {
+      axis = 'y';
+      return;
+    }
     if (swipedSessionId && swipedSessionId !== id) closeSwipedSessionCard();
     startX = e.touches[0].clientX;
     startY = e.touches[0].clientY;
@@ -2430,24 +2917,29 @@ function bindSessionCard(card) {
     offset = baseOffset;
     swiping = false;
     dragged = false;
+    axis = '';
   }, { passive: true });
 
   card.addEventListener('touchmove', (e) => {
     if (e.touches.length !== 1) return;
+    if (axis === 'action' || axis === 'y') return;
     const touch = e.touches[0];
     if (!touch) return;
     const dx = touch.clientX - startX;
     const dy = touch.clientY - startY;
+    const ax = Math.abs(dx);
+    const ay = Math.abs(dy);
     if (!swiping) {
-      const horizontalDistance = Math.abs(dx);
-      const horizontalIntent = horizontalDistance >= SESSION_SWIPE_TRIGGER
-        && horizontalDistance >= Math.abs(dy) * SESSION_SWIPE_DIRECTION_RATIO;
-      // A closed card only responds to a deliberate left swipe. An already
-      // open card accepts either direction so a right swipe can close it.
-      const allowedDirection = baseOffset < 0 || dx < 0;
-      // Keep the gesture with the browser until both distance and direction
-      // are clear; this prevents tiny diagonal movements from revealing red.
-      if (!horizontalIntent || !allowedDirection) return;
+      if (axis !== 'x') {
+        if (ax < SESSION_SWIPE_TRIGGER && ay < SESSION_SWIPE_TRIGGER) return;
+        if (ay >= ax * SESSION_SWIPE_DIRECTION_RATIO || (ay >= SESSION_SWIPE_TRIGGER && ay > ax)) {
+          axis = 'y';
+          return;
+        }
+        const allowedDirection = baseOffset < 0 || dx < 0;
+        if (!allowedDirection || ax < SESSION_SWIPE_TRIGGER || ax < ay * SESSION_SWIPE_DIRECTION_RATIO) return;
+        axis = 'x';
+      }
       swiping = true;
       dragged = true;
       card.classList.add('dragging');
@@ -2461,56 +2953,106 @@ function bindSessionCard(card) {
   }, { passive: false });
 
   const endSwipe = () => {
-    if (!swiping) return;
+    if (!swiping) {
+      axis = '';
+      return;
+    }
     swiping = false;
+    axis = '';
     card.classList.remove('dragging');
-    if (offset <= -SESSION_SWIPE_REVEAL / 2) {
+    if (offset <= -SESSION_SWIPE_OPEN) {
       setSessionCardSwipe(card, -SESSION_SWIPE_REVEAL);
       swipedSessionId = id;
     } else {
       closeSessionCardSwipe(card);
     }
   };
-  card.addEventListener('touchend', endSwipe, { passive: true });
+  card.addEventListener('touchend', (e) => {
+    if (axis === 'action' || isActionTarget(e.target)) {
+      axis = '';
+      // 交给按钮自己处理，绝不能在这里收起左滑或 cancel click
+      return;
+    }
+    if (swiping) {
+      endSwipe();
+      return;
+    }
+    if (swipedSessionId === id) {
+      closeSessionCardSwipe(card);
+      dragged = true;
+      if (e.cancelable) e.preventDefault();
+    }
+  }, { passive: false });
   card.addEventListener('touchcancel', endSwipe, { passive: true });
 
-  card.onclick = () => {
+  card.onclick = (e) => {
+    if (isActionTarget(e.target)) return;
     if (dragged) { dragged = false; return; }
     if (swipedSessionId === id) { closeSessionCardSwipe(card); return; }
     openSession(id);
   };
 
-  const closeBtn = card.querySelector('.session-close-action');
+  if (pinBtn) {
+    let pinHandledAt = 0;
+    const runPin = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const now = Date.now();
+      if (now - pinHandledAt < 500) return;
+      pinHandledAt = now;
+      const pinned = toggleSessionPin(id);
+      showCopyToast(pinned ? '已置顶' : '已取消置顶');
+      swipedSessionId = null;
+      renderSessionList();
+    };
+    pinBtn.addEventListener('touchend', (e) => {
+      if (e.touches && e.touches.length > 0) return;
+      runPin(e);
+    }, { passive: false });
+    pinBtn.addEventListener('click', runPin);
+  }
+
   if (closeBtn) {
-    closeBtn.onclick = (e) => {
+    const runClose = (e) => {
+      e.preventDefault();
       e.stopPropagation();
       const title = card.querySelector('.session-title')?.textContent || '对话';
       void closeSessionFromList(id, title);
     };
+    closeBtn.addEventListener('touchend', (e) => {
+      if (e.touches && e.touches.length > 0) return;
+      runClose(e);
+    }, { passive: false });
+    closeBtn.addEventListener('click', runClose);
   }
 }
 
 function renderSessionList() {
   const list = $('session-list');
   const empty = $('empty-state');
-  const sessions = activeSessionsCache;
+  prunePinnedSessions(activeSessionsCache.map((s) => s.id));
+  const sessions = [...activeSessionsCache].sort((a, b) => {
+    const ap = isSessionPinned(a.id) ? 0 : 1;
+    const bp = isSessionPinned(b.id) ? 0 : 1;
+    if (ap !== bp) return ap - bp;
+    return (b.createdAt || 0) - (a.createdAt || 0);
+  });
 
   const activeCards = sessions.map(s => {
     const dn = s.displayName || '';
     const [tagColor, tagBg] = dn ? getCliTagColors(dn) : ['', ''];
+    const pinned = isSessionPinned(s.id);
     
     // 构建 CLI 标签 HTML（带 logo）
     let tagHtml = '';
     if (dn) tagHtml = cliTagHtml(dn, tagColor, tagBg);
     return `
-    <div class="session-card" data-id="${s.id}">
-      <button type="button" class="session-close-action" aria-hidden="true" aria-label="关闭对话">
-        ${iconSvg('trash', 18)}<span>关闭</span>
-      </button>
+    <div class="session-card${s.id === currentSessionId ? ' is-current' : ''}${pinned ? ' is-pinned' : ''}" data-id="${s.id}">
       <div class="session-card-body">
         <div class="status-dot ${s.status}"></div>
         <div class="session-info">
           <div class="session-title-row">
+            ${pinned ? `<span class="session-pin-badge" title="已置顶">${iconSvg('pin', 12)}</span>` : ''}
             <div class="session-title">${escHtml(s.title || s.presetCommand || '终端')}</div>
             ${tagHtml}
           </div>
@@ -2520,6 +3062,14 @@ function renderSessionList() {
           </div>
         </div>
         <div class="session-arrow">›</div>
+      </div>
+      <div class="session-card-actions">
+        <button type="button" class="session-pin-action" aria-hidden="true" aria-label="${pinned ? '取消置顶' : '置顶'}" tabindex="-1">
+          ${iconSvg('pin', 18)}<span>${pinned ? '取消' : '置顶'}</span>
+        </button>
+        <button type="button" class="session-close-action" aria-hidden="true" aria-label="关闭对话" tabindex="-1">
+          ${iconSvg('trash', 18)}<span>关闭</span>
+        </button>
       </div>
     </div>`;
   }).join('');
@@ -2555,11 +3105,13 @@ function renderSessionList() {
   list.innerHTML = activeCards + closedHtml;
 
   list.querySelectorAll('.session-card[data-id]').forEach(card => bindSessionCard(card));
-  // 列表刚被整体重建，之前滑开的卡片要立刻恢复展开态，否则用户点不到「关闭」。
-  if (swipedSessionId) {
-    const swiped = findSessionCard(swipedSessionId);
-    if (swiped) setSessionCardSwipe(swiped, -SESSION_SWIPE_REVEAL, true);
-    else swipedSessionId = null;
+  closeSwipedSessionCard();
+  if (!list.dataset.swipeScrollBound) {
+    list.dataset.swipeScrollBound = '1';
+    list.addEventListener('scroll', () => {
+      sessionListScrollAt = Date.now();
+      closeSwipedSessionCard();
+    }, { passive: true });
   }
 
   const toggleBtn = list.querySelector('.closed-toggle-btn');
@@ -2607,7 +3159,17 @@ function startSSE() {
   sseSource = new EventSource(`${API}/api/events?token=${encodeURIComponent(token)}`);
   sseSource.onopen = () => {
     sseReconnectAttempt = 0;
+    void syncQuickCommands();
   };
+  sseSource.addEventListener('quick-commands', e => {
+    try {
+      const state = JSON.parse(e.data);
+      if (!state.initialized) return;
+      quickCommandState = state.commands;
+      quickCommandsLoaded = true;
+      renderQuickCommands();
+    } catch {}
+  });
   sseSource.addEventListener('sessions', e => {
     try {
       activeSessionsCache = JSON.parse(e.data);
@@ -2634,25 +3196,21 @@ function startSSE() {
     stopSSE();
     if (navigator.onLine === false) return;
     if (sseReconnectTimer) clearTimeout(sseReconnectTimer);
-    // Token 被桌面端轮换后，SSE 会断；先探测 API，401 则回登录页重新授权
+    // Token 被桌面端轮换后，SSE 会断；先用同一套有界请求探测 API。
     void (async () => {
       try {
-        const r = await fetch(`${API}/api/sessions`, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-        });
-        if (r.status === 401) {
-          logout();
-          return;
-        }
+        await api('/api/sessions', { timeout: 5000 });
       } catch { /* ignore */ }
       if (!token) return;
       const delay = Math.min(profile.sseRetryBaseMs * Math.pow(2, sseReconnectAttempt), profile.sseRetryMaxMs) + Math.floor(Math.random() * 600);
       sseReconnectAttempt++;
       sseReconnectTimer = setTimeout(() => {
         sseReconnectTimer = null;
-        // 会话主页或横屏会话侧栏可见时维持 SSE，保证列表可实时切换。
+        // 会话主页、详情页或横屏会话侧栏可见时维持 SSE，保证返回列表和状态更新不滞后。
         if (!token) return;
-        if ($('main-page').classList.contains('active') || $('main-page').classList.contains('landscape-drawer-open')) {
+        if ($('main-page').classList.contains('active')
+            || $('detail-page').classList.contains('active')
+            || $('main-page').classList.contains('landscape-drawer-open')) {
           startSSE();
         }
       }, delay);
@@ -2821,6 +3379,15 @@ async function renderFileBrowseTree(force = false) {
 function openFilePreview(requestedPath, options = {}) {
   if (!currentSessionId) return;
   const helpers = globalThis.DuoFilePreviewHelpers;
+  if (helpers?.isDownloadableFileName?.(requestedPath)) {
+    const link = document.createElement('a');
+    link.href = `${API}/api/sessions/${encodeURIComponent(currentSessionId)}/file-download?path=${encodeURIComponent(requestedPath)}&token=${encodeURIComponent(token)}`;
+    link.download = requestedPath.split(/[\\/]/).pop() || 'download';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    return;
+  }
   if (helpers?.isPreviewableFileName && !helpers.isPreviewableFileName(requestedPath)) {
     showCopyToast('该文件暂不支持在手机端预览');
     return;
@@ -2871,9 +3438,15 @@ function openFilePreview(requestedPath, options = {}) {
       if (requestId !== mobileFilePreviewRequest || currentSessionId !== sessionId) return;
       title.textContent = data.name || requestedPath;
       meta.textContent = data.path || requestedPath;
-      content.textContent = typeof data.content === 'string' ? data.content : '';
       if (legacyTitle) legacyTitle.textContent = title.textContent;
       if (legacyMeta) legacyMeta.textContent = meta.textContent;
+      const htmlName = data.name || requestedPath;
+      if (/\.(?:html|htm|xhtml)$/i.test(htmlName)) {
+        renderHtmlPreview(typeof data.content === 'string' ? data.content : '', mediaBox, content, legacyContent);
+        return;
+      }
+      content.style.display = '';
+      content.textContent = typeof data.content === 'string' ? data.content : '';
       if (legacyContent) legacyContent.textContent = content.textContent;
     })
     .catch((error) => {
@@ -2881,6 +3454,25 @@ function openFilePreview(requestedPath, options = {}) {
       meta.textContent = '';
       showCopyToast(error.message || '文件预览失败');
     });
+}
+
+function renderHtmlPreview(html, mediaBox, content, legacyContent) {
+  if (content) {
+    content.textContent = '';
+    content.style.display = 'none';
+  }
+  if (legacyContent) legacyContent.textContent = '';
+  if (!mediaBox) return;
+  mediaBox.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'media-preview-wrap';
+  const iframe = document.createElement('iframe');
+  iframe.className = 'media-html';
+  iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation');
+  iframe.title = 'HTML 预览';
+  iframe.srcdoc = String(html || '');
+  wrap.appendChild(iframe);
+  mediaBox.appendChild(wrap);
 }
 
 // 按媒体类型渲染预览元素到 #file-preview-media
@@ -2998,7 +3590,7 @@ function refreshMobileLinkHighlights() {
     const logical = terminalContentHelpers.readLogicalLine(buffer, y);
     if (logical.text.trim()) {
       for (const match of terminalContentHelpers.findLinks(logical.text)) {
-        if (match.kind === 'file' && !globalThis.DuoFilePreviewHelpers?.isPreviewableFileName?.(match.filePath)) continue;
+        if (match.kind === 'file' && !globalThis.DuoFilePreviewHelpers?.isLinkableFileName?.(match.filePath)) continue;
         const range = terminalContentHelpers.matchRange(logical, match);
         if (!range) continue;
         const key = `${range.start.line}:${range.start.cell}-${range.end.line}:${range.end.cell}:${match.kind}`;
@@ -3018,7 +3610,7 @@ function registerMobileFileLinks() {
       const buffer = term.buffer.active;
       const logical = terminalContentHelpers.readLogicalLine(buffer, y - 1);
       const links = terminalContentHelpers.findLinks(logical.text).flatMap((match) => {
-        if (match.kind === 'file' && !globalThis.DuoFilePreviewHelpers.isPreviewableFileName(match.filePath)) return [];
+        if (match.kind === 'file' && !globalThis.DuoFilePreviewHelpers.isLinkableFileName(match.filePath)) return [];
         const range = terminalContentHelpers.matchRange(logical, match);
         if (!range) return [];
         return [{
@@ -3353,42 +3945,14 @@ function createTerminal() {
           const cell = getCellFromTouch(t.clientX, t.clientY);
           if (!cell) return;
           const buffer = term.buffer.active;
-          const lineIndex = cell.row;
-
-          const logical = terminalContentHelpers.readLogicalLine(buffer, lineIndex);
-          const matches = terminalContentHelpers.findLinks(logical.text).filter(match =>
-            match.kind === 'file' && globalThis.DuoFilePreviewHelpers.isPreviewableFileName(match.filePath));
-          if (!matches.length) return;
-
-          const tapCol = cell.col;
-          let tapCharIndex = -1;
-          for (let i = 0; i < logical.positions.length; i++) {
-            const position = logical.positions[i];
-            if (position && position.line === lineIndex && position.cell >= tapCol) {
-              tapCharIndex = i;
-              break;
-            }
-          }
-          if (tapCharIndex < 0) tapCharIndex = logical.positions.length - 1;
-
-          let best = null;
-          let bestDist = Infinity;
-          for (const m of matches) {
-            const mStart = m.index;
-            const mEnd = m.index + m.length;
-            let dist;
-            if (tapCharIndex >= mStart && tapCharIndex < mEnd) {
-              dist = 0;
-            } else {
-              dist = Math.min(Math.abs(tapCharIndex - mStart), Math.abs(tapCharIndex - mEnd));
-            }
-            if (dist < bestDist) {
-              bestDist = dist;
-              best = m;
-            }
-          }
-
-          if (best && bestDist <= 15) {
+          const logical = terminalContentHelpers.readLogicalLine(buffer, cell.row);
+          const best = terminalContentHelpers.findLinkAtCell(logical, cell, {
+            cols: term.cols,
+            maxDistance: 2,
+            predicate: (match) => match.kind === 'file'
+              && globalThis.DuoFilePreviewHelpers.isLinkableFileName(match.filePath),
+          });
+          if (best) {
             linkTapAt = Date.now();
             openFilePreview(best.filePath);
           }
@@ -3461,16 +4025,22 @@ function interceptSpinnerData(rawData) {
 // ========== WebSocket ==========
 
 function connectWebSocket(sessionId) {
+  if (pendingRecreateViewport == null && isUserScrolling && term && terminalSequence >= 0) {
+    pendingRecreateViewport = term.buffer.active.viewportY;
+  }
   closeWebSocket();
   setTerminalInputReady(false);
   hideWeakNetworkPrompt();
   const profile = getNetworkProfile();
+  const generation = ++wsConnectionGeneration;
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`;
-  ws = new WebSocket(wsUrl);
+  const socket = new WebSocket(wsUrl);
+  ws = socket;
 
-  ws.onopen = () => {
+  socket.onopen = () => {
+    if (generation !== wsConnectionGeneration || ws !== socket) return;
     console.log('[ws] onopen, term exists=', !!term);
     hideWeakNetworkPrompt();
     wsReconnectAttempt = 0;
@@ -3511,11 +4081,16 @@ function connectWebSocket(sessionId) {
       hideTerminalLoading();
       writeTerminalOutput('\r\n\x1b[33m⚠ 连接超时，正在重连...\x1b[0m\r\n');
       showWeakNetworkPrompt('连接超时，正在重试');
-      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      // CONNECTING sockets do not reliably emit a useful error on mobile
+      // browsers. Close this exact attempt so the normal retry path runs.
+      if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
     }
   }, profile.wsConnectTimeoutMs);
 
-  ws.onmessage = (event) => {
+  socket.onmessage = (event) => {
+    if (generation !== wsConnectionGeneration || ws !== socket) return;
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === 'submitted') {
@@ -3571,7 +4146,8 @@ function connectWebSocket(sessionId) {
     } catch {}
   };
 
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (generation !== wsConnectionGeneration || ws !== socket) return;
     setTerminalInputReady(false);
     clearInterval(wsHeartbeat);
     if (wsConnectTimeoutTimer) { clearTimeout(wsConnectTimeoutTimer); wsConnectTimeoutTimer = null; }
@@ -3591,16 +4167,18 @@ function connectWebSocket(sessionId) {
     }
   };
 
-  ws.onerror = () => {
+  socket.onerror = () => {
+    if (generation !== wsConnectionGeneration || ws !== socket) return;
     setTerminalInputReady(false);
     // 某些浏览器弱网下只触发 onerror 不触发 onclose，主动 close 统一走重连逻辑
-    if (ws && ws.readyState !== WebSocket.CLOSED) {
-      ws.close();
+    if (socket.readyState !== WebSocket.CLOSED) {
+      socket.close();
     }
   };
 }
 
 function closeWebSocket() {
+  wsConnectionGeneration++;
   clearInterval(wsHeartbeat);
   setTerminalInputReady(false);
   hideWeakNetworkPrompt();
@@ -3644,14 +4222,30 @@ function wsSend(data) {
 
 // ========== 会话详情 ==========
 
-async function openSession(id) {
+function leaveSessionDetail() {
+  const endedId = currentSessionId;
+  saveCurrentMobileDraft();
+  terminalOpenRequest++;
+  currentSessionId = null;
+  closeTerminal();
+  leaveToSessionList(endedId);
+}
+
+async function openSession(id, fromHistory = false) {
   console.log('[openSession] start, id=', id);
   const requestId = ++terminalOpenRequest;
+  if (!fromHistory && history.state?.duocliSession !== id) {
+    history.pushState({ duocliSession: id }, '', `${location.pathname}#session=${encodeURIComponent(id)}`);
+  }
+  saveCurrentMobileDraft();
   currentSessionId = id;
+  failedSubmission = mobilePendingSubmissions.get(id) || null;
+  restoreMobileDraft(id);
   resetFileTreeState(mobileFileTree);
   resetFileTreeState(fileBrowseTree);
   mobileFilePreviewRequest++;
   showPage('detail-page');
+  syncCurrentSessionCard();
 
   // 更新标题（不阻塞 WebSocket 连接）
   api('/api/sessions').then(sessions => {
@@ -3660,6 +4254,10 @@ async function openSession(id) {
       $('detail-name').textContent = s.title || s.presetCommand || '终端';
       $('detail-status').className = `status-dot ${s.status}`;
       lastKnownSessionCwd = s.cwd || '';
+    } else if (Array.isArray(sessions) && !s && currentSessionId === id) {
+      showCopyToast('会话已结束，可在已关闭记录中恢复');
+      if (history.state?.duocliSession === id) history.replaceState({ duocliRoot: true }, '', location.pathname);
+      leaveSessionDetail();
     }
   }).catch(() => {});
 
@@ -3700,12 +4298,24 @@ $('detail-name').onclick = async () => {
 
 // 返回按钮
 $('back-btn').onclick = () => {
-  terminalOpenRequest++;
-  currentSessionId = null;
-  closeTerminal();
-  showPage('main-page');
-  refreshSessions();
+  if (history.state?.duocliSession) history.back();
+  else leaveSessionDetail();
 };
+
+window.addEventListener('popstate', (event) => {
+  const sessionId = event.state?.duocliSession;
+  if (sessionId) {
+    if (currentSessionId !== sessionId) void openSession(sessionId, true);
+    return;
+  }
+  if ($('detail-page').classList.contains('active')) {
+    if (supportsLandscapeWorkspace()) {
+      applyLandscapeWorkspaceChrome();
+      return;
+    }
+    leaveSessionDetail();
+  }
+});
 
 $('file-preview-back-btn').onclick = () => {
   const returnPage = filePreviewReturnPage || 'detail-page';
@@ -3736,6 +4346,21 @@ function openFileBrowse() {
   updateFileBrowseFilterUI();
   showPage('media-browse-page');
   void renderFileBrowseTree(true);
+}
+
+function showSessionPicker() {
+  const sessions = activeSessionsCache.filter(session => session?.id);
+  if (sessions.length <= 1) {
+    showCopyToast('当前只有一个活跃会话');
+    return;
+  }
+  const items = sessions.map(session => ({
+    label: session.id === currentSessionId ? `✓ ${session.title || '终端'}` : (session.title || session.presetCommand || '终端'),
+    action: () => {
+      if (session.id !== currentSessionId) openSession(session.id);
+    },
+  }));
+  showMobileContextMenu(Math.max(12, window.innerWidth / 2 - 84), 58, items);
 }
 
 $('media-browse-back-btn').onclick = () => {
@@ -3785,6 +4410,7 @@ document.addEventListener('click', (event) => {
 $('detail-menu-files-btn').onclick = () => {
   openFileBrowse();
 };
+$('detail-session-picker-btn').onclick = () => { showSessionPicker(); };
 $('detail-menu-plan-btn').onclick = () => {
   if (currentSessionId) showAutoContinueConfigModal(currentSessionId);
 };
@@ -3805,8 +4431,24 @@ document.querySelectorAll('.device-panel-tab').forEach(button => {
 $('mobile-file-tree-refresh').onclick = () => { void renderMobileFileTree(true); };
 setDevicePanel('device');
 $('main-drawer-close').onclick = () => { void toggleLandscapeSessionsPanel(); };
+$('landscape-device-pull')?.addEventListener('click', () => { void toggleLandscapeDevicePanel(); });
 window.addEventListener('resize', () => {
-  if (!supportsLandscapePanels()) closeLandscapePanels();
+  if ($('login-page').classList.contains('active')) return;
+  if (supportsLandscapeWorkspace()) {
+    if ($('main-page').classList.contains('active')) {
+      landscapeSessionsCollapsed = false;
+      const sessionId = currentSessionId || activeSessionsCache[0]?.id || null;
+      showPage('detail-page');
+      if (sessionId && currentSessionId !== sessionId) void openSession(sessionId);
+      else if (!sessionId) showLandscapeEmptyTerminal();
+    } else {
+      applyLandscapeWorkspaceChrome();
+    }
+  } else if (!supportsLandscapePanels()) {
+    landscapeSessionsCollapsed = false;
+    closeLandscapePanels();
+    document.body.classList.remove('landscape-workspace');
+  }
   syncLandscapePanelButtons();
   requestAnimationFrame(fitAndroidSurfaces);
 });
@@ -3920,26 +4562,38 @@ async function sendMessage() {
   }
   const text = input.value.replace(/\r\n?/g, '\n');
   if (!text.trim()) return;
+  const keepKeyboard = document.activeElement === input;
   const sessionId = currentSessionId;
-  const retry = failedSubmission?.sessionId === sessionId && failedSubmission?.text === text;
-  const id = retry ? failedSubmission.id : (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const savedFailure = mobilePendingSubmissions.get(sessionId);
+  const retry = savedFailure?.text === text;
+  const id = retry ? savedFailure.id : (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
   composerSubmission = { id, sessionId };
+  mobilePendingSubmissions.set(sessionId, { id, sessionId, text });
+  saveMobilePendingSubmissions();
   input.value = '';
+  saveMobileDraft(sessionId, '');
   updateComposerAvailability();
   scrollTerminalToBottom();
   try {
     await requestSubmission(sessionId, text, id);
     failedSubmission = null;
+    mobilePendingSubmissions.delete(sessionId);
+    saveMobilePendingSubmissions();
+    if (currentSessionId === sessionId) saveMobileDraft(sessionId, input.value);
   } catch (error) {
     failedSubmission = { id, sessionId, text };
+    saveMobileDraft(sessionId, currentSessionId === sessionId && input.value ? input.value : text);
     if (currentSessionId === sessionId && !input.value) input.value = text;
+    mobilePendingSubmissions.set(sessionId, { id, sessionId, text });
+    saveMobilePendingSubmissions();
     showCopyToast('发送未确认：' + (error.message || error));
   } finally {
     if (composerSubmission?.id === id) {
       composerSubmission = null;
       updateComposerAvailability();
     }
-    input.blur();
+    if (!keepKeyboard || currentSessionId !== sessionId) input.blur();
+    else input.focus({ preventScroll: true });
     resetMobileKeyboardLayout();
     scheduleDelayedTerminalResize();
   }
@@ -3948,6 +4602,7 @@ async function sendMessage() {
 updateComposerAvailability();
 
 $('msg-input').addEventListener('blur', () => {
+  saveCurrentMobileDraft();
   resetMobileKeyboardLayout();
   scheduleDelayedTerminalResize();
 });
@@ -3981,6 +4636,7 @@ $('msg-input').addEventListener('beforeinput', event => {
   }
 });
 $('msg-input').addEventListener('input', event => {
+  saveCurrentMobileDraft();
   if (!['insertLineBreak', 'insertParagraph'].includes(event.inputType) || event.isComposing || composerComposing) return;
   // 部分软键盘只发 input；只移除此次插入的换行，不破坏粘贴的多行文字。
   if (allowComposerLineBreak) { allowComposerLineBreak = false; return; }
@@ -4003,6 +4659,9 @@ function wsSendHex(hexStr) {
 if (window.visualViewport) {
   const vv = window.visualViewport;
   function adjustForKeyboard() {
+    // Pinch/input zoom also shrinks visualViewport. It is not keyboard height;
+    // applying it as a bottom inset can push navigation off screen.
+    if (Math.abs(vv.scale - 1) > 0.01) return;
     const detailPage = $('detail-page');
     if (!detailPage || !detailPage.classList.contains('active')) return;
 
@@ -4046,75 +4705,73 @@ if (window.visualViewport) {
 const QCMD_STORAGE_KEY = 'duocli_quick_commands';
 const QCMD_DEFAULTS = ['/new', '/help', '/compact', '/unicloud-log-viewer', '/uniapp-dev'];
 
-function loadQuickCommands() {
+let quickCommandState = [...QCMD_DEFAULTS];
+let quickCommandsLoaded = false;
+
+async function syncQuickCommands() {
   try {
-    const saved = localStorage.getItem(QCMD_STORAGE_KEY);
-    if (saved) return JSON.parse(saved);
-  } catch {}
-  return [...QCMD_DEFAULTS];
+    let state = await api('/api/quick-commands');
+    if (!state.initialized) {
+      const saved = localStorage.getItem(QCMD_STORAGE_KEY);
+      if (saved) state = await api('/api/quick-commands', {
+        method: 'POST', body: JSON.stringify({ action: 'migrate', commands: JSON.parse(saved) }),
+      });
+    }
+    quickCommandState = state.commands;
+    quickCommandsLoaded = true;
+    renderQuickCommands();
+  } catch (error) {
+    showCopyToast(error.message || '快捷命令同步失败');
+  }
 }
 
-function saveQuickCommands(cmds) {
-  localStorage.setItem(QCMD_STORAGE_KEY, JSON.stringify(cmds));
+async function updateQuickCommands(operation) {
+  try {
+    const state = await api('/api/quick-commands', { method: 'POST', body: JSON.stringify(operation) });
+    quickCommandState = state.commands;
+    renderQuickCommands();
+  } catch (error) { showCopyToast(error.message || '快捷命令保存失败'); }
 }
 
 function renderQuickCommands() {
   const bar = $('quick-commands');
   if (!bar) return;
   bar.innerHTML = '';
-  const cmds = loadQuickCommands();
-
-  cmds.forEach((cmd, idx) => {
+  quickCommandState.forEach(cmd => {
     const btn = document.createElement('button');
     btn.className = 'qcmd-btn';
     btn.textContent = cmd;
-    // 必须走 submit 通道：裸写会被 CLI 的斜杠补全菜单吞掉回车，导致命令重复执行
+    btn.title = '点击插入；长按或右键删除';
+    let suppressClick = false;
+    btn.addEventListener('mousedown', e => e.preventDefault());
     btn.onclick = () => {
-      if (!currentSessionId) return;
-      if (!isTerminalInputReady()) {
-        showCopyToast('终端连接中，请稍候再发送');
-        return;
-      }
-      if (!confirm(`确定发送快捷指令「${cmd}」到当前终端吗？`)) return;
-      const sessionId = currentSessionId;
-      const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      scrollTerminalToBottom();
-      void requestSubmission(sessionId, cmd, id).catch((error) => {
-        showCopyToast('发送未确认：' + (error.message || error));
-      });
+      if (suppressClick) { suppressClick = false; return; }
+      const input = $('msg-input');
+      input.setRangeText(cmd, input.selectionStart, input.selectionEnd, 'end');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.focus();
     };
-    // 长按 → 删除
-    let longTimer = null;
-    btn.addEventListener('touchstart', (e) => {
-      longTimer = setTimeout(() => {
-        longTimer = null;
-        if (confirm(`删除快捷命令「${cmd}」？`)) {
-          const list = loadQuickCommands();
-          list.splice(idx, 1);
-          saveQuickCommands(list);
-          renderQuickCommands();
-        }
-      }, 600);
-    }, { passive: true });
-    btn.addEventListener('touchend', () => { if (longTimer) clearTimeout(longTimer); });
-    btn.addEventListener('touchmove', () => { if (longTimer) clearTimeout(longTimer); });
+    const remove = () => {
+      suppressClick = true;
+      if (confirm(`删除快捷命令「${cmd}」？`)) void updateQuickCommands({ action: 'remove', command: cmd });
+    };
+    btn.oncontextmenu = e => { e.preventDefault(); remove(); };
+    let timer;
+    btn.addEventListener('touchstart', () => { suppressClick = false; timer = setTimeout(remove, 600); }, { passive: true });
+    for (const event of ['touchend', 'touchmove', 'touchcancel']) {
+      btn.addEventListener(event, () => clearTimeout(timer), { passive: true });
+    }
     bar.appendChild(btn);
   });
-
-  // 添加按钮
-  const addBtn = document.createElement('button');
-  addBtn.className = 'qcmd-btn qcmd-add';
-  addBtn.textContent = '+ 添加';
-  addBtn.onclick = () => {
-    const cmd = prompt('输入快捷命令：');
-    if (cmd && cmd.trim()) {
-      const list = loadQuickCommands();
-      list.push(cmd.trim());
-      saveQuickCommands(list);
-      renderQuickCommands();
-    }
+  const add = document.createElement('button');
+  add.className = 'qcmd-btn qcmd-add';
+  add.textContent = '+ 添加';
+  add.disabled = !quickCommandsLoaded;
+  add.onclick = () => {
+    const command = prompt('输入快捷命令（点击后插入输入框，不会发送）：');
+    if (command?.trim()) void updateQuickCommands({ action: 'add', command: command.trim() });
   };
-  bar.appendChild(addBtn);
+  bar.appendChild(add);
 }
 
 renderQuickCommands();
@@ -4126,37 +4783,63 @@ $('upload-btn').onclick = () => {
 
 $('file-input').onchange = async (e) => {
   const files = e.target.files;
-  if (!files || !files.length || !currentSessionId) return;
+  const targetSessionId = currentSessionId;
+  if (!files || !files.length || !targetSessionId) return;
+
+  saveCurrentMobileDraft();
+  let targetDraft = mobileDrafts.get(targetSessionId) || '';
+  let renderedDraft = currentSessionId === targetSessionId ? $('msg-input').value : null;
 
   const btn = $('upload-btn');
   btn.classList.add('uploading');
 
   for (const file of files) {
+    let uploadTimeout = null;
     try {
-      const res = await fetch(`${API}/api/sessions/${currentSessionId}/upload`, {
+      const controller = new AbortController();
+      uploadTimeout = setTimeout(() => controller.abort(), weakNetworkMode ? 60_000 : 30_000);
+      const res = await fetch(`${API}/api/sessions/${encodeURIComponent(targetSessionId)}/upload`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/octet-stream',
           'X-Filename': encodeURIComponent(file.name),
         },
+        signal: controller.signal,
         body: file,
       });
-      const data = await res.json();
+      let data = {};
+      try { data = await res.json(); } catch { data = {}; }
+      clearTimeout(uploadTimeout);
+      uploadTimeout = null;
+      if (!res.ok) throw new Error(data.error || `请求失败 (${res.status})`);
       if (data.ok) {
         // 在终端显示上传成功提示
-        writeTerminalOutput(`\r\n\x1b[32m✓ 已上传: ${file.name} (${formatSize(data.size)})\x1b[0m\r\n`);
+        if (currentSessionId === targetSessionId) {
+          writeTerminalOutput(`\r\n\x1b[32m✓ 已上传: ${file.name} (${formatSize(data.size)})\x1b[0m\r\n`);
+        }
         // 把文件路径填入输入框，方便用户直接发送给 AI
         if (data.path) {
-          const input = $('msg-input');
-          const prev = input.value.trim();
-          input.value = prev ? prev + ' ' + data.path : data.path;
+          targetDraft = targetDraft.trim() ? `${targetDraft.trim()} ${data.path}` : data.path;
+          saveMobileDraft(targetSessionId, targetDraft);
+          if (currentSessionId === targetSessionId) {
+            const input = $('msg-input');
+            if (renderedDraft === null || input.value === renderedDraft) {
+              input.value = targetDraft;
+              renderedDraft = targetDraft;
+            }
+          }
         }
       } else {
-        writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${data.error}\x1b[0m\r\n`);
+        if (currentSessionId === targetSessionId) {
+          writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${data.error || '未知错误'}\x1b[0m\r\n`);
+        }
       }
     } catch (err) {
-      writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${err.message}\x1b[0m\r\n`);
+      if (uploadTimeout) clearTimeout(uploadTimeout);
+      if (currentSessionId === targetSessionId) {
+        writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${err.name === 'AbortError' ? '上传超时' : err.message}\x1b[0m\r\n`);
+      }
     }
   }
 
@@ -4184,47 +4867,29 @@ document.querySelectorAll('.key-btn').forEach(btn => {
   });
 });
 
-// 删除会话
-$('delete-btn').onclick = async () => {
-  if (!currentSessionId) return;
-  if (!confirm('确定终止此会话？')) return;
-  try {
-    await api(`/api/sessions/${currentSessionId}`, { method: 'DELETE' });
-    currentSessionId = null;
-    closeTerminal();
-    showPage('main-page');
-    refreshSessions();
-  } catch (e) {
-    alert('删除失败: ' + e.message);
-  }
-};
+(function bindDeleteSessionButton() {
+  const btn = $('delete-btn');
+  if (!btn) return;
+  const run = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    void closeCurrentMobileSession();
+  };
+  btn.addEventListener('touchend', (e) => {
+    if (e.touches && e.touches.length > 0) return;
+    run(e);
+  }, { passive: false });
+  btn.addEventListener('click', run);
+})();
 
 // 手机浏览器不会经过 Electron 的 before-input-event。拦截 Command/Ctrl+W，
 // 只关闭当前终端会话，避免浏览器直接关闭标签页或退出当前页面。
-let mobileCloseInProgress = false;
 async function closeCurrentMobileSession() {
-  if (mobileCloseInProgress) return;
   if (!currentSessionId || !$('detail-page').classList.contains('active')) {
     showCopyToast('当前没有可关闭的终端');
     return;
   }
-  const sessionId = currentSessionId;
-  const title = $('detail-name').textContent || '终端';
-  if (!confirm(`确定关闭当前终端「${title}」吗？`)) return;
-  mobileCloseInProgress = true;
-  try {
-    await api(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
-    if (currentSessionId !== sessionId) return;
-    terminalOpenRequest++;
-    currentSessionId = null;
-    closeTerminal();
-    showPage('main-page');
-    await refreshSessions();
-  } catch (e) {
-    alert('关闭失败: ' + (e.message || e));
-  } finally {
-    mobileCloseInProgress = false;
-  }
+  await closeSessionFromList(currentSessionId, $('detail-name').textContent || '终端');
 }
 
 // ========== 自定义预设 ==========
@@ -4718,10 +5383,17 @@ function isCanvasContextLost() {
 
 function recoverVisibleTerminal() {
   if (!currentSessionId || !$('detail-page').classList.contains('active')) return;
-  wsLastPongAt = Date.now();
   if (term) term.refresh(0, term.rows - 1);
   if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
     connectWebSocket(currentSessionId);
+  } else if (ws.readyState === WebSocket.OPEN) {
+    const generation = wsConnectionGeneration;
+    wsLastPongAt = Date.now();
+    wsSend({ type: 'ping', foreground: true });
+    setTimeout(() => {
+      if (document.visibilityState !== 'visible' || generation !== wsConnectionGeneration) return;
+      if (ws && ws.readyState === WebSocket.OPEN && Date.now() - wsLastPongAt > 3500) ws.close();
+    }, 4000);
   }
   setTimeout(() => {
     if (isCanvasContextLost()) scheduleRepaint();
@@ -4819,8 +5491,7 @@ document.addEventListener('keydown', (e) => {
 
 async function loadServerInfo() {
   try {
-    const res = await fetch(`${API}/api/server-info`);
-    const info = await res.json();
+    const info = await api('/api/server-info', { timeout: 5000 });
     const el = $('server-info');
     el.innerHTML = `
       <div><span class="label">主机: </span><span class="value">${info.hostname}</span></div>
@@ -4831,12 +5502,18 @@ async function loadServerInfo() {
   }
 }
 
-loadServerInfo();
-
-if (token) {
-  api('/api/sessions').then(() => enterMain()).catch(() => showPage('login-page'));
-} else {
-  showPage('login-page');
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    const sessionId = event.data?.type === 'open-session' ? event.data.sessionId : '';
+    if (!sessionId || !token) return;
+    if ($('detail-page').classList.contains('active') && currentSessionId === sessionId) return;
+    if ($('main-page').classList.contains('active') || supportsLandscapeWorkspace()) {
+      openSession(sessionId);
+    } else {
+      pendingSessionToOpen = sessionId;
+      enterMain().catch(() => {});
+    }
+  });
 }
 
 window.addEventListener('online', () => {
@@ -4858,6 +5535,7 @@ window.addEventListener('offline', () => {
 // ========== 初始化：自动验证 token 并进入主页 ==========
 
 async function init() {
+  void loadServerInfo();
   const savedToken = localStorage.getItem('duocli_token');
   if (!savedToken) {
     showPage('login-page');
@@ -4866,12 +5544,11 @@ async function init() {
 
   // 验证 token 是否有效
   try {
-    const res = await fetch(`${API}/api/auth`, {
+    const data = await api('/api/auth', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: savedToken }),
+      timeout: 8000,
     });
-    const data = await res.json();
     if (data.ok) {
       token = savedToken;
       enterMain();

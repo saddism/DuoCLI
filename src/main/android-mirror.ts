@@ -26,7 +26,10 @@ const DEFAULT_MAX_FPS = 30;
 const DEFAULT_VIDEO_BIT_RATE = '1500000';
 const MIRROR_IDLE_TIMEOUT_MS = 30_000;
 const CONTROL_LEASE_MS = 6_000;
+// 交互式抢占等待窗口：owner 活跃指针在手时，挑战方需等它响应或超时。
+const CONTROL_CHALLENGE_MS = 1500;
 const CONTROL_QUEUE_LIMIT = 128;
+const CONTROL_WRITE_TIMEOUT_MS = 2000;
 const CONTROL_RESULT_CACHE_SIZE = 256;
 
 function controlError(code: string, message: string): Error & { code: string } {
@@ -68,8 +71,13 @@ export function validateAndroidMirrorInput(input: unknown): input is AndroidMirr
   if (type === 'touch' || type === 'tap' || type === 'scroll') {
     if (value.action !== undefined && !['down', 'up', 'move', 'cancel'].includes(value.action)) return false;
     if (value.x === undefined || value.y === undefined || !Number.isFinite(Number(value.x)) || !Number.isFinite(Number(value.y))) return false;
-    if (value.pointerId !== undefined && (!Number.isSafeInteger(Number(value.pointerId)) || Number(value.pointerId) < 0)) return false;
-    if (value.pressure !== undefined && (!Number.isFinite(Number(value.pressure)) || Number(value.pressure) < 0 || Number(value.pressure) > 1)) return false;
+    // Some browsers (WebKit mouse, pending touches) report pointerId -1 or a
+    // float. scrcpy already encodes signed IDs as unsigned 64-bit values.
+    if (value.pointerId !== undefined) {
+      const pointerId = Math.trunc(Number(value.pointerId));
+      if (!Number.isFinite(Number(value.pointerId)) || !Number.isSafeInteger(pointerId)) return false;
+    }
+    if (value.pressure !== undefined && !Number.isFinite(Number(value.pressure))) return false;
     if (type === 'scroll' && (value.hscroll !== undefined && !Number.isFinite(Number(value.hscroll)) || value.vscroll !== undefined && !Number.isFinite(Number(value.vscroll)))) return false;
   }
   if (type === 'key') {
@@ -469,6 +477,8 @@ export class AndroidMirrorSession {
   private leaseTimer: NodeJS.Timeout | null = null;
   private leaseExpiresAt = 0;
   private controlQueueDepth = 0;
+  private challengeTimer: NodeJS.Timeout | null = null;
+  private pendingClaim: { owner: string; challenger: string } | null = null;
   private readonly activePointers = new Set<number>();
   private readonly commandResults = new Map<string, { epoch: number; highest: number; entries: Map<number, Promise<void>> }>();
   private status: AndroidMirrorStatus = 'stopped';
@@ -546,7 +556,9 @@ export class AndroidMirrorSession {
 
   removeClient(clientId: string): void {
     this.clients.delete(clientId);
+    if (this.pendingClaim?.owner === clientId || this.pendingClaim?.challenger === clientId) this.clearChallenge();
     if (this.ownerId === clientId) {
+      if (this.challengeTimer) { clearTimeout(this.challengeTimer); this.challengeTimer = null; }
       this.queuePointerCleanup();
       this.ownerId = this.clients.keys().next().value || null;
       this.controlEpoch = (this.controlEpoch + 1) >>> 0 || 1;
@@ -564,8 +576,41 @@ export class AndroidMirrorSession {
 
   claim(clientId: string, takeover = true): boolean {
     if (!this.clients.has(clientId)) return false;
+    if (this.ownerId === clientId) {
+      this.touchLease();
+      this.broadcastJson({ type: 'android:control-owner', deviceId: this.deviceId, owner: clientId, controlEpoch: this.controlEpoch });
+      return true;
+    }
+    if (this.ownerId && !takeover) return false;
+    // 交互式抢占：持有一方正持有活跃指针（手指按在屏幕上）时不立即夺走，
+    // 先下发 challenge，等待其无响应或释放后再转移，否则两端互相抢租约会
+    // 把每一次点击都变成静默丢失。挑战窗口内 owner 继续输入则撤销转移。
+    if (this.pendingClaim) {
+      // 已有未决挑战：本请求只能排队，不能插队抢走挑战权。
+      return false;
+    }
+    if (this.ownerId && this.activePointers.size > 0) {
+      const currentOwner = this.ownerId;
+      const claim = { owner: currentOwner, challenger: clientId };
+      this.pendingClaim = claim;
+      this.broadcastJson({ type: 'android:control-challenge', deviceId: this.deviceId, owner: currentOwner, challenger: clientId, controlEpoch: this.controlEpoch });
+      this.challengeTimer = setTimeout(() => {
+        if (this.pendingClaim !== claim) return;
+        this.clearChallenge();
+        if (this.ownerId !== currentOwner) return;
+        // 窗口内 owner 无新输入也无释放：让位。
+        this.forceTransfer(clientId);
+      }, CONTROL_CHALLENGE_MS);
+      return false;
+    }
+    this.forceTransfer(clientId);
+    return true;
+  }
+
+  private forceTransfer(clientId: string): boolean {
+    if (!this.clients.has(clientId)) return false;
+    this.clearChallenge();
     if (this.ownerId !== clientId) {
-      if (this.ownerId && !takeover) return false;
       this.queuePointerCleanup();
       // A takeover starts a fresh epoch. Queued commands from the old owner
       // are intentionally discarded before the new owner is announced.
@@ -585,6 +630,32 @@ export class AndroidMirrorSession {
       return false;
     }
     return true;
+  }
+
+  /** 挑战中收到 owner 的真实输入：撤销未决挑战，保持现 owner。 */
+  private resolveChallengeIfAny(): void {
+    if (!this.pendingClaim) return;
+    this.clearChallenge();
+    const owner = this.ownerId;
+    if (owner) {
+      this.broadcastJson({ type: 'android:control-owner', deviceId: this.deviceId, owner, controlEpoch: this.controlEpoch, challenged: false });
+    }
+  }
+
+  private clearChallenge(): void {
+    if (this.challengeTimer) clearTimeout(this.challengeTimer);
+    this.challengeTimer = null;
+    this.pendingClaim = null;
+  }
+
+  private finishInput(input: AndroidMirrorInput, clientId: string, epoch: number): void {
+    // An old socket callback must not resurrect a contact after a handoff.
+    if (this.ownerId !== clientId || this.controlEpoch !== epoch) return;
+    this.trackCommittedInput(input);
+    const claim = this.pendingClaim;
+    if (claim?.owner === clientId && this.activePointers.size === 0) {
+      this.forceTransfer(claim.challenger);
+    }
   }
 
   /** Re-check ownership immediately before every queued socket write. */
@@ -608,6 +679,9 @@ export class AndroidMirrorSession {
 
   release(clientId: string): boolean {
     if (this.ownerId !== clientId) return false;
+    const challenger = this.pendingClaim?.challenger;
+    this.clearChallenge();
+    if (challenger && this.clients.has(challenger)) return this.forceTransfer(challenger);
     this.queuePointerCleanup();
     this.ownerId = null;
     this.controlEpoch = (this.controlEpoch + 1) >>> 0 || 1;
@@ -628,52 +702,6 @@ export class AndroidMirrorSession {
     }
   }
 
-  async sendInput(input: AndroidMirrorInput, sequence?: number, clientId?: string, expectedEpoch?: number, expectedGeometryVersion?: number): Promise<void> {
-    if (this.status !== 'ready' || !this.controlSocket || !this.width || !this.height) {
-      throw controlError('DEVICE_OFFLINE', 'Android 镜像尚未就绪');
-    }
-    if (!validateAndroidMirrorInput(input)) throw controlError('INVALID_INPUT', 'Android 控制参数无效');
-    const senderId = clientId || this.ownerId || '';
-    if (!this.canControl(senderId)) throw controlError('CONTROL_NOT_OWNER', '控制租约已失效');
-    const epoch = Number.isSafeInteger(expectedEpoch) && (expectedEpoch as number) > 0
-      ? expectedEpoch as number : this.controlEpoch;
-    if (epoch !== this.controlEpoch) throw controlError('CONTROL_EPOCH_STALE', '控制租约已更新');
-    if (expectedGeometryVersion !== undefined && expectedGeometryVersion !== this.geometryVersion) {
-      throw controlError('GEOMETRY_STALE', '画面几何版本已更新');
-    }
-    const messages = this.serializeInput(input);
-    if (this.controlQueueDepth + messages.length > CONTROL_QUEUE_LIMIT) {
-      throw controlError('CONTROL_OVERLOADED', 'Android 控制队列已满');
-    }
-    if (Number.isSafeInteger(sequence)) {
-      const key = senderId;
-      let state = this.commandResults.get(key);
-      if (!state || state.epoch !== this.controlEpoch) {
-        state = { epoch: this.controlEpoch, highest: 0, entries: new Map() };
-        this.commandResults.set(key, state);
-      }
-      const previous = state.entries.get(sequence as number);
-      if (previous) return previous;
-      if ((sequence as number) <= state.highest) {
-        throw controlError('CONTROL_SEQ_STALE', '控制序号已过期');
-      }
-      state.highest = sequence as number;
-      this.trackQueuedInput(input);
-      const operation = this.enqueueControl(messages, senderId, epoch, expectedGeometryVersion);
-      state.entries.set(sequence as number, operation);
-      while (state.entries.size > CONTROL_RESULT_CACHE_SIZE) {
-        const oldest = state.entries.keys().next().value;
-        if (oldest === undefined) break;
-        state.entries.delete(oldest);
-      }
-      await operation;
-      this.trackCommittedInput(input);
-      return;
-    }
-    this.trackQueuedInput(input);
-    await this.enqueueControl(messages, senderId, epoch, expectedGeometryVersion);
-    this.trackCommittedInput(input);
-  }
 
   async stop(): Promise<void> {
     // Invalidate every in-flight ADB/bootstrap continuation before tearing down
@@ -827,6 +855,64 @@ export class AndroidMirrorSession {
     }
   }
 
+  async sendInput(input: AndroidMirrorInput, sequence?: number, clientId?: string, expectedEpoch?: number, expectedGeometryVersion?: number): Promise<void> {
+    if (this.status !== 'ready' || !this.controlSocket || !this.width || !this.height) {
+      throw controlError('DEVICE_OFFLINE', 'Android 镜像尚未就绪');
+    }
+    if (!validateAndroidMirrorInput(input)) throw controlError('INVALID_INPUT', 'Android 控制参数无效');
+    const senderId = clientId || this.ownerId || '';
+    if (!this.canControl(senderId)) throw controlError('CONTROL_NOT_OWNER', '控制租约已失效');
+    const epoch = Number.isSafeInteger(expectedEpoch) && (expectedEpoch as number) > 0
+      ? expectedEpoch as number : this.controlEpoch;
+    if (epoch !== this.controlEpoch) throw controlError('CONTROL_EPOCH_STALE', '控制租约已更新');
+    if (expectedGeometryVersion !== undefined && expectedGeometryVersion !== this.geometryVersion) {
+      throw controlError('GEOMETRY_STALE', '画面几何版本已更新');
+    }
+    const messages = this.serializeInput(input);
+    if (this.controlQueueDepth + messages.length > CONTROL_QUEUE_LIMIT) {
+      throw controlError('CONTROL_OVERLOADED', 'Android 控制队列已满');
+    }
+    if (Number.isSafeInteger(sequence)) {
+      const key = senderId;
+      let state = this.commandResults.get(key);
+      if (!state || state.epoch !== this.controlEpoch) {
+        state = { epoch: this.controlEpoch, highest: 0, entries: new Map() };
+        this.commandResults.set(key, state);
+      }
+      const previous = state.entries.get(sequence as number);
+      if (previous) return previous;
+      if ((sequence as number) <= state.highest) {
+        throw controlError('CONTROL_SEQ_STALE', '控制序号已过期');
+      }
+      state.highest = sequence as number;
+      this.acceptControlActivity(input);
+      this.trackQueuedInput(input);
+      const operation = this.enqueueControl(messages, senderId, epoch, expectedGeometryVersion);
+      state.entries.set(sequence as number, operation);
+      while (state.entries.size > CONTROL_RESULT_CACHE_SIZE) {
+        const oldest = state.entries.keys().next().value;
+        if (oldest === undefined) break;
+        state.entries.delete(oldest);
+      }
+      await operation;
+      this.finishInput(input, senderId, epoch);
+      return;
+    }
+    this.acceptControlActivity(input);
+    this.trackQueuedInput(input);
+    await this.enqueueControl(messages, senderId, epoch, expectedGeometryVersion);
+    this.finishInput(input, senderId, epoch);
+  }
+
+  private acceptControlActivity(input: AndroidMirrorInput): void {
+    // Invalid/stale/duplicate requests cannot cancel a pending takeover.
+    // UP/CANCEL completes the current gesture and hands off after its write.
+    const releasing = (!input.type || input.type === 'touch')
+      && (input.action === 'up' || input.action === 'cancel');
+    if (!releasing) this.resolveChallengeIfAny();
+    this.touchLease();
+  }
+
   private serializeInput(input: AndroidMirrorInput): Buffer[] {
     const type = input.type || (input.text !== undefined ? 'text' : 'touch');
     if (type === 'text') return serializeTextControls(String(input.text || ''));
@@ -880,17 +966,11 @@ export class AndroidMirrorSession {
       type: 'touch', action: 'up', pointerId, x: 0, y: 0, pressure: 0,
     }, this.width || 1, this.height || 1));
     this.controlQueueDepth += messages.length;
-    const operation = this.controlQueue.then(() => new Promise<void>((resolve, reject) => {
-      const socket = this.controlSocket;
-      if (!socket || socket.destroyed) { reject(controlError('DEVICE_OFFLINE', 'Android 控制通道不可用')); return; }
-      let index = 0;
-      const writeNext = (error?: Error | null) => {
-        if (error) { reject(error); return; }
-        if (index >= messages.length) { resolve(); return; }
-        socket.write(messages[index++], writeNext);
-      };
-      writeNext();
-    })).finally(() => { this.controlQueueDepth = Math.max(0, this.controlQueueDepth - messages.length); });
+    const socket = this.controlSocket;
+    const operation = this.controlQueue.then(() => {
+      if (!socket || socket.destroyed || socket !== this.controlSocket) throw controlError('DEVICE_OFFLINE', 'Android 控制通道不可用');
+      return this.writeControls(socket, messages);
+    }).finally(() => { this.controlQueueDepth = Math.max(0, this.controlQueueDepth - messages.length); });
     this.controlQueue = operation.catch(() => {});
   }
 
@@ -899,31 +979,55 @@ export class AndroidMirrorSession {
       return Promise.reject(Object.assign(new Error('Android 控制队列已满'), { code: 'CONTROL_OVERLOADED' }));
     }
     this.controlQueueDepth += messages.length;
-    const operation = this.controlQueue.then(() => new Promise<void>((resolve, reject) => {
-      const socket = this.controlSocket;
-      if (!socket || socket.destroyed) {
-        reject(controlError('DEVICE_OFFLINE', 'Android 控制通道不可用'));
-        return;
-      }
-      let index = 0;
-      const writeNext = (error?: Error | null) => {
-        if (error) { reject(error); return; }
-        try {
-          this.assertQueuedControl(clientId, epoch, geometryVersion);
-        } catch (assertionError) {
-          reject(assertionError instanceof Error ? assertionError : new Error(String(assertionError)));
-          return;
-        }
-        if (index >= messages.length) { resolve(); return; }
-        socket.write(messages[index++], writeNext);
-      };
-      writeNext();
-    })).finally(() => { this.controlQueueDepth = Math.max(0, this.controlQueueDepth - messages.length); });
+    const socket = this.controlSocket;
+    const operation = this.controlQueue.then(() => {
+      if (!socket || socket.destroyed || socket !== this.controlSocket) throw controlError('DEVICE_OFFLINE', 'Android 控制通道不可用');
+      return this.writeControls(socket, messages, () => this.assertQueuedControl(clientId, epoch, geometryVersion));
+    }).finally(() => { this.controlQueueDepth = Math.max(0, this.controlQueueDepth - messages.length); });
     this.controlQueue = operation.catch(() => {});
     return operation;
   }
 
+  private writeControls(socket: net.Socket, messages: Buffer[], beforeWrite?: () => void): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let index = 0;
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.removeListener('close', onClose);
+        socket.removeListener('error', onError);
+        if (error) reject(error); else resolve();
+      };
+      const onClose = () => finish(controlError('DEVICE_OFFLINE', 'Android 控制通道已关闭'));
+      const onError = (error: Error) => finish(error);
+      const timer = setTimeout(() => {
+        const error = controlError('CONTROL_WRITE_TIMEOUT', 'Android 控制通道超时，正在重新连接');
+        finish(error);
+        if (this.controlSocket === socket) this.fail(error);
+      }, CONTROL_WRITE_TIMEOUT_MS);
+      socket.once('close', onClose);
+      socket.once('error', onError);
+      const writeNext = (error?: Error | null) => {
+        if (settled) return;
+        if (error) { finish(error); return; }
+        try {
+          if (this.controlSocket !== socket) { onClose(); return; }
+          beforeWrite?.();
+          if (index >= messages.length) { finish(); return; }
+          socket.write(messages[index++], writeNext);
+        } catch (assertionError) {
+          finish(assertionError instanceof Error ? assertionError : new Error(String(assertionError)));
+        }
+      };
+      writeNext();
+    });
+  }
+
   private touchLease(): void {
+    // Background heartbeats prove connectivity, not an active gesture. They
+    // must not prevent another client from recovering a stuck contact.
     this.leaseExpiresAt = Date.now() + CONTROL_LEASE_MS;
     if (this.leaseTimer) clearTimeout(this.leaseTimer);
     this.leaseTimer = setTimeout(() => this.expireLease(), CONTROL_LEASE_MS + 50);
@@ -938,6 +1042,7 @@ export class AndroidMirrorSession {
   private expireLease(): void {
     if (!this.ownerId || !this.leaseExpiresAt || this.leaseExpiresAt > Date.now()) return;
     const owner = this.ownerId;
+    this.clearChallenge();
     this.queuePointerCleanup();
     this.ownerId = null;
     this.controlEpoch = (this.controlEpoch + 1) >>> 0 || 1;
@@ -968,6 +1073,7 @@ export class AndroidMirrorSession {
   }
 
   private cleanupResources(): void {
+    this.clearChallenge();
     const videoSocket = this.videoSocket;
     const controlSocket = this.controlSocket;
     this.videoSocket = null;

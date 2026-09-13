@@ -16,14 +16,16 @@ const server = http.createServer((req, res) => {
     res.setHeader('Content-Type', 'text/javascript');
     return res.end(bundle.outputFiles[0].text);
   }
+  if (req.url === '/styles.css') {
+    res.setHeader('Content-Type', 'text/css');
+    return res.end(readFileSync('src/renderer/styles.css'));
+  }
   if (req.url === '/xterm.css') {
     res.setHeader('Content-Type', 'text/css');
     return res.end(css);
   }
-  res.end(`<!doctype html><link rel="stylesheet" href="/xterm.css">
-    <style>#area{position:relative;width:820px;height:420px}
-    .terminal-container{position:absolute;inset:0;display:none;padding:4px}
-    .terminal-container.active{display:block}.xterm{height:100%}</style>
+  res.end(`<!doctype html><link rel="stylesheet" href="/xterm.css"><link rel="stylesheet" href="/styles.css">
+    <style>#area{position:relative;width:820px;height:420px}</style>
     <div id="area"></div><script src="/bundle.js"></script>`);
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -43,6 +45,7 @@ try {
       window.duocli = { filewatcherOpen() {} };
       window.mgr = new DuoTerminal.TerminalManager(document.getElementById('area'));
       mgr.create('t1', 'vscode-dark', '/tmp', () => {});
+      mgr.mountTo('t1', document.getElementById('area'));
       window.t = mgr.instances.get('t1').terminal;
       window.frames = async (count = 5) => {
         for (let i = 0; i < count; i++) await new Promise(requestAnimationFrame);
@@ -216,6 +219,88 @@ try {
       return t.buffer.active.baseY - t.buffer.active.viewportY;
     });
     assert.equal(distance, 0);
+  });
+  await run('switching panes while holding the mouse follows on release', async page => {
+    const result = await page.evaluate(async () => {
+      wheel(-180);
+      await frames();
+      t.scrollLines(-40);
+      t.select(0, 10, 5);
+      mgr.create('t2', 'vscode-dark', '/tmp', () => {});
+      await new Promise(resolve => setTimeout(resolve, 160));
+      // Pane focus runs on pointerdown, after the scroll controller pauses.
+      mgr.instances.get('t1').container.querySelector('.xterm-screen')
+        .dispatchEvent(new PointerEvent('pointerdown', { button: 0, bubbles: true }));
+      mgr.switchTo('t1');
+      await new Promise(resolve => setTimeout(resolve, 200));
+      document.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+      await frames();
+      const afterRelease = t.buffer.active.baseY - t.buffer.active.viewportY;
+      await write('latest after switching\r\n');
+      return { afterRelease, afterWrite: t.buffer.active.baseY - t.buffer.active.viewportY };
+    });
+    assert.equal(result.afterRelease, 0);
+    assert.equal(result.afterWrite, 0);
+  });
+  await run('a newer history gesture wins over delayed switch layout', async page => {
+    const distance = await page.evaluate(async () => {
+      mgr.create('t2', 'vscode-dark', '/tmp', () => {});
+      mgr.switchTo('t1');
+      wheel(-180);
+      t.scrollLines(-30);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      return t.buffer.active.baseY - t.buffer.active.viewportY;
+    });
+    // Fit may change the number of visible rows, but must retain history.
+    assert.ok(distance > 0, `distance=${distance}`);
+  });
+  await run('drag selection scrolls across screens and stays in history on release', async page => {
+    const point = await page.evaluate(async () => {
+      // Mirror PaneWorkspace's bubbling focus callback for every pointerdown.
+      document.getElementById('area').addEventListener('pointerdown', () => mgr.switchTo('t1'));
+      wheel(-180);
+      await frames();
+      t.scrollToLine(20);
+      await frames();
+      const rect = t.element.querySelector('.xterm-screen').getBoundingClientRect();
+      return { x: rect.left + 8, y: rect.top + 12, bottom: rect.bottom + 40 };
+    });
+    await page.mouse.move(point.x, point.y);
+    await page.mouse.down();
+    await page.mouse.move(point.x + 70, point.bottom, { steps: 8 });
+    await page.waitForFunction(() => {
+      const pos = t.getSelectionPosition();
+      return pos && pos.end.y - pos.start.y > t.rows;
+    });
+    await page.mouse.up();
+    const result = await page.evaluate(async () => {
+      await frames();
+      const before = t.buffer.active.viewportY;
+      const selection = t.getSelection();
+      await write('output after selection\r\n');
+      return { before, after: t.buffer.active.viewportY, selection, afterSelection: t.getSelection(),
+        distance: t.buffer.active.baseY - t.buffer.active.viewportY };
+    });
+    assert.ok(result.distance > 0);
+    assert.equal(result.after, result.before);
+    assert.ok(result.selection.includes('line 21'));
+    assert.equal(result.afterSelection, result.selection);
+  });
+  await run('rapid switches keep keyboard focus on the last session', async page => {
+    const result = await page.evaluate(async () => {
+      const focusCalls = [];
+      const originalFocus = t.focus.bind(t);
+      t.focus = () => { focusCalls.push('t1'); originalFocus(); };
+      mgr.create('t2', 'vscode-dark', '/tmp', () => {});
+      mgr.switchTo('t1');
+      mgr.destroy('t2');
+      // An old delayed switch must not steal focus after the active id changes.
+      mgr.create('t3', 'vscode-dark', '/tmp', () => {});
+      await new Promise(resolve => setTimeout(resolve, 200));
+      return { staleFocusCalls: focusCalls, focused: mgr.instances.get('t3').container.contains(document.activeElement) };
+    });
+    assert.deepEqual(result.staleFocusCalls, []);
+    assert.equal(result.focused, true);
   });
   assert.deepEqual(errors, [], 'browser errors');
   assert.deepEqual(failures, [], 'failed scroll scenarios');

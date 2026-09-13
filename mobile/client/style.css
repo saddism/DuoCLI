@@ -26,13 +26,7 @@
   --shadow-card: 0 4px 16px rgba(0, 0, 0, 0.35);
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
-}
-
-#device-hint {
-  padding: 10px 14px;
-  color: var(--yellow);
-  background: var(--bg2);
-  overflow-wrap: anywhere;
+  --device-chrome-width: 80px;
 }
 
 html, body {
@@ -268,6 +262,9 @@ header h2 {
 .icon-btn.danger {
   color: var(--danger);
   border-color: rgba(244, 63, 94, 0.25);
+  touch-action: manipulation;
+  position: relative;
+  z-index: 2;
 }
 
 .icon-btn.danger:active {
@@ -275,17 +272,49 @@ header h2 {
 }
 
 .landscape-panel-toggle,
-.landscape-panel-close {
+.landscape-panel-close,
+.landscape-device-pull {
   display: none;
 }
 
-/* 电脑（鼠标/触控板）始终可展开侧栏；手机只在横屏时出现。
-   不用 min-width 判断，避免折叠屏/高分屏竖屏被当成桌面。 */
-@media (hover: hover) and (pointer: fine), (orientation: landscape) {
-  .landscape-panel-toggle,
-  #main-page.landscape-drawer-open .landscape-panel-close {
-    display: flex;
-  }
+/* 宽屏分栏才用顶栏开关；竖屏/窄屏只留返回，避免和返回键同时出现。 */
+body.landscape-workspace:not(.landscape-sessions-open) .landscape-sessions-toggle,
+body.landscape-workspace:not(.landscape-device-open) .landscape-device-toggle,
+#main-page.landscape-drawer-open .landscape-panel-close {
+  display: flex;
+}
+
+body.landscape-workspace #back-btn,
+#detail-session-picker-btn {
+  display: none;
+}
+
+.landscape-device-pull {
+  position: fixed;
+  top: 50%;
+  right: 0;
+  z-index: 70;
+  transform: translateY(-50%);
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 36px;
+  min-height: 96px;
+  padding: 12px 0;
+  border: 1px solid var(--border);
+  border-right: none;
+  border-radius: 10px 0 0 10px;
+  background: rgba(19, 25, 38, 0.94);
+  color: #dbeafe;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  box-shadow: -6px 0 18px rgba(0, 0, 0, 0.28);
+}
+
+.landscape-device-pull span {
+  writing-mode: vertical-rl;
 }
 
 /* ========== 会话列表 ========== */
@@ -305,10 +334,12 @@ header h2 {
 }
 
 .session-card {
-  display: flex;
+  /* 不用 flex：避免操作按钮偶发挤进文档流，右侧一直露出色条 */
+  display: block;
   margin-bottom: 10px;
   border-radius: 14px;
   border: 1px solid var(--border);
+  background: var(--bg2);
   cursor: pointer;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
@@ -318,11 +349,16 @@ header h2 {
   touch-action: pan-y;
 }
 
+.session-card.is-pinned {
+  border-color: color-mix(in srgb, #f59e0b 45%, var(--border));
+  box-shadow: 0 2px 10px rgba(245, 158, 11, 0.18);
+}
+
 .session-card-body {
-  flex: 1;
-  min-width: 0;
   display: flex;
   align-items: center;
+  width: 100%;
+  box-sizing: border-box;
   padding: 15px 16px;
   background: var(--bg2);
   position: relative;
@@ -330,16 +366,36 @@ header h2 {
   transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1), background 0.2s ease;
 }
 
+.session-card:not(.swiped):not(.dragging) .session-card-body {
+  transform: none !important;
+}
+
 .session-card.dragging .session-card-body {
   transition: none;
 }
 
-.session-close-action {
+.session-card-actions {
   position: absolute;
   top: 0;
   right: 0;
   bottom: 0;
+  z-index: 0;
+  display: none;
+  align-items: stretch;
+  pointer-events: none;
+}
+
+.session-card.swiped .session-card-actions,
+.session-card.dragging .session-card-actions {
+  display: flex;
+  pointer-events: auto;
+  z-index: 3;
+}
+
+.session-pin-action,
+.session-close-action {
   width: 84px;
+  height: 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -350,12 +406,34 @@ header h2 {
   color: #fff;
   font-size: 13px;
   font-weight: 600;
-  background: linear-gradient(150deg, #ef4444, #b91c1c);
   cursor: pointer;
+  touch-action: manipulation;
+}
+
+.session-pin-action {
+  width: 72px;
+  background: linear-gradient(150deg, #fbbf24, #d97706);
+}
+
+.session-pin-action:active {
+  background: linear-gradient(150deg, #f59e0b, #b45309);
+}
+
+.session-close-action {
+  background: linear-gradient(150deg, #ef4444, #b91c1c);
 }
 
 .session-close-action:active {
   background: linear-gradient(150deg, #dc2626, #991b1b);
+}
+
+.session-pin-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #fbbf24;
+  opacity: 0.95;
 }
 
 .session-card::before {
@@ -518,6 +596,16 @@ header h2 {
 .session-card:active .session-arrow {
   transform: translateX(2px);
   color: var(--accent);
+}
+
+.session-card.is-current {
+  border-color: rgba(59, 130, 246, 0.45);
+  background: #1a2a44;
+}
+
+.session-card.is-current .session-card-body {
+  /* 必须不透明，否则右下关闭红底会透出来 */
+  background: #1a2a44;
 }
 
 .closed-sessions-header {
@@ -975,7 +1063,9 @@ header h2 {
 }
 
 .key-btn {
-  padding: 6px 12px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.05);
@@ -1161,10 +1251,12 @@ header h2 {
   z-index: 100;
   justify-content: center;
   align-items: flex-end;
+  pointer-events: none;
 }
 
 .modal.active {
   display: flex;
+  pointer-events: auto;
 }
 
 .modal-content {
@@ -1424,6 +1516,17 @@ header h2 {
   margin-top: 24px;
 }
 
+#mobile-confirm-dialog .confirm-mobile-message {
+  margin: 8px 0 0;
+  color: var(--text2);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+#mobile-confirm-dialog .modal-content {
+  animation: none;
+}
+
 .btn-secondary, .btn-primary, .btn-danger {
   flex: 1;
   padding: 13px 16px;
@@ -1519,21 +1622,69 @@ header h2 {
 
 /* ========== 设备页 ========== */
 
+.device-workspace {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  background: #080d14;
+}
+
+.device-side-chrome {
+  flex: 0 0 var(--device-chrome-width);
+  width: var(--device-chrome-width);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 8px 5px;
+  padding-top: calc(8px + var(--safe-top));
+  padding-bottom: calc(8px + var(--safe-bottom));
+  padding-right: calc(5px + env(safe-area-inset-right, 0px));
+  background: #111a27;
+  border-left: 1px solid rgba(148, 163, 184, 0.12);
+  min-height: 0;
+  z-index: 8;
+}
+
 #device-page header {
   display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 12px;
-  padding-top: calc(12px + var(--safe-top));
-  min-height: 56px;
-  border-bottom: 1px solid var(--border);
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 0;
+  min-height: 0;
+  border: none;
+  background: none;
   flex-shrink: 0;
+}
+
+#device-page header .icon-btn {
+  align-self: center;
+}
+
+.device-header-right {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 6px;
+  margin-left: 0;
+  min-width: 0;
+  width: 100%;
 }
 
 .device-header-tools,
 .detail-header-tools {
   position: relative;
   flex-shrink: 0;
+}
+
+#device-page .device-header-tools {
+  align-self: center;
 }
 
 .device-more-menu,
@@ -1548,6 +1699,11 @@ header h2 {
   border-radius: 12px;
   background: var(--bg2);
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+}
+
+.device-more-menu {
+  top: 0;
+  right: calc(100% + 6px);
 }
 
 .device-more-menu[hidden],
@@ -1577,6 +1733,7 @@ header h2 {
 
 .device-page-body {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   padding: 0;
   display: flex;
@@ -1584,15 +1741,34 @@ header h2 {
 }
 
 .device-select-header {
-  flex: 1;
-  padding: 6px 10px;
+  flex: 0 0 auto;
+  width: 100%;
+  max-width: none;
+  padding: 6px 4px;
   border: 1px solid var(--border);
   border-radius: 9px;
   background: var(--bg);
   color: var(--text);
-  font-size: 13px;
+  font-size: 12px;
+  line-height: 1.2;
   outline: none;
   min-width: 0;
+}
+
+#device-hint {
+  padding: 0 2px;
+  color: var(--yellow);
+  font-size: 10px;
+  line-height: 1.35;
+  background: transparent;
+  overflow-wrap: anywhere;
+  max-height: 6.6em;
+  overflow: auto;
+  flex: 0 1 auto;
+}
+
+#device-hint[hidden] {
+  display: none;
 }
 
 .device-hint {
@@ -1614,9 +1790,124 @@ header h2 {
   background: #0f1326;
   overflow: hidden;
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-height: 0;
+}
+
+.device-preview-wrap .android-screen {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  background: #080d14;
+}
+
+.fullscreen-stage {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+
+#fullscreen-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  flex-direction: column;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+#fullscreen-overlay .device-workspace,
+#fullscreen-overlay .fullscreen-stage,
+#fullscreen-overlay .android-screen {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+}
+
+#fullscreen-overlay .device-side-chrome > .icon-btn {
+  align-self: center;
+}
+
+#fullscreen-overlay .fullscreen-stream-status {
+  align-self: stretch;
+  width: 100%;
+  text-align: center;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  border-radius: 10px;
+  padding: 6px 4px;
+  line-height: 1.25;
+}
+
+.android-side-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  margin-top: auto;
+  flex: 0 0 auto;
+}
+
+.android-nav-keys {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  width: auto;
+  min-height: 0;
+  margin-top: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+}
+
+.device-side-chrome .android-nav-keys {
+  padding-bottom: 2px;
+}
+
+.android-nav-btn {
+  width: 100%;
+  min-height: 48px;
+  padding: 6px 4px 4px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: #e7eef9;
+  display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-height: 0;
+  gap: 3px;
+  cursor: pointer;
+}
+
+.android-nav-btn svg {
+  width: 22px;
+  height: 22px;
+  display: block;
+}
+
+.android-nav-btn span {
+  font-size: 10px;
+  line-height: 1;
+  color: #94a3b8;
+}
+
+.android-nav-btn:active {
+  background: rgba(148, 163, 184, 0.16);
 }
 
 #device-preview,
@@ -1629,10 +1920,19 @@ header h2 {
 }
 
 .device-preview-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: var(--text2);
   font-size: 12px;
   padding: 20px;
   text-align: center;
+  max-width: none;
+  overflow-wrap: anywhere;
+  pointer-events: none;
 }
 
 .device-log-output {
@@ -1652,22 +1952,29 @@ header h2 {
 
 .device-panel-tabs {
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
   gap: 4px;
-  padding: 6px 10px;
-  background: var(--bg2);
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
+  margin-left: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  flex: 0 0 auto;
+  width: 100%;
 }
 
 .device-panel-tab {
-  flex: 1;
+  flex: 0 0 auto;
+  width: 100%;
   min-width: 0;
-  padding: 7px 8px;
+  padding: 8px 4px;
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
   color: var(--text2);
   font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -1807,7 +2114,7 @@ header h2 {
        (orientation: landscape) and (min-width: 720px) {
   :root {
     --landscape-panel-width: clamp(220px, 28vw, 300px);
-    --landscape-device-panel-width: clamp(260px, calc((100vh - 96px) * 9 / 19.5), min(46vw, 480px));
+    --landscape-device-panel-width: min(52vw, calc(100vh * 9 / 19.5 + var(--device-chrome-width)), calc(560px + var(--device-chrome-width)));
   }
 
   #detail-header {
@@ -1829,7 +2136,7 @@ header h2 {
     width: var(--landscape-panel-width);
     z-index: 60;
     contain: layout paint;
-    box-shadow: 0 0 22px rgba(0, 0, 0, 0.42);
+    box-shadow: none;
   }
 
   #device-page.landscape-drawer-open {
@@ -1884,26 +2191,23 @@ header h2 {
 
   #main-page.landscape-drawer-open .session-card-body {
     padding: 12px 10px;
+    width: 100%;
   }
 
   #main-page.landscape-drawer-open .session-card {
     border-radius: 10px;
   }
 
-  #device-page.landscape-drawer-open header {
-    flex-wrap: nowrap;
-    gap: 6px;
-    padding: 8px;
-    min-height: 56px;
+  #main-page.landscape-drawer-open .session-arrow {
+    display: none;
   }
 
-  #device-page.landscape-drawer-open .device-select-header {
-    flex: 1;
-    width: auto;
+  #device-page.landscape-drawer-open .device-side-chrome {
+    padding-top: 8px;
   }
 
-  #device-page.landscape-drawer-open #device-hint {
-    padding: 6px 8px;
+  #device-page.landscape-drawer-open .device-panel-tab {
+    padding: 7px 4px;
     font-size: 11px;
   }
 }
@@ -1913,7 +2217,7 @@ header h2 {
        (hover: hover) and (pointer: fine) and (max-width: 719px) {
   :root {
     --landscape-panel-width: min(78vw, 300px);
-    --landscape-device-panel-width: min(78vw, calc((100vh - 72px) * 9 / 19.5), 360px);
+    --landscape-device-panel-width: min(78vw, calc(100vh * 9 / 19.5 + var(--device-chrome-width)), calc(420px + var(--device-chrome-width)));
   }
 
   #main-page.landscape-drawer-open,
@@ -1950,8 +2254,7 @@ header h2 {
     font-size: 16px;
   }
 
-  #main-page.landscape-drawer-open header,
-  #device-page.landscape-drawer-open header {
+  #main-page.landscape-drawer-open header {
     padding: 8px;
   }
 
@@ -1960,15 +2263,44 @@ header h2 {
     display: none !important;
   }
 
-  #device-page.landscape-drawer-open header {
-    flex-wrap: nowrap;
-    gap: 6px;
-    min-height: 56px;
+  #device-page.landscape-drawer-open .device-side-chrome {
+    padding-top: 8px;
+  }
+}
+
+#device-page.landscape-drawer-open .device-workspace {
+  flex: 1;
+  min-height: 0;
+}
+
+@media (orientation: landscape) and (max-height: 520px) {
+  .device-side-chrome {
+    gap: 4px;
+    padding-top: 6px;
+    padding-bottom: 6px;
   }
 
-  #device-page.landscape-drawer-open .device-select-header {
-    flex: 1;
-    width: auto;
+  #device-page header,
+  .device-header-right,
+  .android-side-actions {
+    gap: 4px;
+  }
+
+  .device-panel-tab {
+    min-height: 26px;
+    padding: 5px 4px;
+  }
+
+  .device-side-chrome .android-nav-btn {
+    min-height: 40px;
+  }
+
+  .device-side-chrome .android-nav-btn span {
+    display: none;
+  }
+
+  #device-hint {
+    max-height: 3.8em;
   }
 }
 
@@ -2246,11 +2578,17 @@ header h2 {
   word-break: break-all;
 }
 
-.media-pdf {
+.media-pdf,
+.media-html {
   width: 100%;
   height: 75vh;
   border: 1px solid var(--border);
   background: #fff;
+}
+
+.media-html {
+  background: #fff;
+  min-height: 60vh;
 }
 
 .media-error {
@@ -2463,8 +2801,7 @@ body {
 header,
 #detail-header,
 #file-preview-header,
-#media-browse-header,
-#device-page header {
+#media-browse-header {
   background: linear-gradient(180deg, rgba(22, 32, 47, 0.96), rgba(15, 23, 35, 0.96));
   border-color: var(--border-strong);
 }
@@ -2473,6 +2810,13 @@ header {
   min-height: 58px;
   padding-left: 14px;
   padding-right: 14px;
+}
+
+#device-page header {
+  min-height: 0;
+  padding: 0;
+  background: none;
+  border: none;
 }
 
 .header-brand {
@@ -2518,7 +2862,11 @@ header h2 {
 
 .session-card-body {
   padding: 14px 13px;
-  background: linear-gradient(145deg, rgba(23, 33, 49, 0.96), rgba(15, 23, 35, 0.96));
+  background: linear-gradient(145deg, #172131, #0f1723);
+}
+
+.session-card.is-current .session-card-body {
+  background: linear-gradient(145deg, #1e3354, #172844);
 }
 
 .session-card .status-dot {
@@ -2609,7 +2957,9 @@ header h2 {
 }
 
 .key-btn {
-  padding: 6px 10px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 10px 10px;
   border-color: rgba(148, 163, 184, 0.16);
   border-radius: 7px;
   background: rgba(148, 163, 184, 0.07);
@@ -2671,14 +3021,41 @@ header h2 {
   background: #080d14;
 }
 
+.device-side-chrome {
+  background: #111a27;
+  border-left-color: rgba(148, 163, 184, 0.12);
+}
+
 .android-screen {
+  position: relative;
   flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
   background: #000;
+  touch-action: none;
+  pointer-events: auto;
+}
+
+.android-screen canvas,
+.android-screen img {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+  background: #080d14;
+  touch-action: none;
+  pointer-events: auto;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: crosshair;
 }
 
 #device-video,
@@ -2686,14 +3063,6 @@ header h2 {
 #device-preview,
 #fullscreen-preview {
   display: block;
-  flex: 0 0 auto;
-  width: auto;
-  height: auto;
-  min-width: 0;
-  min-height: 0;
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
   background: #080d14;
   touch-action: none;
   user-select: none;
@@ -2736,13 +3105,13 @@ header h2 {
 }
 
 .device-panel-tabs {
-  gap: 5px;
-  padding: 7px 10px;
-  background: #111a27;
+  gap: 4px;
+  padding: 0;
+  background: transparent;
 }
 
 .device-panel-tab {
-  min-height: 32px;
+  min-height: 30px;
   border-radius: 8px;
   color: #8ea0b6;
 }
@@ -2858,5 +3227,18 @@ header h2 {
   .session-card-body {
     padding-left: 14px;
     padding-right: 14px;
+  }
+}
+
+/* Keep touch browsers at the app viewport; small focused fields can trigger
+   automatic input zoom even when the viewport meta requests a fixed scale. */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+@media (any-pointer: coarse) {
+  html, body { touch-action: pan-x pan-y; }
+  input, select, textarea, [contenteditable="true"] {
+    font-size: max(16px, 1em) !important;
   }
 }

@@ -68,7 +68,7 @@ export function playCompletionSound(): void {
 /**
  * 显示系统通知（如果支持的话）
  */
-export function showSystemNotification(title: string, body: string): void {
+export function showSystemNotification(title: string, body: string, sessionId?: string): void {
   // 检查浏览器是否支持 Notification API
   if (!('Notification' in window)) {
     console.warn('[Notification] 当前浏览器不支持系统通知');
@@ -77,11 +77,11 @@ export function showSystemNotification(title: string, body: string): void {
   
   // 请求权限
   if (Notification.permission === 'granted') {
-    createNotification(title, body);
+    createNotification(title, body, sessionId);
   } else if (Notification.permission !== 'denied') {
     Notification.requestPermission().then(permission => {
       if (permission === 'granted') {
-        createNotification(title, body);
+        createNotification(title, body, sessionId);
       }
     });
   }
@@ -90,7 +90,7 @@ export function showSystemNotification(title: string, body: string): void {
 /**
  * 创建并显示通知
  */
-function createNotification(title: string, body: string): void {
+function createNotification(title: string, body: string, sessionId?: string): void {
   const notification = new Notification(title, {
     body: body,
     icon: '/icon.png', // 使用应用图标（如果需要）
@@ -101,6 +101,7 @@ function createNotification(title: string, body: string): void {
   
   notification.onclick = () => {
     window.focus();
+    if (sessionId) window.dispatchEvent(new CustomEvent('duocli:open-session', { detail: { sessionId } }));
     notification.close();
   };
   
@@ -129,7 +130,7 @@ export function notifyWithCooldown(
   playCompletionSound();
   
   // 显示系统通知
-  showSystemNotification(title, body);
+  showSystemNotification(title, body, sessionId);
   
   // 记录会话 ID（如果有）
   if (sessionId) {

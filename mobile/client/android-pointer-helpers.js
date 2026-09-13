@@ -60,8 +60,9 @@
     if (!displayed.width || !displayed.height) return null;
     const clientX = Number(options.clientX);
     const clientY = Number(options.clientY);
-    if (clientX < displayed.left || clientX > displayed.left + displayed.width
-      || clientY < displayed.top || clientY > displayed.top + displayed.height) return null;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return null;
+    if (!options.clampToEdge && (clientX < displayed.left || clientX > displayed.left + displayed.width
+      || clientY < displayed.top || clientY > displayed.top + displayed.height)) return null;
     const latest = Number(options.latestGeometry) || 0;
     const presented = Number(options.presentedGeometry) || 0;
     if (latest && presented && presented !== latest) return null;

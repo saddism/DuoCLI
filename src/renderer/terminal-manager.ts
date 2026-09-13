@@ -1,3 +1,4 @@
+import { createQuickCommandComposer } from './quick-command-composer';
 import { Terminal, ILinkProvider, ILink } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { TerminalScrollController } from './terminal-scroll-controller';
@@ -169,16 +170,16 @@ export const USER_THEMES_CONFIG = [
   { id: 'theme-9', name: '老式显示器', text: '#0a0a0a', bg: '#00ff00' },
   { id: 'theme-10', name: '霓虹粉', text: '#0a0a0a', bg: '#ff00ff' },
   { id: 'theme-11', name: '赛博青', text: '#0a0a0a', bg: '#00ffff' },
-  { id: 'theme-12', name: '电光紫', text: '#0a0a0a', bg: '#bf00ff' },
+  { id: 'theme-12', name: '电光紫', text: '#f5f5f5', bg: '#bf00ff' },
   { id: 'theme-13', name: '火焰橙', text: '#0a0a0a', bg: '#ff4500' },
   { id: 'theme-14', name: '淡蓝', text: '#0a0a0a', bg: '#6cb2eb' },
   { id: 'theme-15', name: '薄荷绿', text: '#0a0a0a', bg: '#7fffd4' },
   { id: 'theme-16', name: '薰衣草紫', text: '#0a0a0a', bg: '#b39eb5' },
   { id: 'theme-17', name: '珊瑚粉', text: '#0a0a0a', bg: '#ff7f50' },
-  { id: 'theme-18', name: '海洋蓝', text: '#0a0a0a', bg: '#1e90ff' },
-  { id: 'theme-19', name: '森林绿', text: '#0a0a0a', bg: '#228b22' },
+  { id: 'theme-18', name: '海洋蓝', text: '#f5f5f5', bg: '#1e90ff' },
+  { id: 'theme-19', name: '森林绿', text: '#f5f5f5', bg: '#228b22' },
   { id: 'theme-20', name: '日落橙', text: '#0a0a0a', bg: '#ff8c00' },
-  { id: 'theme-21', name: '午夜紫', text: '#0a0a0a', bg: '#9370db' },
+  { id: 'theme-21', name: '午夜紫', text: '#f5f5f5', bg: '#9370db' },
   { id: 'theme-22', name: '极简白', text: '#000000', bg: '#ffffff' },
   { id: 'theme-23', name: '极简黑', text: '#ffffff', bg: '#000000' },
   { id: 'theme-24', name: '红黑', text: '#ff0000', bg: '#1a1a1a' },
@@ -310,8 +311,7 @@ function attachCursorKeyBindings(
 
   const cursorCell = (): Cell => {
     const buffer = terminal.buffer.active;
-    // cursorY 已是 buffer 绝对行号（= buffer.y），不要再加 baseY
-    return { col: buffer.cursorX, row: buffer.cursorY };
+    return { col: buffer.cursorX, row: buffer.baseY + buffer.cursorY };
   };
 
   // 鼠标选区另起一套，点一下就丢掉键盘锚点，避免下次从旧位置接着扩
@@ -325,6 +325,22 @@ function attachCursorKeyBindings(
     if (e.type !== 'keydown') return true;
     // 拼音等 IME 组合期间一律交回 xterm，插手会把组合中的文字截断
     if (e.isComposing || e.keyCode === 229) return true;
+
+    const isCopy = e.key.toLowerCase() === 'c' && !e.altKey
+      && ((e.metaKey && !e.ctrlKey) || (e.ctrlKey && e.shiftKey && !e.metaKey));
+    if (isCopy && terminal.hasSelection()) {
+      const position = terminal.getSelectionPosition();
+      if (position) {
+        const text = terminalContentHelpers.getSelectionText(terminal.buffer.active, position);
+        // xterm selections are not DOM selections, so the browser may not
+        // dispatch a native copy event for the hidden input's shortcut.
+        void navigator.clipboard.writeText(text).catch(() => {
+          document.execCommand('copy');
+        });
+        e.preventDefault();
+        return false;
+      }
+    }
 
     if (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
       if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return true;
@@ -379,6 +395,7 @@ interface TermInstance {
   container: HTMLDivElement;
   themeId: string;
   scroll: TerminalScrollController;
+  disposeComposer: () => void;
 }
 
 export class TerminalManager {
@@ -434,7 +451,13 @@ export class TerminalManager {
     container.id = `tc-${id}`;
     this.detachedHost.appendChild(container);
 
-    terminal.open(container);
+    const surface = document.createElement('div');
+    surface.className = 'terminal-surface';
+    container.appendChild(surface);
+    terminal.open(surface);
+    this.resizeObserver.observe(surface);
+    const composer = createQuickCommandComposer(id);
+    container.appendChild(composer.element);
     terminal.onData((data) => onData(data));
     attachCursorKeyBindings(terminal, container, onData);
 
@@ -483,6 +506,7 @@ export class TerminalManager {
 
     // 拦截粘贴事件，检测剪贴板图片或文件
     container.addEventListener('paste', async (e: ClipboardEvent) => {
+      if ((e.target as Element)?.closest('.terminal-composer')) return;
       if (!e.clipboardData) return;
       const hasImage = Array.from(e.clipboardData.items).some(
         (item) => item.type.startsWith('image/')
@@ -514,6 +538,7 @@ export class TerminalManager {
 
     // 拦截复制事件：将 isWrapped 的软换行合并为连贯文本
     container.addEventListener('copy', (e: ClipboardEvent) => {
+      if ((e.target as Element)?.closest('.terminal-composer')) return;
       if (!terminal.hasSelection()) return;
       const selPos = terminal.getSelectionPosition();
       if (!selPos) return;
@@ -531,10 +556,10 @@ export class TerminalManager {
     scrollBtn.innerHTML = '<svg class="ui-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v13"></path><polyline points="6 11 12 17 18 11"></polyline><path d="M5 20h14"></path></svg>';
     scrollBtn.title = '滚到底部';
     scrollBtn.style.display = 'none';
-    container.appendChild(scrollBtn);
+    surface.appendChild(scrollBtn);
 
     const scroll = new TerminalScrollController(terminal, container, scrollBtn);
-    this.instances.set(id, { id, terminal, fitAddon, container, themeId, scroll });
+    this.instances.set(id, { id, terminal, fitAddon, container, themeId, scroll, disposeComposer: composer.dispose });
     // Keep the manager independently usable by the existing xterm tests and
     // embedders. The desktop app mounts views through PaneWorkspace instead.
     if (!this.terminalArea.classList.contains('pane-workspace-root')) this.switchTo(id);
@@ -562,14 +587,16 @@ export class TerminalManager {
   switchTo(id: string): void {
     const target = this.instances.get(id);
     if (!target) return;
+    // Pane pointerdown also focuses the current session while selecting text.
+    // Sidebar selections explicitly call followSession, including reselects.
+    if (this.activeId === id) return;
     target.container.classList.add('active');
     target.container.classList.remove('pane-detached');
     this.activeId = id;
     target.scroll.followAfterLayout();
     setTimeout(() => {
-      if (this.instances.get(id) !== target) return;
+      if (this.instances.get(id) !== target || this.activeId !== id) return;
       this.fitTerminal(id, true);
-      target.scroll.followAfterLayout();
     }, 50);
   }
 
@@ -593,6 +620,8 @@ export class TerminalManager {
   destroy(id: string): string | null {
     const inst = this.instances.get(id);
     if (!inst) return this.activeId;
+    if (inst.terminal.element?.parentElement) this.resizeObserver.unobserve(inst.terminal.element.parentElement);
+    inst.disposeComposer();
     inst.scroll.dispose();
     inst.terminal.dispose();
     inst.container.remove();
@@ -650,7 +679,7 @@ export class TerminalManager {
         const { cols, rows } = instance.terminal;
         if (cols > 0 && rows > 0) this.onResize(instance.id, cols, rows);
       }
-      if (focus) instance.terminal.focus();
+      if (focus && !instance.container.querySelector('.terminal-composer')?.contains(document.activeElement)) instance.terminal.focus();
     } catch {}
   }
 

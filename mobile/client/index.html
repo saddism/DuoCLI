@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#1a1a2e">
@@ -87,6 +87,9 @@
       <button id="back-btn" class="icon-btn" title="返回会话列表">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
       </button>
+      <button id="detail-session-picker-btn" class="icon-btn" title="切换会话" aria-label="切换会话">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><circle cx="4" cy="6" r="1"></circle><circle cx="4" cy="12" r="1"></circle><circle cx="4" cy="18" r="1"></circle></svg>
+      </button>
       <button class="icon-btn landscape-panel-toggle landscape-sessions-toggle" title="展开会话侧栏" aria-label="展开会话侧栏" aria-expanded="false">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
       </button>
@@ -108,7 +111,7 @@
       <button class="icon-btn landscape-panel-toggle landscape-device-toggle" title="展开手机侧栏" aria-label="展开手机侧栏" aria-expanded="false">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg>
       </button>
-      <button id="delete-btn" class="icon-btn danger" title="终止会话">
+      <button type="button" id="delete-btn" class="icon-btn danger" title="关闭对话" aria-label="关闭对话">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
       </button>
     </header>
@@ -125,6 +128,7 @@
     <div id="shortcut-bar">
       <button class="key-btn" data-key="\x1b">Esc</button>
       <button class="key-btn" data-key="\x1b[A">↑</button>
+      <button type="button" id="option-up-key" class="key-btn" data-key="\x1b[1;3A" title="Option + ↑" aria-label="Option 加方向上键">⌥ + ↑</button>
       <button class="key-btn" data-key="\x1b[B">↓</button>
       <button class="key-btn" data-key="\x1b[D">←</button>
       <button class="key-btn" data-key="\x1b[C">→</button>
@@ -151,6 +155,11 @@
     <!-- 快捷命令栏 -->
     <div id="quick-commands"></div>
   </div>
+
+  <button type="button" id="landscape-device-pull" class="landscape-device-pull" title="拉入手机界面" aria-label="拉入手机界面">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg>
+    <span>手机</span>
+  </button>
 
   <!-- 文本文件预览页 -->
   <div id="file-preview-page" class="page">
@@ -294,37 +303,15 @@
 
   <!-- 设备页 -->
   <div id="device-page" class="page">
-    <header>
-      <button id="device-back-btn" class="icon-btn" title="返回">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
-      </button>
-      <select id="device-select" class="device-select-header">
-        <option value="">正在加载设备...</option>
-      </select>
-      <div class="device-header-tools">
-        <button id="device-more-btn" class="icon-btn" type="button" title="更多" aria-haspopup="true" aria-expanded="false" aria-controls="device-more-menu">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="5" r="1.4"></circle><circle cx="12" cy="12" r="1.4"></circle><circle cx="12" cy="19" r="1.4"></circle></svg>
-        </button>
-        <div id="device-more-menu" class="device-more-menu" hidden>
-          <button id="device-fullscreen-btn" type="button">全屏操控</button>
-          <button id="device-refresh-btn" type="button">刷新设备</button>
-          <button id="device-shot-btn" type="button">刷新截图</button>
-          <button id="device-tap-toggle" type="button" aria-pressed="true">远程点击 · 已开</button>
-        </div>
-      </div>
-    </header>
-    <nav id="device-panel-tabs" class="device-panel-tabs" role="tablist" aria-label="侧栏内容">
-      <button class="device-panel-tab active" data-device-panel="device" role="tab" aria-selected="true">设备</button>
-      <button class="device-panel-tab" data-device-panel="files" role="tab" aria-selected="false">文件树</button>
-      <button class="device-panel-tab" data-device-panel="preview" role="tab" aria-selected="false">预览</button>
-    </nav>
-    <div id="device-hint" role="status" aria-live="polite" hidden></div>
-    <div class="device-page-body">
+    <div class="device-workspace">
+      <div class="device-page-body">
       <section id="device-panel-device" class="device-panel-view active">
         <div class="device-preview-wrap">
-          <canvas id="device-video" aria-label="Android 实时画面" hidden></canvas>
-          <img id="device-preview" alt="设备截图" />
-          <div id="device-preview-empty" class="device-preview-empty">正在连接 Android 实时镜像…</div>
+          <div id="device-screen" class="android-screen">
+            <canvas id="device-video" aria-label="Android 实时画面" hidden></canvas>
+            <img id="device-preview" alt="设备截图" />
+            <div id="device-preview-empty" class="device-preview-empty">正在连接 Android 实时镜像…</div>
+          </div>
         </div>
       </section>
       <section id="device-panel-files" class="device-panel-view" hidden>
@@ -340,25 +327,94 @@
         <div id="mobile-file-preview-media" class="mobile-file-preview-media"></div>
         <pre id="mobile-file-preview-content" class="mobile-file-preview-content"></pre>
       </section>
+      </div>
+      <aside class="device-side-chrome" aria-label="设备操作">
+      <header>
+        <button id="device-back-btn" class="icon-btn" title="返回">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+        </button>
+        <div class="device-header-right">
+          <select id="device-select" class="device-select-header">
+            <option value="">正在加载设备...</option>
+          </select>
+          <nav id="device-panel-tabs" class="device-panel-tabs" role="tablist" aria-label="侧栏内容">
+            <button class="device-panel-tab active" data-device-panel="device" role="tab" aria-selected="true">设备</button>
+            <button class="device-panel-tab" data-device-panel="files" role="tab" aria-selected="false">树</button>
+            <button class="device-panel-tab" data-device-panel="preview" role="tab" aria-selected="false">预览</button>
+          </nav>
+          <div class="device-header-tools">
+            <button id="device-more-btn" class="icon-btn" type="button" title="更多" aria-haspopup="true" aria-expanded="false" aria-controls="device-more-menu">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="5" r="1.4"></circle><circle cx="12" cy="12" r="1.4"></circle><circle cx="12" cy="19" r="1.4"></circle></svg>
+            </button>
+            <div id="device-more-menu" class="device-more-menu" hidden>
+              <button id="device-fullscreen-btn" type="button">全屏操控</button>
+              <button id="device-refresh-btn" type="button">刷新设备</button>
+              <button id="device-shot-btn" type="button">刷新截图</button>
+              <button id="device-tap-toggle" type="button" aria-pressed="true">远程点击 · 已开</button>
+            </div>
+          </div>
+        </div>
+      </header>
+      <div id="device-hint" role="status" aria-live="polite" hidden></div>
+      <div class="android-side-actions">
+        <button type="button" class="android-nav-btn android-text-btn" id="device-text-btn" title="输入文字" aria-label="输入文字">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"></rect><line x1="6" y1="8" x2="6.01" y2="8" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="10" y1="8" x2="10.01" y2="8" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="14" y1="8" x2="14.01" y2="8" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="18" y1="8" x2="18.01" y2="8" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="8" y1="12" x2="16" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="6" y1="16" x2="18" y2="16" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line></svg>
+          <span>输入</span>
+        </button>
+      <nav class="android-nav-keys" aria-label="Android 导航键">
+        <button type="button" class="android-nav-btn" data-android-key="back" title="返回" aria-label="返回">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 6.5L9 12l6.5 5.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+          <span>返回</span>
+        </button>
+        <button type="button" class="android-nav-btn" data-android-key="home" title="主屏" aria-label="主屏">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="5.5" fill="none" stroke="currentColor" stroke-width="2"></circle></svg>
+          <span>主屏</span>
+        </button>
+        <button type="button" class="android-nav-btn" data-android-key="recents" title="菜单" aria-label="菜单">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.6" fill="none" stroke="currentColor" stroke-width="2"></rect></svg>
+          <span>菜单</span>
+        </button>
+      </nav>
+      </div>
+      </aside>
     </div>
   </div>
 
   <!-- 全屏截图 overlay -->
-  <div id="fullscreen-overlay" style="display:none;position:fixed;inset:0;z-index:200;background:#000;flex-direction:column;">
-    <button id="fullscreen-back-btn" style="position:absolute;top:calc(12px + env(safe-area-inset-top,0px));left:12px;z-index:201;width:40px;height:40px;border:none;border-radius:10px;background:rgba(0,0,0,0.5);color:#fff;font-size:20px;cursor:pointer;">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
-    </button>
-    <div style="position:absolute;top:calc(12px + env(safe-area-inset-top,0px));right:12px;z-index:201;display:flex;align-items:center;gap:6px;">
-      <span id="fullscreen-auto-btn" class="fullscreen-stream-status">实时流</span>
-    </div>
-    <div id="fullscreen-screen" class="android-screen">
-      <canvas id="fullscreen-video" aria-label="Android 实时画面" hidden></canvas>
-      <img id="fullscreen-preview" alt="Android 设备画面" />
-    </div>
-    <div id="fullscreen-toolbar" style="display:flex;align-items:center;justify-content:center;gap:16px;padding:8px 12px;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px));background:#111;">
-      <button id="fullscreen-text-btn" style="width:44px;height:44px;border:none;border-radius:50%;background:#333;color:#fff;font-size:22px;cursor:pointer;">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2" ry="2"></rect><line x1="6" y1="8" x2="6.01" y2="8"></line><line x1="10" y1="8" x2="10.01" y2="8"></line><line x1="14" y1="8" x2="14.01" y2="8"></line><line x1="18" y1="8" x2="18.01" y2="8"></line><line x1="8" y1="12" x2="16" y2="12"></line><line x1="6" y1="16" x2="18" y2="16"></line></svg>
-      </button>
+  <div id="fullscreen-overlay" style="display:none">
+    <div class="device-workspace">
+      <div class="fullscreen-stage">
+        <div id="fullscreen-screen" class="android-screen">
+          <canvas id="fullscreen-video" aria-label="Android 实时画面" hidden></canvas>
+          <img id="fullscreen-preview" alt="Android 设备画面" />
+        </div>
+      </div>
+      <aside class="device-side-chrome" aria-label="全屏操控">
+        <button id="fullscreen-back-btn" class="icon-btn" title="退出全屏">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+        </button>
+        <span id="fullscreen-auto-btn" class="fullscreen-stream-status">实时流</span>
+        <div class="android-side-actions">
+          <button type="button" class="android-nav-btn android-text-btn" id="fullscreen-text-btn" title="输入文字" aria-label="输入文字">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"></rect><line x1="6" y1="8" x2="6.01" y2="8" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="10" y1="8" x2="10.01" y2="8" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="14" y1="8" x2="14.01" y2="8" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="18" y1="8" x2="18.01" y2="8" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="8" y1="12" x2="16" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line><line x1="6" y1="16" x2="18" y2="16" stroke="currentColor" stroke-width="2" stroke-linecap="round"></line></svg>
+            <span>输入</span>
+          </button>
+          <nav class="android-nav-keys" aria-label="Android 导航键">
+            <button type="button" class="android-nav-btn" data-android-key="back" title="返回" aria-label="返回">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 6.5L9 12l6.5 5.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+              <span>返回</span>
+            </button>
+            <button type="button" class="android-nav-btn" data-android-key="home" title="主屏" aria-label="主屏">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="5.5" fill="none" stroke="currentColor" stroke-width="2"></circle></svg>
+              <span>主屏</span>
+            </button>
+            <button type="button" class="android-nav-btn" data-android-key="recents" title="菜单" aria-label="菜单">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.6" fill="none" stroke="currentColor" stroke-width="2"></rect></svg>
+              <span>菜单</span>
+            </button>
+          </nav>
+        </div>
+      </aside>
     </div>
   </div>
 
@@ -383,10 +439,11 @@
   <script src="addon-unicode11.js"></script>
   <script src="android-mirror-client.js"></script>
   <script src="android-pointer-helpers.js"></script>
+  <script src="android-nav-keys.js"></script>
+  <script src="terminal-content-helpers.js"></script>
   <script src="file-preview-helpers.js"></script>
   <script src="terminal-scroll-helpers.js"></script>
   <script src="spinner-interceptor.js"></script>
-  <script src="terminal-content-helpers.js"></script>
   <script src="cli-tag-colors.js"></script>
   <script src="cli-logos.js"></script>
   <script src="app.js"></script>

@@ -34,10 +34,17 @@ export class TerminalScrollController {
     const endPointer = () => {
       if (!this.pointerDown) return;
       this.pointerDown = false;
+      // A pane switch can request following while the focus click is held.
+      // Honor that request on release even when an old selection is present.
+      if (this.following) {
+        this.sync();
+        return;
+      }
       this.checkAfterGesture(this.gesture, 0);
     };
     document.addEventListener('pointerup', endPointer, options);
     document.addEventListener('pointercancel', endPointer, options);
+    window.addEventListener('blur', endPointer, options);
 
     container.addEventListener('keydown', (event) => {
       if (!event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
@@ -107,13 +114,15 @@ export class TerminalScrollController {
   followAfterLayout(): void {
     this.follow();
     this.cancelLayoutTimer();
+    const version = this.gesture;
     const scroll = () => {
-      if (this.disposed || !this.following || this.pointerDown) return;
+      if (this.disposed || version !== this.gesture || !this.following || this.pointerDown) return;
       this.terminal.scrollToBottom();
       this.updateButton();
     };
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
+        if (this.disposed || version !== this.gesture) return;
         scroll();
         this.layoutTimer = setTimeout(() => {
           this.layoutTimer = null;

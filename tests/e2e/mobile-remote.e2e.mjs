@@ -145,17 +145,17 @@ try {
     await page.evaluate(() => sendMessage());
     assert.deepEqual(inputs, ['\x1b[200~你好 Cursor\x1b[201~', '\r']);
   });
-  await check('quick command button submits one paste and one Enter', async () => {
+  await check('quick command inserts a draft and explicit send submits once', async () => {
     output('\x1b[?2004h'); await settle();
     inputs.length = 0;
     const label = await page.evaluate(() => {
-      const real = window.confirm;
-      window.confirm = () => true;
       const btn = document.querySelector('.qcmd-btn');
       btn.click();
-      window.confirm = real;
       return btn.textContent;
     });
+    assert.deepEqual(inputs, []);
+    assert.equal(await page.$eval('#msg-input', input => input.value), label);
+    await page.click('#send-btn');
     await sleep(250);
     assert.deepEqual(inputs, [`\x1b[200~${label}\x1b[201~`, '\r']);
   });

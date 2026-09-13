@@ -1,4 +1,5 @@
-import { TerminalManager } from './terminal-manager';
+import { TerminalManager, USER_THEMES_CONFIG } from './terminal-manager';
+import { buildContrastingTerminalTheme, pickContrastingForeground } from './theme-contrast';
 import { PaneWorkspace } from './pane-workspace';
 import { countPanes, listPanes, type PaneContent } from './pane-layout';
 import { AndroidMirrorClient } from './android-mirror-client';
@@ -21,9 +22,6 @@ const { getLogoUrl, getDefaultLogoUrl, hasLogo } = require('../../mobile/client/
   getDefaultLogoUrl: () => string;
   hasLogo: (cliName: string) => boolean;
 };
-
-// 导入用户主题配置
-import { USER_THEMES_CONFIG } from './terminal-manager';
 
 // 导入通知助手
 import { setupNotificationListener } from './notification-helpers';
@@ -114,6 +112,9 @@ declare global {
       // 会话状态同步
       syncSessionStatus: (statuses: Record<string, string>) => void;
       // 催工配置中转
+      autoContinueManaged: boolean;
+      getAutoContinueConfigs: () => Promise<{ configs: Record<string, any>; persisted: boolean }>;
+      syncAutoContinueConfigs: (configs: Record<string, any>) => void;
       onGetAutoContinueConfig: (cb: (sessionId: string) => void) => void;
       sendAutoContinueConfig: (sessionId: string, config: any) => void;
       onSetAutoContinueConfig: (cb: (sessionId: string, config: any) => void) => void;
@@ -207,6 +208,7 @@ interface AutoContinueConfig {
 }
 
 const sessionAutoContinue: Map<string, AutoContinueConfig> = new Map();
+let sessionRegistryReady = false;
 const AUTO_CONTINUE_DEFAULT_MESSAGES = ['继续'];
 const AUTO_CONTINUE_DEFAULT_INTERVAL = 10 * 60 * 1000; // 10 分钟
 const AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL = 2000; // 命令间隔 2 秒
@@ -245,12 +247,49 @@ function serializeAutoContinueConfig(config: AutoContinueConfig): Record<string,
 }
 
 // 持久化催工配置到 localStorage
+let autoContinueStateReady = false;
+
 function saveAutoContinueToStorage(): void {
   const data: Record<string, any> = {};
   sessionAutoContinue.forEach((config, sessionId) => {
     data[sessionId] = serializeAutoContinueConfig(config);
   });
   localStorage.setItem(AUTO_CONTINUE_STORAGE_KEY, JSON.stringify(data));
+  if (autoContinueStateReady && window.duocli.autoContinueManaged) {
+    window.duocli.syncAutoContinueConfigs(data);
+  }
+}
+
+function hydrateAutoContinueConfig(sessionId: string, config: any): void {
+  const msgs = Array.isArray(config?.messages)
+    ? config.messages
+    : (config?.message ? [config.message] : [...AUTO_CONTINUE_DEFAULT_MESSAGES]);
+  const intervalMs = config?.intervalMs ?? AUTO_CONTINUE_DEFAULT_INTERVAL;
+  const initialDelayMs = config?.initialDelayMs ?? AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
+  sessionAutoContinue.set(sessionId, {
+    enabled: config?.enabled ?? false,
+    messages: msgs,
+    intervalMs,
+    commandIntervalMs: config?.commandIntervalMs ?? AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL,
+    autoAgree: config?.autoAgree ?? true,
+    autoAgreeDelaySec: config?.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC,
+    sendDelaySec: config?.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC,
+    maxLoops: config?.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
+    initialDelayMs,
+    loopCount: config?.loopCount ?? 0,
+    nextRunAt: resolveNextRunAt(config?.nextRunAt, Date.now(), initialDelayMs),
+    sending: false,
+    runVersion: 0,
+    timeoutIds: new Set(),
+  });
+}
+
+function replaceAutoContinueConfigs(data: Record<string, any>): void {
+  sessionAutoContinue.forEach(config => cancelAutoContinueRun(config));
+  sessionAutoContinue.clear();
+  for (const [sessionId, config] of Object.entries(data)) {
+    hydrateAutoContinueConfig(sessionId, config);
+  }
 }
 
 // 从 localStorage 恢复催工配置
@@ -261,27 +300,7 @@ function loadAutoContinueFromStorage(): void {
     const data = JSON.parse(raw) as Record<string, any>;
     for (const [sessionId, config] of Object.entries(data)) {
       // 兼容旧版 message → messages 迁移
-      const msgs = Array.isArray(config.messages)
-        ? config.messages
-        : (config.message ? [config.message] : [...AUTO_CONTINUE_DEFAULT_MESSAGES]);
-      const intervalMs = config.intervalMs ?? AUTO_CONTINUE_DEFAULT_INTERVAL;
-      const initialDelayMs = config.initialDelayMs ?? AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
-      sessionAutoContinue.set(sessionId, {
-        enabled: config.enabled ?? false,
-        messages: msgs,
-        intervalMs,
-        commandIntervalMs: config.commandIntervalMs ?? AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL,
-        autoAgree: config.autoAgree ?? true,
-        autoAgreeDelaySec: config.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC,
-        sendDelaySec: config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC,
-        maxLoops: config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
-        initialDelayMs,
-        loopCount: config.loopCount ?? 0,
-        nextRunAt: resolveNextRunAt(config.nextRunAt, Date.now(), initialDelayMs),
-        sending: false,
-        runVersion: 0,
-        timeoutIds: new Set(),
-      });
+      hydrateAutoContinueConfig(sessionId, config);
     }
   } catch {}
 }
@@ -291,13 +310,33 @@ let autoContinueTimer: ReturnType<typeof setInterval> | null = null;
 
 // 启动时恢复催工配置并启动定时器
 loadAutoContinueFromStorage();
+const autoContinueManagedByMain = window.duocli.autoContinueManaged === true;
+autoContinueStateReady = !autoContinueManagedByMain;
 // 旧逻辑会无条件清空磁盘配置，导致用户的催工设置永远丢失。
 // 现状：冷启动时 sessionTitles 为空 → loadAutoContinueFromStorage 写入的旧 session-id 配置
 // 不会命中任何当前会话，定时器自然 no-op；当 onRemoteCreated/createPty 创建新会话时
 // 会通过 onSetAutoContinueConfig 同步推送新配置覆盖旧条目。
 // 检查是否有启用的配置，如果有则启动定时器
 const hasEnabledConfig = Array.from(sessionAutoContinue.values()).some(c => c.enabled);
-if (hasEnabledConfig) initAutoContinueTimer();
+if (hasEnabledConfig && !autoContinueManagedByMain) initAutoContinueTimer();
+if (autoContinueManagedByMain) {
+  void window.duocli.getAutoContinueConfigs().then((state) => {
+    if (state.persisted) {
+      replaceAutoContinueConfigs(state.configs || {});
+      localStorage.setItem(AUTO_CONTINUE_STORAGE_KEY, JSON.stringify(state.configs || {}));
+    } else {
+      // 首次升级时把旧版 renderer 配置迁移到 main；之后以 main 的文件为准。
+      autoContinueStateReady = true;
+      saveAutoContinueToStorage();
+      return;
+    }
+    autoContinueStateReady = true;
+    if (sessionRegistryReady) renderSessionList();
+  }).catch(() => {
+    // main manager 正常启动时不会进入这里；保留配置但不在 renderer 重复调度。
+    autoContinueStateReady = true;
+  });
+}
 
 // 首次循环有独立的启动时间；首次完成后，手动输入才重置下一轮计时。
 function writePtyWithAutoReset(id: string, data: string): void {
@@ -312,10 +351,16 @@ function writePtyWithAutoReset(id: string, data: string): void {
 
 // 初始化自动继续定时器
 function initAutoContinueTimer(): void {
+  if (window.duocli.autoContinueManaged) {
+    if (autoContinueTimer) clearInterval(autoContinueTimer);
+    autoContinueTimer = null;
+    return;
+  }
   if (autoContinueTimer) {
     clearInterval(autoContinueTimer);
   }
   autoContinueTimer = setInterval(() => {
+    if (!sessionRegistryReady) return;
     const now = Date.now();
     const staleSessionIds: string[] = [];
     sessionAutoContinue.forEach((config, sessionId) => {
@@ -1376,7 +1421,7 @@ function renderEmptyPane(body: HTMLElement, paneId: string): void {
   button.textContent = '创建终端';
   button.addEventListener('click', () => {
     paneWorkspace.focusPane(paneId);
-    openNewSessionDialog(paneWorkspace.getWorkspaceKey() || currentCwd);
+    openNewSessionDialog(currentCwd);
   });
   const androidButton = document.createElement('button');
   androidButton.type = 'button';
@@ -1394,7 +1439,7 @@ function renderFilePane(body: HTMLElement, filePath: string): void {
   const requestToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   body.dataset.previewToken = requestToken;
   body.innerHTML = '<div class="pane-empty-content">正在读取文件…</div>';
-  const workspace = body.dataset.workspaceKey || currentCwd;
+  const workspace = currentCwd;
   void window.duocli.readFilePreview(workspace, filePath).then((result) => {
     if (body.dataset.previewToken !== requestToken) return;
     if (!result?.ok) {
@@ -1578,7 +1623,8 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
         if (message.status === 'starting') setHint('正在建立实时镜像…');
         else if (message.status === 'ready') {
           setHint('');
-          if (!mirror?.isController) mirror?.claimControl(true);
+          // Do NOT auto-claim on ready: both desktop and phone receive it and
+          // keep stealing the lease from each other. Claim on interaction.
         } else if (message.status === 'error') {
           setHint(mirrorLastError || '实时镜像不可用，已切换截图回退');
           startFallback();
@@ -1587,6 +1633,8 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
           startFallback();
         } else if (message.status === 'control-owner' && message.controller === false) {
           setHint('设备正在由其他客户端控制');
+        } else if (message.type === 'android:control-challenge') {
+          setHint('其他端点正在请求控制权；继续操作即可保持控制');
         }
       },
       onMeta: (meta) => {
@@ -1804,14 +1852,16 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
         for (let attempt = 0; attempt < 6; attempt++) {
           if (currentDevice !== state.deviceId) return;
           if (sendLiveGesture(state.start, point, event.pointerId)) return;
-          if (!mirror?.isReady()) {
+          if (!mirror?.isReady() && attempt >= 2) {
             sendLegacyGesture(state.deviceId, state.start, point);
             return;
           }
           if (attempt === 0 || !mirror.isController) mirror.claimControl(true);
           await new Promise(resolve => setTimeout(resolve, 50));
         }
-        setHint('Android 控制权尚未就绪，请稍后再试');
+        // Claim kept failing on the live channel: deliver via ADB instead of
+        // silently dropping the user's gesture.
+        sendLegacyGesture(state.deviceId, state.start, point);
       })();
     });
     surface.addEventListener('pointercancel', (event) => {
@@ -1941,7 +1991,7 @@ function applyCurrentCwd(cwd: string): void {
   cwdInput.value = next;
   localStorage.setItem('duocli_cwd', next);
   addRecentCwd(next);
-  paneWorkspace.setWorkspace(next);
+  // Do not swap pane layout: splits are global and may already show other projects.
   startFileWatcher(next);
   updateSessionTitleBar();
   void renderFileTree();
@@ -2127,12 +2177,11 @@ function updatePaneAccents(): void {
       const sessionId = (pane.content as any).sessionId;
       const themeDotColor = TerminalManager.getThemeDotColor(sessionThemes.get(sessionId) || 'vscode-dark');
       
-      // 在标题前添加一个小圆圈指示器
+      // 方块色标插在终端图标之后，避免盖住图标
       let dotIndicator = titleElement.querySelector('.pane-color-indicator');
       if (!dotIndicator) {
         dotIndicator = document.createElement('span');
         dotIndicator.className = 'pane-color-indicator';
-        titleElement.insertBefore(dotIndicator, titleElement.firstChild);
         const paneId = pane.id;
         const sid = sessionId;
         dotIndicator.addEventListener('click', (e) => {
@@ -2140,6 +2189,9 @@ function updatePaneAccents(): void {
           showColorPickerDialogForPane(paneId, sid, dotIndicator as HTMLElement);
         });
       }
+      const kindIcon = titleElement.querySelector('.pane-kind-icon');
+      if (kindIcon) kindIcon.after(dotIndicator);
+      else titleElement.insertBefore(dotIndicator, titleElement.firstChild);
       (dotIndicator as HTMLElement).style.backgroundColor = themeDotColor;
       (dotIndicator as HTMLElement).style.cursor = 'pointer';
       (dotIndicator as HTMLElement).title = '点击更改颜色';
@@ -2281,7 +2333,7 @@ function getActiveSessionId(): string | null {
 function getActiveSessionCwd(): string {
   const activeId = getActiveSessionId();
   if (activeId) return sessionCwds.get(activeId) || currentCwd;
-  return paneWorkspace.getWorkspaceKey() || currentCwd;
+  return currentCwd;
 }
 
 function quotePathForShell(filePath: string): string {
@@ -2297,8 +2349,6 @@ function insertPathToActiveTerminal(filePath: string): void {
 }
 
 function openFileInPane(filePath: string): void {
-  const workspace = getActiveSessionCwd() || currentCwd || paneWorkspace.getWorkspaceKey();
-  if (workspace && workspace !== paneWorkspace.getWorkspaceKey()) paneWorkspace.setWorkspace(workspace);
   const label = filePath.split(/[/\\]/).pop() || filePath;
   paneWorkspace.openContent({ kind: 'file', path: filePath, label });
 }
@@ -2557,7 +2607,7 @@ function showColorPickerDialog(sessionId: string, currentDot: HTMLElement): void
   for (let i = 0; i < 10; i++) {
     const seed = `random-${sessionId}-${i}-${Date.now()}`;
     const bgColor = generateRandomThemeColor(seed);
-    const textColor = Math.random() > 0.7 ? '#0a0a0a' : '#ffffff';
+    const textColor = pickContrastingForeground(bgColor);
     
     const randomBtn = document.createElement('button');
     randomBtn.className = 'color-picker-btn';
@@ -2631,7 +2681,7 @@ function showColorPickerDialogForClosedSession(closedSessionId: string, currentD
   for (let i = 0; i < 10; i++) {
     const seed = `random-cs-${closedSessionId}-${i}-${Date.now()}`;
     const bgColor = generateRandomThemeColor(seed);
-    const textColor = Math.random() > 0.7 ? '#0a0a0a' : '#ffffff';
+    const textColor = pickContrastingForeground(bgColor);
     
     const randomBtn = document.createElement('button');
     randomBtn.className = 'color-picker-btn';
@@ -2702,7 +2752,7 @@ function showColorPickerDialogForPane(paneId: string, sessionId: string, current
   for (let i = 0; i < 10; i++) {
     const seed = `random-pane-${paneId}-${i}-${Date.now()}`;
     const bgColor = generateRandomThemeColor(seed);
-    const textColor = Math.random() > 0.7 ? '#0a0a0a' : '#ffffff';
+    const textColor = pickContrastingForeground(bgColor);
     
     const randomBtn = document.createElement('button');
     randomBtn.className = 'color-picker-btn';
@@ -2760,30 +2810,8 @@ async function applyNewThemeToSession(sessionId: string, bgColor: string, fgColo
     // 保存到 sessionThemes
     sessionThemes.set(sessionId, newThemeId);
     
-    // 创建动态主题配置
-    const tempTheme = {
-      background: bgColor,
-      foreground: fgColor,
-      cursor: '#ffffff',
-      cursorAccent: '#000000',
-      selectionBackground: 'rgba(255, 255, 255, 0.3)',
-      black: '#1a1a1a',
-      red: '#ff6b6b',
-      green: '#51cf66',
-      yellow: '#ffd43b',
-      blue: '#339af0',
-      magenta: '#cc5de8',
-      cyan: '#20c997',
-      white: '#f8f9fa',
-      brightBlack: '#495057',
-      brightRed: '#fa5252',
-      brightGreen: '#69db7c',
-      brightYellow: '#ffe066',
-      brightBlue: '#54a9ff',
-      brightMagenta: '#bb81e6',
-      brightCyan: '#48c9b0',
-      brightWhite: '#ffffff',
-    };
+    // 按背景亮度校正前景/光标/选区，避免浅色底白字或深色底黑字
+    const tempTheme = buildContrastingTerminalTheme(bgColor, fgColor);
     
     // 注册动态主题
     TerminalManager.registerDynamicTheme(newThemeId, tempTheme);
@@ -3323,7 +3351,7 @@ async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
     claimed = await window.duocli.closedSessionsBeginRestore(cs.id);
     if (!claimed) return;
 
-    const cwd = cs.cwd || sessionCwds.get(getActiveSessionId() || '') || paneWorkspace.getWorkspaceKey() || '';
+    const cwd = cs.cwd || sessionCwds.get(getActiveSessionId() || '') || currentCwd || '';
     const themeId = resolveThemeId(currentThemeId, cwd);
     const result = await window.duocli.createPty(cwd, resumeCmd, themeId, resolvePresetEnv(getCustomPresets(), resumeCmd));
     resultId = result.id;
@@ -3336,7 +3364,6 @@ async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
     sessionDisplayNames.set(result.id, cs.displayName || result.displayName);
     syncPaneLiveSessions();
     termManager.create(result.id, result.themeId, cwd, (data) => { writePtyWithAutoReset(result.id, data); });
-    paneWorkspace.setWorkspace(result.cwd || cwd);
     showTerminalSession(result.id);
     termManager.followSession(result.id);
     updatePaneAccents();
@@ -3418,7 +3445,6 @@ async function createSession(): Promise<boolean> {
   }
   // 初始化终端
   termManager.create(result.id, result.themeId, currentCwd, (data) => { writePtyWithAutoReset(result.id, data); });
-  paneWorkspace.setWorkspace(currentCwd);
   showTerminalSession(result.id);
   updatePaneAccents();
   updateEmptyState();
@@ -3434,8 +3460,6 @@ async function createSession(): Promise<boolean> {
 }
 
 function switchSession(id: string): void {
-  const cwd = sessionCwds.get(id) || currentCwd;
-  if (cwd) paneWorkspace.setWorkspace(cwd);
   const prev = getActiveSessionId();
   showTerminalSession(id);
 
@@ -3941,11 +3965,13 @@ document.addEventListener('dragleave', (e) => {
 });
 
 document.addEventListener('drop', (e) => {
-  e.preventDefault();
   terminalArea.classList.remove('drag-over');
-  // 只有当数据来自外部文件时才处理
+  // Only claim file drops. Pane-header swaps use text/plain and must reach
+  // their own handlers; calling preventDefault here for every drop broke
+  // vertical swaps when the release landed on the terminal body.
   const files = Array.from(e.dataTransfer?.files || []);
   if (!files.length) return;
+  e.preventDefault();
   const activeId = getActiveSessionId();
   if (!activeId) {
     alert('请先选择一个终端会话');
@@ -4055,7 +4081,8 @@ window.duocli.onPtyData((id, data) => {
     const plain = recentDataBuffer.get(id)!.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
     // 催工开启时，自动确认 CLI 各类确认提示（proceed / make this edit / 等）
     const acConfig = sessionAutoContinue.get(id);
-    if (acConfig?.enabled && (acConfig.autoAgree ?? true) && /Do you want to .*\?/.test(plain)) {
+    if (!window.duocli.autoContinueManaged
+      && acConfig?.enabled && (acConfig.autoAgree ?? true) && /Do you want to .*\?/.test(plain)) {
       // 数选项行数（格式: "  1. xxx"、"  2. xxx"...）
       const optionCount = (plain.match(/^\s+\d+\.\s/gm) || []).length;
       // 3个选项: 1=Yes, 2=Yes永久, 3=No → 选2
@@ -4150,9 +4177,7 @@ window.duocli.onRemoteCreated((info) => {
   if (info.cwd) addRecentCwd(info.cwd);
   // 创建 xterm 实例（桌面端也能看到和操作）
   termManager.create(info.id, info.themeId, info.cwd, (data) => { writePtyWithAutoReset(info.id, data); });
-  if (normalizeCwd(paneWorkspace.getWorkspaceKey()) === normalizeCwd(info.cwd || currentCwd)) {
-    showTerminalSession(info.id);
-  }
+  showTerminalSession(info.id);
   updateEmptyState();
   renderSessionList();
   updateSessionTitleBar();
@@ -4298,10 +4323,12 @@ window.duocli.getSessions().then((sessions) => {
   syncPaneLiveSessions();
   rebalanceDistinctAutoThemes();
   paneWorkspace.remountAll();
+  sessionRegistryReady = true;
   updatePaneAccents();
   updateEmptyState();
   renderSessionList();
 }).catch(() => {
+  sessionRegistryReady = true;
   syncPaneLiveSessions();
 });
 
@@ -4512,6 +4539,13 @@ document.querySelector('.footer-tip')!.addEventListener('click', () => {
 async function initApp(): Promise<void> {
   // 注册通知监听（桌面端和网页端通用）
   setupNotificationListener();
+  window.addEventListener('duocli:open-session', (event) => {
+    const sessionId = (event as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+    if (sessionId) switchSession(sessionId);
+  });
+  window.duocli.onNotificationOpen((sessionId: string) => {
+    if (sessionId) switchSession(sessionId);
+  });
   
   // 其他初始化...
 }

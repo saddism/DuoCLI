@@ -2,7 +2,7 @@
 
 > **一个窗口，随手管理你常用的 AI CLI。**
 
-DuoCLI 是一个轻量级 AI CLI 多终端管理器。它把 Claude Code、Codex、Gemini、Kimi、Cursor、Kiro、QoderCN、OpenCode、Antigravity 等工具放进同一个清爽的桌面工作区。
+DuoCLI 是一个轻量级 AI CLI 多终端管理器。它把 Claude Code、Codex、Gemini、Kimi、Cursor、Kiro、QoderCN、OpenCode、Antigravity、DSH 等工具放进同一个清爽的桌面工作区。
 
 你不用再在一排相似的终端窗口里寻找“刚才跑部署的是哪一个”，也不用为了换一个 CLI 重复切换目录、输入长命令。选好工作目录和预设，点一下就能开始。
 
@@ -20,6 +20,19 @@ DuoCLI 把这些琐事收进一个侧边栏：
 - 手机可远程查看和操控桌面端终端，支持局域网或互联网连接
 
 核心原则只有一句话：**不强迫你学习新的终端工作流，只让原本麻烦的操作少一点。**
+
+## v1.4.0：离开电脑，工作也接得住
+
+手机远程开发最怕的不是断一次线，而是重连后草稿没了、命令重复执行，或者上传的文件跑进了另一个会话。v1.4.0 把这些容易翻车的细节收紧了：
+
+- 每个会话独立保存草稿、上传结果与待确认提交
+- 计划执行和自动同意移入主进程，桌面窗口不活跃也能继续
+- 桌面与手机共享快捷命令，点击先插入、确认后发送
+- 通知直达对应会话，手机横屏可同时查看会话、终端和 Android 画面
+- 跨项目 Pane 保持同一块工作区，支持拖拽交换位置
+- 终端中的中文路径、换行路径、压缩包和常见工作文件可直接预览或下载
+
+[查看 v1.4.0 中英双语更新说明](./docs/updates/v1.4.0-release-notes.md)
 
 ## 核心体验
 
@@ -75,6 +88,8 @@ npm run test:unit
 
 ## English
 
-DuoCLI is a lightweight desktop workspace for the AI CLI tools you already use. Keep Claude Code, Codex, Gemini, Kimi, Cursor, and more in one place, switch sessions from a clear sidebar, and split only when side-by-side visibility is useful.
+DuoCLI is a lightweight desktop workspace for the AI CLI tools you already use. Keep Claude Code, Codex, Gemini, Kimi, Cursor, DSH, and more in one place, switch sessions from a clear sidebar, and split only when side-by-side visibility is useful.
 
-Ordinary sessions are not blocked by the four-pane readability limit. Fewer terminal windows to search through, fewer commands to repeat, and a simpler way to keep your AI coding work moving.
+Version 1.4.0 makes remote work dependable across desktop and phone: drafts stay with the right session, retries do not duplicate commands, scheduled work continues outside the renderer, and shared quick commands wait for your explicit send. Ordinary sessions are not blocked by the four-pane readability limit, and the same global pane board can hold work from different projects.
+
+[Read the bilingual v1.4.0 release notes](./docs/updates/v1.4.0-release-notes.md).
