@@ -21,6 +21,17 @@ DuoCLI 把这些琐事收进一个侧边栏：
 
 核心原则只有一句话：**不强迫你学习新的终端工作流，只让原本麻烦的操作少一点。**
 
+## v1.4.1：滚出去很远，也还记得自己在说什么
+
+对话一长，最先找不到的是你自己刚才那句话。v1.4.1 把它钉在顶上，并修了几个文件和会话顺序上的别扭：
+
+- 桌面和手机网页都显示「最近在说」，可展开，也能滚回标题栏顶部
+- 电脑上发的话，手机打开同一会话就能看见
+- 文件可用其他应用程序打开，不只走默认应用
+- 已关闭会话按最后活动时间排，下载不再被存成 `.html`
+
+[查看 v1.4.1 中英双语更新说明](./docs/updates/v1.4.1-release-notes.md)
+
 ## v1.4.0：离开电脑，工作也接得住
 
 手机远程开发最怕的不是断一次线，而是重连后草稿没了、命令重复执行，或者上传的文件跑进了另一个会话。v1.4.0 把这些容易翻车的细节收紧了：
@@ -89,6 +100,10 @@ npm run test:unit
 ## English
 
 DuoCLI is a lightweight desktop workspace for the AI CLI tools you already use. Keep Claude Code, Codex, Gemini, Kimi, Cursor, DSH, and more in one place, switch sessions from a clear sidebar, and split only when side-by-side visibility is useful.
+
+Version 1.4.1 pins your latest real prompt above the conversation on desktop and phone, jumps back to the title-bar top after a long scroll, lets you open files with another app, and sorts closed sessions by last activity. Downloads keep their real filenames instead of turning into `.html`.
+
+[Read the bilingual v1.4.1 release notes](./docs/updates/v1.4.1-release-notes.md).
 
 Version 1.4.0 makes remote work dependable across desktop and phone: drafts stay with the right session, retries do not duplicate commands, scheduled work continues outside the renderer, and shared quick commands wait for your explicit send. Ordinary sessions are not blocked by the four-pane readability limit, and the same global pane board can hold work from different projects.
 
