@@ -94,6 +94,7 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
       </button>
       <div class="detail-title">
+        <img id="detail-cli-logo" class="detail-cli-logo" alt="" hidden>
         <span id="detail-name"></span>
         <span id="detail-status" class="status-dot"></span>
       </div>
@@ -116,6 +117,14 @@
       </button>
     </header>
 
+    <div id="user-prompt-banner" class="user-prompt-banner" hidden>
+      <div class="user-prompt-banner-copy">
+        <span class="user-prompt-kicker">最近在说</span>
+        <p class="user-prompt-text"></p>
+        <button type="button" class="user-prompt-more" hidden>更多</button>
+      </div>
+      <button type="button" class="user-prompt-jump">滚动到这里</button>
+    </div>
     <!-- xterm.js 终端 -->
     <div id="terminal-container">
       <div id="terminal-loading" class="terminal-loading">
@@ -137,6 +146,7 @@
       <button class="key-btn" data-key="\x03">^C</button>
       <button class="key-btn" data-key="y\r">Y</button>
       <button type="button" id="option-up-key" class="key-btn" data-key="\x1b[1;3A" title="Option + ↑" aria-label="Option 加方向上键">⌥ + ↑</button>
+      <button type="button" id="ctrl-slash-key" class="key-btn" data-key="\x1f" title="Ctrl + /" aria-label="Ctrl 加斜杠">^/</button>
     </div>
 
     <!-- 输入区域 -->
@@ -168,6 +178,7 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
       </button>
       <div id="file-preview-title">文件预览</div>
+      <button id="file-preview-download-btn" class="mini-btn" type="button" title="下载文件" aria-label="下载文件" hidden>下载</button>
     </header>
     <main id="file-preview-body">
       <div id="file-preview-meta"></div>
@@ -322,7 +333,10 @@
         <div id="mobile-file-tree-list" class="mobile-file-tree-list"></div>
       </section>
       <section id="device-panel-preview" class="device-panel-view" hidden>
-        <div id="mobile-file-preview-title" class="mobile-file-preview-title">文件预览</div>
+        <div class="mobile-file-preview-heading">
+          <div id="mobile-file-preview-title" class="mobile-file-preview-title">文件预览</div>
+          <button id="mobile-file-preview-download-btn" class="mini-btn" type="button" title="下载文件" aria-label="下载文件" hidden>下载</button>
+        </div>
         <div id="mobile-file-preview-meta" class="mobile-file-preview-meta"></div>
         <div id="mobile-file-preview-media" class="mobile-file-preview-media"></div>
         <pre id="mobile-file-preview-content" class="mobile-file-preview-content"></pre>
@@ -446,6 +460,7 @@
   <script src="spinner-interceptor.js"></script>
   <script src="cli-tag-colors.js"></script>
   <script src="cli-logos.js"></script>
+  <script src="user-prompt-banner.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

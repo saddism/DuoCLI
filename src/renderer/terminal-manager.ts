@@ -9,6 +9,25 @@ const terminalContentHelpers = require('../../mobile/client/terminal-content-hel
   findLinks: (text: string) => Array<any>;
   matchRange: (logicalLine: any, match: any) => any;
 };
+const userPromptBanner = require('../../mobile/client/user-prompt-banner.js') as {
+  looksLikeUserPrompt: (text: string) => boolean;
+  normalizePrompt: (text: string) => string;
+  findPromptLine: (buffer: any, text: string) => number;
+  promptBlockStartLine: (buffer: any, text: string) => number;
+  resolvePromptJumpLine: (buffer: any, text: string, marker?: { line: number; isDisposed: boolean } | null) => number;
+  scrollLineToTop: (terminal: Terminal, line: number) => number;
+  consumeTypedInput: (currentLine: string, data: string) => { line: string; segments: string[] };
+  readStoredPrompt: (sessionId: string) => string;
+  writeStoredPrompt: (sessionId: string, text: string) => void;
+  markerAtLine: (terminal: Terminal, line: number) => { dispose(): void; line: number; isDisposed: boolean } | null;
+  createBanner: () => {
+    element: HTMLElement;
+    textEl: HTMLElement;
+    moreBtn: HTMLButtonElement;
+    jumpBtn: HTMLButtonElement;
+  };
+  renderBanner: (banner: any, state: { text?: string; expanded?: boolean }) => void;
+};
 
 // 终端配色方案
 const THEMES: Record<string, any> = {
@@ -255,7 +274,8 @@ class FilePathLinkProvider implements ILinkProvider {
           },
           text: match.display,
           activate: () => { this.onClickCallback(resolved); },
-        });
+          resolvedPath: resolved,
+        } as ILink & { resolvedPath: string });
       }
     }
     callback(links.length > 0 ? links : undefined);
@@ -263,35 +283,75 @@ class FilePathLinkProvider implements ILinkProvider {
 }
 
 // 终端右键菜单（文件链接上右键）
-function showTermContextMenu(x: number, y: number, fileName: string, openFn: () => void): void {
-  // 移除已有菜单
+function addTermContextItem(menu: HTMLElement, label: string, action: () => void): void {
+  const item = document.createElement('div');
+  item.className = 'term-context-item';
+  item.textContent = label;
+  item.addEventListener('click', () => {
+    item.closest('.term-context-menu')?.remove();
+    action();
+  });
+  menu.appendChild(item);
+}
+
+function addTermContextSeparator(menu: HTMLElement): void {
+  const sep = document.createElement('div');
+  sep.className = 'term-context-sep';
+  menu.appendChild(sep);
+}
+
+function clampTermContextMenu(menu: HTMLElement): void {
+  const rect = menu.getBoundingClientRect();
+  if (rect.bottom > window.innerHeight) {
+    menu.style.top = `${Math.max(8, window.innerHeight - rect.height - 8)}px`;
+  }
+  if (rect.right > window.innerWidth) {
+    menu.style.left = `${Math.max(8, window.innerWidth - rect.width - 8)}px`;
+  }
+}
+
+async function showTermContextMenu(x: number, y: number, filePath: string, openFn: () => void): Promise<void> {
   document.querySelectorAll('.term-context-menu').forEach(el => el.remove());
 
   const menu = document.createElement('div');
   menu.className = 'term-context-menu';
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
+  const fileName = filePath.split(/[\\/]/).pop() || filePath;
+  const duocli = (window as any).duocli;
 
-  const openItem = document.createElement('div');
-  openItem.className = 'term-context-item';
-  openItem.textContent = `打开 ${fileName.split('/').pop() || fileName}`;
-  openItem.addEventListener('click', () => { menu.remove(); openFn(); });
+  addTermContextItem(menu, `打开 ${fileName}`, openFn);
+  addTermContextItem(menu, '用系统默认应用打开', () => { void duocli?.openFile?.(filePath); });
+  addTermContextSeparator(menu);
 
-  const editorItem = document.createElement('div');
-  editorItem.className = 'term-context-item';
-  editorItem.textContent = '更换编辑器...';
-  editorItem.addEventListener('click', async () => {
-    menu.remove();
-    await (window as any).duocli.filewatcherSelectEditor();
-  });
+  const appsHost = document.createElement('div');
+  menu.appendChild(appsHost);
 
-  menu.appendChild(openItem);
-  menu.appendChild(editorItem);
+  addTermContextItem(menu, '其他应用程序...', () => { void duocli?.openWithSystemDialog?.(filePath); });
+  addTermContextSeparator(menu);
+  addTermContextItem(menu, '在 Finder 中显示', () => { void duocli?.openFolder?.(filePath); });
+  addTermContextItem(menu, '更换默认编辑器...', () => { void duocli?.filewatcherSelectEditor?.(); });
+
   document.body.appendChild(menu);
+  clampTermContextMenu(menu);
 
-  // 点击其他地方关闭
-  const close = () => { menu.remove(); document.removeEventListener('click', close); };
-  setTimeout(() => document.addEventListener('click', close), 0);
+  const close = (event: Event) => {
+    if (menu.contains(event.target as Node)) return;
+    menu.remove();
+    document.removeEventListener('mousedown', close);
+  };
+  setTimeout(() => document.addEventListener('mousedown', close), 0);
+
+  try {
+    const apps = await duocli?.listOpenWithApps?.(filePath);
+    if (!menu.isConnected || !Array.isArray(apps) || apps.length === 0) return;
+    for (const app of apps) {
+      addTermContextItem(appsHost, `用 ${app.name} 打开`, () => {
+        void duocli?.openWithApp?.(filePath, app.path);
+      });
+    }
+    clampTermContextMenu(menu);
+  } catch { /* 系统应用列表失败时仍保留其他打开方式 */ }
 }
 
 interface Cell {
@@ -396,6 +456,11 @@ interface TermInstance {
   themeId: string;
   scroll: TerminalScrollController;
   disposeComposer: () => void;
+  promptBanner: ReturnType<typeof userPromptBanner.createBanner>;
+  promptText: string;
+  promptExpanded: boolean;
+  promptMarker: { dispose(): void; line: number; isDisposed: boolean } | null;
+  typedLine: string;
 }
 
 export class TerminalManager {
@@ -453,12 +518,19 @@ export class TerminalManager {
 
     const surface = document.createElement('div');
     surface.className = 'terminal-surface';
+    const promptBanner = userPromptBanner.createBanner();
+    container.appendChild(promptBanner.element);
     container.appendChild(surface);
     terminal.open(surface);
     this.resizeObserver.observe(surface);
-    const composer = createQuickCommandComposer(id);
+    const composer = createQuickCommandComposer(id, {
+      onSubmitText: (text) => this.noteUserPrompt(id, text),
+    });
     container.appendChild(composer.element);
-    terminal.onData((data) => onData(data));
+    terminal.onData((data) => {
+      this.trackTypedPrompt(id, data);
+      onData(data);
+    });
     attachCursorKeyBindings(terminal, container, onData);
 
     // 兜底：拦截 xterm 内部可能生成的 <a> 点击，避免在 Electron 窗口内导航
@@ -496,10 +568,12 @@ export class TerminalManager {
 
       // 用 linkProvider 检测该行是否有链接
       linkProvider.provideLinks(bufferY, (links) => {
-        if (!links || links.length === 0) return;
+        const fileLink = (links || []).find((item) => 'resolvedPath' in item && (item as { resolvedPath?: string }).resolvedPath);
+        const resolvedPath = (fileLink as { resolvedPath?: string } | undefined)?.resolvedPath;
+        if (!fileLink || !resolvedPath) return;
         e.preventDefault();
-        showTermContextMenu(e.clientX, e.clientY, links[0].text, () => {
-          (links[0] as any).activate(undefined, links[0].text);
+        void showTermContextMenu(e.clientX, e.clientY, resolvedPath, () => {
+          fileLink.activate();
         });
       });
     });
@@ -559,7 +633,29 @@ export class TerminalManager {
     surface.appendChild(scrollBtn);
 
     const scroll = new TerminalScrollController(terminal, container, scrollBtn);
-    this.instances.set(id, { id, terminal, fitAddon, container, themeId, scroll, disposeComposer: composer.dispose });
+    const instance: TermInstance = {
+      id,
+      terminal,
+      fitAddon,
+      container,
+      themeId,
+      scroll,
+      disposeComposer: composer.dispose,
+      promptBanner,
+      promptText: userPromptBanner.readStoredPrompt(id),
+      promptExpanded: false,
+      promptMarker: null,
+      typedLine: '',
+    };
+    promptBanner.moreBtn.addEventListener('click', () => {
+      instance.promptExpanded = !instance.promptExpanded;
+      this.renderPromptBanner(instance);
+      this.fitTerminal(id, false);
+    });
+    promptBanner.jumpBtn.addEventListener('click', () => this.jumpToUserPrompt(id));
+    this.instances.set(id, instance);
+    this.renderPromptBanner(instance);
+    this.rebindPromptMarker(instance);
     // Keep the manager independently usable by the existing xterm tests and
     // embedders. The desktop app mounts views through PaneWorkspace instead.
     if (!this.terminalArea.classList.contains('pane-workspace-root')) this.switchTo(id);
@@ -609,12 +705,66 @@ export class TerminalManager {
   write(id: string, data: string): void {
     const inst = this.instances.get(id);
     if (!inst) return;
-    // onWriteParsed follows the latest user intent after the whole parse batch.
-    inst.terminal.write(data);
+    inst.terminal.write(data, () => {
+      if (inst.promptText && (!inst.promptMarker || inst.promptMarker.isDisposed)) {
+        this.rebindPromptMarker(inst);
+      }
+    });
   }
 
   notifyInput(id: string): void {
     this.instances.get(id)?.scroll.follow();
+  }
+
+  private trackTypedPrompt(id: string, data: string): void {
+    const instance = this.instances.get(id);
+    if (!instance) return;
+    const parsed = userPromptBanner.consumeTypedInput(instance.typedLine, data);
+    instance.typedLine = parsed.line;
+    const last = parsed.segments.filter((segment) => userPromptBanner.looksLikeUserPrompt(segment)).pop();
+    if (last) this.noteUserPrompt(id, last);
+  }
+
+  private noteUserPrompt(id: string, text: string): void {
+    const instance = this.instances.get(id);
+    if (!instance || !userPromptBanner.looksLikeUserPrompt(text)) return;
+    const normalized = userPromptBanner.normalizePrompt(text);
+    instance.promptMarker?.dispose();
+    instance.promptText = normalized;
+    instance.promptExpanded = false;
+    instance.promptMarker = instance.terminal.registerMarker(0);
+    userPromptBanner.writeStoredPrompt(id, normalized);
+    this.renderPromptBanner(instance);
+    this.fitTerminal(id, false);
+  }
+
+  private renderPromptBanner(instance: TermInstance): void {
+    userPromptBanner.renderBanner(instance.promptBanner, {
+      text: instance.promptText,
+      expanded: instance.promptExpanded,
+    });
+  }
+
+  private rebindPromptMarker(instance: TermInstance): void {
+    if (!instance.promptText) return;
+    const line = userPromptBanner.promptBlockStartLine(instance.terminal.buffer.active, instance.promptText);
+    if (line < 0) return;
+    instance.promptMarker?.dispose();
+    instance.promptMarker = userPromptBanner.markerAtLine(instance.terminal, line);
+  }
+
+  private jumpToUserPrompt(id: string): void {
+    const instance = this.instances.get(id);
+    if (!instance?.promptText) return;
+    this.rebindPromptMarker(instance);
+    const line = userPromptBanner.resolvePromptJumpLine(
+      instance.terminal.buffer.active,
+      instance.promptText,
+      instance.promptMarker,
+    );
+    if (line < 0) return;
+    instance.scroll.scrollToLine(line);
+    userPromptBanner.scrollLineToTop(instance.terminal, line);
   }
 
   destroy(id: string): string | null {
@@ -623,6 +773,7 @@ export class TerminalManager {
     if (inst.terminal.element?.parentElement) this.resizeObserver.unobserve(inst.terminal.element.parentElement);
     inst.disposeComposer();
     inst.scroll.dispose();
+    inst.promptMarker?.dispose();
     inst.terminal.dispose();
     inst.container.remove();
     this.instances.delete(id);
@@ -672,6 +823,7 @@ export class TerminalManager {
     if (!instance) return;
     try {
       instance.fitAddon.fit();
+      this.rebindPromptMarker(instance);
       instance.scroll.sync();
       const rect = instance.container.getBoundingClientRect();
       this.lastFitSizes.set(id, { w: rect.width, h: rect.height });

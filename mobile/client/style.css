@@ -277,14 +277,20 @@ header h2 {
   display: none;
 }
 
-/* 宽屏分栏才用顶栏开关；竖屏/窄屏只留返回，避免和返回键同时出现。 */
-body.landscape-workspace:not(.landscape-sessions-open) .landscape-sessions-toggle,
-body.landscape-workspace:not(.landscape-device-open) .landscape-device-toggle,
-#main-page.landscape-drawer-open .landscape-panel-close {
+/* 宽屏分栏：列表已在左侧，不再显示「返回列表」；对话顶栏菜单键负责收起/展开。
+   窄屏横屏覆盖层才在列表顶栏显示收起箭头。 */
+body.landscape-workspace .landscape-sessions-toggle,
+body.landscape-workspace:not(.landscape-device-open) .landscape-device-toggle {
+  display: flex;
+}
+
+body:not(.landscape-workspace) #main-page.landscape-drawer-open .landscape-panel-close {
   display: flex;
 }
 
 body.landscape-workspace #back-btn,
+body.landscape-sessions-open #back-btn,
+body.landscape-workspace #main-drawer-close,
 #detail-session-picker-btn {
   display: none;
 }
@@ -530,10 +536,11 @@ body.landscape-workspace #back-btn,
 .session-meta {
   color: var(--text2);
   font-size: 12px;
-  margin-top: 4px;
+  margin-top: 5px;
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .session-time {
@@ -544,44 +551,44 @@ body.landscape-workspace #back-btn,
 
 .session-cwd {
   min-width: 0;
+  flex: 1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  direction: rtl;
-  text-align: left;
-  font-family: 'SF Mono', 'Menlo', monospace;
-  font-size: 11px;
-  color: var(--text2);
+  font-size: 13px;
+  font-weight: 500;
+  color: #b6c3d4;
 }
 
 .cli-tag {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
   font-size: 11px;
-  line-height: 1.5;
-  padding: 1px 7px;
-  border-radius: 6px;
-  font-weight: 600;
+  line-height: 1.4;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-weight: 500;
   white-space: nowrap;
   flex-shrink: 0;
-  color: var(--cli-c);
-  background: var(--cli-bg);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  max-width: 42%;
+  overflow: hidden;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.cli-tag span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* CLI Logo */
 .cli-logo-img {
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
   border-radius: 3px;
-  margin-right: 6px;
   object-fit: contain;
   flex-shrink: 0;
-  transition: transform 0.15s ease;
-}
-
-.cli-logo-img:hover {
-  transform: scale(1.2);
 }
 
 .session-arrow {
@@ -739,7 +746,15 @@ body.landscape-workspace #back-btn,
   min-width: 0;
 }
 
-.detail-title span:first-child {
+.detail-cli-logo {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.detail-title #detail-name {
   font-weight: 600;
   font-size: 16px;
   white-space: nowrap;
@@ -766,6 +781,72 @@ body.landscape-workspace #back-btn,
   touch-action: none;
   overscroll-behavior: contain;
   position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.user-prompt-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 10px;
+  background: rgba(22, 32, 47, 0.96);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+  flex-shrink: 0;
+  z-index: 6;
+}
+
+.user-prompt-banner[hidden] {
+  display: none !important;
+}
+
+.user-prompt-banner-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.user-prompt-kicker {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: #7d8ea3;
+  margin-bottom: 2px;
+}
+
+.user-prompt-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #e2e8f0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.user-prompt-banner.is-expanded .user-prompt-text {
+  white-space: pre-wrap;
+  max-height: 7.4em;
+  overflow: auto;
+}
+
+.user-prompt-more,
+.user-prompt-jump {
+  flex-shrink: 0;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 6px;
+  background: rgba(148, 163, 184, 0.08);
+  color: #dbeafe;
+  font-size: 11px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.user-prompt-more {
+  margin-top: 4px;
+}
+
+.user-prompt-jump {
+  align-self: center;
 }
 
 /* 终端加载中遮罩 */
@@ -857,7 +938,9 @@ body.landscape-workspace #back-btn,
 }
 
 #terminal-container .xterm {
-  height: 100%;
+  flex: 1;
+  min-height: 0;
+  height: auto;
   padding: 6px;
   /* 防止内容变化导致布局重排 */
   transform: translateZ(0);
@@ -986,6 +1069,7 @@ body.landscape-workspace #back-btn,
 }
 
 #file-preview-title {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1785,6 +1869,14 @@ body.landscape-workspace #back-btn,
   white-space: nowrap;
 }
 
+#file-preview-header .mini-btn,
+.mobile-file-preview-heading .mini-btn {
+  flex-shrink: 0;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+}
+
 .device-preview-wrap {
   flex: 1;
   background: #0f1326;
@@ -2074,7 +2166,16 @@ body.landscape-workspace #back-btn,
   text-align: left;
 }
 
+.mobile-file-preview-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 0 4px;
+}
+
 .mobile-file-preview-title {
+  flex: 1;
+  min-width: 0;
   padding: 12px 14px 4px;
   color: var(--text);
   font-size: 14px;
@@ -2082,6 +2183,10 @@ body.landscape-workspace #back-btn,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.mobile-file-preview-heading .mobile-file-preview-title {
+  padding: 4px 4px 4px 10px;
 }
 
 .mobile-file-preview-meta {
@@ -2877,13 +2982,16 @@ header h2 {
   color: #e5edf8;
 }
 
+.session-cwd {
+  color: #c5d0de;
+}
+
 .session-meta {
   gap: 7px;
 }
 
 .cli-tag {
-  padding: 2px 7px;
-  border-radius: 5px;
+  padding: 1px 6px;
 }
 
 .session-arrow {
@@ -2931,7 +3039,7 @@ header h2 {
   gap: 7px;
 }
 
-.detail-title span:first-child {
+.detail-title #detail-name {
   color: #e5edf8;
   border-bottom-color: rgba(148, 163, 184, 0.55);
 }

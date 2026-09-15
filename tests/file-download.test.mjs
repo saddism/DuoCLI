@@ -46,6 +46,7 @@ test('downloads stream exact bytes with attachment headers and enforce workspace
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-disposition'), /^attachment;/);
     assert.ok(response.headers.get('content-disposition').includes(encodeURIComponent(name)));
+    assert.equal(response.headers.get('content-type'), 'application/octet-stream');
     assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
   }
@@ -53,4 +54,33 @@ test('downloads stream exact bytes with attachment headers and enforce workspace
     assert.equal((await get(file)).status, 400, file);
   }
   assert.equal((await get('missing.zip')).status, 404);
+});
+
+test('previewed media and text can be downloaded when extra extensions are allowed', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'duocli-preview-dl-'));
+  const workspace = path.join(root, 'workspace');
+  fs.mkdirSync(workspace);
+  const videoName = 'clip.mp4';
+  const textName = 'notes.md';
+  const videoBytes = Buffer.from([0, 0, 0, 24, 102, 116, 121, 112]);
+  const textBytes = Buffer.from('# hi\n', 'utf8');
+  fs.writeFileSync(path.join(workspace, videoName), videoBytes);
+  fs.writeFileSync(path.join(workspace, textName), textBytes);
+  fs.writeFileSync(path.join(workspace, '.env'), 'secret');
+  const app = express();
+  app.get('/download', (req, res) => sendFileDownload(workspace, String(req.query.path || ''), res, ['.mp4', '.md']));
+  const server = app.listen(0, '127.0.0.1');
+  await new Promise(resolve => server.once('listening', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const get = file => fetch(`http://127.0.0.1:${server.address().port}/download?path=${encodeURIComponent(file)}`);
+  const videoRes = await get(videoName);
+  assert.equal(videoRes.status, 200);
+  assert.equal(videoRes.headers.get('content-type'), 'application/octet-stream');
+  assert.match(videoRes.headers.get('content-disposition'), /^attachment;/);
+  assert.match(videoRes.headers.get('content-disposition'), /filename\*=UTF-8''clip\.mp4/);
+  assert.deepEqual(Buffer.from(await videoRes.arrayBuffer()), videoBytes);
+  const textRes = await get(textName);
+  assert.equal(textRes.status, 200);
+  assert.deepEqual(Buffer.from(await textRes.arrayBuffer()), textBytes);
+  assert.equal((await get('.env')).status, 400);
 });

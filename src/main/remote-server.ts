@@ -28,7 +28,7 @@ import { CustomPreset, getCliProvider, resolveSessionDisplayName } from './cli-p
 import { resolvePresetEnv } from './preset-env';
 import { BUILTIN_PRESETS, getAvailableBuiltinPresets } from './cli-detect';
 import { buildResumeCommand } from './session-resume';
-import { ClosedSessionsManager } from './closed-sessions';
+import { ClosedSessionsManager, sortClosedSessionsByUpdatedAt } from './closed-sessions';
 
 // 缓存 ptyManager 和回调供远程创建使用（在 startRemoteServer 中设置）
 let cachedPtyManager: PtyManager | null = null;
@@ -38,6 +38,9 @@ let PORT = parseInt(process.env.DUOCLI_REMOTE_PORT || '9800');
 const HOST = process.env.DUOCLI_REMOTE_HOST || '0.0.0.0';
 
 const DUOCLI_APP_ROOT = path.resolve(__dirname, '../..');
+const userPromptBanner = require(path.join(DUOCLI_APP_ROOT, 'mobile/client/user-prompt-banner.js')) as {
+  lastUserPromptFrom: (segments: unknown) => string;
+};
 
 function findLsof(): string | null {
   const candidates = process.platform === 'darwin'
@@ -396,7 +399,7 @@ export function startRemoteServer(
   onRemoteCreate?: (sessionInfo: any) => void,
   onRemoteDestroy?: (id: string) => void,
   onServerStarted?: (info: { lanUrl: string; token: string; port: number }) => void,
-  onSessionClosed?: (session: { title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; resumeSource?: any }) => void,
+  onSessionClosed?: (session: { title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; resumeSource?: any; updatedAt?: number }) => void,
   closedSessionsManager?: ClosedSessionsManager,
   userDataPath?: string, // 新增参数：用户数据目录
 ): http.Server {
@@ -1519,6 +1522,7 @@ export function startRemoteServer(
       provider: s.provider,
       status: getSessionStatus(s.id, s.ptyProcess),
       createdAt: s.createdAt || Date.now(),
+      lastUserPrompt: userPromptBanner.lastUserPromptFrom(s.accumulatedInputs),
     };
   }
 
@@ -1528,11 +1532,18 @@ export function startRemoteServer(
     res.json(sessions);
   });
 
-  app.get('/api/sessions/:id/file-download', (req, res) => {
-    const session = ptyManager.getSession(req.params.id);
+  const sendSessionFileDownload = (req: express.Request, res: express.Response) => {
+    const session = ptyManager.getSession(String(req.params.id));
     if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
-    sendFileDownload(session.cwd, String(req.query.path || ''), res);
-  });
+    sendFileDownload(
+      session.cwd,
+      String(req.query.path || ''),
+      res,
+      [...PREVIEW_EXTENSIONS, ...Object.keys(MEDIA_EXT_MAP)],
+    );
+  };
+  app.get('/api/sessions/:id/file-download/:filename', sendSessionFileDownload);
+  app.get('/api/sessions/:id/file-download', sendSessionFileDownload);
 
   // 手机端只读预览会话 cwd 内的文本文件
   app.get('/api/sessions/:id/file-preview', (req, res) => {
@@ -1823,6 +1834,7 @@ export function startRemoteServer(
       resumeCommand: cs.resumeCommand,
       displayName: cs.displayName || getDisplayName(cs.presetCommand),
       closedAt: cs.closedAt,
+      updatedAt: cs.updatedAt || cs.closedAt,
       state: cs.state || 'closed',
     };
   }
@@ -1830,8 +1842,7 @@ export function startRemoteServer(
   // 已关闭会话 — 可恢复的历史记录
   app.get('/api/closed-sessions', (_req, res) => {
     if (!closedSessionsManager) { res.json([]); return; }
-    const items = closedSessionsManager.list()
-      .sort((a, b) => b.closedAt - a.closedAt)
+    const items = sortClosedSessionsByUpdatedAt(closedSessionsManager.list())
       .map(mapClosedSessionToApi);
     res.json(items);
   });
@@ -1974,6 +1985,12 @@ export function startRemoteServer(
         resumeId,
         resumeCommand,
         resumeSource: capture?.source || beforeClose.resumeSource || undefined,
+        updatedAt: Math.max(
+          beforeClose.updatedAt || 0,
+          beforeClose.createdAt || 0,
+          beforeClose.lastInputAt?.desktop || 0,
+          beforeClose.lastInputAt?.mobile || 0,
+        ) || Date.now(),
       });
     }
     onRemoteDestroy?.(req.params.id);
@@ -2306,8 +2323,7 @@ export function startRemoteServer(
         res.write(`event: sessions\ndata: ${sessions}\n\n`);
       }
       if (!closedSessionsManager) return;
-      const closed = JSON.stringify(closedSessionsManager.list()
-        .sort((a, b) => b.closedAt - a.closedAt)
+      const closed = JSON.stringify(sortClosedSessionsByUpdatedAt(closedSessionsManager.list())
         .map(mapClosedSessionToApi));
       if (closed !== lastClosedPayload) {
         lastClosedPayload = closed;

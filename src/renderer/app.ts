@@ -11,11 +11,6 @@ import {
 } from './auto-continue-runtime';
 import { formatPresetEnv, parsePresetEnv, resolvePresetEnv } from '../main/preset-env';
 
-// 与手机端共用同一份 CLI 标签配色，见 mobile/client/cli-tag-colors.js
-const { getCliTagColors } = require('../../mobile/client/cli-tag-colors.js') as {
-  getCliTagColors: (displayName: string) => [string, string];
-};
-
 // 与手机端共用同一份 CLI Logo，见 mobile/client/cli-logos.js
 const { getLogoUrl, getDefaultLogoUrl, hasLogo } = require('../../mobile/client/cli-logos.js') as {
   getLogoUrl: (cliName: string) => string;
@@ -86,6 +81,9 @@ declare global {
       filewatcherOpen: (filePath: string) => Promise<void>;
       filewatcherSelectEditor: () => Promise<string | null>;
       filewatcherGetEditor: () => Promise<string | null>;
+      listOpenWithApps: (filePath: string) => Promise<Array<{ name: string; path: string }>>;
+      openWithApp: (filePath: string, appPath: string) => Promise<void>;
+      openWithSystemDialog: (filePath: string) => Promise<void>;
       openFolder: (folderPath: string) => Promise<void>;
       openUrl: (url: string) => Promise<void>;
       onFileChange: (cb: (filename: string, eventType: string) => void) => void;
@@ -119,13 +117,13 @@ declare global {
       sendAutoContinueConfig: (sessionId: string, config: any) => void;
       onSetAutoContinueConfig: (cb: (sessionId: string, config: any) => void) => void;
       // 已关闭会话
-      closedSessionsList: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>>;
+      closedSessionsList: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number }>>;
       closedSessionsBeginRestore: (id: string) => Promise<boolean>;
       closedSessionsCancelRestore: (id: string) => Promise<boolean>;
-      closedSessionsRemove: (id: string) => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>>;
-      closedSessionsClear: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>>;
+      closedSessionsRemove: (id: string) => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number }>>;
+      closedSessionsClear: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number }>>;
       closedSessionsConfirmRestore: (closedId: string, sessionId: string) => Promise<boolean>;
-      onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>) => void) => void;
+      onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number }>) => void) => void;
       onCloseCurrentSession: (cb: () => void) => void;
     };
   }
@@ -183,10 +181,11 @@ interface ClosedSessionInfo {
   resumeCommand: string;
   displayName: string;
   closedAt: number;
+  updatedAt?: number;
   state?: 'closed' | 'restoring';
 }
 let closedSessions: ClosedSessionInfo[] = [];
-let closedSessionsCollapsed = false;
+let closedSessionsCollapsed = true;
 const restoringClosedSessionIds = new Set<string>();
 
 // 自动继续配置
@@ -1287,11 +1286,9 @@ const sidebarResizer = document.getElementById('sidebar-resizer')!;
 const fileStatusbar = document.getElementById('file-statusbar')!;
 const fileStatusbarFiles = document.getElementById('file-statusbar-files')!;
 
-const sidebarTabs = document.querySelectorAll('.sidebar-tab');
-const tabSessions = document.getElementById('tab-sessions')!;
-
-// AI 配置相关 DOM
-const tabAiConfig = document.getElementById('tab-ai-config')!;
+const sidebarSettingsBtn = document.getElementById('sidebar-settings-btn')!;
+const aiConfigOverlay = document.getElementById('ai-config-overlay')!;
+const aiConfigClose = document.getElementById('ai-config-close')!;
 
 const aiApplyBtn = document.getElementById('ai-apply-btn')!;
 const aiTestBtn = document.getElementById('ai-test-btn')!;
@@ -1960,7 +1957,6 @@ paneWorkspace = new PaneWorkspace(paneWorkspaceRoot, currentCwd, {
   onContentMount: mountPaneContent,
   onContentUnmount: unmountPaneContent,
   onFocus: handlePaneFocus,
-  getAgentTagColors: getCliTagColors,
   onLayoutChange: (layout) => {
     const count = countPanes(layout.root);
     const isEmptyLayout = layout.root.type === 'pane' && layout.root.content.kind === 'empty';
@@ -2073,6 +2069,7 @@ function buildTerminalPaneContent(sessionId: string): Extract<PaneContent, { kin
     kind: 'terminal',
     sessionId,
     label: sessionTitles.get(sessionId) || '终端',
+    projectLabel: sessionProjectLabel(sessionCwds.get(sessionId) || ''),
     agentLabel: sessionDisplayNames.get(sessionId) || '',
   };
 }
@@ -2095,6 +2092,7 @@ function syncTerminalPaneHeaders(): void {
     const meta = buildTerminalPaneContent(pane.content.sessionId);
     paneWorkspace.updateTerminalPaneMeta(pane.content.sessionId, {
       label: meta.label,
+      projectLabel: meta.projectLabel,
       agentLabel: meta.agentLabel,
     });
   }
@@ -2131,8 +2129,12 @@ function normalizeCwd(cwd: string): string {
 // 取路径最后一段作为项目名
 function cwdShortName(cwd: string): string {
   if (!cwd) return '未知项目';
-  const parts = cwd.replace(/\/+$/, '').split('/');
+  const parts = cwd.replace(/\/+$/, '').split(/[\\/]/);
   return parts[parts.length - 1] || cwd;
+}
+
+function sessionProjectLabel(cwd: string): string {
+  return cwd ? cwdShortName(cwd) : '';
 }
 
 // 自动配色：多窗口分割时优先给每个终端分配不同主题，便于辨认
@@ -2307,8 +2309,9 @@ function updateSessionTitleBar(): void {
     const title = sessionTitles.get(activeId) || '';
     const displayName = sessionDisplayNames.get(activeId) || '';
     const parts = ['DuoCLI'];
-    if (displayName) parts.push(displayName);
     if (title && title !== '新会话' && title !== '新对话') parts.push(title);
+    if (cwdDisplay) parts.push(cwdDisplay);
+    if (displayName) parts.push(displayName);
     window.duocli.setWindowTitle(parts.join('-'));
   } else if (focused?.kind === 'file') {
     fileTreePath.textContent = focused.path.split(/[/\\]/).pop() || '文件';
@@ -2376,6 +2379,7 @@ function showTreeContextMenu(e: MouseEvent, itemPath: string, isDir: boolean): v
       { label: '插入路径到终端', action: () => insertPathToActiveTerminal(itemPath) },
       { label: '用默认应用打开', action: () => window.duocli.openFile(itemPath) },
       { label: '用编辑器打开', action: () => window.duocli.filewatcherOpen(itemPath) },
+      { label: '其他应用程序...', action: () => { void window.duocli.openWithSystemDialog(itemPath); } },
     );
   }
 
@@ -3105,20 +3109,21 @@ function renderSessionList(): void {
 
       const metaRow = document.createElement('div');
       metaRow.className = 'session-meta-row';
-      const timeSpan = document.createElement('span');
-      timeSpan.className = 'session-time';
-      timeSpan.textContent = friendlyTime(sessionUpdateTimes.get(id) || Date.now());
-      metaRow.appendChild(timeSpan);
+      const itemCwd = sessionCwds.get(id) || '';
+      const projectName = sessionProjectLabel(itemCwd);
+      if (projectName) {
+        const projectSpan = document.createElement('span');
+        projectSpan.className = 'session-cwd';
+        projectSpan.textContent = projectName;
+        projectSpan.title = itemCwd;
+        metaRow.appendChild(projectSpan);
+      }
       const displayName = sessionDisplayNames.get(id);
       if (displayName) {
         const nameSpan = document.createElement('span');
         nameSpan.className = 'session-display-name';
         nameSpan.title = displayName;
         fillCliCaption(nameSpan, displayName);
-        
-        const [tagColor, tagBg] = getCliTagColors(displayName);
-        nameSpan.style.setProperty('--cli-tag-color', tagColor);
-        nameSpan.style.setProperty('--cli-tag-bg', tagBg);
         metaRow.appendChild(nameSpan);
       }
 
@@ -3131,6 +3136,10 @@ function renderSessionList(): void {
         providerSpan.title = '实际使用的模型提供商';
         metaRow.appendChild(providerSpan);
       }
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'session-time';
+      timeSpan.textContent = friendlyTime(sessionUpdateTimes.get(id) || Date.now());
+      metaRow.appendChild(timeSpan);
 
       // 第一行：dot + 置顶 + 标题 + 编辑 + 关闭按钮
       const topRow = document.createElement('div');
@@ -3222,8 +3231,8 @@ function renderSessionList(): void {
     sessionList.appendChild(header);
 
     if (!closedSessionsCollapsed) {
-      // 按关闭时间降序（最近关闭排最前）
-      const sorted = [...closedSessions].sort((a, b) => b.closedAt - a.closedAt);
+      // 按最后更新时间降序（最近活动排最前）；旧记录没有 updatedAt 时退回关闭时间
+      const sorted = [...closedSessions].sort((a, b) => (b.updatedAt || b.closedAt) - (a.updatedAt || a.closedAt));
       for (const cs of sorted) {
         const item = document.createElement('div');
         item.className = 'session-item session-item-closed';
@@ -3236,21 +3245,25 @@ function renderSessionList(): void {
 
         const metaRow = document.createElement('div');
         metaRow.className = 'session-meta-row';
-        const timeSpan = document.createElement('span');
-        timeSpan.className = 'session-time';
-        timeSpan.textContent = friendlyTime(cs.closedAt);
-        metaRow.appendChild(timeSpan);
+        const closedProject = sessionProjectLabel(cs.cwd || '');
+        if (closedProject) {
+          const projectSpan = document.createElement('span');
+          projectSpan.className = 'session-cwd';
+          projectSpan.textContent = closedProject;
+          projectSpan.title = cs.cwd || '';
+          metaRow.appendChild(projectSpan);
+        }
         if (cs.displayName) {
           const nameSpan = document.createElement('span');
           nameSpan.className = 'session-display-name';
           nameSpan.title = cs.displayName;
           fillCliCaption(nameSpan, cs.displayName);
-          
-          const [tagColor, tagBg] = getCliTagColors(cs.displayName);
-          nameSpan.style.setProperty('--cli-tag-color', tagColor);
-          nameSpan.style.setProperty('--cli-tag-bg', tagBg);
           metaRow.appendChild(nameSpan);
         }
+        const timeSpan = document.createElement('span');
+        timeSpan.className = 'session-time';
+        timeSpan.textContent = friendlyTime(cs.updatedAt || cs.closedAt);
+        metaRow.appendChild(timeSpan);
         
         // 如果该会话有对话历史，显示"导出上下文"按钮
         if (cs.contextHistory && cs.contextHistory.length > 0) {
@@ -3672,13 +3685,18 @@ async function handleAiTest(): Promise<void> {
   }
 }
 
-function switchTab(tabName: string): void {
-  sidebarTabs.forEach((tab) => {
-    tab.classList.toggle('active', tab.getAttribute('data-tab') === tabName);
-  });
-  tabSessions.classList.toggle('active', tabName === 'sessions');
-  tabAiConfig.classList.toggle('active', tabName === 'ai-config');
-  if (tabName === 'ai-config') refreshAiConfig();
+function openAiConfig(): void {
+  aiConfigOverlay.classList.add('active');
+  sidebarSettingsBtn.classList.add('active');
+  sidebarSettingsBtn.setAttribute('aria-expanded', 'true');
+  void refreshAiConfig();
+  aiConfigOverlay.focus();
+}
+
+function closeAiConfig(): void {
+  aiConfigOverlay.classList.remove('active');
+  sidebarSettingsBtn.classList.remove('active');
+  sidebarSettingsBtn.setAttribute('aria-expanded', 'false');
 }
 
 // ========== 事件绑定 ==========
@@ -4039,15 +4057,18 @@ presetManageBtn.addEventListener('click', () => {
   showPresetManageDialog();
 });
 
-// Tab 切换
-sidebarTabs.forEach((tab) => {
-  tab.addEventListener('click', () => {
-    const tabName = tab.getAttribute('data-tab');
-    if (tabName) switchTab(tabName);
-  });
+sidebarSettingsBtn.addEventListener('click', () => openAiConfig());
+aiConfigClose.addEventListener('click', () => closeAiConfig());
+aiConfigOverlay.addEventListener('click', (e) => {
+  if (e.target === aiConfigOverlay) closeAiConfig();
+});
+aiConfigOverlay.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeAiConfig();
+  }
 });
 
-// AI 配置按钮
 aiTestBtn.addEventListener('click', () => handleAiTest());
 aiApplyBtn.addEventListener('click', () => handleAiApply());
 terminalAutoResponseSave.addEventListener('click', () => { void saveTerminalAutoResponseConfig(); });

@@ -110,6 +110,23 @@ export class TerminalScrollController {
     this.sync();
   }
 
+  stopFollowing(): void {
+    if (this.disposed) return;
+    this.following = false;
+    this.gesture++;
+    this.cancelFrame();
+    this.updateButton();
+  }
+
+  scrollToLine(line: number): void {
+    if (this.disposed) return;
+    this.stopFollowing();
+    const buffer = this.terminal.buffer.active;
+    const max = Math.max(0, buffer.baseY);
+    this.terminal.scrollToLine(Math.min(Math.max(0, line), max));
+    this.updateButton();
+  }
+
   /** Re-follow after mount, fit or pane focus when xterm may still be settling. */
   followAfterLayout(): void {
     this.follow();

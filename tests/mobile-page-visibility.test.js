@@ -34,6 +34,16 @@ test('empty splash is centered and has a new-session button', () => {
   assert.match(styleCss, /\.empty-state\s*\{[^}]*align-items:\s*center/);
 });
 
+test('landscape workspace hides back arrows because the session list is already visible', () => {
+  assert.match(styleCss, /body\.landscape-workspace #back-btn/);
+  assert.match(styleCss, /body\.landscape-sessions-open #back-btn/);
+  assert.match(styleCss, /body\.landscape-workspace #main-drawer-close/);
+  assert.match(
+    styleCss,
+    /body:not\(\.landscape-workspace\) #main-page\.landscape-drawer-open \.landscape-panel-close/,
+  );
+});
+
 test('service worker precaches every mobile client script', () => {
   const clientDir = path.join(__dirname, '..', 'mobile', 'client');
   const html = fs.readFileSync(path.join(clientDir, 'index.html'), 'utf8');

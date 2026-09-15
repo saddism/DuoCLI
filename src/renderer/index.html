@@ -142,6 +142,73 @@
     </div>
   </div>
 
+  <!-- AI 配置弹窗 -->
+  <div id="ai-config-overlay" class="new-session-overlay" tabindex="-1">
+    <div class="new-session-dialog ai-config-dialog" role="dialog" aria-modal="true" aria-labelledby="ai-config-title">
+      <div class="new-session-header">
+        <h3 id="ai-config-title">AI 配置</h3>
+        <button id="ai-config-close" class="new-session-close" title="关闭" type="button">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <div id="ai-config-form">
+        <div class="ai-config-description">
+          <strong>AI 用途</strong>
+          <span>用于整理会话历史，并根据你发送给终端的内容自动生成对话标题；不参与终端命令执行。</span>
+        </div>
+        <div class="ai-form-group">
+          <label class="ai-form-label">API 格式</label>
+          <select id="ai-format-select" class="ai-form-input">
+            <option value="anthropic">Anthropic</option>
+            <option value="openai">OpenAI 兼容</option>
+            <option value="gemini">Gemini</option>
+            <option value="ollama">Ollama</option>
+          </select>
+        </div>
+        <div class="ai-form-group">
+          <label class="ai-form-label">Base URL</label>
+          <input id="ai-baseurl-input" class="ai-form-input" type="text" placeholder="https://api.anthropic.com" />
+        </div>
+        <div class="ai-form-group">
+          <label class="ai-form-label">API Key</label>
+          <div class="ai-key-row">
+            <input id="ai-apikey-input" class="ai-form-input" type="password" placeholder="输入 API Key..." />
+            <button id="ai-key-toggle" class="ai-key-toggle-btn" title="显示/隐藏" type="button">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+            </button>
+          </div>
+        </div>
+        <div class="ai-form-group">
+          <label class="ai-form-label">模型</label>
+          <input id="ai-model-input" class="ai-form-input" type="text" placeholder="claude-3-5-haiku-20241022" />
+        </div>
+
+        <section class="terminal-auto-response-section">
+          <div class="terminal-auto-response-heading">终端容错自动回复</div>
+          <label class="terminal-auto-response-toggle">
+            <input id="terminal-auto-response-enabled" type="checkbox" />
+            检测终端错误后自动发送回复
+          </label>
+          <label class="ai-form-label" for="terminal-auto-response-rules">规则</label>
+          <textarea id="terminal-auto-response-rules" class="ai-form-input" rows="4" placeholder="每行：错误关键词 => 自动发送内容"></textarea>
+          <div class="terminal-auto-response-number-row">
+            <label class="ai-form-group">发送延迟（秒）
+              <input id="terminal-auto-response-delay" class="ai-form-input" type="number" min="0" max="60" />
+            </label>
+            <label class="ai-form-group">同规则冷却（秒）
+              <input id="terminal-auto-response-cooldown" class="ai-form-input" type="number" min="0" max="3600" />
+            </label>
+          </div>
+          <button id="terminal-auto-response-save" class="toolbar-btn terminal-auto-response-save" type="button">保存容错规则</button>
+        </section>
+      </div>
+      <div id="ai-config-actions">
+        <button id="ai-test-btn" class="toolbar-btn ai-btn" type="button">测试</button>
+        <button id="ai-apply-btn" class="toolbar-btn ai-btn ai-apply-btn" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 主体 -->
   <div id="main">
     <!-- 左侧目录树收起按钮 -->
@@ -255,83 +322,17 @@
         </div>
         <div class="remote-info-token-hint" hidden></div>
       </div>
-      <div id="sidebar-tabs">
-        <button class="sidebar-tab active" data-tab="sessions">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
-          <span>终端会话</span>
-        </button>
-        <button class="sidebar-tab" data-tab="ai-config">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-          <span>AI 配置</span>
-        </button>
-      </div>
-
-      <!-- 会话 Tab -->
-      <div id="tab-sessions" class="tab-content active">
-        <div id="session-list"></div>
-      </div>
-
-      <!-- AI 配置 Tab -->
-      <div id="tab-ai-config" class="tab-content">
-        <div id="ai-config-form">
-          <div class="ai-config-description">
-            <strong>AI 用途</strong>
-            <span>用于整理会话历史，并根据你发送给终端的内容自动生成对话标题；不参与终端命令执行。</span>
-          </div>
-          <div class="ai-form-group">
-            <label class="ai-form-label">API 格式</label>
-            <select id="ai-format-select" class="ai-form-input">
-              <option value="anthropic">Anthropic</option>
-              <option value="openai">OpenAI 兼容</option>
-              <option value="gemini">Gemini</option>
-              <option value="ollama">Ollama</option>
-            </select>
-          </div>
-          <div class="ai-form-group">
-            <label class="ai-form-label">Base URL</label>
-            <input id="ai-baseurl-input" class="ai-form-input" type="text" placeholder="https://api.anthropic.com" />
-          </div>
-          <div class="ai-form-group">
-            <label class="ai-form-label">API Key</label>
-            <div class="ai-key-row">
-              <input id="ai-apikey-input" class="ai-form-input" type="password" placeholder="输入 API Key..." />
-              <button id="ai-key-toggle" class="ai-key-toggle-btn" title="显示/隐藏">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-              </button>
-            </div>
-          </div>
-          <div class="ai-form-group">
-            <label class="ai-form-label">模型</label>
-            <input id="ai-model-input" class="ai-form-input" type="text" placeholder="claude-3-5-haiku-20241022" />
-          </div>
-
-          <section class="terminal-auto-response-section">
-            <div class="terminal-auto-response-heading">终端容错自动回复</div>
-            <label class="terminal-auto-response-toggle">
-              <input id="terminal-auto-response-enabled" type="checkbox" />
-              检测终端错误后自动发送回复
-            </label>
-            <label class="ai-form-label" for="terminal-auto-response-rules">规则</label>
-            <textarea id="terminal-auto-response-rules" class="ai-form-input" rows="4" placeholder="每行：错误关键词 => 自动发送内容"></textarea>
-            <div class="terminal-auto-response-number-row">
-              <label class="ai-form-group">发送延迟（秒）
-                <input id="terminal-auto-response-delay" class="ai-form-input" type="number" min="0" max="60" />
-              </label>
-              <label class="ai-form-group">同规则冷却（秒）
-                <input id="terminal-auto-response-cooldown" class="ai-form-input" type="number" min="0" max="3600" />
-              </label>
-            </div>
-            <button id="terminal-auto-response-save" class="toolbar-btn terminal-auto-response-save" type="button">保存容错规则</button>
-          </section>
-        </div>
-        <div id="ai-config-actions">
-          <button id="ai-test-btn" class="toolbar-btn ai-btn">测试</button>
-          <button id="ai-apply-btn" class="toolbar-btn ai-btn ai-apply-btn">保存</button>
-        </div>
-      </div>
+      <div id="session-list"></div>
 
       <!-- 版权信息 -->
       <div id="sidebar-footer">
+        <button type="button" id="sidebar-settings-btn" class="sidebar-settings-btn" title="AI 配置" aria-label="AI 配置" aria-haspopup="dialog" aria-expanded="false">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0-2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+          <span>AI 配置</span>
+        </button>
         <div class="footer-line">DuoCLI — 多开 CLI 神器</div>
         <div class="footer-line">by 大壮好大</div>
         <div class="footer-line"><a id="footer-github" href="#">GitHub</a></div>

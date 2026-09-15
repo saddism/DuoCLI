@@ -15,16 +15,31 @@ export const DOWNLOAD_EXTENSIONS = new Set([
   '.m4b', '.opus', '.aiff', '.aif',
 ]);
 
-export function sendFileDownload(cwd: string, requestedPath: string, res: Response): void {
+export function attachmentDisposition(filename: string): string {
+  const fallback = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+}
+
+export function sendFileDownload(
+  cwd: string,
+  requestedPath: string,
+  res: Response,
+  extraExtensions: Iterable<string> = [],
+): void {
   let filePath: string;
+  let fileStat: fs.Stats;
   try {
     const root = fs.realpathSync(cwd);
     const raw = requestedPath.trim().replace(/^['"`]|['"`]$/g, '');
     const expanded = raw.startsWith('@/') ? raw.slice(2) : raw;
     filePath = fs.realpathSync(path.resolve(root, expanded));
     const relative = path.relative(root, filePath);
+    const name = path.basename(filePath).toLowerCase();
+    const allowed = new Set([...DOWNLOAD_EXTENSIONS, ...extraExtensions]);
+    fileStat = fs.statSync(filePath);
     if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)
-      || !DOWNLOAD_EXTENSIONS.has(path.extname(filePath).toLowerCase()) || !fs.statSync(filePath).isFile()) {
+      || name === '.env' || name.startsWith('.env.')
+      || !allowed.has(path.extname(filePath).toLowerCase()) || !fileStat.isFile()) {
       res.status(400).json({ error: '只支持工作目录内的可下载文件' });
       return;
     }
@@ -32,9 +47,17 @@ export function sendFileDownload(cwd: string, requestedPath: string, res: Respon
     res.status(404).json({ error: '文件不存在或无法读取' });
     return;
   }
+  // 不要按扩展名发 video/mp4：Safari/微信会当成网页打开，保存成 xxx.mp4.html。
+  const filename = path.basename(filePath);
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.download(filePath, path.basename(filePath), (error) => {
-    if (error && !res.headersSent) res.status(500).json({ error: '文件下载失败' });
-  });
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Disposition', attachmentDisposition(filename));
+  res.setHeader('Content-Length', String(fileStat.size));
+  fs.createReadStream(filePath)
+    .on('error', () => {
+      if (!res.headersSent) res.status(500).json({ error: '文件下载失败' });
+      else res.end();
+    })
+    .pipe(res);
 }

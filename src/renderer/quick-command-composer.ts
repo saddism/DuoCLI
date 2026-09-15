@@ -1,4 +1,7 @@
-export function createQuickCommandComposer(sessionId: string): { element: HTMLElement; dispose: () => void } {
+export function createQuickCommandComposer(
+  sessionId: string,
+  options?: { onSubmitText?: (text: string) => void },
+): { element: HTMLElement; dispose: () => void } {
   const api = (window as any).duocli;
   const element = document.createElement('div');
   element.className = 'terminal-composer';
@@ -68,6 +71,7 @@ export function createQuickCommandComposer(sessionId: string): { element: HTMLEl
     send.disabled = true;
     status.textContent = '';
     try {
+      options?.onSubmitText?.(text);
       await api.submitPty(sessionId, crypto.randomUUID(), text);
       if (input.value === text) input.value = '';
     } catch (error) { showError(error); }

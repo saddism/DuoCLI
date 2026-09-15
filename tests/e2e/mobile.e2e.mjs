@@ -39,6 +39,7 @@ function pushSessionsEvent() {
 let mockSessions = [{
   id: 's1', title: 'e2e-session', status: 'running',
   cwd: '/tmp/e2e-proj', presetCommand: 'claude', createdAt: Date.now(),
+  lastUserPrompt: '修好远程镜像交互',
 }];
 
 // 新建会话面板的数据源：内置预制 / 自定义预设 / 最近目录 / 预设使用次数
@@ -101,6 +102,14 @@ const server = http.createServer((req, res) => {
     sseClient = res;
     const t = setInterval(() => res.write(': ping\n\n'), 5000);
     req.on('close', () => { clearInterval(t); if (sseClient === res) sseClient = null; });
+    return;
+  }
+  if (p.startsWith('/api/sessions/') && p.includes('/file-download')) {
+    const reqPath = url.searchParams.get('path') || 'download.bin';
+    const filename = reqPath.split(/[\\/]/).pop() || 'download.bin';
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="download.bin"; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    res.end(Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]));
     return;
   }
   if (p.startsWith('/api/sessions/') && p.endsWith('/file-preview')) {
@@ -230,6 +239,17 @@ async function main() {
 
   const cols = await page.evaluate(() => term.cols);
   console.log(`terminal cols = ${cols}`);
+  const remoteBanner = await page.evaluate(() => {
+    const el = document.getElementById('user-prompt-banner');
+    return {
+      hidden: el?.hidden ?? true,
+      text: el?.querySelector('.user-prompt-text')?.textContent || '',
+      parent: el?.parentElement?.id || '',
+    };
+  });
+  check('打开会话后显示服务端最近在说',
+    !remoteBanner.hidden && remoteBanner.text.includes('修好远程镜像交互') && remoteBanner.parent === 'detail-page',
+    JSON.stringify(remoteBanner));
 
   // ===== Test 0: 长回放在平滑滚动配置下也必须瞬时到末尾 =====
   // 某些移动端/缓存中的 xterm 会把公开 scrollToBottom() 变成平滑动画。
@@ -608,8 +628,14 @@ async function main() {
   check('Option + ↑ 只发送组合键序列',
     receivedInputs.length === 1 && receivedInputs[0] === '\x1b[1;3A',
     `received=${JSON.stringify(receivedInputs)}`);
+  receivedInputs.length = 0;
+  await page.click('#ctrl-slash-key');
+  await sleep(200);
+  check('Ctrl + / 只发送控制字符',
+    receivedInputs.length === 1 && receivedInputs[0] === '\x1f',
+    `received=${JSON.stringify(receivedInputs)}`);
   const lastShortcutId = await page.evaluate(() => document.getElementById('shortcut-bar').lastElementChild?.id);
-  check('Option + ↑ 位于快捷键栏最后', lastShortcutId === 'option-up-key', `last=${lastShortcutId}`);
+  check('Ctrl + / 位于快捷键栏最后', lastShortcutId === 'ctrl-slash-key', `last=${lastShortcutId}`);
 
   // ===== Test 7: 发送后输入框清空且只发一次 =====
   receivedInputs.length = 0;
@@ -622,6 +648,13 @@ async function main() {
   const submitted = receivedSubmissions.join('');
   check('发送后输入框为空', inputVal === '', `value="${inputVal}"`);
   check('消息只发送一次', submitted === 'e2e message body' && receivedSubmissions.length === 1, `received=${JSON.stringify(submitted)}`);
+  const sentBanner = await page.evaluate(() => {
+    const el = document.getElementById('user-prompt-banner');
+    return { hidden: el?.hidden ?? true, text: el?.querySelector('.user-prompt-text')?.textContent || '' };
+  });
+  check('发送后横幅更新为刚才那句话',
+    !sentBanner.hidden && sentBanner.text.includes('e2e message body'),
+    JSON.stringify(sentBanner));
 
   // ===== Test 8: 竖屏恢复手机模式，不显示左右侧栏菜单 =====
   await page.evaluate(() => showPage('detail-page'));
@@ -646,19 +679,21 @@ async function main() {
     listPage: document.getElementById('main-page').classList.contains('active'),
     sessionsOpen: document.getElementById('main-page').classList.contains('landscape-drawer-open'),
     backButton: getComputedStyle(document.querySelector('#back-btn')).display,
+    listCloseButton: getComputedStyle(document.querySelector('#main-drawer-close')).display,
     pickerButton: getComputedStyle(document.querySelector('#detail-session-picker-btn')).display,
     sessionsButton: getComputedStyle(document.querySelector('#detail-header .landscape-sessions-toggle')).display,
     deviceButton: getComputedStyle(document.querySelector('#detail-header .landscape-device-toggle')).display,
     devicePull: getComputedStyle(document.getElementById('landscape-device-pull')).display,
   }));
-  check('电脑横屏默认左侧列表 + 中间 CLI，不进入独立会话页',
+  check('电脑横屏默认左侧列表 + 中间 CLI，隐藏返回/收起箭头',
     landscapeDrawer.workspace
       && landscapeDrawer.detail
       && !landscapeDrawer.listPage
       && landscapeDrawer.sessionsOpen
       && landscapeDrawer.backButton === 'none'
+      && landscapeDrawer.listCloseButton === 'none'
       && landscapeDrawer.pickerButton === 'none'
-      && landscapeDrawer.sessionsButton === 'none'
+      && landscapeDrawer.sessionsButton !== 'none'
       && landscapeDrawer.deviceButton !== 'none'
       && landscapeDrawer.devicePull === 'none',
     JSON.stringify(landscapeDrawer));
@@ -1256,26 +1291,86 @@ async function main() {
     && viewportResult.headerVisible, JSON.stringify(viewportResult));
   await page.screenshot({ path: '/tmp/duocli-mobile-viewport.png' });
 
-  const downloadClick = await page.evaluate(() => {
+  const downloadClick = await page.evaluate(async () => {
     currentSessionId = 's1';
     const original = HTMLAnchorElement.prototype.click;
     let captured;
     HTMLAnchorElement.prototype.click = function () {
-      captured = { href: this.href, download: this.download, attached: this.isConnected };
+      captured = {
+        href: this.href,
+        download: this.download,
+        attached: this.isConnected,
+        protocol: new URL(this.href).protocol,
+      };
     };
     try {
-      openFilePreview('data-store/Artifacts/家长糖宣传图-V7.zip');
+      await downloadSessionFile('data-store/Artifacts/家长糖宣传图-V7.zip');
     } finally {
       HTMLAnchorElement.prototype.click = original;
     }
-    const url = new URL(captured.href);
-    return { ...captured, path: url.searchParams.get('path'), authenticated: url.searchParams.get('token') === token };
+    return captured;
   });
-  check('ZIP 点击生成带认证的下载入口',
-    downloadClick.href.includes('/api/sessions/s1/file-download?')
-      && downloadClick.path === 'data-store/Artifacts/家长糖宣传图-V7.zip'
+  check('ZIP 点击保存为原文件名而不是 html',
+    downloadClick.protocol === 'blob:'
       && downloadClick.download === '家长糖宣传图-V7.zip'
-      && downloadClick.attached && downloadClick.authenticated, JSON.stringify(downloadClick));
+      && !String(downloadClick.download).includes('.html')
+      && downloadClick.attached, JSON.stringify(downloadClick));
+
+  const videoPreview = await page.evaluate(() => {
+    currentSessionId = 's1';
+    openFilePreview('Artifacts/demo.mp4', { useStandalonePreview: true, returnPage: 'detail-page' });
+    const video = document.querySelector('#file-preview-media video');
+    const downloadBtn = document.getElementById('file-preview-download-btn');
+    return {
+      previewActive: document.getElementById('file-preview-page').classList.contains('active'),
+      hasVideo: Boolean(video),
+      downloadHidden: downloadBtn?.hidden,
+    };
+  });
+  check('视频预览显示播放器和下载按钮',
+    videoPreview.previewActive && videoPreview.hasVideo && videoPreview.downloadHidden === false,
+    JSON.stringify(videoPreview));
+
+  const previewDownload = await page.evaluate(async () => {
+    currentSessionId = 's1';
+    const original = HTMLAnchorElement.prototype.click;
+    let captured;
+    HTMLAnchorElement.prototype.click = function () {
+      captured = {
+        href: this.href,
+        download: this.download,
+        protocol: new URL(this.href).protocol,
+      };
+    };
+    try {
+      await downloadSessionFile('桂先老师-视频3秒信息图4秒版.mp4');
+    } finally {
+      HTMLAnchorElement.prototype.click = original;
+    }
+    return captured;
+  });
+  check('中文视频下载保存为 mp4 而不是 html',
+    previewDownload.protocol === 'blob:'
+      && previewDownload.download === '桂先老师-视频3秒信息图4秒版.mp4'
+      && !String(previewDownload.download).endsWith('.html'), JSON.stringify(previewDownload));
+
+  const stopped = await page.evaluate(() => {
+    currentSessionId = 's1';
+    openFilePreview('Artifacts/demo.mp4', { useStandalonePreview: true, returnPage: 'detail-page' });
+    const video = document.querySelector('#file-preview-media video');
+    let paused = false;
+    if (video) video.pause = () => { paused = true; };
+    document.getElementById('file-preview-back-btn').click();
+    return {
+      paused,
+      remaining: document.querySelectorAll('#file-preview-media video, #mobile-file-preview-media video').length,
+      previewActive: document.getElementById('file-preview-page').classList.contains('active'),
+      downloadHidden: document.getElementById('file-preview-download-btn')?.hidden,
+    };
+  });
+  check('返回预览后停止视频播放',
+    stopped.paused && stopped.remaining === 0 && !stopped.previewActive && stopped.downloadHidden,
+    JSON.stringify(stopped));
 
   await browser.close();
   server.close();

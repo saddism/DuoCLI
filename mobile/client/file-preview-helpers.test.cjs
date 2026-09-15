@@ -5,6 +5,8 @@ const {
   isPreviewableFileName,
   findFilePathMatches,
   getMediaKind,
+  stopMediaElements,
+  isHtmlDownloadPayload,
 } = require('./file-preview-helpers.js');
 
 test('preview helper accepts common text files case-insensitively', () => {
@@ -65,4 +67,44 @@ test('parenthesized HTML artifact path is a previewable link', () => {
     findFilePathMatches(`全片制作总稿 HTML (${html})。它包含全文`).map((item) => item.filePath),
     [html],
   );
+});
+
+test('stopMediaElements pauses video and blanks iframes', () => {
+  const video = {
+    src: 'https://example/a.mp4',
+    pauseCalls: 0,
+    loadCalls: 0,
+    pause() { this.pauseCalls += 1; },
+    removeAttribute(name) { if (name === 'src') this.src = ''; },
+    load() { this.loadCalls += 1; },
+    querySelectorAll() { return []; },
+  };
+  const iframe = {
+    src: 'https://example/doc',
+    srcdoc: '<video autoplay></video>',
+    removeAttribute(name) { if (name === 'srcdoc') this.srcdoc = ''; },
+  };
+  const root = {
+    querySelectorAll(sel) {
+      if (sel === 'video, audio') return [video];
+      if (sel === 'iframe') return [iframe];
+      return [];
+    },
+  };
+  stopMediaElements(root);
+  assert.equal(video.pauseCalls, 1);
+  assert.equal(video.src, '');
+  assert.equal(video.loadCalls, 1);
+  assert.equal(iframe.src, 'about:blank');
+  assert.equal(iframe.srcdoc, '');
+});
+
+test('html or json payloads are rejected so mp4 is not saved as html', () => {
+  const html = Uint8Array.from(Buffer.from('<!doctype html><html>'));
+  const mp4 = Uint8Array.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]);
+  assert.equal(isHtmlDownloadPayload('text/html; charset=utf-8', mp4), true);
+  assert.equal(isHtmlDownloadPayload('application/json', Uint8Array.from([123])), true);
+  assert.equal(isHtmlDownloadPayload('application/octet-stream', html), true);
+  assert.equal(isHtmlDownloadPayload('video/mp4', mp4), false);
+  assert.equal(isHtmlDownloadPayload('application/octet-stream', mp4), false);
 });

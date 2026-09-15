@@ -22,6 +22,11 @@ import { AutoContinueManager } from './auto-continue-manager';
 import { parseAndroidDevices, runAdb } from './android-devices';
 import { extractContextFromChunks } from './context-capture';
 import { exportSessionContext, writeExportToFile } from './context-export';
+import {
+  listAppsForFile,
+  openFileWithApp,
+  openFileWithSystemDialog,
+} from './open-with';
 
 // macOS: 设置为普通应用模式，显示在 Dock 和 Command+Tab 切换器中
 if (process.platform === 'darwin') {
@@ -80,6 +85,16 @@ const DESKTOP_MAX_PREVIEW_BYTES = 2 * 1024 * 1024;
 // ========== 已关闭会话持久化 ==========
 let closedSessionsManager: ClosedSessionsManager;
 
+function sessionUpdatedAt(session?: { updatedAt?: number; createdAt?: number; lastInputAt?: { desktop?: number; mobile?: number } } | null): number {
+  if (!session) return Date.now();
+  return Math.max(
+    session.updatedAt || 0,
+    session.createdAt || 0,
+    session.lastInputAt?.desktop || 0,
+    session.lastInputAt?.mobile || 0,
+  ) || Date.now();
+}
+
 function addClosedSession(session: {
   title: string;
   cwd: string;
@@ -88,6 +103,7 @@ function addClosedSession(session: {
   resumeCommand: string;
   resumeSource?: ResumeCapture['source'];
   contextHistory?: ContextHistoryEntry[];
+  updatedAt?: number;
 }): void {
   const saved = closedSessionsManager.add(session);
   safeSend('closed-sessions:update', saved);
@@ -525,6 +541,7 @@ function setupPtyManager(): void {
           resumeId: session.resumeId,
           resumeCommand: session.resumeCommand || '',
           resumeSource: session.resumeSource || undefined,
+          updatedAt: sessionUpdatedAt(session),
         });
       }
 
@@ -650,6 +667,7 @@ function registerIPC(): void {
         resumeCommand: beforeClose.resumeCommand || '',
         resumeSource: beforeClose.resumeSource || undefined,
         contextHistory,
+        updatedAt: sessionUpdatedAt(beforeClose),
       });
     } else if (capture?.sessionId) {
       // `close` normally leaves the session object available until destroy;
@@ -662,6 +680,7 @@ function registerIPC(): void {
         resumeCommand: capture.resumeCommand,
         resumeSource: capture.source,
         contextHistory,
+        updatedAt: sessionUpdatedAt(beforeClose),
       });
     }
     sessionOutputTail.delete(id);
@@ -1037,6 +1056,25 @@ function registerIPC(): void {
     return loadEditorPreference();
   });
 
+  ipcMain.handle('open-with:list', (_e, filePath: string) => listAppsForFile(String(filePath || '')));
+  ipcMain.handle('open-with:app', (_e, filePath: string, appPath: string) =>
+    openFileWithApp(String(filePath || ''), String(appPath || '')));
+  ipcMain.handle('open-with:system-dialog', async (_e, filePath: string) => {
+    const target = String(filePath || '');
+    if (process.platform === 'linux') {
+      if (!mainWindow) return;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: '选择应用程序',
+        defaultPath: '/usr/bin',
+        properties: ['openFile'],
+      });
+      if (result.canceled || !result.filePaths[0]) return;
+      await openFileWithApp(target, result.filePaths[0]);
+      return;
+    }
+    await openFileWithSystemDialog(target);
+  });
+
   // 在 Finder 中打开目录
   ipcMain.handle('shell:open-folder', (_e, folderPath: string) => {
     shell.showItemInFolder(folderPath);
@@ -1279,6 +1317,7 @@ app.whenReady().then(async () => {
   closedSessionsManager = new ClosedSessionsManager(app.getPath('userData'));
   closedSessionsManager.onUpdate((sessions) => safeSend('closed-sessions:update', sessions));
   closedSessionsManager.resetStaleRestores();
+  closedSessionsManager.backfillUpdatedAtFromLocalSessions();
 
   setupPtyManager();
   autoContinueManager = new AutoContinueManager(

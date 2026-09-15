@@ -15,13 +15,18 @@ import {
 } from './pane-layout';
 import { loadGlobalWorkspaceLayout, saveWorkspaceLayout, GLOBAL_WORKSPACE_KEY } from './pane-layout-store';
 
+const { getLogoUrl, getDefaultLogoUrl, hasLogo } = require('../../mobile/client/cli-logos.js') as {
+  getLogoUrl: (cliName: string) => string;
+  getDefaultLogoUrl: () => string;
+  hasLogo: (cliName: string) => boolean;
+};
+
 export interface PaneWorkspaceCallbacks {
   onContentMount: (paneId: string, content: PaneContent, body: HTMLElement) => void;
   onContentUnmount?: (paneId: string, content: PaneContent) => void;
   onFocus?: (paneId: string, content: PaneContent) => void;
   onRequestClose?: (paneId: string, content: PaneContent) => void;
   onLayoutChange?: (layout: WorkspaceLayout) => void;
-  getAgentTagColors?: (agentLabel: string) => [string, string];
 }
 
 export function paneContentKey(content: PaneContent): string {
@@ -165,11 +170,16 @@ export class PaneWorkspace {
             && current.kind === 'terminal'
             && content.agentLabel !== undefined
             && current.agentLabel !== content.agentLabel;
-          if (labelChanged || agentChanged) {
+          const projectChanged = content.kind === 'terminal'
+            && current.kind === 'terminal'
+            && content.projectLabel !== undefined
+            && current.projectLabel !== content.projectLabel;
+          if (labelChanged || agentChanged || projectChanged) {
             this.layout = setPaneContent(this.layout, existingId, {
               ...current,
               ...(labelChanged ? { label: content.label } : {}),
               ...(agentChanged ? { agentLabel: content.agentLabel } : {}),
+              ...(projectChanged ? { projectLabel: content.projectLabel } : {}),
             } as PaneContent);
             this.render();
           }
@@ -273,14 +283,18 @@ export class PaneWorkspace {
   /** Sync terminal pane header text (session title + agent badge). */
   updateTerminalPaneMeta(
     sessionId: string,
-    meta: { label?: string; agentLabel?: string },
+    meta: { label?: string; projectLabel?: string; agentLabel?: string },
   ): void {
     const paneId = this.getPaneIdForContent('terminal', sessionId);
     if (!paneId) return;
     const pane = findPane(this.layout.root, paneId);
     if (!pane || pane.content.kind !== 'terminal') return;
     const next = { ...pane.content, ...meta };
-    if (next.label === pane.content.label && next.agentLabel === pane.content.agentLabel) return;
+    if (
+      next.label === pane.content.label
+      && next.projectLabel === pane.content.projectLabel
+      && next.agentLabel === pane.content.agentLabel
+    ) return;
     this.layout = setPaneContent(this.layout, paneId, next);
     this.renderPaneTitleDom(paneId);
   }
@@ -492,32 +506,31 @@ export class PaneWorkspace {
     if (!paneContent) return;
     title.replaceChildren();
 
-    const kindIcon = document.createElement('span');
-    kindIcon.className = 'pane-kind-icon';
-    kindIcon.setAttribute('aria-hidden', 'true');
-    kindIcon.innerHTML = this.kindIconSvg(paneContent.kind);
-    title.appendChild(kindIcon);
+    this.appendKindIcon(title, paneContent);
 
     if (paneContent.kind === 'terminal') {
-      const agent = paneContent.agentLabel?.trim();
-      if (agent) {
-        const tag = document.createElement('span');
-        tag.className = 'pane-agent-tag';
-        tag.textContent = agent;
-        tag.title = agent;
-        const [tagColor, tagBg] = this.callbacks.getAgentTagColors?.(agent) || ['', ''];
-        if (tagColor) {
-          tag.style.setProperty('--cli-tag-color', tagColor);
-          tag.style.setProperty('--cli-tag-bg', tagBg);
-        }
-        title.appendChild(tag);
-      }
       const label = document.createElement('span');
       label.className = 'pane-session-label';
       const text = paneContent.label || '终端';
       label.textContent = text;
       label.title = text;
       title.appendChild(label);
+      const project = paneContent.projectLabel?.trim();
+      if (project) {
+        const projectEl = document.createElement('span');
+        projectEl.className = 'pane-project-label';
+        projectEl.textContent = project;
+        projectEl.title = project;
+        title.appendChild(projectEl);
+      }
+      const agent = paneContent.agentLabel?.trim();
+      if (agent) {
+        const tag = document.createElement('span');
+        tag.className = 'pane-agent-tag';
+        tag.textContent = agent;
+        tag.title = agent;
+        title.appendChild(tag);
+      }
       return;
     }
     const label = document.createElement('span');
@@ -526,6 +539,36 @@ export class PaneWorkspace {
     label.textContent = text;
     label.title = text;
     title.appendChild(label);
+  }
+
+  private appendCliLogo(parent: HTMLElement, cliName: string): void {
+    const fallback = getDefaultLogoUrl();
+    const img = document.createElement('img');
+    img.className = 'cli-logo' + (hasLogo(cliName) ? '' : ' cli-logo-default');
+    img.src = getLogoUrl(cliName);
+    img.alt = '';
+    img.referrerPolicy = 'no-referrer';
+    img.addEventListener('error', () => {
+      if (img.src !== fallback) {
+        img.src = fallback;
+        img.classList.add('cli-logo-default');
+      }
+    });
+    parent.appendChild(img);
+  }
+
+  private appendKindIcon(title: HTMLElement, content: PaneContent): void {
+    const kindIcon = document.createElement('span');
+    kindIcon.className = 'pane-kind-icon';
+    kindIcon.setAttribute('aria-hidden', 'true');
+    const agent = content.kind === 'terminal' ? content.agentLabel?.trim() : '';
+    if (agent) {
+      kindIcon.title = agent;
+      this.appendCliLogo(kindIcon, agent);
+    } else {
+      kindIcon.innerHTML = this.kindIconSvg(content.kind);
+    }
+    title.appendChild(kindIcon);
   }
 
   private kindIconSvg(kind: PaneContent['kind']): string {

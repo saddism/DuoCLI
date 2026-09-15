@@ -9,7 +9,7 @@
 export type PaneDirection = 'horizontal' | 'vertical';
 
 export type PaneContent =
-  | { kind: 'terminal'; sessionId: string; label?: string; agentLabel?: string }
+  | { kind: 'terminal'; sessionId: string; label?: string; projectLabel?: string; agentLabel?: string }
   | { kind: 'file'; path: string; label?: string }
   | { kind: 'android'; deviceId?: string; label?: string }
   | { kind: 'empty' };

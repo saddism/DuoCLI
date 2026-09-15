@@ -104,6 +104,9 @@ contextBridge.exposeInMainWorld('duocli', {
   filewatcherOpen: (filePath: string) => ipcRenderer.invoke('filewatcher:open', filePath),
   filewatcherSelectEditor: () => ipcRenderer.invoke('filewatcher:select-editor'),
   filewatcherGetEditor: () => ipcRenderer.invoke('filewatcher:get-editor'),
+  listOpenWithApps: (filePath: string) => ipcRenderer.invoke('open-with:list', filePath),
+  openWithApp: (filePath: string, appPath: string) => ipcRenderer.invoke('open-with:app', filePath, appPath),
+  openWithSystemDialog: (filePath: string) => ipcRenderer.invoke('open-with:system-dialog', filePath),
   onFileChange: (cb: (filename: string, eventType: string) => void) =>
     ipcRenderer.on('filewatcher:change', (_e, filename, eventType) => cb(filename, eventType)),
 
@@ -170,7 +173,7 @@ contextBridge.exposeInMainWorld('duocli', {
   closedSessionsClear: () => ipcRenderer.invoke('closed-sessions:clear'),
   closedSessionsConfirmRestore: (closedId: string, sessionId: string) =>
     ipcRenderer.invoke('closed-sessions:confirm-restore', closedId, sessionId),
-  onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; contextHistory?: Array<{ role: 'user' | 'assistant'; content: string; timestamp?: number }>; exportPath?: string }>) => void) =>
+  onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number; contextHistory?: Array<{ role: 'user' | 'assistant'; content: string; timestamp?: number }>; exportPath?: string }>) => void) =>
     ipcRenderer.on('closed-sessions:update', (_e, sessions) => cb(sessions)),
 
   // ========== 上下文导出功能 ==========

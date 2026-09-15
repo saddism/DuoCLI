@@ -52,6 +52,7 @@ export interface PtySession {
   themeId: string;
   provider: string | null;    // 实际使用的模型提供商 (如 MiniMax, GLM 等)
   createdAt: number;          // 创建时间戳
+  updatedAt: number;          // 最后活动时间（输出或输入）
   resumeId: string | null;    // 捕获的 resume session ID (UUID)
   resumeCommand: string | null; // 完整 resume 命令 (如 "claude --resume xxx")
   resumeSource: ResumeCapture['source'] | null;
@@ -389,6 +390,7 @@ export class PtyManager {
       themeId,
       provider: null,
       createdAt: Date.now(),
+      updatedAt: Date.now(),
       resumeId: initialResume?.sessionId || null,
       resumeCommand: initialResume?.resumeCommand || null,
       resumeSource: initialResume?.source || null,
@@ -482,6 +484,7 @@ export class PtyManager {
         }
       }
 
+      session.updatedAt = Date.now();
       this.events.onData(id, data);
       session.terminalState.write(data, sequence => {
         // Only publish raw history after the same bytes have been parsed by
@@ -560,6 +563,7 @@ export class PtyManager {
     }
 
     session.lastInputAt[source] = Date.now();
+    session.updatedAt = session.lastInputAt[source];
     if (session.sizeOwner !== source) {
       session.sizeOwner = source;
       // 接管终端的那一端立刻拿回自己上次 fit 出的尺寸

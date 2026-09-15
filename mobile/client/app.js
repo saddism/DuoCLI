@@ -44,6 +44,7 @@ const mobileFileTree = createFileTreeState();
 const fileBrowseTree = createFileTreeState();
 let fileBrowseFilter = 'all';
 let filePreviewReturnPage = 'detail-page';
+let filePreviewCurrentPath = '';
 let mobileFilePreviewRequest = 0;
 let currentDevicePanel = 'device';
 let devicePanelReturnPage = 'main-page';
@@ -305,17 +306,31 @@ function shortenPath(p, maxLen = 30) {
   return '…/' + result;
 }
 
-// CLI 标签配色来自 cli-tag-colors.js，桌面端用的是同一份
-const { getCliTagColors } = globalThis.DuoCliTagColors || {
-  getCliTagColors: () => ['#94a3b8', '#1e293b'],
-};
-
 // CLI Logo 来自 cli-logos.js，桌面端用的也是同一份
 const { getLogoUrl, getDefaultLogoUrl, hasLogo } = globalThis.DuoCliLogos || {
   getLogoUrl: () => '',
   getDefaultLogoUrl: () => '',
   hasLogo: () => false,
 };
+
+function setDetailCliLogo(displayName) {
+  const img = $('detail-cli-logo');
+  if (!img) return;
+  const name = String(displayName || '').trim();
+  if (!name) {
+    img.hidden = true;
+    img.removeAttribute('src');
+    img.removeAttribute('title');
+    return;
+  }
+  const fallback = typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : getLogoUrl(name);
+  img.onerror = () => {
+    if (img.src !== fallback) img.src = fallback;
+  };
+  img.src = getLogoUrl(name);
+  img.title = name;
+  img.hidden = false;
+}
 
 function hideTerminalLoading() {
   const el = $('terminal-loading');
@@ -481,6 +496,7 @@ function showLandscapeEmptyTerminal() {
   closeTerminal();
   setTerminalInputReady(false);
   if ($('detail-name')) $('detail-name').textContent = '未选择会话';
+  setDetailCliLogo('');
   if ($('detail-status')) $('detail-status').className = 'status-dot inactive';
   const loading = $('terminal-loading');
   if (!loading) return;
@@ -550,7 +566,9 @@ async function toggleLandscapeDevicePanel() {
 
 function setDevicePanel(panel) {
   const allowed = ['device', 'files', 'preview'];
-  currentDevicePanel = allowed.includes(panel) ? panel : 'device';
+  const next = allowed.includes(panel) ? panel : 'device';
+  if (currentDevicePanel === 'preview' && next !== 'preview') stopFilePreviewPlayback();
+  currentDevicePanel = next;
   document.querySelectorAll('.device-panel-tab').forEach((button) => {
     const selected = button.dataset.devicePanel === currentDevicePanel;
     button.classList.toggle('active', selected);
@@ -582,6 +600,7 @@ function showPage(id) {
     id = 'detail-page';
     landscapeSessionsCollapsed = false;
   }
+  stopFilePreviewPlayback();
   if (id === 'main-page' || id === 'login-page') stopAndroidMirror();
   if (id !== 'detail-page') closeLandscapePanels();
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -985,6 +1004,8 @@ function restoreTerminalSnapshot(msg) {
           }
           if (recreateViewport != null) pendingRecreateViewport = null;
         }
+        rebindMobilePromptMarker();
+        renderMobilePromptBanner();
         if (hasReplayBody) hideTerminalLoading();
       }
       resolve();
@@ -1001,6 +1022,7 @@ function syncTerminalToViewport() {
   try { fitAddon.fit(); } catch {}
   lastTerminalSize = `${container.clientWidth}x${container.clientHeight}`;
   handleResize();
+  rebindMobilePromptMarker();
   scheduleTerminalSelectHandlesUpdate();
 }
 
@@ -2316,6 +2338,7 @@ function initDevicePage() {
     if ($('device-page').classList.contains('landscape-drawer-open')) {
       $('device-page').classList.remove('landscape-drawer-open');
       document.body.classList.remove('landscape-device-open');
+      stopFilePreviewPlayback();
       stopAndroidMirror();
       syncLandscapePanelButtons();
       scheduleLandscapeWorkspaceResize();
@@ -2616,18 +2639,22 @@ async function refreshSessions() {
   }
 }
 
-function cliTagHtml(dn, tagColor, tagBg) {
+function cliTagHtml(dn) {
   const logoUrl = getLogoUrl(dn);
   const fallback = typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : logoUrl;
-  return `<span class="cli-tag" style="--cli-c:${tagColor};--cli-bg:${tagBg}"><img class="cli-logo-img" src="${logoUrl}" alt="${escHtml(dn)}" data-fallback="${fallback}" onerror="this.onerror=null;this.src=this.dataset.fallback||this.src"><span>${escHtml(dn)}</span></span>`;
+  return `<span class="cli-tag" title="${escHtml(dn)}"><img class="cli-logo-img" src="${logoUrl}" alt="" data-fallback="${fallback}" onerror="this.onerror=null;this.src=this.dataset.fallback||this.src"><span>${escHtml(dn)}</span></span>`;
+}
+
+function sessionProjectName(cwd) {
+  const value = String(cwd || '').trim();
+  if (!value) return '';
+  return value.split(/[\\/]/).filter(Boolean).pop() || value;
 }
 
 function renderClosedSessionCard(cs) {
   const dn = cs.displayName || '';
-  const [tagColor, tagBg] = dn ? getCliTagColors(dn) : ['', ''];
-
-  let tagHtml = '';
-  if (dn) tagHtml = cliTagHtml(dn, tagColor, tagBg);
+  const tagHtml = dn ? cliTagHtml(dn) : '';
+  const projectName = sessionProjectName(cs.cwd);
   
   const restoring = restoringClosedSessionIds.has(cs.id) || cs.state === 'restoring';
   return `
@@ -2637,11 +2664,11 @@ function renderClosedSessionCard(cs) {
         <div class="session-info">
           <div class="session-title-row">
             <div class="session-title">${escHtml(cs.title || '新对话')}</div>
-            ${tagHtml}
           </div>
           <div class="session-meta">
-            <span class="session-time">${formatTime(cs.closedAt)}</span>
-            <span class="session-cwd">${escHtml((cs.cwd || '').split('/').pop() || cs.cwd || '')}</span>
+            ${projectName ? `<span class="session-cwd">${escHtml(projectName)}</span>` : ''}
+            ${tagHtml}
+            <span class="session-time">${formatTime(cs.updatedAt || cs.closedAt)}</span>
           </div>
         </div>
         <div class="closed-session-actions">
@@ -3040,12 +3067,9 @@ function renderSessionList() {
 
   const activeCards = sessions.map(s => {
     const dn = s.displayName || '';
-    const [tagColor, tagBg] = dn ? getCliTagColors(dn) : ['', ''];
     const pinned = isSessionPinned(s.id);
-    
-    // 构建 CLI 标签 HTML（带 logo）
-    let tagHtml = '';
-    if (dn) tagHtml = cliTagHtml(dn, tagColor, tagBg);
+    const tagHtml = dn ? cliTagHtml(dn) : '';
+    const projectName = sessionProjectName(s.cwd);
     return `
     <div class="session-card${s.id === currentSessionId ? ' is-current' : ''}${pinned ? ' is-pinned' : ''}" data-id="${s.id}">
       <div class="session-card-body">
@@ -3054,11 +3078,11 @@ function renderSessionList() {
           <div class="session-title-row">
             ${pinned ? `<span class="session-pin-badge" title="已置顶">${iconSvg('pin', 12)}</span>` : ''}
             <div class="session-title">${escHtml(s.title || s.presetCommand || '终端')}</div>
-            ${tagHtml}
           </div>
           <div class="session-meta">
+            ${projectName ? `<span class="session-cwd">${escHtml(projectName)}</span>` : ''}
+            ${tagHtml}
             <span class="session-time">${formatTime(s.createdAt)}</span>
-            <span class="session-cwd">${escHtml(String(s.cwd || '').split('/').pop() || s.cwd || '')}</span>
           </div>
         </div>
         <div class="session-arrow">›</div>
@@ -3076,7 +3100,7 @@ function renderSessionList() {
 
   let closedHtml = '';
   if (closedSessions.length > 0) {
-    const sorted = [...closedSessions].sort((a, b) => b.closedAt - a.closedAt);
+    const sorted = [...closedSessions].sort((a, b) => (b.updatedAt || b.closedAt) - (a.updatedAt || a.closedAt));
     const cards = closedSessionsCollapsed ? '' : sorted.map(renderClosedSessionCard).join('');
     closedHtml = `
       <div class="closed-sessions-header">
@@ -3180,6 +3204,7 @@ function startSSE() {
         const s = activeSessionsCache.find(x => x.id === currentSessionId);
         if (s) {
           $('detail-status').className = `status-dot ${s.status}`;
+          applyRemoteUserPrompt(s);
         }
       }
     } catch {}
@@ -3376,16 +3401,93 @@ async function renderFileBrowseTree(force = false) {
   });
 }
 
+function downloadSessionFileUrl(filePath) {
+  return `${API}/api/sessions/${encodeURIComponent(currentSessionId)}/file-download?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(token)}`;
+}
+
+function canShareDownloadFile(file) {
+  const ua = navigator.userAgent || '';
+  const iOS = /iPhone|iPad|iPod/i.test(ua)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (!iOS || typeof navigator.canShare !== 'function') return false;
+  try { return navigator.canShare({ files: [file] }); } catch { return false; }
+}
+
+async function downloadSessionFile(filePath) {
+  if (!currentSessionId || !filePath) return;
+  const filename = String(filePath).split(/[\\/]/).pop() || 'download';
+  const url = downloadSessionFileUrl(filePath);
+  try {
+    const res = await fetch(url, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      credentials: 'omit',
+    });
+    if (res.status === 401) { logout(); return; }
+    const contentType = res.headers.get('content-type') || '';
+    const buffer = await res.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const helpers = globalThis.DuoFilePreviewHelpers;
+    if (!res.ok || helpers?.isHtmlDownloadPayload?.(contentType, bytes)) {
+      let message = '下载失败';
+      if ((contentType || '').toLowerCase().includes('application/json')) {
+        try {
+          const data = JSON.parse(new TextDecoder().decode(bytes));
+          if (data && typeof data.error === 'string' && data.error.trim()) message = data.error.trim();
+        } catch {}
+      }
+      showCopyToast(message);
+      return;
+    }
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const file = typeof File === 'function'
+      ? new File([blob], filename, { type: 'application/octet-stream' })
+      : null;
+    if (file && canShareDownloadFile(file)) {
+      try {
+        await navigator.share({ files: [file] });
+        return;
+      } catch (error) {
+        if (error && error.name === 'AbortError') return;
+      }
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = filename;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
+  } catch (error) {
+    showCopyToast(error && error.message ? error.message : '下载失败');
+  }
+}
+
+function setFilePreviewDownloadPath(filePath) {
+  filePreviewCurrentPath = String(filePath || '');
+  const visible = Boolean(filePreviewCurrentPath);
+  for (const id of ['file-preview-download-btn', 'mobile-file-preview-download-btn']) {
+    const btn = $(id);
+    if (btn) btn.hidden = !visible;
+  }
+}
+
+function stopFilePreviewPlayback() {
+  const helpers = globalThis.DuoFilePreviewHelpers;
+  for (const id of ['file-preview-media', 'mobile-file-preview-media']) {
+    const root = $(id);
+    helpers?.stopMediaElements?.(root);
+    if (root) root.innerHTML = '';
+  }
+  setFilePreviewDownloadPath('');
+}
+
 function openFilePreview(requestedPath, options = {}) {
   if (!currentSessionId) return;
   const helpers = globalThis.DuoFilePreviewHelpers;
   if (helpers?.isDownloadableFileName?.(requestedPath)) {
-    const link = document.createElement('a');
-    link.href = `${API}/api/sessions/${encodeURIComponent(currentSessionId)}/file-download?path=${encodeURIComponent(requestedPath)}&token=${encodeURIComponent(token)}`;
-    link.download = requestedPath.split(/[\\/]/).pop() || 'download';
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
+    void downloadSessionFile(requestedPath);
     return;
   }
   if (helpers?.isPreviewableFileName && !helpers.isPreviewableFileName(requestedPath)) {
@@ -3412,7 +3514,10 @@ function openFilePreview(requestedPath, options = {}) {
   meta.textContent = '正在读取…';
   content.textContent = '';
   content.style.display = '';
-  if (mediaBox) mediaBox.innerHTML = '';
+  if (mediaBox) {
+    helpers?.stopMediaElements?.(mediaBox);
+    mediaBox.innerHTML = '';
+  }
   if (legacyTitle) legacyTitle.textContent = baseName;
   if (legacyMeta) legacyMeta.textContent = '正在读取…';
   if (legacyContent) legacyContent.textContent = '';
@@ -3424,6 +3529,7 @@ function openFilePreview(requestedPath, options = {}) {
     openDevicePanel('preview');
     $('file-preview-page').classList.add('active', 'legacy-preview-active');
   }
+  setFilePreviewDownloadPath(requestedPath);
 
   const mediaKind = helpers?.getMediaKind?.(requestedPath);
   if (mediaKind) {
@@ -3696,7 +3802,15 @@ function createTerminal() {
   registerMobileFileLinks();
 
   // 终端键盘输入 → WebSocket
+  mobileTypedLine = '';
+  mobilePromptMarker = null;
   term.onData((data) => {
+    if (userPromptBanner) {
+      const parsed = userPromptBanner.consumeTypedInput(mobileTypedLine, data);
+      mobileTypedLine = parsed.line;
+      const last = parsed.segments.filter((segment) => userPromptBanner.looksLikeUserPrompt(segment)).pop();
+      if (last) noteMobileUserPrompt(last);
+    }
     sendInputWithHexEnter(data);
   });
 
@@ -4241,6 +4355,11 @@ async function openSession(id, fromHistory = false) {
   currentSessionId = id;
   failedSubmission = mobilePendingSubmissions.get(id) || null;
   restoreMobileDraft(id);
+  mobilePromptExpanded = false;
+  mobilePromptMarker = null;
+  mobileTypedLine = '';
+  applyRemoteUserPrompt(activeSessionsCache.find(x => x.id === id));
+  renderMobilePromptBanner();
   resetFileTreeState(mobileFileTree);
   resetFileTreeState(fileBrowseTree);
   mobileFilePreviewRequest++;
@@ -4252,8 +4371,10 @@ async function openSession(id, fromHistory = false) {
     const s = sessions.find(x => x.id === id);
     if (s && currentSessionId === id) {
       $('detail-name').textContent = s.title || s.presetCommand || '终端';
+      setDetailCliLogo(s.displayName || s.presetCommand || '');
       $('detail-status').className = `status-dot ${s.status}`;
       lastKnownSessionCwd = s.cwd || '';
+      applyRemoteUserPrompt(s);
     } else if (Array.isArray(sessions) && !s && currentSessionId === id) {
       showCopyToast('会话已结束，可在已关闭记录中恢复');
       if (history.state?.duocliSession === id) history.replaceState({ duocliRoot: true }, '', location.pathname);
@@ -4327,6 +4448,17 @@ $('file-preview-back-btn').onclick = () => {
     });
   }
 };
+
+function handleFilePreviewDownload() {
+  if (!filePreviewCurrentPath) {
+    showCopyToast('当前没有可下载的文件');
+    return;
+  }
+  void downloadSessionFile(filePreviewCurrentPath);
+}
+
+$('file-preview-download-btn')?.addEventListener('click', () => handleFilePreviewDownload());
+$('mobile-file-preview-download-btn')?.addEventListener('click', () => handleFilePreviewDownload());
 
 // ========== 项目文件浏览页 ==========
 function updateFileBrowseFilterUI() {
@@ -4524,6 +4656,90 @@ let submitAfterComposition = false;
 let allowComposerLineBreak = false;
 let failedSubmission = null;
 const pendingSubmissions = new Map();
+const userPromptBanner = globalThis.DuoUserPromptBanner;
+let mobilePromptBanner = null;
+let mobilePromptExpanded = false;
+let mobilePromptMarker = null;
+let mobileTypedLine = '';
+let lastLocalPromptAt = 0;
+
+function currentMobilePromptText() {
+  return userPromptBanner?.readStoredPrompt(currentSessionId) || '';
+}
+
+function renderMobilePromptBanner() {
+  if (!userPromptBanner || !mobilePromptBanner) return;
+  userPromptBanner.renderBanner(mobilePromptBanner, {
+    text: currentMobilePromptText(),
+    expanded: mobilePromptExpanded,
+  });
+  scheduleTerminalResize();
+}
+
+function bindMobilePromptBanner() {
+  if (!userPromptBanner) return;
+  const root = $('user-prompt-banner');
+  if (!root) return;
+  if (mobilePromptBanner?.element === root) {
+    renderMobilePromptBanner();
+    return;
+  }
+  mobilePromptBanner = userPromptBanner.bindExistingBanner(root);
+  mobilePromptBanner?.moreBtn?.addEventListener('click', () => {
+    mobilePromptExpanded = !mobilePromptExpanded;
+    renderMobilePromptBanner();
+  });
+  mobilePromptBanner?.jumpBtn?.addEventListener('click', () => jumpToMobileUserPrompt());
+  renderMobilePromptBanner();
+}
+
+function applyRemoteUserPrompt(session) {
+  if (!userPromptBanner || !session?.id || !session.lastUserPrompt) return;
+  if (session.id === currentSessionId && Date.now() - lastLocalPromptAt < 3000) return;
+  const incoming = userPromptBanner.normalizePrompt(session.lastUserPrompt);
+  if (!incoming || incoming === userPromptBanner.readStoredPrompt(session.id)) return;
+  userPromptBanner.writeStoredPrompt(session.id, incoming);
+  if (session.id === currentSessionId) {
+    mobilePromptExpanded = false;
+    renderMobilePromptBanner();
+  }
+}
+
+function noteMobileUserPrompt(text) {
+  if (!userPromptBanner?.looksLikeUserPrompt(text) || !currentSessionId) return;
+  const normalized = userPromptBanner.normalizePrompt(text);
+  try { mobilePromptMarker?.dispose(); } catch {}
+  mobilePromptExpanded = false;
+  lastLocalPromptAt = Date.now();
+  userPromptBanner.writeStoredPrompt(currentSessionId, normalized);
+  mobilePromptMarker = term ? term.registerMarker(0) : null;
+  renderMobilePromptBanner();
+}
+
+function rebindMobilePromptMarker() {
+  if (!term || !userPromptBanner) return;
+  const text = currentMobilePromptText();
+  if (!text) return;
+  const line = userPromptBanner.promptBlockStartLine(term.buffer.active, text);
+  if (line < 0) return;
+  try { mobilePromptMarker?.dispose(); } catch {}
+  mobilePromptMarker = userPromptBanner.markerAtLine(term, line);
+}
+
+function jumpToMobileUserPrompt() {
+  if (!term || !userPromptBanner) return;
+  const text = currentMobilePromptText();
+  if (!text) return;
+  rebindMobilePromptMarker();
+  const line = userPromptBanner.resolvePromptJumpLine(term.buffer.active, text, mobilePromptMarker);
+  if (line < 0) {
+    showCopyToast('还没在记录里找到这句话');
+    return;
+  }
+  markUserScrolling();
+  programmaticScrollUntil = Date.now() + 400;
+  userPromptBanner.scrollLineToTop(term, line);
+}
 
 function requestSubmission(sessionId, text, id) {
   return new Promise((resolve, reject) => {
@@ -4562,6 +4778,7 @@ async function sendMessage() {
   }
   const text = input.value.replace(/\r\n?/g, '\n');
   if (!text.trim()) return;
+  noteMobileUserPrompt(text);
   const keepKeyboard = document.activeElement === input;
   const sessionId = currentSessionId;
   const savedFailure = mobilePendingSubmissions.get(sessionId);
@@ -4600,6 +4817,7 @@ async function sendMessage() {
 }
 
 updateComposerAvailability();
+bindMobilePromptBanner();
 
 $('msg-input').addEventListener('blur', () => {
   saveCurrentMobileDraft();

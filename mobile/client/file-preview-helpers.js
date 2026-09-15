@@ -101,6 +101,32 @@
     return true;
   }
 
+  function stopMediaElements(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+    root.querySelectorAll('video, audio').forEach((el) => {
+      try { el.pause(); } catch {}
+      try { el.removeAttribute('src'); } catch {}
+      try {
+        el.querySelectorAll('source').forEach((source) => source.remove());
+      } catch {}
+      try { el.load(); } catch {}
+    });
+    root.querySelectorAll('iframe').forEach((frame) => {
+      try { frame.src = 'about:blank'; } catch {}
+      try { frame.removeAttribute('srcdoc'); } catch {}
+    });
+  }
+
+  function isHtmlDownloadPayload(contentType, bytes) {
+    const type = String(contentType || '').toLowerCase();
+    if (/(?:text\/html|application\/json|text\/javascript|application\/javascript)\b/.test(type)) return true;
+    if (!bytes || !bytes.length) return false;
+    const n = Math.min(bytes.length, 64);
+    let text = '';
+    for (let i = 0; i < n; i++) text += String.fromCharCode(bytes[i]);
+    return /^(?:\uFEFF)?\s*<(?:!doctype\s+html\b|html\b|head\b)/i.test(text);
+  }
+
   function findFilePathMatches(text) {
     if (!terminalContentHelpers) return [];
     return terminalContentHelpers.findLinks(String(text || ''))
@@ -121,5 +147,7 @@
     getFileExtension,
     shouldSkipDirName,
     matchesFileBrowseFilter,
+    stopMediaElements,
+    isHtmlDownloadPayload,
   };
 });

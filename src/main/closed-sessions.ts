@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { getDisplayName, PtyManager } from './pty-manager';
 import {
@@ -25,6 +26,8 @@ export interface ClosedSession {
   resumeCommand: string;
   displayName: string;
   closedAt: number;
+  /** 会话最后活动时间；列表按这个从新到旧排，而不是按点击关闭的时间 */
+  updatedAt?: number;
   cli?: string;
   resumeSource?: ResumeCapture['source'];
   state?: 'closed' | 'restoring';
@@ -38,6 +41,58 @@ export interface ClosedSession {
 }
 
 const MAX_CLOSED_SESSIONS = 20;
+
+export function closedSessionUpdatedAt(session: {
+  updatedAt?: number;
+  closedAt?: number;
+  contextHistory?: ContextHistoryEntry[];
+}): number {
+  const updated = Number(session.updatedAt);
+  if (Number.isFinite(updated) && updated > 0) return updated;
+  const history = session.contextHistory;
+  if (Array.isArray(history)) {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const ts = Number(history[i]?.timestamp);
+      if (Number.isFinite(ts) && ts > 0) return ts;
+    }
+  }
+  const closed = Number(session.closedAt);
+  return Number.isFinite(closed) ? closed : 0;
+}
+
+export function sortClosedSessionsByUpdatedAt<T extends {
+  updatedAt?: number;
+  closedAt?: number;
+  contextHistory?: ContextHistoryEntry[];
+}>(sessions: T[]): T[] {
+  return [...sessions].sort((a, b) => closedSessionUpdatedAt(b) - closedSessionUpdatedAt(a));
+}
+
+function collectResumeFileMtimes(root: string, wanted: Set<string>): Map<string, number> {
+  const found = new Map<string, number>();
+  if (!wanted.size) return found;
+  const walk = (dir: string, depth: number) => {
+    if (depth > 8) return;
+    let names: string[] = [];
+    try { names = fs.readdirSync(dir); } catch { return; }
+    for (const name of names) {
+      const full = path.join(dir, name);
+      let stat: fs.Stats;
+      try { stat = fs.statSync(full); } catch { continue; }
+      if (stat.isDirectory()) {
+        walk(full, depth + 1);
+        continue;
+      }
+      for (const id of wanted) {
+        if (!name.includes(id)) continue;
+        const prev = found.get(id) || 0;
+        if (stat.mtimeMs > prev) found.set(id, Math.round(stat.mtimeMs));
+      }
+    }
+  };
+  walk(root, 0);
+  return found;
+}
 
 export class ClosedSessionsManager {
   private filePath: string;
@@ -84,7 +139,7 @@ export class ClosedSessionsManager {
   }
 
   list(options?: { resetRestoring?: boolean }): ClosedSession[] {
-    return this.read().map((value: any) => {
+    const mapped = this.read().map((value: any) => {
       const session = { ...value } as ClosedSession;
       if (session.resumeId && (
         !isResumeCommandCompatible(session.presetCommand || '', session.resumeCommand || '')
@@ -102,6 +157,7 @@ export class ClosedSessionsManager {
       }
       return session;
     }).filter((session: ClosedSession) => !!session.resumeId);
+    return sortClosedSessionsByUpdatedAt(mapped);
   }
 
   resetStaleRestores(): ClosedSession[] {
@@ -109,9 +165,30 @@ export class ClosedSessionsManager {
     return this.save(list);
   }
 
+  /** 旧记录只有关闭时间。启动时按本地 CLI 会话文件的最后写入时间补上 updatedAt，已有字段的不改。 */
+  backfillUpdatedAtFromLocalSessions(sessionRoot = path.join(os.homedir(), '.codex', 'sessions')): ClosedSession[] {
+    const sessions = this.list();
+    const missing = sessions.filter(session => !session.updatedAt && session.resumeId);
+    if (!missing.length) return sessions;
+    const wanted = new Set(missing.map(session => session.resumeId));
+    const found = collectResumeFileMtimes(sessionRoot, wanted);
+    let changed = false;
+    for (const session of sessions) {
+      if (session.updatedAt) continue;
+      const mtime = found.get(session.resumeId);
+      if (mtime) {
+        session.updatedAt = mtime;
+        changed = true;
+      }
+    }
+    return changed ? this.save(sessions) : sessions;
+  }
+
   private save(sessions: ClosedSession[]): ClosedSession[] {
     const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-    const filtered = sessions.filter(s => s.closedAt > cutoff).slice(-MAX_CLOSED_SESSIONS);
+    const filtered = sortClosedSessionsByUpdatedAt(
+      sessions.filter(s => s.closedAt > cutoff)
+    ).slice(0, MAX_CLOSED_SESSIONS);
     const serialized = JSON.stringify(filtered, null, 2);
     try {
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
@@ -138,12 +215,14 @@ export class ClosedSessionsManager {
     resumeId: string;
     resumeCommand: string;
     resumeSource?: ResumeCapture['source'];
+    updatedAt?: number;
   }): ClosedSession[] {
     const list = this.list();
     const cli = identifyCli(session.presetCommand);
     const duplicateIndex = list.findIndex(item =>
       item.resumeId === session.resumeId && (item.cli || identifyCli(item.presetCommand)) === cli,
     );
+    const updatedAt = Number(session.updatedAt);
     const entry: ClosedSession = {
       id: duplicateIndex >= 0
         ? list[duplicateIndex].id
@@ -155,6 +234,7 @@ export class ClosedSessionsManager {
       resumeCommand: session.resumeCommand || buildResumeCommand(session.presetCommand, session.resumeId),
       displayName: this.displayNameResolver?.(session.presetCommand) || getDisplayName(session.presetCommand),
       closedAt: Date.now(),
+      updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : Date.now(),
       cli,
       resumeSource: session.resumeSource,
       state: 'closed',
