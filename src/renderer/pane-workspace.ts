@@ -15,10 +15,12 @@ import {
 } from './pane-layout';
 import { loadGlobalWorkspaceLayout, saveWorkspaceLayout, GLOBAL_WORKSPACE_KEY } from './pane-layout-store';
 
-const { getLogoUrl, getDefaultLogoUrl, hasLogo } = require('../../mobile/client/cli-logos.js') as {
+const { getLogoUrl, getDefaultLogoUrl, getLetterLogoUrl, hasLogo, logoNeedsInvert } = require('../../mobile/client/cli-logos.js') as {
   getLogoUrl: (cliName: string) => string;
   getDefaultLogoUrl: () => string;
+  getLetterLogoUrl: (cliName: string) => string;
   hasLogo: (cliName: string) => boolean;
+  logoNeedsInvert: (cliName: string) => boolean;
 };
 
 export interface PaneWorkspaceCallbacks {
@@ -542,9 +544,11 @@ export class PaneWorkspace {
   }
 
   private appendCliLogo(parent: HTMLElement, cliName: string): void {
-    const fallback = getDefaultLogoUrl();
+    const fallback = getLetterLogoUrl(cliName) || getDefaultLogoUrl();
     const img = document.createElement('img');
-    img.className = 'cli-logo' + (hasLogo(cliName) ? '' : ' cli-logo-default');
+    img.className = 'cli-logo'
+      + (hasLogo(cliName) ? '' : ' cli-logo-default')
+      + (logoNeedsInvert(cliName) ? ' cli-logo-invert' : '');
     img.src = getLogoUrl(cliName);
     img.alt = '';
     img.referrerPolicy = 'no-referrer';
@@ -552,6 +556,7 @@ export class PaneWorkspace {
       if (img.src !== fallback) {
         img.src = fallback;
         img.classList.add('cli-logo-default');
+        img.classList.remove('cli-logo-invert');
       }
     });
     parent.appendChild(img);

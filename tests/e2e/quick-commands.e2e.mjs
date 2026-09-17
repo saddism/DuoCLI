@@ -23,7 +23,6 @@ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const browser = await puppeteer.launch({ executablePath: resolveChromeExecutable(), headless: true, args: ['--no-sandbox'] });
 try {
   const origin = `http://127.0.0.1:${server.address().port}`;
-  const submissions = [];
   const pages = [];
   for (let i = 0; i < 2; i++) {
     const context = await browser.createBrowserContext();
@@ -31,43 +30,65 @@ try {
     await page.setViewport({ width: 960, height: 700 });
     await page.exposeFunction('readCommands', () => store.read());
     await page.exposeFunction('editCommands', operation => store.update(operation));
-    await page.exposeFunction('submitDraft', (id, submissionId, text) => { submissions.push({ id, text }); });
     await page.goto(origin);
     await page.evaluate(() => {
-      window.duocli = { getQuickCommands: readCommands, updateQuickCommands: editCommands, submitPty: submitDraft };
+      window.duocli = { getQuickCommands: readCommands, updateQuickCommands: editCommands };
+      window.ptyWrites = [];
       window.manager = new DuoTerminal.TerminalManager(document.getElementById('area'));
-      manager.create('s1', 'vscode-dark', '/tmp', () => { throw new Error('Shortcut wrote directly to PTY'); });
+      manager.create('s1', 'vscode-dark', '/tmp', data => { window.ptyWrites.push(data); });
       manager.mountTo('s1', document.getElementById('area'));
     });
     await page.waitForSelector('.desktop-quick-commands button');
     pages.push(page);
   }
   const [first, second] = pages;
+  assert.equal(await second.$('.terminal-compose-row'), null);
+  assert.equal(await second.$('.compose-send'), null);
+  const truncated = await first.evaluate(() => {
+    const button = [...document.querySelectorAll('.desktop-quick-commands [data-command]')].find(item => item.dataset.command === '/unicloud-log-viewer');
+    return { label: button?.textContent, command: button?.dataset.command };
+  });
+  assert.equal(truncated.command, '/unicloud-log-viewer');
+  assert.equal(truncated.label, '/unicloud-…');
   await first.evaluate(() => [...document.querySelectorAll('.desktop-quick-commands button')].find(button => button.textContent === '+ 添加').click());
   await first.type('.quick-command-editor input', '检查代码');
   await first.click('.quick-command-editor button');
-  await second.waitForFunction(() => [...document.querySelectorAll('.desktop-quick-commands button')].some(button => button.textContent === '检查代码'));
-  await second.evaluate(() => {
-    const input = document.querySelector('.terminal-compose-row textarea');
-    input.value = '前文后文'; input.focus(); input.setSelectionRange(2, 2);
-  });
-  const button = await second.evaluateHandle(() => [...document.querySelectorAll('.desktop-quick-commands button')].find(button => button.textContent === '检查代码'));
+  await second.waitForFunction(() => [...document.querySelectorAll('.desktop-quick-commands [data-command]')].some(button => button.dataset.command === '检查代码'));
+  const button = await second.evaluateHandle(() => [...document.querySelectorAll('.desktop-quick-commands [data-command]')].find(item => item.dataset.command === '检查代码'));
   await button.asElement().click();
-  assert.deepEqual(await second.evaluate(() => {
-    const input = document.querySelector('.terminal-compose-row textarea');
-    return { text: input.value, caret: input.selectionStart, focused: document.activeElement === input };
-  }), { text: '前文检查代码后文', caret: 6, focused: true });
-  assert.equal(submissions.length, 0);
-  await second.keyboard.press('Enter');
-  assert.equal(submissions.length, 0);
-  await second.click('.compose-send');
-  await second.waitForFunction(() => document.querySelector('.terminal-compose-row textarea').value === '');
-  assert.equal(submissions.length, 1);
-  assert.equal(submissions[0].text, '前文检查代码\n后文');
+  await second.waitForSelector('.quick-command-confirm-overlay');
+  assert.equal(await second.$eval('.quick-command-confirm-text', el => el.textContent), '检查代码');
+  await second.click('.quick-command-confirm-overlay [data-confirm="no"]');
+  await second.waitForFunction(() => !document.querySelector('.quick-command-confirm-overlay'));
+  assert.deepEqual(await second.evaluate(() => window.ptyWrites), []);
+  await button.asElement().click();
+  await second.waitForSelector('.quick-command-confirm-overlay [data-confirm="yes"]');
+  await second.click('.quick-command-confirm-overlay [data-confirm="yes"]');
+  await second.waitForFunction(() => window.ptyWrites.includes('检查代码'));
+  assert.deepEqual(await second.evaluate(() => window.ptyWrites), ['检查代码']);
+  assert.deepEqual(await first.evaluate(() => window.ptyWrites), []);
+  const orderBefore = await first.evaluate(() => [...document.querySelectorAll('.desktop-quick-commands [data-command]')].map(button => button.dataset.command));
+  assert.ok(orderBefore.length >= 2);
+  await first.evaluate(async () => {
+    const source = document.querySelector('.desktop-quick-commands [data-command]');
+    const target = document.querySelectorAll('.desktop-quick-commands [data-command]')[1];
+    const from = source.getBoundingClientRect();
+    const to = target.getBoundingClientRect();
+    const pointer = { bubbles: true, button: 0, pointerId: 7, pointerType: 'mouse', isPrimary: true };
+    source.dispatchEvent(new PointerEvent('pointerdown', { ...pointer, clientX: from.left + 6, clientY: from.top + 6 }));
+    await new Promise(resolve => setTimeout(resolve, 500));
+    source.dispatchEvent(new PointerEvent('pointermove', { ...pointer, clientX: to.right + 8, clientY: to.top + 6 }));
+    source.dispatchEvent(new PointerEvent('pointerup', { ...pointer, clientX: to.right + 8, clientY: to.top + 6 }));
+  });
+  await first.waitForFunction((previous) => {
+    const next = [...document.querySelectorAll('.desktop-quick-commands [data-command]')].map(button => button.dataset.command);
+    return next[0] === previous[1] && next[1] === previous[0];
+  }, {}, orderBefore);
+  assert.deepEqual(store.read().commands.slice(0, 2), [orderBefore[1], orderBefore[0]]);
   store.update({ action: 'remove', command: '检查代码' });
-  for (const page of pages) await page.waitForFunction(() => ![...document.querySelectorAll('.desktop-quick-commands button')].some(button => button.textContent === '检查代码'));
+  for (const page of pages) await page.waitForFunction(() => ![...document.querySelectorAll('.desktop-quick-commands [data-command]')].some(button => button.dataset.command === '检查代码'));
   await first.screenshot({ path: '/tmp/duocli-desktop-quick-commands.png' });
-  console.log('PASS: isolated clients share persisted additions/deletions; cursor insertion does not submit; explicit Send submits once.');
+  console.log('PASS: isolated clients share persisted additions/deletions; shortcut writes into the CLI.');
 } finally {
   await browser.close();
   await new Promise(resolve => server.close(resolve));

@@ -19,6 +19,20 @@ test('lastUserPromptFrom returns the latest real prompt', () => {
   assert.equal(banner.lastUserPromptFrom(['ok']), '');
 });
 
+test('stored prompts stay isolated per session id', () => {
+  const storage = {
+    data: {},
+    getItem(key) { return this.data[key] ?? null; },
+    setItem(key, value) { this.data[key] = String(value); },
+  };
+  banner.writeStoredPrompt('term-old-1', '别的对话里的话', storage);
+  banner.writeStoredPrompt('term-new-2', '', storage);
+  assert.equal(banner.readStoredPrompt('term-old-1', storage), '别的对话里的话');
+  assert.equal(banner.readStoredPrompt('term-new-2', storage), '');
+  banner.writeStoredPrompt('term-old-1', '', storage);
+  assert.equal(banner.readStoredPrompt('term-old-1', storage), '');
+});
+
 
 test('looksLikeUserPrompt ignores confirmations and empty text', () => {
   assert.equal(banner.looksLikeUserPrompt('  '), false);

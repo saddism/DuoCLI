@@ -1,11 +1,13 @@
 // DuoCLI Mobile - Service Worker
 
-const CACHE_NAME = 'duocli-v50';
+const CACHE_NAME = 'duocli-v72';
 const ASSETS = [
   '/',
   '/index.html',
   '/style.css',
   '/app.js',
+  '/network-mode.js',
+  '/native-chat-view.js',
   '/xterm.css',
   '/xterm.js',
   '/addon-fit.js',
@@ -15,11 +17,17 @@ const ASSETS = [
   '/android-nav-keys.js',
   '/file-preview-helpers.js',
   '/terminal-scroll-helpers.js',
+  '/terminal-history-layer.js',
   '/spinner-interceptor.js',
   '/terminal-content-helpers.js',
   '/cli-tag-colors.js',
   '/cli-logos.js',
   '/user-prompt-banner.js',
+  '/mac-desktop-novnc-bundle.js',
+  '/mac-desktop-client.js',
+  '/mac-desktop-keyboard.js',
+  '/mac-desktop-view.html',
+  '/mac-desktop-view.js',
   '/manifest.json',
 ];
 

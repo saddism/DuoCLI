@@ -17,7 +17,15 @@ export interface RemoteServerInfoPayload {
   token: string;
   port: number;
   publicUrl?: string;
-  tunnel?: { installed?: boolean; running: boolean; url: string; message?: string };
+  tunnel?: {
+    installed?: boolean;
+    running: boolean;
+    url: string;
+    message?: string;
+    configPath?: string;
+    configExists?: boolean;
+    configReady?: boolean;
+  };
   health?: RemoteSyncHealthPayload;
 }
 
@@ -67,8 +75,21 @@ contextBridge.exposeInMainWorld('duocli', {
   remoteSyncRecentCwds: (cwds: string[]) => ipcRenderer.invoke('remote:sync-recent-cwds', cwds),
 
   // 监听事件
+  snapshotPty: (id: string, options?: { scrollback?: number }) =>
+    ipcRenderer.invoke('pty:snapshot', id, options),
+  historyBeforePty: (id: string, query?: {
+    beforeCursor?: string | null;
+    limitRows?: number;
+    requestId?: string;
+    epoch?: number;
+  }) => ipcRenderer.invoke('pty:history-before', id, query),
+  historyMetaPty: (id: string) => ipcRenderer.invoke('pty:history-meta', id),
+
   onPtyData: (cb: (id: string, data: string) => void) =>
     ipcRenderer.on('pty:data', (_e, id, data) => cb(id, data)),
+
+  onPtyParsed: (cb: (id: string, data: string, sequence: number) => void) =>
+    ipcRenderer.on('pty:parsed', (_e, id, data, sequence) => cb(id, data, sequence)),
 
   onTitleUpdate: (cb: (id: string, title: string) => void) =>
     ipcRenderer.on('pty:title-update', (_e, id, title) => cb(id, title)),
@@ -92,6 +113,9 @@ contextBridge.exposeInMainWorld('duocli', {
     { ok: true; token: string } | { ok: false; error: string }
   >,
   generateRemoteToken: () => ipcRenderer.invoke('remote:generate-token') as Promise<string>,
+  prepareRemoteTunnelConfig: () => ipcRenderer.invoke('remote:prepare-tunnel-config') as Promise<
+    { ok: true; configPath: string; created: boolean; configReady: boolean } | { ok: false; error: string }
+  >,
 
   // 剪贴板图片
   clipboardSaveImage: () => ipcRenderer.invoke('clipboard:save-image'),
@@ -149,6 +173,8 @@ contextBridge.exposeInMainWorld('duocli', {
   // 会话状态同步：renderer → main（供手机端读取）
   syncSessionStatus: (statuses: Record<string, string>) =>
     ipcRenderer.send('session:sync-status', statuses),
+  onSessionRemoteView: (cb: (id: string, info: { viewed?: boolean; viewing?: boolean }) => void) =>
+    ipcRenderer.on('session:remote-view', (_e, id, info) => cb(id, info)),
 
   // 催工配置：供 main 进程从 renderer 读写
   autoContinueManaged: true,

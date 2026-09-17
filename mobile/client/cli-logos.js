@@ -114,9 +114,43 @@
     return DEFAULT_LOGO_URL;
   }
 
+  function isPlainTerminalName(cliName) {
+    const raw = String(cliName || '').trim();
+    return !raw || raw === '终端' || raw === '空终端';
+  }
+
+  /** 无品牌图标时用显示名首字符大写做头像；纯终端仍用默认终端图标。 */
+  function firstLogoLetter(cliName) {
+    if (isPlainTerminalName(cliName)) return '';
+    const raw = String(cliName || '').trim();
+    const trimmed = raw.replace(/^[^0-9A-Za-z\u4e00-\u9fff]+/, '');
+    const ch = Array.from(trimmed || raw)[0] || '';
+    return ch.toLocaleUpperCase('en-US');
+  }
+
+  function getLetterLogoUrl(cliName) {
+    const letter = firstLogoLetter(cliName);
+    if (!letter) return DEFAULT_LOGO_URL;
+    const safe = letter
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+    // 中文略缩小字号，避免挤出圆角方块
+    const fontSize = Array.from(letter).length === 1 && /[\u4e00-\u9fff]/.test(letter) ? 13 : 14;
+    return 'data:image/svg+xml,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+      + '<rect width="24" height="24" rx="6" fill="#475569"/>'
+      + `<text x="12" y="12" text-anchor="middle" dominant-baseline="central" `
+      + `font-family="ui-sans-serif,system-ui,-apple-system,sans-serif" `
+      + `font-size="${fontSize}" font-weight="700" fill="#f8fafc">${safe}</text>`
+      + '</svg>'
+    );
+  }
+
   function getLogoUrl(cliName) {
     const file = resolveLogoFile(cliName);
-    if (!file) return DEFAULT_LOGO_URL;
+    if (!file) return getLetterLogoUrl(cliName);
     return isFullLogoUrl(file) ? file : logoCdnUrl(file);
   }
 
@@ -127,6 +161,13 @@
 
   function hasLogo(cliName) {
     return !!resolveLogoFile(cliName);
+  }
+
+  // cursor / antigravity 这类官方稿是黑图标，深色底上看不清，渲染时反色。
+  function logoNeedsInvert(cliName) {
+    const file = resolveLogoFile(cliName);
+    if (!file || isFullLogoUrl(file)) return false;
+    return !/-color$/.test(file);
   }
 
   function getCliList() {
@@ -146,7 +187,10 @@
     resolveLogoFile,
     getLogoUrl,
     getDefaultLogoUrl,
+    getLetterLogoUrl,
+    firstLogoLetter,
     hasLogo,
+    logoNeedsInvert,
     getCliList,
     getCliLabel,
   };

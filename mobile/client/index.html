@@ -33,6 +33,7 @@
       </div>
       <h1>DuoCLI</h1>
       <p class="login-sub">轻量级多 CLI · 手机远程开发 · 局域网 / 互联网</p>
+      <p class="login-token-hint">Token 在电脑 DuoCLI 右侧「手机远程同步」里，点眼睛即可复制。</p>
       <div id="server-info" class="server-info"></div>
       <div class="login-input-wrap">
         <input type="password" id="token-input" placeholder="输入访问 Token" autocomplete="off">
@@ -56,7 +57,9 @@
           <span class="header-brand-dot"></span>
           <h2>DuoCLI</h2>
         </div>
-        <button id="net-mode-btn" class="net-mode-btn" style="display:none;" title="切换网络模式"></button>
+        <span id="main-net-mode-host" class="net-mode-host">
+          <button id="net-mode-btn" class="net-mode-btn" style="display:none;" title="切换网络模式"></button>
+        </span>
       </div>
       <div class="header-right">
         <button id="device-console-btn" class="icon-btn" title="手机设备">
@@ -93,27 +96,27 @@
       <button class="icon-btn landscape-panel-toggle landscape-sessions-toggle" title="展开会话侧栏" aria-label="展开会话侧栏" aria-expanded="false">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
       </button>
+      <span id="detail-net-mode-host" class="net-mode-host"></span>
       <div class="detail-title">
         <img id="detail-cli-logo" class="detail-cli-logo" alt="" hidden>
         <span id="detail-name"></span>
         <span id="detail-status" class="status-dot"></span>
       </div>
-      <span id="detail-ac-label" class="ac-label" title="计划设置">设</span>
+      <span id="detail-ac-label" class="ac-label" hidden title="计划设置">设</span>
       <div class="detail-header-tools">
         <button id="detail-more-btn" class="icon-btn" title="更多" aria-haspopup="true" aria-expanded="false" aria-controls="detail-more-menu">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="5" r="1.4"></circle><circle cx="12" cy="12" r="1.4"></circle><circle cx="12" cy="19" r="1.4"></circle></svg>
         </button>
         <div id="detail-more-menu" class="detail-more-menu" hidden>
           <button id="detail-menu-files-btn" type="button">项目文件</button>
+          <button id="detail-menu-view-btn" type="button" hidden>切换到终端</button>
           <button id="detail-menu-plan-btn" type="button">计划设置</button>
           <button id="detail-menu-device-btn" type="button">手机设备</button>
+          <button type="button" id="delete-btn" class="danger">关闭对话</button>
         </div>
       </div>
       <button class="icon-btn landscape-panel-toggle landscape-device-toggle" title="展开手机侧栏" aria-label="展开手机侧栏" aria-expanded="false">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg>
-      </button>
-      <button type="button" id="delete-btn" class="icon-btn danger" title="关闭对话" aria-label="关闭对话">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
       </button>
     </header>
 
@@ -124,6 +127,9 @@
         <button type="button" class="user-prompt-more" hidden>更多</button>
       </div>
       <button type="button" class="user-prompt-jump">滚动到这里</button>
+    </div>
+    <div id="chat-container" hidden>
+      <div id="chat-transcript" class="native-chat-transcript"></div>
     </div>
     <!-- xterm.js 终端 -->
     <div id="terminal-container">
@@ -147,6 +153,7 @@
       <button class="key-btn" data-key="y\r">Y</button>
       <button type="button" id="option-up-key" class="key-btn" data-key="\x1b[1;3A" title="Option + ↑" aria-label="Option 加方向上键">⌥ + ↑</button>
       <button type="button" id="ctrl-slash-key" class="key-btn" data-key="\x1f" title="Ctrl + /" aria-label="Ctrl 加斜杠">^/</button>
+      <button type="button" id="ctrl-o-key" class="key-btn" data-key="\x0f" title="Ctrl + O" aria-label="Ctrl 加 O">^O</button>
     </div>
 
     <!-- 输入区域 -->
@@ -265,33 +272,33 @@
         <label class="ac-config-command-label">命令列表（每行一条，按顺序发送）</label>
         <textarea id="ac-message" class="ac-config-command" rows="3" placeholder="每行一条命令，按顺序发送"></textarea>
         <section class="ac-config-group ac-config-group-primary">
-        <div class="ac-config-group-title">运行安排</div>
-        <div class="ac-config-grid">
-          <label class="ac-config-field">开始时间
-            <span class="ac-field-hint">延迟分钟，0 表示立即</span>
-            <input type="number" id="ac-initial-delay" min="0" value="0" placeholder="0" />
-          </label>
-          <label class="ac-config-field">运行次数
-            <span class="ac-field-hint">-1 表示不限制</span>
-            <input type="number" id="ac-max-loops" min="-1" value="-1" placeholder="-1" />
-          </label>
-        </div>
-      </section>
-      <section class="ac-config-group">
-        <div class="ac-config-group-title">计划与发送</div>
-        <div class="ac-config-grid">
-          <label class="ac-config-field">计划间隔（分钟）
-            <input type="number" id="ac-interval" min="1" placeholder="分钟" />
-          </label>
-          <label class="ac-config-field">命令间隔（秒）
-            <input type="number" id="ac-cmd-interval" min="0" value="2" placeholder="秒" />
-          </label>
-          <label class="ac-config-field ac-config-field-wide">发送延迟（秒）
-            <span class="ac-field-hint">文字写入后等待多久再发送回车</span>
-            <input type="number" id="ac-send-delay" min="0" value="2" placeholder="秒" />
-          </label>
-        </div>
-      </section>
+          <div class="ac-config-group-title">发送安排</div>
+          <div class="ac-config-grid">
+            <label class="ac-config-field">开始时间
+              <span class="ac-field-hint">延迟分钟，0 表示立即</span>
+              <input type="number" id="ac-initial-delay" min="0" value="0" placeholder="0" />
+            </label>
+          </div>
+        </section>
+        <section class="ac-config-group">
+          <div class="ac-config-group-title">循环设置</div>
+          <div class="ac-config-grid">
+            <label class="ac-config-field">计划间隔（分钟）
+              <input type="number" id="ac-interval" min="1" placeholder="分钟" />
+            </label>
+            <label class="ac-config-field">循环次数
+              <span class="ac-field-hint">-1 表示不限制</span>
+              <input type="number" id="ac-max-loops" min="-1" value="-1" placeholder="-1" />
+            </label>
+            <label class="ac-config-field">命令间隔（秒）
+              <input type="number" id="ac-cmd-interval" min="0" value="2" placeholder="秒" />
+            </label>
+            <label class="ac-config-field ac-config-field-wide">发送延迟（秒）
+              <span class="ac-field-hint">文字写入后等待多久再发送回车</span>
+              <input type="number" id="ac-send-delay" min="0" value="2" placeholder="秒" />
+            </label>
+          </div>
+        </section>
       <section class="ac-config-group">
         <div class="ac-config-group-title">自动同意</div>
         <label class="ac-config-toggle">
@@ -322,6 +329,7 @@
             <canvas id="device-video" aria-label="Android 实时画面" hidden></canvas>
             <img id="device-preview" alt="设备截图" />
             <div id="device-preview-empty" class="device-preview-empty">正在连接 Android 实时镜像…</div>
+            <div id="mac-desktop-container" class="mac-desktop-hidden"></div>
           </div>
         </div>
       </section>
@@ -349,7 +357,8 @@
         </button>
         <div class="device-header-right">
           <select id="device-select" class="device-select-header">
-            <option value="">正在加载设备...</option>
+            <!-- 由 JS 动态渲染 Android 设备 -->
+            <option value="" disabled selected>正在加载设备...</option>
           </select>
           <nav id="device-panel-tabs" class="device-panel-tabs" role="tablist" aria-label="侧栏内容">
             <button class="device-panel-tab active" data-device-panel="device" role="tab" aria-selected="true">设备</button>
@@ -362,6 +371,7 @@
             </button>
             <div id="device-more-menu" class="device-more-menu" hidden>
               <button id="device-fullscreen-btn" type="button">全屏操控</button>
+              <button id="device-desktop-window-btn" type="button">新窗口打开桌面</button>
               <button id="device-refresh-btn" type="button">刷新设备</button>
               <button id="device-shot-btn" type="button">刷新截图</button>
               <button id="device-tap-toggle" type="button" aria-pressed="true">远程点击 · 已开</button>
@@ -401,6 +411,7 @@
         <div id="fullscreen-screen" class="android-screen">
           <canvas id="fullscreen-video" aria-label="Android 实时画面" hidden></canvas>
           <img id="fullscreen-preview" alt="Android 设备画面" />
+          <img id="mac-desktop-fullscreen-preview" class="mac-desktop-fullscreen-preview" alt="电脑桌面" hidden />
         </div>
       </div>
       <aside class="device-side-chrome" aria-label="全屏操控">
@@ -457,10 +468,19 @@
   <script src="terminal-content-helpers.js"></script>
   <script src="file-preview-helpers.js"></script>
   <script src="terminal-scroll-helpers.js"></script>
+  <script src="terminal-history-layer.js"></script>
   <script src="spinner-interceptor.js"></script>
   <script src="cli-tag-colors.js"></script>
   <script src="cli-logos.js"></script>
   <script src="user-prompt-banner.js"></script>
+  <script src="native-chat-view.js"></script>
+  <script src="network-mode.js"></script>
+  
+  <!-- Mac 远程桌面 - noVNC 将由 esbuild 打包 -->
+  <script src="mac-desktop-novnc-bundle.js"></script>
+  <script src="mac-desktop-client.js"></script>
+  <script src="mac-desktop-keyboard.js"></script>
+  
   <script src="app.js"></script>
 </body>
 </html>

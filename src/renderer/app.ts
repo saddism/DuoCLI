@@ -2,6 +2,11 @@ import { TerminalManager, USER_THEMES_CONFIG } from './terminal-manager';
 import { buildContrastingTerminalTheme, pickContrastingForeground } from './theme-contrast';
 import { PaneWorkspace } from './pane-workspace';
 import { countPanes, listPanes, type PaneContent } from './pane-layout';
+import {
+  compactLayoutPhase,
+  nextSidebarWidth,
+  shouldFileTreeCollapse,
+} from './compact-layout';
 import { AndroidMirrorClient } from './android-mirror-client';
 import {
   cancelAutoContinueRun,
@@ -10,12 +15,15 @@ import {
   shouldResetAfterManualInput,
 } from './auto-continue-runtime';
 import { formatPresetEnv, parsePresetEnv, resolvePresetEnv } from '../main/preset-env';
+import { isTransientTerminalOutput } from '../main/session-status';
 
 // 与手机端共用同一份 CLI Logo，见 mobile/client/cli-logos.js
-const { getLogoUrl, getDefaultLogoUrl, hasLogo } = require('../../mobile/client/cli-logos.js') as {
+const { getLogoUrl, getDefaultLogoUrl, getLetterLogoUrl, hasLogo, logoNeedsInvert } = require('../../mobile/client/cli-logos.js') as {
   getLogoUrl: (cliName: string) => string;
   getDefaultLogoUrl: () => string;
+  getLetterLogoUrl: (cliName: string) => string;
   hasLogo: (cliName: string) => boolean;
+  logoNeedsInvert: (cliName: string) => boolean;
 };
 
 // 导入通知助手
@@ -26,7 +34,15 @@ let remoteServerInfo: {
   token: string;
   port: number;
   publicUrl?: string;
-  tunnel?: { installed?: boolean; running: boolean; url: string; message?: string };
+  tunnel?: {
+    installed?: boolean;
+    running: boolean;
+    url: string;
+    message?: string;
+    configPath?: string;
+    configExists?: boolean;
+    configReady?: boolean;
+  };
   health?: RemoteSyncHealth;
 } | null = null;
 
@@ -62,7 +78,21 @@ declare global {
       fileTreeListDir: (dirPath: string) => Promise<Array<{ name: string; path: string; isDir: boolean }>>;
       remoteAddRecentCwd: (cwd: string) => Promise<boolean>;
       remoteSyncRecentCwds: (cwds: string[]) => Promise<boolean>;
+      snapshotPty: (id: string, options?: { scrollback?: number }) => Promise<any>;
+      historyBeforePty: (id: string, query?: {
+        beforeCursor?: string | null;
+        limitRows?: number;
+        requestId?: string;
+        epoch?: number;
+      }) => Promise<any>;
+      historyMetaPty: (id: string) => Promise<{
+        epoch: number;
+        historyCursor: string | null;
+        historyHasMore: boolean;
+        truncated: boolean;
+      }>;
       onPtyData: (cb: (id: string, data: string) => void) => void;
+      onPtyParsed: (cb: (id: string, data: string, sequence: number) => void) => void;
       onTitleUpdate: (cb: (id: string, title: string) => void) => void;
       onPtyExit: (cb: (id: string) => void) => void;
       onRemoteCreated: (cb: (sessionInfo: { id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }) => void) => void;
@@ -73,6 +103,9 @@ declare global {
       retryRemoteSync: () => Promise<RemoteSyncHealth | null>;
       setRemoteToken: (token: string) => Promise<{ ok: true; token: string } | { ok: false; error: string }>;
       generateRemoteToken: () => Promise<string>;
+      prepareRemoteTunnelConfig: () => Promise<
+        { ok: true; configPath: string; created: boolean; configReady: boolean } | { ok: false; error: string }
+      >;
       clipboardSaveImage: () => Promise<string | null>;
       clipboardGetFilePath: () => Promise<string | null>;
       // 文件监听 API
@@ -109,6 +142,7 @@ declare global {
       androidInputText: (deviceId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
       // 会话状态同步
       syncSessionStatus: (statuses: Record<string, string>) => void;
+      onSessionRemoteView: (cb: (id: string, info: { viewed?: boolean; viewing?: boolean }) => void) => void;
       // 催工配置中转
       autoContinueManaged: boolean;
       getAutoContinueConfigs: () => Promise<{ configs: Record<string, any>; persisted: boolean }>;
@@ -241,7 +275,7 @@ function serializeAutoContinueConfig(config: AutoContinueConfig): Record<string,
     maxLoops: config.maxLoops,
     initialDelayMs: config.initialDelayMs,
     loopCount: config.loopCount,
-    nextRunAt: config.nextRunAt,
+    // Note: nextRunAt is excluded and will be computed by main process from initialDelayMs
   };
 }
 
@@ -591,7 +625,6 @@ function showAutoContinueConfigDialog(sessionId: string): void {
     config.sendDelaySec = sendDelay;
     config.maxLoops = maxLoops;
     config.initialDelayMs = initialDelayMinutes * 60000;
-    config.nextRunAt = Date.now() + config.initialDelayMs;
     config.enabled = true;
     sessionAutoContinue.set(sessionId, config);
 
@@ -828,11 +861,12 @@ function renderRemoteServerInfo(): void {
   statusEl.textContent = health?.message
     ?? (syncStatus === 'healthy' ? '公网与局域网均正常' : '正在检测连接状态…');
 
-  const tunnelReady = syncStatus === 'healthy' && Boolean(remoteServerInfo.publicUrl);
-  urlEl.textContent = tunnelReady
+  const hasPublicUrl = Boolean(remoteServerInfo.publicUrl);
+  const tunnelReady = syncStatus === 'healthy' && hasPublicUrl;
+  urlEl.textContent = hasPublicUrl
     ? remoteServerInfo.publicUrl!
     : remoteServerInfo.lanUrl;
-  urlEl.title = tunnelReady
+  urlEl.title = hasPublicUrl
     ? `公网地址（局域网：${remoteServerInfo.lanUrl}）`
     : '点击复制局域网地址';
 
@@ -872,6 +906,21 @@ function renderRemoteServerInfo(): void {
   retryBtn.hidden = !showRetry;
   retryBtn.disabled = syncStatus === 'retrying';
   retryBtn.textContent = syncStatus === 'retrying' ? '恢复中…' : '重试';
+
+  const guideHintEl = remoteServerInfoEl.querySelector('.remote-info-guide-hint') as HTMLButtonElement | null;
+  if (guideHintEl) {
+    if (tunnelReady) {
+      guideHintEl.textContent = '手机浏览器打开上面的公网地址，再粘贴 Token。查看完整步骤';
+    } else if (syncStatus === 'error') {
+      guideHintEl.textContent = '本地远程服务异常，点「怎么连」查看排查步骤';
+    } else if (hasPublicUrl) {
+      guideHintEl.textContent = '公网已配置。连不上就点「重试」，或先用局域网。查看完整步骤';
+    } else {
+      guideHintEl.textContent = '同一 Wi-Fi 下，手机浏览器打开上面的地址，再粘贴 Token。公网怎么配？';
+    }
+  }
+
+  renderRemoteGuide();
 }
 
 async function handleRemoteRetryClick(): Promise<void> {
@@ -893,6 +942,120 @@ async function handleRemoteRetryClick(): Promise<void> {
     console.warn('[RemoteSync] Manual retry failed:', err);
   } finally {
     renderRemoteServerInfo();
+  }
+}
+
+function getPreferredRemoteBaseUrl(): string | null {
+  if (!remoteServerInfo) return null;
+  return remoteServerInfo.publicUrl || remoteServerInfo.lanUrl || null;
+}
+
+function getRemoteLoginUrl(): string | null {
+  const base = getPreferredRemoteBaseUrl();
+  if (!base || !remoteServerInfo) return null;
+  return `${base.replace(/\/+$/, '')}/?token=${encodeURIComponent(remoteServerInfo.token)}`;
+}
+
+async function copyRemoteGuideText(text: string, button: HTMLButtonElement, doneLabel = '已复制'): Promise<void> {
+  const original = button.textContent || '';
+  try {
+    await navigator.clipboard.writeText(text);
+    button.textContent = doneLabel;
+  } catch {
+    button.textContent = '复制失败';
+  }
+  window.setTimeout(() => { button.textContent = original; }, 1600);
+}
+
+function renderRemoteGuide(): void {
+  const statusEl = document.getElementById('remote-guide-status');
+  const lanEl = document.getElementById('remote-guide-lan-url');
+  const checklistEl = document.getElementById('remote-guide-checklist');
+  const configPathEl = document.getElementById('remote-guide-config-path');
+  if (!statusEl || !lanEl || !checklistEl || !configPathEl) return;
+
+  const health = remoteServerInfo?.health;
+  const tunnel = remoteServerInfo?.tunnel;
+  const publicReady = health?.status === 'healthy' && Boolean(remoteServerInfo?.publicUrl);
+  lanEl.textContent = remoteServerInfo?.lanUrl || '启动后自动显示';
+
+  statusEl.classList.remove('is-ok', 'is-warn', 'is-error');
+  const title = document.createElement('strong');
+  const detail = document.createElement('span');
+  if (!remoteServerInfo) {
+    statusEl.classList.add('is-warn');
+    title.textContent = '正在启动本地远程服务';
+    detail.textContent = '打开 DuoCLI 后会自动出现局域网地址和 Token。';
+  } else if (publicReady) {
+    statusEl.classList.add('is-ok');
+    title.textContent = '公网和局域网都可以用';
+    detail.textContent = `手机打开 ${remoteServerInfo.publicUrl}，再粘贴 Token。`;
+  } else if (health?.status === 'error') {
+    statusEl.classList.add('is-error');
+    title.textContent = '本地远程服务未就绪';
+    detail.textContent = health.message || '手机现在连不上，先看下面的排查步骤。';
+  } else {
+    statusEl.classList.add('is-warn');
+    title.textContent = '现在只能走局域网';
+    detail.textContent = health?.message || tunnel?.message || '同一 Wi-Fi 下已经能连。要出门用，按第 2 步配置固定域名。';
+  }
+  statusEl.replaceChildren(title, detail);
+
+  const checks = [
+    { done: Boolean(tunnel?.installed), label: '已安装 cloudflared' },
+    { done: Boolean(tunnel?.configExists), label: '已有本机配置文件' },
+    { done: Boolean(tunnel?.configReady), label: '配置已改成你自己的域名和隧道' },
+    { done: Boolean(tunnel?.running), label: '隧道正在运行' },
+    { done: publicReady, label: '公网地址可以访问' },
+  ];
+  checklistEl.replaceChildren(...checks.map((item) => {
+    const li = document.createElement('li');
+    const mark = document.createElement('span');
+    mark.className = item.done ? 'remote-guide-check is-done' : 'remote-guide-check';
+    mark.setAttribute('aria-hidden', 'true');
+    const text = document.createElement('span');
+    text.textContent = item.label;
+    li.append(mark, text);
+    return li;
+  }));
+
+  configPathEl.textContent = tunnel?.configPath || '还没有本机配置文件，点「生成配置并打开」即可创建';
+}
+
+function openRemoteGuide(): void {
+  const overlay = document.getElementById('remote-guide-overlay');
+  if (!overlay) return;
+  renderRemoteGuide();
+  overlay.classList.add('active');
+  overlay.focus();
+}
+
+function closeRemoteGuide(): void {
+  document.getElementById('remote-guide-overlay')?.classList.remove('active');
+}
+
+async function handlePrepareRemoteTunnelConfig(openInEditor: boolean): Promise<void> {
+  const pathEl = document.getElementById('remote-guide-config-path');
+  try {
+    const result = await window.duocli.prepareRemoteTunnelConfig();
+    if (!result.ok) {
+      if (pathEl) pathEl.textContent = result.error;
+      return;
+    }
+    if (pathEl) {
+      pathEl.textContent = result.created
+        ? `已生成模板：${result.configPath}。请改成你自己的隧道名、域名和凭证路径。`
+        : result.configPath;
+    }
+    if (openInEditor) await window.duocli.openFile(result.configPath);
+    else await window.duocli.openFolder(result.configPath);
+    const info = await window.duocli.getRemoteServerInfo();
+    if (info) {
+      remoteServerInfo = info;
+      renderRemoteServerInfo();
+    }
+  } catch (err) {
+    if (pathEl) pathEl.textContent = err instanceof Error ? err.message : String(err);
   }
 }
 
@@ -955,9 +1118,11 @@ async function saveRemoteTokenEdit(): Promise<void> {
 }
 
 function appendCliLogo(parent: HTMLElement, cliName: string): HTMLImageElement {
-  const fallback = getDefaultLogoUrl();
+  const fallback = getLetterLogoUrl(cliName) || getDefaultLogoUrl();
   const img = document.createElement('img');
-  img.className = 'cli-logo' + (hasLogo(cliName) ? '' : ' cli-logo-default');
+  img.className = 'cli-logo'
+    + (hasLogo(cliName) ? '' : ' cli-logo-default')
+    + (logoNeedsInvert(cliName) ? ' cli-logo-invert' : '');
   img.src = getLogoUrl(cliName);
   img.alt = '';
   img.loading = 'lazy';
@@ -966,6 +1131,7 @@ function appendCliLogo(parent: HTMLElement, cliName: string): HTMLImageElement {
     if (img.src !== fallback) {
       img.src = fallback;
       img.classList.add('cli-logo-default');
+      img.classList.remove('cli-logo-invert');
       return;
     }
     img.style.display = 'none';
@@ -1312,10 +1478,19 @@ let fileTreeRootCwd: string | null = null;
 const fileTreeExpandedDirs: Set<string> = new Set();
 const fileTreeChildrenCache: Map<string, FileTreeItem[]> = new Map();
 
-// 未读消息状态（绿点：AI 完成工作，等待输入）
+// 未查看状态（黄点：已停止且尚未点进去看）
 const sessionUnread: Set<string> = new Set();
-// 工作中状态（黄点：AI 正在输出）
+// 手机端正在看着的会话（停下来应直接变灰，不要标黄）
+const sessionRemoteViewers: Set<string> = new Set();
+// 进行中状态（绿点：AI 正在输出）
 const sessionBusy: Set<string> = new Set();
+// 切换会话后短暂忽略 resize 重绘，避免误标为进行中
+const statusBusySuppressUntil: Map<string, number> = new Map();
+const STATUS_BUSY_SUPPRESS_MS = 1500;
+
+function suppressSessionBusyFromResize(id: string): void {
+  statusBusySuppressUntil.set(id, Date.now() + STATUS_BUSY_SUPPRESS_MS);
+}
 // 未读延迟计时器（静默超时检测）
 const unreadTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 // 最近收到的数据缓冲（用于提示符检测）
@@ -1325,14 +1500,51 @@ const sessionTitleLocked: Set<string> = new Set();
 // 置顶会话
 const pinnedSessions: Set<string> = new Set();
 
+function sessionIsBeingWatched(id: string): boolean {
+  return id === getActiveSessionId() || sessionRemoteViewers.has(id);
+}
+
+function sessionStatusClass(id: string): 'running' | 'idle' | 'inactive' {
+  if (sessionBusy.has(id)) return 'running';
+  if (sessionUnread.has(id) && !sessionIsBeingWatched(id)) return 'idle';
+  return 'inactive';
+}
+
+function createSessionStatusDot(id: string, status?: 'running' | 'idle' | 'inactive' | 'exited'): HTMLSpanElement {
+  const kind = status || sessionStatusClass(id);
+  const dot = document.createElement('span');
+  dot.className = `session-status-dot ${kind}`;
+  dot.title = kind === 'running'
+    ? '进行中'
+    : kind === 'idle'
+      ? '已停止（未查看）'
+      : kind === 'exited'
+        ? '已关闭'
+        : '已查看';
+  return dot;
+}
+
+function createSessionColorDot(id: string, onPick: (el: HTMLElement) => void): HTMLSpanElement {
+  const dot = document.createElement('span');
+  dot.className = 'session-color-dot';
+  const themeId = sessionThemes.get(id);
+  dot.style.backgroundColor = themeId ? TerminalManager.getThemeDotColor(themeId) : '#666';
+  dot.title = '点击更改颜色';
+  dot.addEventListener('click', (e) => {
+    e.stopPropagation();
+    onPick(dot);
+  });
+  return dot;
+}
+
 // 同步会话状态到 main 进程（供手机端 remote-server 读取）
 function syncSessionStatusToMain(): void {
   const statuses: Record<string, string> = {};
   for (const id of sessionTitles.keys()) {
     if (sessionBusy.has(id)) {
-      statuses[id] = 'running';   // 黄灯：AI 正在工作
-    } else if (sessionUnread.has(id)) {
-      statuses[id] = 'idle';      // 绿灯：等待输入
+      statuses[id] = 'running';   // 绿灯：进行中
+    } else if (sessionUnread.has(id) && !sessionIsBeingWatched(id)) {
+      statuses[id] = 'idle';      // 黄灯：已停止未查看
     } else {
       statuses[id] = 'inactive';  // 灰灯：已查看
     }
@@ -1342,6 +1554,7 @@ function syncSessionStatusToMain(): void {
 
 // 终端管理器
 const termManager = new TerminalManager(paneWorkspaceRoot, (id, cols, rows) => {
+  suppressSessionBusyFromResize(id);
   window.duocli.resizePty(id, cols, rows);
 });
 
@@ -2179,7 +2392,7 @@ function updatePaneAccents(): void {
       const sessionId = (pane.content as any).sessionId;
       const themeDotColor = TerminalManager.getThemeDotColor(sessionThemes.get(sessionId) || 'vscode-dark');
       
-      // 方块色标插在终端图标之后，避免盖住图标
+      // 方块色标跟在会话标题后面，和侧边栏改名位置一致
       let dotIndicator = titleElement.querySelector('.pane-color-indicator');
       if (!dotIndicator) {
         dotIndicator = document.createElement('span');
@@ -2191,9 +2404,9 @@ function updatePaneAccents(): void {
           showColorPickerDialogForPane(paneId, sid, dotIndicator as HTMLElement);
         });
       }
-      const kindIcon = titleElement.querySelector('.pane-kind-icon');
-      if (kindIcon) kindIcon.after(dotIndicator);
-      else titleElement.insertBefore(dotIndicator, titleElement.firstChild);
+      const sessionLabel = titleElement.querySelector('.pane-session-label');
+      if (sessionLabel) sessionLabel.after(dotIndicator);
+      else titleElement.appendChild(dotIndicator);
       (dotIndicator as HTMLElement).style.backgroundColor = themeDotColor;
       (dotIndicator as HTMLElement).style.cursor = 'pointer';
       (dotIndicator as HTMLElement).title = '点击更改颜色';
@@ -3057,30 +3270,8 @@ function renderSessionList(): void {
       item.dataset.sessionId = id;
       item.dataset.sessionType = 'pty';
 
-      const dot = document.createElement('span');
-      dot.className = 'session-color-dot';
-      if (sessionBusy.has(id)) {
-        dot.style.backgroundColor = '#e5a100';
-      } else if (sessionUnread.has(id)) {
-        dot.style.backgroundColor = '#73c991';
-      } else {
-        // 使用会话主题色
-        const themeId = sessionThemes.get(id);
-        if (themeId) {
-          const themeDotColor = TerminalManager.getThemeDotColor(themeId);
-          dot.style.backgroundColor = themeDotColor;
-        } else {
-          dot.style.backgroundColor = '#666';
-        }
-      }
-      
-      // 点击 dot 打开颜色选择器
-      dot.style.cursor = 'pointer';
-      dot.title = '点击更改颜色';
-      dot.addEventListener('click', (e) => {
-        e.stopPropagation();
-        showColorPickerDialog(id, dot);
-      });
+      const statusDot = createSessionStatusDot(id);
+      const colorDot = createSessionColorDot(id, (el) => showColorPickerDialog(id, el));
 
       const pinBtn = document.createElement('button');
       pinBtn.className = 'session-pin' + (isPinned ? ' pinned' : '');
@@ -3110,13 +3301,16 @@ function renderSessionList(): void {
       const metaRow = document.createElement('div');
       metaRow.className = 'session-meta-row';
       const itemCwd = sessionCwds.get(id) || '';
-      const projectName = sessionProjectLabel(itemCwd);
-      if (projectName) {
-        const projectSpan = document.createElement('span');
-        projectSpan.className = 'session-cwd';
-        projectSpan.textContent = projectName;
-        projectSpan.title = itemCwd;
-        metaRow.appendChild(projectSpan);
+      // 项目分组头已经显示目录名；只有置顶区不在原项目组里，才补一行项目名。
+      if (isPinnedGroup) {
+        const projectName = sessionProjectLabel(itemCwd);
+        if (projectName) {
+          const projectSpan = document.createElement('span');
+          projectSpan.className = 'session-cwd';
+          projectSpan.textContent = projectName;
+          projectSpan.title = itemCwd;
+          metaRow.appendChild(projectSpan);
+        }
       }
       const displayName = sessionDisplayNames.get(id);
       if (displayName) {
@@ -3153,8 +3347,9 @@ function renderSessionList(): void {
       const titleRow = document.createElement('div');
       titleRow.className = 'session-title-row';
       titleRow.appendChild(titleSpan);
+      titleRow.appendChild(colorDot);
       titleRow.appendChild(editBtn);
-      topRow.appendChild(dot);
+      topRow.appendChild(statusDot);
       topRow.appendChild(pinBtn);
       topRow.appendChild(titleRow);
       topRow.appendChild(closeBtn);
@@ -3304,23 +3499,14 @@ function renderSessionList(): void {
 
         const titleRow = document.createElement('div');
         titleRow.className = 'session-title-row';
+        const colorDot = createSessionColorDot(cs.id, (el) => showColorPickerDialogForClosedSession(cs.id, el));
         titleRow.appendChild(titleSpan);
+        titleRow.appendChild(colorDot);
         titleRow.appendChild(restoreBtn);
 
         const topRow = document.createElement('div');
         topRow.className = 'session-item-top';
-        const dot = document.createElement('span');
-        dot.className = 'session-color-dot';
-        dot.style.backgroundColor = '#555';
-        
-        // 点击 dot 打开颜色选择器（已关闭会话）
-        dot.style.cursor = 'pointer';
-        dot.title = '点击更改颜色';
-        dot.addEventListener('click', (e) => {
-          e.stopPropagation();
-          showColorPickerDialogForClosedSession(cs.id, dot);
-        });
-        topRow.appendChild(dot);
+        topRow.appendChild(createSessionStatusDot(cs.id, 'exited'));
         topRow.appendChild(titleRow);
         topRow.appendChild(delBtn);
 
@@ -3474,18 +3660,17 @@ async function createSession(): Promise<boolean> {
 
 function switchSession(id: string): void {
   const prev = getActiveSessionId();
+  // 必须先压住 resize 重绘，再挂终端；否则黄/灰会先被刷成绿
+  suppressSessionBusyFromResize(id);
   showTerminalSession(id);
 
-  // 用户切换到该会话 → 清除所有状态指示灯（黄/绿→灰）
+  // 点进会话 = 已查看：只清未查看黄点；进行中绿点保留（仍在跑应继续绿）
   const hadUnread = sessionUnread.delete(id);
-  const hadBusy = sessionBusy.delete(id);
   // 切换到不同会话才重渲染列表，避免重建 DOM 导致 dblclick 无法触发
-  if (prev !== id || hadUnread || hadBusy) renderSessionList();
+  if (prev !== id || hadUnread) renderSessionList();
   updateSessionTitleBar();
   void renderFileTree();
   renderFileStatusbar();
-  const dims = termManager.getActiveDimensions();
-  if (dims) window.duocli.resizePty(id, dims.cols, dims.rows);
   termManager.followSession(id);
 }
 
@@ -3511,7 +3696,9 @@ function clearSessionState(id: string): void {
   sessionUpdateTimes.delete(id);
   sessionCreateTimes.delete(id);
   sessionUnread.delete(id);
+  sessionRemoteViewers.delete(id);
   sessionBusy.delete(id);
+  statusBusySuppressUntil.delete(id);
   clearTimeout(unreadTimers.get(id));
   unreadTimers.delete(id);
   recentDataBuffer.delete(id);
@@ -3755,6 +3942,9 @@ cwdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') cwdInput.bl
 // 左侧目录树收起/展开
 let fileTreeCollapsed = false;
 let fileTreeLastWidth = 220;
+let fileTreeUserCollapsed = false;
+let fileTreePinnedOpen = false;
+let layoutCompact = false;
 
 function syncPanelTogglePositions(): void {
   const toggleInset = 8;
@@ -3784,10 +3974,15 @@ function updatePanelToggleA11y(toggle: HTMLElement, collapsed: boolean, panelNam
   toggle.setAttribute('title', `${expanded ? '收起' : '展开'}${panelName}`);
 }
 
-fileTreeToggle.addEventListener('click', () => {
-  fileTreeCollapsed = !fileTreeCollapsed;
-  if (fileTreeCollapsed) {
-    fileTreeLastWidth = fileTreePanel.offsetWidth;
+function applyFileTreeCollapsed(collapsed: boolean): void {
+  if (collapsed === fileTreeCollapsed && fileTreePanel.classList.contains('collapsed') === collapsed) {
+    updatePanelToggleA11y(fileTreeToggle, collapsed, '目录树');
+    syncPanelTogglePositions();
+    return;
+  }
+  fileTreeCollapsed = collapsed;
+  if (collapsed) {
+    if (fileTreePanel.offsetWidth > 0) fileTreeLastWidth = fileTreePanel.offsetWidth;
     fileTreePanel.classList.add('collapsed');
     fileTreeToggle.classList.add('collapsed');
     setIcon(fileTreeToggle, 'chevron-right', 12);
@@ -3799,22 +3994,35 @@ fileTreeToggle.addEventListener('click', () => {
   }
   updatePanelToggleA11y(fileTreeToggle, fileTreeCollapsed, '目录树');
   syncPanelTogglePositions();
-  localStorage.setItem('duocli_filetree_collapsed', String(fileTreeCollapsed));
+}
+
+fileTreeToggle.addEventListener('click', () => {
+  const next = !fileTreeCollapsed;
+  fileTreeUserCollapsed = next;
+  fileTreePinnedOpen = !next;
+  applyFileTreeCollapsed(next);
+  localStorage.setItem('duocli_filetree_collapsed', String(fileTreeUserCollapsed));
 });
 
 // 右侧边栏收起/展开
 let sidebarCollapsed = false;
 let sidebarLastWidth = 260;
+let sidebarPreferredWidth = 260;
+let sidebarPinnedWidth = false;
 
 sidebarToggle.addEventListener('click', () => {
   sidebarCollapsed = !sidebarCollapsed;
   if (sidebarCollapsed) {
-    sidebarLastWidth = sidebar.offsetWidth;
+    if (sidebar.offsetWidth > 0) {
+      sidebarLastWidth = sidebar.offsetWidth;
+      sidebarPreferredWidth = sidebar.offsetWidth;
+    }
     sidebar.classList.add('collapsed');
     sidebarToggle.classList.add('collapsed');
     setIcon(sidebarToggle, 'chevron-left', 12);
   } else {
-    sidebar.style.width = sidebarLastWidth + 'px';
+    sidebarPinnedWidth = layoutCompact;
+    sidebar.style.width = sidebarPreferredWidth + 'px';
     sidebar.classList.remove('collapsed');
     sidebarToggle.classList.remove('collapsed');
     setIcon(sidebarToggle, 'chevron-right', 12);
@@ -3842,6 +4050,48 @@ const dragState: DragState = {
   minWidth: 0,
   maxWidth: 0
 };
+
+function applySidebarWidth(width: number): void {
+  if (sidebarCollapsed) return;
+  if (Math.abs((sidebar.offsetWidth || 0) - width) < 2) {
+    syncPanelTogglePositions();
+    return;
+  }
+  sidebar.style.width = width + 'px';
+  syncPanelTogglePositions();
+}
+
+function syncCompactLayout(): void {
+  if (dragState.isDragging) return;
+  const phase = compactLayoutPhase(window.innerWidth, layoutCompact);
+  if (phase === 'hold') return;
+  layoutCompact = phase === 'compact';
+  document.body.classList.toggle('layout-compact', layoutCompact);
+  if (phase === 'roomy') {
+    fileTreePinnedOpen = false;
+    sidebarPinnedWidth = false;
+  }
+
+  applyFileTreeCollapsed(shouldFileTreeCollapse({
+    phase,
+    userCollapsed: fileTreeUserCollapsed,
+    userPinnedOpen: fileTreePinnedOpen,
+    collapsed: fileTreeCollapsed,
+  }));
+
+  const currentSidebarWidth = sidebar.offsetWidth || sidebarPreferredWidth;
+  if (phase === 'compact' && !sidebarCollapsed && !sidebarPinnedWidth && currentSidebarWidth > sidebarPreferredWidth) {
+    sidebarPreferredWidth = currentSidebarWidth;
+  }
+  const sidebarWidth = nextSidebarWidth({
+    phase,
+    userCollapsed: sidebarCollapsed,
+    userPinnedWidth: sidebarPinnedWidth,
+    currentWidth: currentSidebarWidth,
+    preferredWidth: sidebarPreferredWidth,
+  });
+  if (sidebarWidth != null) applySidebarWidth(sidebarWidth);
+}
 
 // 左侧目录树拖拽
 fileTreeResizer.addEventListener('mousedown', (e) => {
@@ -3889,8 +4139,12 @@ document.addEventListener('mouseup', () => {
     fileTreeResizer.classList.remove('active');
     sidebarResizer.classList.remove('active');
     if (dragState.panel === fileTreePanel) {
+      fileTreeLastWidth = fileTreePanel.offsetWidth;
       localStorage.setItem('duocli_filetree_width', String(fileTreePanel.offsetWidth));
     } else if (dragState.panel === sidebar) {
+      sidebarLastWidth = sidebar.offsetWidth;
+      sidebarPreferredWidth = sidebar.offsetWidth;
+      sidebarPinnedWidth = layoutCompact;
       localStorage.setItem('duocli_sidebar_width', String(sidebar.offsetWidth));
     }
     syncPanelTogglePositions();
@@ -3898,7 +4152,10 @@ document.addEventListener('mouseup', () => {
   }
 });
 
-window.addEventListener('resize', syncPanelTogglePositions);
+window.addEventListener('resize', () => {
+  syncCompactLayout();
+  syncPanelTogglePositions();
+});
 
 // 恢复保存的面板状态
 (function restorePanelStates() {
@@ -3910,15 +4167,13 @@ window.addEventListener('resize', syncPanelTogglePositions);
   const savedSidebarWidth = localStorage.getItem('duocli_sidebar_width');
   if (savedSidebarWidth) {
     sidebar.style.width = savedSidebarWidth + 'px';
-    sidebarLastWidth = parseInt(savedSidebarWidth);
+    sidebarLastWidth = parseInt(savedSidebarWidth, 10);
+    sidebarPreferredWidth = sidebarLastWidth;
   }
   const savedFileTreeCollapsed = localStorage.getItem('duocli_filetree_collapsed');
   if (savedFileTreeCollapsed === 'true') {
-    fileTreeCollapsed = true;
-    fileTreePanel.classList.add('collapsed');
-    fileTreeToggle.classList.add('collapsed');
-    setIcon(fileTreeToggle, 'chevron-right', 12);
-    updatePanelToggleA11y(fileTreeToggle, true, '目录树');
+    fileTreeUserCollapsed = true;
+    applyFileTreeCollapsed(true);
   }
   const savedSidebarCollapsed = localStorage.getItem('duocli_sidebar_collapsed');
   if (savedSidebarCollapsed === 'true') {
@@ -3928,6 +4183,7 @@ window.addEventListener('resize', syncPanelTogglePositions);
     setIcon(sidebarToggle, 'chevron-left', 12);
     updatePanelToggleA11y(sidebarToggle, true, '会话列表');
   }
+  syncCompactLayout();
   syncPanelTogglePositions();
 })();
 
@@ -4078,20 +4334,33 @@ aiKeyToggle.addEventListener('click', () => {
 
 // ========== IPC 监听 ==========
 
+window.duocli.onPtyParsed((id, _data, sequence) => {
+  termManager.applyParsed(id, _data, sequence);
+});
+
 window.duocli.onPtyData((id, data) => {
-  termManager.write(id, data);
+  // Rendering uses the ordered parsed stream below, the same sequence domain
+  // as snapshots. Raw output still drives activity/status without double paint.
   if (sessionTitles.has(id)) {
     sessionUpdateTimes.set(id, Date.now());
   }
-  // 所有会话都追踪状态（工作中/等待输入），确保切换查看后状态不丢失
-  const activeId = getActiveSessionId();
+  // 所有会话都追踪状态（进行中/已停未查看），确保切换查看后状态不丢失
   if (sessionTitles.has(id)) {
-    // 有新输出就优先显示"工作中"（黄点），并清掉旧的"待处理"（绿点）
+    // 有新输出 → 标为进行中（绿点），并清掉「未查看」
+    // 切换后短窗口内的 resize 重绘忽略，避免灰→误绿
+    const suppressBusy = Date.now() < (statusBusySuppressUntil.get(id) || 0);
     const prevBusy = sessionBusy.has(id);
     const prevUnread = sessionUnread.has(id);
-    sessionBusy.add(id);
-    sessionUnread.delete(id);
-    if (!prevBusy || prevUnread) renderSessionList();
+    // 切换/fit 带来的 CSI 重绘不能把黄、灰点刷成绿
+    const ignoreBusy = suppressBusy || (isTransientTerminalOutput(data) && !sessionBusy.has(id));
+    if (!ignoreBusy) {
+      sessionBusy.add(id);
+      sessionUnread.delete(id);
+      if (statusBusySuppressUntil.has(id)) statusBusySuppressUntil.delete(id);
+    }
+    if ((!prevBusy && sessionBusy.has(id)) || (prevUnread && !sessionUnread.has(id))) {
+      renderSessionList();
+    }
 
     // 累积最近数据用于提示符检测（保留最后 500 字符）
     const prev = recentDataBuffer.get(id) || '';
@@ -4130,30 +4399,30 @@ window.duocli.onPtyData((id, data) => {
     const hasPrompt = (promptLike || shellPrompt) && !cliWorking;
 
     if (hasPrompt) {
-      // 检测到提示符 → 从工作中转为等待输入（黄→绿/灰）
+      // 检测到提示符 → 从进行中转为已停止（绿→黄/灰）
       clearTimeout(unreadTimers.get(id));
       unreadTimers.delete(id);
       recentDataBuffer.delete(id);
+      statusBusySuppressUntil.delete(id);
       const wasBusy = sessionBusy.delete(id);
       const hadUnread = sessionUnread.has(id);
-      // 当前活跃会话直接变灰（用户正在看着）；非活跃会话标记为待处理（绿点）
-      if (id !== activeId && !sessionUnread.has(id)) {
+      // 桌面或手机正在看着 → 灰；没人看 → 黄（未查看）
+      if (!sessionIsBeingWatched(id) && !sessionUnread.has(id)) {
         sessionUnread.add(id);
       }
       const nowUnread = sessionUnread.has(id);
       if (wasBusy || hadUnread !== nowUnread) renderSessionList();
-    } else {
-      // 未检测到提示符：用静默超时兜底（15秒无新输出 → 黄→绿/灰）
-      // 避免提示符匹配不到时永远卡在黄灯
+    } else if (!ignoreBusy) {
+      // 未检测到提示符：静默超时兜底（无新输出 → 绿→黄/灰）
+      // 避免提示符匹配不到时永远卡在绿灯；suppress 窗口内不启超时
       clearTimeout(unreadTimers.get(id));
       unreadTimers.set(id, setTimeout(() => {
         unreadTimers.delete(id);
         recentDataBuffer.delete(id);
-        // 超时兜底：如果仍然是黄灯状态，转为绿灯或灰灯
+        // 超时兜底：如果仍然是进行中，转为黄（未查看）或灰（当前会话）
         if (sessionBusy.has(id)) {
           sessionBusy.delete(id);
-          const currentActiveId = getActiveSessionId();
-          if (id !== currentActiveId) {
+          if (!sessionIsBeingWatched(id)) {
             sessionUnread.add(id);
           }
           renderSessionList();
@@ -4172,6 +4441,15 @@ window.duocli.onTitleUpdate((id, title) => {
     renderSessionList();
     updateSessionTitleBar();
   }
+});
+
+window.duocli.onSessionRemoteView((id, info) => {
+  let changed = false;
+  if (info?.viewed && sessionUnread.delete(id)) changed = true;
+  if (info?.viewing === true) sessionRemoteViewers.add(id);
+  else if (info?.viewing === false) sessionRemoteViewers.delete(id);
+  if (changed) renderSessionList();
+  else if (info?.viewed) syncSessionStatusToMain();
 });
 
 window.duocli.onPtyExit((id) => {
@@ -4252,11 +4530,73 @@ remoteServerInfoEl.querySelector('.remote-info-retry')?.addEventListener('click'
   void handleRemoteRetryClick();
 });
 
+remoteServerInfoEl.querySelector('.remote-info-guide')?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  openRemoteGuide();
+});
+
+remoteServerInfoEl.querySelector('.remote-info-guide-hint')?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  openRemoteGuide();
+});
+
+document.getElementById('empty-remote-guide-btn')?.addEventListener('click', () => {
+  openRemoteGuide();
+});
+
+const remoteGuideOverlay = document.getElementById('remote-guide-overlay');
+document.getElementById('remote-guide-close')?.addEventListener('click', () => closeRemoteGuide());
+document.getElementById('remote-guide-done')?.addEventListener('click', () => closeRemoteGuide());
+remoteGuideOverlay?.addEventListener('click', (event) => {
+  if (event.target === remoteGuideOverlay) closeRemoteGuide();
+});
+remoteGuideOverlay?.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeRemoteGuide();
+});
+
+document.getElementById('remote-guide-copy-lan')?.addEventListener('click', (event) => {
+  const url = remoteServerInfo?.lanUrl;
+  if (!url) return;
+  void copyRemoteGuideText(url, event.currentTarget as HTMLButtonElement);
+});
+
+document.getElementById('remote-guide-copy-token')?.addEventListener('click', (event) => {
+  const token = remoteServerInfo?.token;
+  if (!token) return;
+  remoteTokenVisible = true;
+  renderRemoteServerInfo();
+  void copyRemoteGuideText(token, event.currentTarget as HTMLButtonElement);
+});
+
+document.getElementById('remote-guide-copy-login')?.addEventListener('click', (event) => {
+  const loginUrl = getRemoteLoginUrl();
+  if (!loginUrl) return;
+  void copyRemoteGuideText(loginUrl, event.currentTarget as HTMLButtonElement);
+});
+
+document.getElementById('remote-guide-prepare-config')?.addEventListener('click', () => {
+  void handlePrepareRemoteTunnelConfig(true);
+});
+
+document.getElementById('remote-guide-reveal-config')?.addEventListener('click', () => {
+  void handlePrepareRemoteTunnelConfig(false);
+});
+
+document.getElementById('remote-guide-retry')?.addEventListener('click', () => {
+  void handleRemoteRetryClick();
+});
+
+document.querySelectorAll<HTMLButtonElement>('.remote-guide-copy-cmd').forEach((button) => {
+  button.addEventListener('click', () => {
+    const cmd = button.dataset.cmd;
+    if (!cmd) return;
+    void copyRemoteGuideText(cmd, button);
+  });
+});
+
 remoteServerInfoEl.querySelector('.remote-info-url')?.addEventListener('click', () => {
-  if (!remoteServerInfo) return;
-  const text = remoteServerInfo.publicUrl && remoteServerInfo.health?.status === 'healthy'
-    ? remoteServerInfo.publicUrl
-    : remoteServerInfo.lanUrl;
+  const text = getPreferredRemoteBaseUrl();
+  if (!text) return;
   void navigator.clipboard.writeText(text).catch(() => { /* ignore */ });
 });
 

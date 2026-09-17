@@ -92,24 +92,24 @@
         <textarea id="auto-continue-message" class="ac-config-command" rows="4" placeholder="每行一条命令，按顺序发送"></textarea>
 
         <section class="ac-config-group ac-config-group-primary">
-          <div class="ac-config-group-title">运行安排</div>
+          <div class="ac-config-group-title">发送安排</div>
           <div class="ac-config-grid">
             <label class="ac-config-field">开始时间
               <span class="ac-field-hint">延迟分钟，0 表示立即</span>
               <input id="auto-continue-initial-delay" type="number" min="0" value="0" placeholder="0" />
             </label>
-            <label class="ac-config-field">运行次数
-              <span class="ac-field-hint">-1 表示不限制</span>
-              <input id="auto-continue-max-loops" type="number" min="-1" value="-1" placeholder="-1" />
-            </label>
           </div>
         </section>
 
         <section class="ac-config-group">
-          <div class="ac-config-group-title">计划与发送</div>
+          <div class="ac-config-group-title">循环设置</div>
           <div class="ac-config-grid">
             <label class="ac-config-field">计划间隔（分钟）
               <input id="auto-continue-interval" type="number" min="1" placeholder="分钟" />
+            </label>
+            <label class="ac-config-field">循环次数
+              <span class="ac-field-hint">-1 表示不限制</span>
+              <input id="auto-continue-max-loops" type="number" min="-1" value="-1" placeholder="-1" />
             </label>
             <label class="ac-config-field">命令间隔（秒）
               <input id="auto-continue-command-interval" type="number" min="0" value="2" placeholder="秒" />
@@ -209,6 +209,91 @@
     </div>
   </div>
 
+  <!-- 远程连接指南 -->
+  <div id="remote-guide-overlay" class="new-session-overlay" tabindex="-1">
+    <div class="new-session-dialog remote-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="remote-guide-title">
+      <div class="new-session-header">
+        <h3 id="remote-guide-title">远程连接指南</h3>
+        <button id="remote-guide-close" class="new-session-close" title="关闭" type="button">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <div class="remote-guide-body">
+        <div id="remote-guide-status" class="remote-guide-status"></div>
+
+        <section class="remote-guide-section">
+          <h4>1. 同一 Wi-Fi，马上能用</h4>
+          <p>电脑打开 DuoCLI 后，本地服务会自动在 9800 端口就绪，不用再装别的软件。</p>
+          <ol>
+            <li>手机和电脑连同一个 Wi-Fi</li>
+            <li>手机浏览器打开下面的局域网地址</li>
+            <li>粘贴 Token，点「连接终端」</li>
+          </ol>
+          <div class="remote-guide-kv">
+            <span class="remote-guide-k">局域网</span>
+            <code id="remote-guide-lan-url">启动后自动显示</code>
+          </div>
+          <div class="remote-guide-actions">
+            <button type="button" id="remote-guide-copy-lan" class="toolbar-btn">复制地址</button>
+            <button type="button" id="remote-guide-copy-token" class="toolbar-btn">复制 Token</button>
+            <button type="button" id="remote-guide-copy-login" class="toolbar-btn">复制一键登录链接</button>
+          </div>
+          <p class="remote-guide-note">地址和 Token 也在右侧「手机远程同步」卡片里。点眼睛可查看 Token。</p>
+        </section>
+
+        <section class="remote-guide-section">
+          <h4>2. 固定公网地址，出门也能连</h4>
+          <p>局域网只能在家里用。要在外面用手机连，需要一个你自己的固定域名，通过 Cloudflare Tunnel 转到本机 9800。不用自己买云服务器，也不用开端口。</p>
+          <ul id="remote-guide-checklist" class="remote-guide-checklist"></ul>
+          <ol>
+            <li>
+              安装 cloudflared
+              <div class="remote-guide-cmd-row">
+                <code>brew install cloudflared</code>
+                <button type="button" class="remote-guide-copy-cmd" data-cmd="brew install cloudflared">复制</button>
+              </div>
+            </li>
+            <li>
+              登录 Cloudflare，并创建一条隧道
+              <div class="remote-guide-cmd-row">
+                <code>cloudflared tunnel login</code>
+                <button type="button" class="remote-guide-copy-cmd" data-cmd="cloudflared tunnel login">复制</button>
+              </div>
+              <div class="remote-guide-cmd-row">
+                <code>cloudflared tunnel create duocli</code>
+                <button type="button" class="remote-guide-copy-cmd" data-cmd="cloudflared tunnel create duocli">复制</button>
+              </div>
+              <p class="remote-guide-note">登录后会得到隧道 ID，凭证一般在 <code>~/.cloudflared/&lt;隧道ID&gt;.json</code>。域名要在 Cloudflare 里指到这条隧道。</p>
+            </li>
+            <li>
+              生成本机配置文件，把隧道名、域名、凭证路径改成你自己的
+              <div class="remote-guide-actions">
+                <button type="button" id="remote-guide-prepare-config" class="toolbar-btn">生成配置并打开</button>
+                <button type="button" id="remote-guide-reveal-config" class="toolbar-btn">在 Finder 中显示</button>
+              </div>
+              <p id="remote-guide-config-path" class="remote-guide-path">配置路径将在这里显示</p>
+            </li>
+            <li>保存文件后回到 DuoCLI 点「重试」，侧栏地址应变为 <code>https://你的域名</code></li>
+          </ol>
+        </section>
+
+        <section class="remote-guide-section">
+          <h4>连不上时</h4>
+          <ul>
+            <li>先确认电脑 DuoCLI 还在运行。关掉窗口一般还能连，完全退出应用后本地服务会停。</li>
+            <li>局域网打不开：确认同一 Wi-Fi，并让防火墙放行 9800 端口。</li>
+            <li>提示 Token 错误：从侧栏点眼睛复制，不要手打。</li>
+            <li>公网打不开：配置文件里不能还留着 <code>YOUR_TUNNEL_NAME</code>、<code>duocli.example.com</code> 这类占位符。</li>
+          </ul>
+        </section>
+      </div>
+      <div class="remote-guide-footer">
+        <button type="button" id="remote-guide-retry" class="toolbar-btn">重试检测</button>
+        <button type="button" id="remote-guide-done" class="toolbar-btn">知道了</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 主体 -->
   <div id="main">
     <!-- 左侧目录树收起按钮 -->
@@ -263,6 +348,7 @@
               <div class="empty-feat-chip"><span class="feat-dot blue"></span>Codex 全功能</div>
               <div class="empty-feat-chip"><span class="feat-dot orange"></span>手机远程实时同步</div>
             </div>
+            <button type="button" id="empty-remote-guide-btn" class="empty-remote-guide-btn">手机怎么连？</button>
           </div>
         </div>
       </div>
@@ -297,7 +383,10 @@
         <div class="remote-info-header">
           <span class="remote-status-pulse status-healthy"></span>
           <span class="remote-info-title">手机远程同步</span>
-          <button type="button" class="remote-info-retry" hidden>重试</button>
+          <div class="remote-info-header-actions">
+            <button type="button" class="remote-info-guide">怎么连</button>
+            <button type="button" class="remote-info-retry" hidden>重试</button>
+          </div>
         </div>
         <div class="remote-info-status">检测中…</div>
         <div class="remote-info-url" title="点击复制公网或局域网地址"></div>
@@ -321,6 +410,7 @@
           <button type="button" class="remote-info-token-cancel" title="取消" aria-label="取消修改" hidden>取消</button>
         </div>
         <div class="remote-info-token-hint" hidden></div>
+        <button type="button" class="remote-info-guide-hint">同一 Wi-Fi 下，手机浏览器打开上面的地址，再粘贴 Token。公网怎么配？</button>
       </div>
       <div id="session-list"></div>
 

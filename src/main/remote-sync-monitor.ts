@@ -29,7 +29,7 @@ export function probeLocalRemoteServer(port: number, host = '127.0.0.1', timeout
   });
 }
 
-export function probePublicRemoteServer(publicBaseUrl: string, timeoutMs = 8000): Promise<boolean> {
+function probePublicRemoteServerOnce(publicBaseUrl: string, timeoutMs: number): Promise<boolean> {
   const base = String(publicBaseUrl || '').trim().replace(/\/+$/, '');
   if (!base) return Promise.resolve(false);
 
@@ -42,7 +42,8 @@ export function probePublicRemoteServer(publicBaseUrl: string, timeoutMs = 8000)
 
   const lib = url.protocol === 'https:' ? https : http;
   return new Promise((resolve) => {
-    const req = lib.get(url, { timeout: timeoutMs }, (res) => {
+    // 优先 IPv4，避免个别网络 IPv6 半通导致整次探测超时。
+    const req = lib.get(url, { timeout: timeoutMs, family: 4 }, (res) => {
       resolve(res.statusCode === 200);
       res.resume();
     });
@@ -52,6 +53,19 @@ export function probePublicRemoteServer(publicBaseUrl: string, timeoutMs = 8000)
       resolve(false);
     });
   });
+}
+
+export async function probePublicRemoteServer(
+  publicBaseUrl: string,
+  timeoutMs = 8000,
+  attempts = 2,
+): Promise<boolean> {
+  const total = Number.isInteger(attempts) && attempts > 0 ? attempts : 1;
+  for (let i = 0; i < total; i++) {
+    if (await probePublicRemoteServerOnce(publicBaseUrl, timeoutMs)) return true;
+    if (i < total - 1) await sleep(400);
+  }
+  return false;
 }
 
 function sleep(ms: number): Promise<void> {

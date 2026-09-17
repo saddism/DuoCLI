@@ -34,6 +34,50 @@ test('empty splash is centered and has a new-session button', () => {
   assert.match(styleCss, /\.empty-state\s*\{[^}]*align-items:\s*center/);
 });
 
+test('device picker includes a computer remote-desktop entry', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'mobile', 'client', 'index.html'), 'utf8');
+  const app = fs.readFileSync(path.join(__dirname, '..', 'mobile', 'client', 'app.js'), 'utf8');
+  assert.match(html, /id="mac-desktop-container"/);
+  assert.match(html, /id="mac-desktop-fullscreen-preview"/);
+  assert.match(html, /id="device-desktop-window-btn"/);
+  assert.match(app, /const COMPUTER_DEVICE_ID = 'duocli-computer'/);
+  assert.match(app, /opt\.textContent = '电脑'/);
+  assert.match(app, /function showComputerDesktop/);
+  assert.match(app, /function startMacDesktopPreview/);
+  assert.match(app, /function openMacDesktopFullscreen/);
+  assert.match(app, /function openMacDesktopWindow/);
+  assert.match(app, /\/api\/mac-desktop\/screenshot/);
+  assert.match(app, /function androidControlDeviceId/);
+  assert.match(app, /if \(!id \|\| isComputerDevice\(id\)\) return;/);
+  assert.equal(app.includes('checkIsMacDesktop()'), false);
+  assert.match(styleCss, /body\.computer-desktop-fullscreen/);
+});
+
+test('mac desktop dedicated viewer page exists', () => {
+  const clientDir = path.join(__dirname, '..', 'mobile', 'client');
+  const html = fs.readFileSync(path.join(clientDir, 'mac-desktop-view.html'), 'utf8');
+  const js = fs.readFileSync(path.join(clientDir, 'mac-desktop-view.js'), 'utf8');
+  const sw = fs.readFileSync(path.join(clientDir, 'sw.js'), 'utf8');
+  assert.match(html, /id="desktop"/);
+  assert.match(html, /mac-desktop-view\.js/);
+  assert.match(js, /\/api\/mac-desktop\/screenshot/);
+  assert.match(js, /\/api\/mac-desktop\/tap/);
+  assert.match(sw, /mac-desktop-view\.html/);
+  assert.match(sw, /mac-desktop-view\.js/);
+});
+
+test('network mode chip lives in a shared host and is not hidden by the landscape drawer', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'mobile', 'client', 'index.html'), 'utf8');
+  assert.match(html, /id="main-net-mode-host"/);
+  assert.match(html, /id="detail-net-mode-host"/);
+  assert.match(html, /id="net-mode-btn"/);
+  assert.equal(
+    /#main-page\.landscape-drawer-open #net-mode-btn/.test(styleCss),
+    false,
+    'landscape session drawer must not hide the network switch',
+  );
+});
+
 test('landscape workspace hides back arrows because the session list is already visible', () => {
   assert.match(styleCss, /body\.landscape-workspace #back-btn/);
   assert.match(styleCss, /body\.landscape-sessions-open #back-btn/);

@@ -7,6 +7,7 @@ export class TerminalScrollController {
   private gesture = 0;
   private pointerDown = false;
   private disposed = false;
+  private lastBufferType: string | null = null;
   private layoutTimer: ReturnType<typeof setTimeout> | null = null;
   private events = new AbortController();
   private subscriptions: IDisposable[] = [];
@@ -15,18 +16,22 @@ export class TerminalScrollController {
     private terminal: Terminal,
     container: HTMLElement,
     private button: HTMLButtonElement,
+    private onHistoryIntent?: () => void,
   ) {
     const options = { capture: true, signal: this.events.signal };
     // The rendered screen and viewport are siblings. Listen above both, before
     // xterm processes the gesture or an asynchronous write can complete.
     container.addEventListener('wheel', (event) => {
+      if (event.target instanceof Element && event.target.closest('.terminal-history-layer')) return;
       if (event.deltaY === 0 || terminal.buffer.active.type === 'alternate') return;
       const version = this.pause();
+      if (event.deltaY < 0 && terminal.buffer.active.viewportY <= 3) this.onHistoryIntent?.();
       this.checkAfterGesture(version, event.deltaY > 0 ? 3 : 0);
     }, { ...options, passive: true });
 
     container.addEventListener('pointerdown', (event) => {
       if (event.button !== 0 || !(event.target instanceof Element)
+        || event.target.closest('.terminal-history-layer')
         || !event.target.closest('.xterm')) return;
       this.pointerDown = true;
       this.pause();
@@ -63,7 +68,9 @@ export class TerminalScrollController {
       terminal.onWriteParsed(() => this.sync()),
       terminal.buffer.onBufferChange(() => {
         const buffer = terminal.buffer.active;
-        if (!this.following && buffer.type === 'normal' && buffer.viewportY < buffer.baseY) {
+        const typeChanged = this.lastBufferType != null && this.lastBufferType !== buffer.type;
+        this.lastBufferType = buffer.type;
+        if (typeChanged && !this.following && buffer.type === 'normal' && buffer.viewportY < buffer.baseY) {
           // The alternate viewport can reset xterm's internal user-scrolling
           // flag. Reapply the saved normal position through public scroll APIs
           // before the parser appends output to this buffer again.
@@ -87,9 +94,12 @@ export class TerminalScrollController {
     // Native scroll events and xterm's DOM scroll area settle on later frames.
     const check = () => {
       if (this.disposed || version !== this.gesture) return;
+      const buffer = this.terminal.buffer.active;
       if (!this.pointerDown && !this.terminal.hasSelection()
-        && this.terminal.buffer.active.type === 'normal' && this.distance() <= tolerance) {
+        && buffer.type === 'normal' && this.distance() <= tolerance) {
         this.follow();
+      } else if (!this.pointerDown && buffer.type === 'normal' && buffer.viewportY <= 3) {
+        this.onHistoryIntent?.();
       }
       this.updateButton();
     };
@@ -108,6 +118,10 @@ export class TerminalScrollController {
     this.cancelFrame();
     this.cancelLayoutTimer();
     this.sync();
+  }
+
+  gestureVersion(): number {
+    return this.gesture;
   }
 
   stopFollowing(): void {
@@ -134,17 +148,13 @@ export class TerminalScrollController {
     const version = this.gesture;
     const scroll = () => {
       if (this.disposed || version !== this.gesture || !this.following || this.pointerDown) return;
-      this.terminal.scrollToBottom();
+      if (this.distance() > 0) this.safeScrollToBottom();
       this.updateButton();
     };
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         if (this.disposed || version !== this.gesture) return;
         scroll();
-        this.layoutTimer = setTimeout(() => {
-          this.layoutTimer = null;
-          scroll();
-        }, 50);
       });
     });
   }
@@ -152,18 +162,40 @@ export class TerminalScrollController {
   sync(): void {
     if (this.disposed) return;
     if (this.following && !this.pointerDown) {
-      this.terminal.scrollToBottom();
-      this.scheduleSync();
+      this.safeScrollToBottom();
+      if (this.distance() > 0) this.scheduleSync();
     }
     this.updateButton();
   }
 
+  private safeScrollToBottom(): void {
+    const renderService = (this.terminal as unknown as { _core?: { _renderService?: { dimensions?: unknown } } })._core?._renderService;
+    if (!renderService?.dimensions) return;
+    try {
+      if (this.terminal.options) this.terminal.options.smoothScrollDuration = 0;
+    } catch { /* options may be read-only during dispose */ }
+    const baseY = this.terminal.buffer.active.baseY;
+    if (this.distance() <= 0) {
+      // Already on the live edge: still tell xterm the user is not scrolling,
+      // otherwise a full live buffer recycles one row on the next write.
+      try { this.terminal.scrollToLine(baseY); } catch { /* renderer may not exist yet */ }
+      return;
+    }
+    const viewport = (this.terminal as unknown as { _core?: { _viewport?: { scrollToLine?: (y: number, force?: boolean) => void } } })._core?._viewport;
+    try {
+      if (typeof viewport?.scrollToLine === 'function') viewport.scrollToLine(baseY, true);
+      else this.terminal.scrollToLine(baseY);
+    } catch {
+      try { this.terminal.scrollToBottom(); } catch { /* renderer may not exist yet */ }
+    }
+  }
+
   private scheduleSync(): void {
-    if (this.disposed || !this.following || this.pointerDown || this.frame !== null) return;
+    if (this.disposed || !this.following || this.pointerDown || this.frame !== null || this.distance() <= 0) return;
     this.frame = requestAnimationFrame(() => {
       // Keep frame set during scrollToBottom: its synchronous onScroll must
       // not schedule another frame. Read current intent, never an old snapshot.
-      if (this.following && !this.pointerDown) this.terminal.scrollToBottom();
+      if (this.following && !this.pointerDown && this.distance() > 0) this.safeScrollToBottom();
       this.updateButton();
       this.frame = null;
     });

@@ -8,7 +8,16 @@ export interface CloudflaredStatus {
   running: boolean;
   url: string;
   configPath: string;
+  configExists: boolean;
+  configReady: boolean;
   message?: string;
+}
+
+export interface PrepareTunnelConfigResult {
+  ok: true;
+  configPath: string;
+  created: boolean;
+  configReady: boolean;
 }
 
 const TEMPLATE_MARKERS = [
@@ -16,16 +25,48 @@ const TEMPLATE_MARKERS = [
   'YOUR_TUNNEL_ID',
   '/ABSOLUTE/PATH/TO/',
   'duocli.example.com',
+  'your-tunnel-name',
+  'your-tunnel-id',
+  'your-domain.example.com',
 ];
+
+export const CLOUDFLARED_USER_CONFIG_TEMPLATE = `# DuoCLI 公网隧道配置。把下面三处改成你自己的，保存后回应用点「重试」。
+# 1) tunnel: cloudflared tunnel create 得到的名称
+# 2) credentials-file: ~/.cloudflared/<隧道ID>.json 的绝对路径
+# 3) hostname: 你已经在 Cloudflare 里指到这条隧道的域名
+tunnel: YOUR_TUNNEL_NAME
+credentials-file: /ABSOLUTE/PATH/TO/.cloudflared/YOUR_TUNNEL_ID.json
+protocol: http2
+
+ingress:
+  - hostname: duocli.example.com
+    service: http://127.0.0.1:9800
+
+  - service: http_status:404
+`;
+
+export function isCloudflaredConfigReady(raw: string): boolean {
+  if (!raw.trim()) return false;
+  return !TEMPLATE_MARKERS.some(marker => raw.includes(marker));
+}
 
 export class CloudflaredManager {
   private child: ChildProcess | null = null;
-  private readonly configPath: string;
-  private readonly logPath: string;
+  private readonly projectRoot: string;
+  private readonly homeConfigPath: string;
 
-  constructor(projectRoot: string) {
-    this.configPath = this.resolveConfigPath(projectRoot);
-    this.logPath = path.join(path.dirname(this.configPath), 'cloudflared.log');
+  constructor(projectRoot: string, options?: { homeConfigPath?: string }) {
+    this.projectRoot = projectRoot;
+    this.homeConfigPath = options?.homeConfigPath
+      || path.join(os.homedir(), '.config', 'duocli-tunnel', 'config.yml');
+  }
+
+  get configPath(): string {
+    return this.resolveConfigPath();
+  }
+
+  get logPath(): string {
+    return path.join(path.dirname(this.configPath), 'cloudflared.log');
   }
 
   getStatus(): CloudflaredStatus {
@@ -35,15 +76,41 @@ export class CloudflaredManager {
     const running = installed && this.isRunning();
     const config = this.readConfig();
     const publicUrl = config.hostname ? `https://${config.hostname}` : '';
-    const configReady = this.isConfigReady(config.raw);
+    const configReady = isCloudflaredConfigReady(config.raw);
     const message = this.getStatusMessage(installed, configReady, config);
     return {
       installed,
       running,
       url: publicUrl,
       configPath: this.configPath,
+      configExists: config.exists,
+      configReady,
       message,
     };
+  }
+
+  /**
+   * 为不会改仓库文件的用户准备一份可编辑的本机配置。
+   * 已有 local/private/home 配置时不覆盖，只返回路径。
+   */
+  prepareUserConfig(): PrepareTunnelConfigResult | { ok: false; error: string } {
+    const target = this.getPreferredUserConfigPath();
+    try {
+      if (fs.existsSync(target)) {
+        const raw = fs.readFileSync(target, 'utf-8');
+        return {
+          ok: true,
+          configPath: target,
+          created: false,
+          configReady: isCloudflaredConfigReady(raw),
+        };
+      }
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, CLOUDFLARED_USER_CONFIG_TEMPLATE, 'utf-8');
+      return { ok: true, configPath: target, created: true, configReady: false };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   /** 与 start 相同，语义上表示“确保隧道在跑”。 */
@@ -80,15 +147,19 @@ export class CloudflaredManager {
         running: false,
         url: publicUrl,
         configPath: this.configPath,
+        configExists: false,
+        configReady: false,
         message: `找不到 cloudflared 配置: ${this.configPath}`,
       };
     }
-    if (!this.isConfigReady(config.raw)) {
+    if (!isCloudflaredConfigReady(config.raw)) {
       return {
         installed: true,
         running: false,
         url: publicUrl,
         configPath: this.configPath,
+        configExists: true,
+        configReady: false,
         message: `Cloudflare 配置未完成，请填写本机私有配置: ${this.configPath}`,
       };
     }
@@ -159,23 +230,52 @@ export class CloudflaredManager {
     }
   }
 
-  private resolveConfigPath(projectRoot: string): string {
+  private getPreferredUserConfigPath(): string {
+    const localYml = path.join(this.projectRoot, 'frp', 'cloudflared-config.local.yml');
+    const privateYml = path.join(this.projectRoot, 'frp', 'cloudflared-config.private.yml');
+    if (fs.existsSync(localYml)) return localYml;
+    if (fs.existsSync(privateYml)) return privateYml;
+    if (fs.existsSync(this.homeConfigPath)) return this.homeConfigPath;
+    if (this.isProjectFrpWritable()) return localYml;
+    return this.homeConfigPath;
+  }
+
+  private isProjectFrpWritable(): boolean {
+    const frpDir = path.join(this.projectRoot, 'frp');
+    if (!fs.existsSync(frpDir)) return false;
+    if (process.resourcesPath && frpDir.startsWith(process.resourcesPath)) return false;
+    try {
+      fs.accessSync(frpDir, fs.constants.W_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private resolveConfigPath(): string {
+    const explicit = process.env.DUOCLI_CLOUDFLARED_CONFIG || '';
+    if (explicit && fs.existsSync(explicit)) return explicit;
+
     const candidates = [
-      process.env.DUOCLI_CLOUDFLARED_CONFIG || '',
-      path.join(projectRoot, 'frp', 'cloudflared-config.local.yml'),
-      path.join(projectRoot, 'frp', 'cloudflared-config.private.yml'),
-      path.join(os.homedir(), '.config', 'duocli-tunnel', 'config.yml'),
+      path.join(this.projectRoot, 'frp', 'cloudflared-config.local.yml'),
+      path.join(this.projectRoot, 'frp', 'cloudflared-config.private.yml'),
+      this.homeConfigPath,
       process.resourcesPath ? path.join(process.resourcesPath, 'frp', 'cloudflared-config.local.yml') : '',
       process.resourcesPath ? path.join(process.resourcesPath, 'frp', 'cloudflared-config.private.yml') : '',
       process.resourcesPath ? path.join(process.resourcesPath, 'frp', 'cloudflared-config.yml') : '',
-      path.join(projectRoot, 'frp', 'cloudflared-config.yml'),
+      path.join(this.projectRoot, 'frp', 'cloudflared-config.yml'),
     ].filter(Boolean);
 
     for (const candidate of candidates) {
-      if (fs.existsSync(candidate)) return candidate;
+      if (!fs.existsSync(candidate)) continue;
+      try {
+        if (isCloudflaredConfigReady(fs.readFileSync(candidate, 'utf-8'))) return candidate;
+      } catch {
+        continue;
+      }
     }
 
-    return path.join(projectRoot, 'frp', 'cloudflared-config.local.yml');
+    return this.getPreferredUserConfigPath();
   }
 
   private resolveBinary(): string | null {
@@ -231,11 +331,6 @@ export class CloudflaredManager {
       raw,
       hostname: hostnameMatch ? hostnameMatch[1].trim() : null,
     };
-  }
-
-  private isConfigReady(raw: string): boolean {
-    if (!raw.trim()) return false;
-    return !TEMPLATE_MARKERS.some(marker => raw.includes(marker));
   }
 
   private getStatusMessage(

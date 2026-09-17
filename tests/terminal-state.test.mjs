@@ -77,9 +77,34 @@ test('large history and resize restore a parsed screen, never an arbitrary ANSI 
   await state.snapshot(value => { snapshot = value; });
   assert.equal(snapshot.cols, 43);
   assert.equal(snapshot.rows, 33);
+  assert.equal(snapshot.hasMoreHistory, false);
   await write(restored, snapshot.data);
   assert.deepEqual(buffer(restored), buffer(state.terminal));
   assert.equal(restored.modes.bracketedPasteMode, true);
+});
+
+test('limited scrollback snapshot is only the latest screen and reports more history', async t => {
+  const state = new TerminalState();
+  const restored = browserTerminal(40, 12);
+  t.after(() => { state.dispose(); restored.dispose(); });
+  state.resize(40, 12);
+  state.write(Array.from({ length: 80 }, (_, i) => `line-${String(i).padStart(3, '0')}\r\n`).join(''), () => {});
+  let latest;
+  await state.snapshot(value => { latest = value; }, { scrollback: 0 });
+  assert.equal(latest.scrollback, 0);
+  assert.equal(latest.hasMoreHistory, true);
+  assert.ok(latest.scrollbackTotal > 0);
+  assert.ok(latest.data.length < 20_000);
+
+  let fuller;
+  await state.snapshot(value => { fuller = value; }, { scrollback: 40 });
+  assert.equal(fuller.scrollback, 40);
+  assert.ok(fuller.data.length > latest.data.length);
+
+  await write(restored, latest.data);
+  const text = buffer(restored).lines.join('\n');
+  assert.match(text, /line-079/);
+  assert.doesNotMatch(text, /line-000/);
 });
 
 test('duplicate submission IDs emit one paste and one Enter; separate submissions retain order', async t => {

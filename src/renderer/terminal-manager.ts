@@ -9,6 +9,25 @@ const terminalContentHelpers = require('../../mobile/client/terminal-content-hel
   findLinks: (text: string) => Array<any>;
   matchRange: (logicalLine: any, match: any) => any;
 };
+const terminalScrollHelpers = require('../../mobile/client/terminal-scroll-helpers.js') as {
+  LIVE_TERMINAL_SCROLLBACK: number;
+};
+const terminalHistoryLayer = require('../../mobile/client/terminal-history-layer.js') as {
+  createHistoryLayer: (options?: Record<string, unknown>) => {
+    root: HTMLElement;
+    show: (meta?: Record<string, unknown>) => void;
+    hide: () => void;
+    reset: () => void;
+    prepend: (page: unknown) => { applied: boolean; stale?: boolean };
+    setCols: (cols: number) => void;
+    setLiveUnread: (value: boolean) => void;
+    setLoading: (value: boolean) => void;
+    isVisible: () => boolean;
+    findText: (text: string) => number;
+    scrollToItem: (index: number) => boolean;
+  };
+  shouldEnterHistory: (input: Record<string, unknown>) => boolean;
+};
 const userPromptBanner = require('../../mobile/client/user-prompt-banner.js') as {
   looksLikeUserPrompt: (text: string) => boolean;
   normalizePrompt: (text: string) => string;
@@ -448,6 +467,8 @@ function attachCursorKeyBindings(
   });
 }
 
+const HIDDEN_WRITE_BUDGET = 32 * 1024;
+
 interface TermInstance {
   id: string;
   terminal: Terminal;
@@ -461,6 +482,21 @@ interface TermInstance {
   promptExpanded: boolean;
   promptMarker: { dispose(): void; line: number; isDisposed: boolean } | null;
   typedLine: string;
+  historyLayer: ReturnType<typeof terminalHistoryLayer.createHistoryLayer>;
+  hiddenQueued: string[];
+  hiddenBytes: number;
+  needsResync: boolean;
+  resyncing: boolean;
+  appliedSeq: number;
+  receivedSeq: number;
+  liveTail: Array<{ data: string; sequence: number }>;
+  epoch: number;
+  historyCursor: string | null;
+  historyHasMore: boolean;
+  historyRequestId: number;
+  revealGeneration: number;
+  revealPromise: Promise<void> | null;
+  lastReportedSize: { cols: number; rows: number } | null;
 }
 
 export class TerminalManager {
@@ -504,7 +540,8 @@ export class TerminalManager {
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
       cursorBlink: true,
       allowProposedApi: true,
-      scrollback: 10000,
+      scrollback: terminalScrollHelpers.LIVE_TERMINAL_SCROLLBACK,
+      smoothScrollDuration: 0,
       linkHandler: TERMINAL_LINK_HANDLER,
     });
 
@@ -523,8 +560,12 @@ export class TerminalManager {
     container.appendChild(surface);
     terminal.open(surface);
     this.resizeObserver.observe(surface);
-    const composer = createQuickCommandComposer(id, {
-      onSubmitText: (text) => this.noteUserPrompt(id, text),
+    const composer = createQuickCommandComposer({
+      onSendKey: (data) => {
+        this.trackTypedPrompt(id, data);
+        onData(data);
+        terminal.focus();
+      },
     });
     container.appendChild(composer.element);
     terminal.onData((data) => {
@@ -632,7 +673,16 @@ export class TerminalManager {
     scrollBtn.style.display = 'none';
     surface.appendChild(scrollBtn);
 
-    const scroll = new TerminalScrollController(terminal, container, scrollBtn);
+    const historyLayer = terminalHistoryLayer.createHistoryLayer({
+      onRequest: (query: { requestId?: string; beforeCursor?: string | null }) => {
+        void this.requestHistory(id, query);
+      },
+      onBackToLive: () => this.exitHistory(id),
+    });
+    surface.appendChild(historyLayer.root);
+    const scroll = new TerminalScrollController(terminal, container, scrollBtn, () => {
+      this.maybeEnterHistory(id);
+    });
     const instance: TermInstance = {
       id,
       terminal,
@@ -646,6 +696,21 @@ export class TerminalManager {
       promptExpanded: false,
       promptMarker: null,
       typedLine: '',
+      historyLayer,
+      hiddenQueued: [],
+      hiddenBytes: 0,
+      needsResync: false,
+      resyncing: false,
+      appliedSeq: 0,
+      receivedSeq: 0,
+      liveTail: [],
+      epoch: 1,
+      historyCursor: null,
+      historyHasMore: false,
+      historyRequestId: 0,
+      revealGeneration: 0,
+      revealPromise: null,
+      lastReportedSize: null,
     };
     promptBanner.moreBtn.addEventListener('click', () => {
       instance.promptExpanded = !instance.promptExpanded;
@@ -665,9 +730,10 @@ export class TerminalManager {
   mountTo(id: string, host: HTMLElement): boolean {
     const instance = this.instances.get(id);
     if (!instance) return false;
+    instance.container.classList.add('terminal-reveal-pending');
     host.appendChild(instance.container);
     instance.container.classList.remove('pane-detached');
-    this.fitTerminal(id, false);
+    void this.revealLatest(instance, false);
     return true;
   }
 
@@ -686,30 +752,73 @@ export class TerminalManager {
     // Pane pointerdown also focuses the current session while selecting text.
     // Sidebar selections explicitly call followSession, including reselects.
     if (this.activeId === id) return;
+    // Standalone users of the manager do not have PaneWorkspace to mount a
+    // newly created view. A child of the detached host cannot receive focus.
+    if (!this.terminalArea.classList.contains('pane-workspace-root')) {
+      for (const instance of this.instances.values()) {
+        if (instance === target) continue;
+        this.detachedHost.appendChild(instance.container);
+        instance.container.classList.add('pane-detached');
+        instance.container.classList.remove('active');
+      }
+      this.terminalArea.appendChild(target.container);
+    }
+    this.exitHistory(id);
     target.container.classList.add('active');
+    target.container.classList.add('terminal-reveal-pending');
     target.container.classList.remove('pane-detached');
     this.activeId = id;
-    target.scroll.followAfterLayout();
-    setTimeout(() => {
-      if (this.instances.get(id) !== target || this.activeId !== id) return;
-      this.fitTerminal(id, true);
-    }, 50);
+    void this.revealLatest(target, true);
   }
 
   /** Keep the active session pinned to the latest output after sidebar switches. */
   followSession(id: string): void {
     if (this.activeId !== id) return;
-    this.instances.get(id)?.scroll.followAfterLayout();
+    const instance = this.instances.get(id);
+    if (!instance || instance.container.classList.contains('terminal-reveal-pending')) return;
+    if (instance.needsResync) {
+      void this.revealLatest(instance, true);
+      return;
+    }
+    instance.scroll.follow();
   }
 
   write(id: string, data: string): void {
     const inst = this.instances.get(id);
-    if (!inst) return;
-    inst.terminal.write(data, () => {
-      if (inst.promptText && (!inst.promptMarker || inst.promptMarker.isDisposed)) {
-        this.rebindPromptMarker(inst);
+    if (!inst || inst.needsResync || inst.resyncing) return;
+    if (this.isDetached(inst)) {
+      if (inst.hiddenBytes + data.length > HIDDEN_WRITE_BUDGET) {
+        inst.hiddenQueued = [];
+        inst.hiddenBytes = 0;
+        inst.needsResync = true;
+        return;
       }
-    });
+      inst.hiddenQueued.push(data);
+      inst.hiddenBytes += data.length;
+      return;
+    }
+    this.writeLive(inst, data);
+  }
+
+  applyParsed(id: string, data: string, sequence: number): void {
+    const inst = this.instances.get(id);
+    if (!inst || !Number.isInteger(sequence) || sequence <= inst.appliedSeq) return;
+    inst.receivedSeq = Math.max(inst.receivedSeq, sequence);
+    if (inst.resyncing || inst.needsResync) {
+      inst.liveTail.push({ data, sequence });
+      // Keep only a bounded tail while hidden. A sequence gap is reconciled
+      // from a fresh snapshot, never treated as successfully rendered output.
+      let bytes = 0;
+      let start = inst.liveTail.length;
+      while (start > 0 && bytes + inst.liveTail[start - 1].data.length <= HIDDEN_WRITE_BUDGET) {
+        bytes += inst.liveTail[--start].data.length;
+      }
+      if (start > 0) inst.liveTail = inst.liveTail.slice(start);
+      return;
+    }
+    inst.appliedSeq = sequence;
+    this.write(id, data);
+    if (inst.historyLayer.isVisible()) inst.historyLayer.setLiveUnread(true);
   }
 
   notifyInput(id: string): void {
@@ -762,7 +871,16 @@ export class TerminalManager {
       instance.promptText,
       instance.promptMarker,
     );
-    if (line < 0) return;
+    if (line < 0) {
+      const historyIndex = instance.historyLayer.findText(instance.promptText);
+      if (historyIndex >= 0) {
+        this.enterHistory(id);
+        instance.historyLayer.scrollToItem(historyIndex);
+        return;
+      }
+      this.showJumpMiss(instance, '这段内容不在当前已加载范围');
+      return;
+    }
     instance.scroll.scrollToLine(line);
     userPromptBanner.scrollLineToTop(instance.terminal, line);
   }
@@ -772,12 +890,19 @@ export class TerminalManager {
     if (!inst) return this.activeId;
     if (inst.terminal.element?.parentElement) this.resizeObserver.unobserve(inst.terminal.element.parentElement);
     inst.disposeComposer();
+    inst.historyLayer.reset();
     inst.scroll.dispose();
     inst.promptMarker?.dispose();
-    inst.terminal.dispose();
+    const terminal = inst.terminal;
+    // xterm Viewport schedules syncScrollArea on a 0-timeout during open.
+    // Disposing in the same turn leaves that callback on a dead renderer.
+    window.setTimeout(() => {
+      try { terminal.dispose(); } catch { /* already torn down */ }
+    }, 0);
     inst.container.remove();
     this.instances.delete(id);
     this.lastFitSizes.delete(id);
+    userPromptBanner.writeStoredPrompt(id, '');
 
     // Prefer a still-mounted pane when the focused terminal is destroyed.
     // Detached instances belong to another workspace and must stay hidden
@@ -818,21 +943,308 @@ export class TerminalManager {
     }
   }
 
+  private isDetached(instance: TermInstance): boolean {
+    return instance.container.classList.contains('pane-detached');
+  }
+
+  private writeLive(inst: TermInstance, data: string): Promise<void> {
+    return new Promise(resolve => {
+      inst.terminal.write(data, () => {
+        if (inst.promptText && (!inst.promptMarker || inst.promptMarker.isDisposed)) {
+          this.rebindPromptMarker(inst);
+        }
+        if (inst.historyLayer.isVisible()) inst.historyLayer.setLiveUnread(true);
+        resolve();
+      });
+    });
+  }
+
+  private flushHidden(instance: TermInstance): Promise<void> {
+    if (!instance.hiddenQueued.length) return Promise.resolve();
+    const queued = instance.hiddenQueued.join('');
+    instance.hiddenQueued = [];
+    instance.hiddenBytes = 0;
+    return this.writeLive(instance, queued);
+  }
+
+  private isRevealStale(instance: TermInstance, generation: number): boolean {
+    return this.instances.get(instance.id) !== instance || instance.revealGeneration !== generation;
+  }
+
+  private async frames(count = 2): Promise<void> {
+    for (let i = 0; i < count; i++) {
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    }
+  }
+
+  private async revealLatest(instance: TermInstance, focus: boolean): Promise<void> {
+    const generation = ++instance.revealGeneration;
+    instance.container.classList.add('terminal-reveal-pending');
+    const previous = instance.revealPromise;
+    const work = (async () => {
+      const gestureAtStart = instance.scroll.gestureVersion();
+      await previous?.catch(() => undefined);
+      if (this.isRevealStale(instance, generation)) return;
+      if (instance.needsResync) await this.resyncFromSnapshot(instance);
+      else await this.flushHidden(instance);
+      if (this.isRevealStale(instance, generation)) return;
+      if (instance.needsResync) {
+        instance.container.classList.remove('terminal-reveal-pending', 'terminal-connecting');
+        this.showJumpMiss(instance, '同步未完成，重新选择此会话重试');
+        return;
+      }
+      this.fitTerminal(instance.id, false);
+      if (instance.scroll.gestureVersion() === gestureAtStart) instance.scroll.follow();
+      await this.frames(2);
+      if (this.isRevealStale(instance, generation)) return;
+      this.fitTerminal(instance.id, false);
+      if (instance.scroll.gestureVersion() === gestureAtStart) instance.scroll.follow();
+      void this.refreshHistoryMeta(instance);
+      instance.container.classList.remove('terminal-reveal-pending');
+      instance.container.classList.remove('terminal-connecting');
+      if (focus) {
+        // Focus on the next visible frame, not an arbitrary delayed timer.
+        // A later switch or detach must invalidate this pending focus.
+        requestAnimationFrame(() => {
+          if (this.isRevealStale(instance, generation) || this.activeId !== instance.id
+              || this.isDetached(instance)) return;
+          if (instance.container.querySelector('.terminal-composer')?.contains(document.activeElement)) return;
+          try { instance.terminal.focus(); } catch { /* ignore an unmounted renderer */ }
+        });
+      }
+    })();
+    instance.revealPromise = work;
+    window.setTimeout(() => {
+      if (this.isRevealStale(instance, generation)) return;
+      if (instance.container.classList.contains('terminal-reveal-pending')) {
+        instance.container.classList.add('terminal-connecting');
+      }
+    }, 150);
+    return work;
+  }
+
+  private async resyncFromSnapshot(instance: TermInstance): Promise<void> {
+    const api = (window as unknown as { duocli?: {
+      snapshotPty?: (id: string, options?: { scrollback?: number }) => Promise<any>;
+    } }).duocli;
+    if (!api?.snapshotPty) {
+      instance.needsResync = false;
+      this.flushHidden(instance);
+      return;
+    }
+    instance.resyncing = true;
+    instance.hiddenQueued = [];
+    instance.hiddenBytes = 0;
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const snapshot = await Promise.race([
+          api.snapshotPty(instance.id, { scrollback: 0 }),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Terminal snapshot timed out')), 8000);
+          }),
+        ]).finally(() => clearTimeout(timer));
+        if (this.instances.get(instance.id) !== instance) return;
+        if (!Number.isInteger(snapshot?.sequence) || typeof snapshot?.data !== 'string') {
+          throw new Error('Invalid terminal snapshot');
+        }
+        // Drain any write submitted before resync before resetting its parser.
+        await new Promise<void>(resolve => instance.terminal.write('', resolve));
+        if (this.instances.get(instance.id) !== instance) return;
+        instance.appliedSeq = snapshot.sequence;
+        instance.receivedSeq = Math.max(instance.receivedSeq, snapshot.sequence);
+        if (snapshot.epoch && snapshot.epoch !== instance.epoch) instance.historyLayer.reset();
+        instance.epoch = Number(snapshot.epoch) || instance.epoch;
+        instance.historyCursor = snapshot.historyCursor || null;
+        instance.historyHasMore = Boolean(snapshot.historyHasMore);
+        instance.terminal.reset();
+        if (Number.isInteger(snapshot.cols) && Number.isInteger(snapshot.rows)
+            && snapshot.cols >= 2 && snapshot.rows > 0) {
+          instance.terminal.resize(snapshot.cols, snapshot.rows);
+        }
+        await new Promise<void>(resolve => instance.terminal.write(snapshot.data, resolve));
+        // Output arriving DURING an asynchronous tail write belongs to the
+        // next batch. Do not clear resyncing until the tail is actually empty.
+        for (let batch = 0; batch < 32; batch++) {
+          if (this.instances.get(instance.id) !== instance) return;
+          const tail = instance.liveTail.filter(chunk => chunk.sequence > instance.appliedSeq);
+          instance.liveTail = [];
+          let next = instance.appliedSeq + 1;
+          const ordered: Array<{ data: string; sequence: number }> = [];
+          let gap = false;
+          for (const chunk of tail) {
+            if (chunk.sequence < next) continue;
+            if (chunk.sequence !== next) { gap = true; break; }
+            ordered.push(chunk);
+            next++;
+          }
+          if (gap || (!ordered.length && instance.receivedSeq > instance.appliedSeq)) break;
+          if (!ordered.length) {
+            instance.needsResync = false;
+            return;
+          }
+          await new Promise<void>(resolve => instance.terminal.write(ordered.map(chunk => chunk.data).join(''), resolve));
+          instance.appliedSeq = ordered[ordered.length - 1].sequence;
+        }
+        // A bounded tail was evicted or the producer outran parsing. Start
+        // from another recent screen instead of silently skipping sequences.
+      }
+      instance.needsResync = true;
+    } catch {
+      instance.needsResync = true;
+    } finally {
+      instance.resyncing = false;
+    }
+  }
+
+  private async refreshHistoryMeta(instance: TermInstance): Promise<void> {
+    const api = (window as unknown as { duocli?: {
+      historyMetaPty?: (id: string) => Promise<{
+        epoch: number;
+        historyCursor: string | null;
+        historyHasMore: boolean;
+        truncated: boolean;
+      }>;
+    } }).duocli;
+    if (!api?.historyMetaPty) return;
+    try {
+      const meta = await api.historyMetaPty(instance.id);
+      if (this.instances.get(instance.id) !== instance) return;
+      instance.epoch = Number(meta?.epoch) || instance.epoch;
+      instance.historyCursor = meta?.historyCursor ?? instance.historyCursor;
+      instance.historyHasMore = Boolean(meta?.historyHasMore);
+    } catch { /* overlay can retry on the next gesture */ }
+  }
+
+  private maybeEnterHistory(id: string): void {
+    void this.maybeEnterHistoryAsync(id);
+  }
+
+  private async maybeEnterHistoryAsync(id: string): Promise<void> {
+    const instance = this.instances.get(id);
+    if (!instance || instance.historyLayer.isVisible()) return;
+    const gesture = instance.scroll.gestureVersion();
+    const reveal = instance.revealGeneration;
+    await this.refreshHistoryMeta(instance);
+    if (this.instances.get(id) !== instance || instance.historyLayer.isVisible()
+        || instance.scroll.gestureVersion() !== gesture
+        || instance.revealGeneration !== reveal || this.isDetached(instance)) return;
+    const buffer = instance.terminal.buffer.active;
+    if (!terminalHistoryLayer.shouldEnterHistory({
+      explicitIntent: true,
+      hasMore: instance.historyHasMore,
+      loading: false,
+      touchActive: false,
+      bufferType: buffer.type,
+      noLocalHistory: buffer.baseY <= 0,
+      viewportY: buffer.viewportY,
+    })) return;
+    this.enterHistory(id);
+  }
+
+  private enterHistory(id: string): void {
+    const instance = this.instances.get(id);
+    if (!instance) return;
+    instance.container.querySelector('.terminal-surface')?.classList.add('is-history');
+    instance.historyLayer.show({
+      hasMore: instance.historyHasMore,
+      nextCursor: instance.historyCursor,
+    });
+    instance.historyLayer.setCols(instance.terminal.cols);
+  }
+
+  private exitHistory(id: string): void {
+    const instance = this.instances.get(id);
+    if (!instance) return;
+    instance.historyLayer.hide();
+    instance.container.querySelector('.terminal-surface')?.classList.remove('is-history');
+    instance.scroll.follow();
+  }
+
+  private async requestHistory(id: string, query: { requestId?: string; beforeCursor?: string | null }): Promise<void> {
+    const instance = this.instances.get(id);
+    const api = (window as unknown as { duocli?: {
+      historyBeforePty?: (id: string, query: Record<string, unknown>) => Promise<any>;
+    } }).duocli;
+    if (!instance || !api?.historyBeforePty) {
+      instance?.historyLayer.setLoading(false);
+      return;
+    }
+    const revision = ++instance.historyRequestId;
+    const epoch = instance.epoch;
+    const requestId = query.requestId || `d${revision}`;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const isCurrent = () => this.instances.get(id) === instance
+      && instance.historyRequestId === revision && instance.epoch === epoch;
+    try {
+      const page = await Promise.race([
+        api.historyBeforePty(id, {
+          epoch,
+          requestId,
+          beforeCursor: query.beforeCursor !== undefined ? query.beforeCursor : instance.historyCursor,
+          limitRows: 80,
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Terminal history timed out')), 10000);
+        }),
+      ]);
+      if (!isCurrent()) return;
+      // The layer owns the older-page cursor. Keep the live snapshot boundary
+      // separate so reaching the oldest page cannot disable future history.
+      instance.historyLayer.prepend(page);
+    } catch {
+      // An older request must not unlock a newer request or overwrite its UI.
+      if (isCurrent()) {
+        instance.historyLayer.setLoading(false);
+        this.showJumpMiss(instance, '历史加载中断，继续向上滚动重试');
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private showJumpMiss(instance: TermInstance, message: string): void {
+    let hint = instance.container.querySelector('.terminal-jump-miss') as HTMLElement | null;
+    if (!hint) {
+      hint = document.createElement('div');
+      hint.className = 'terminal-jump-miss';
+      instance.container.appendChild(hint);
+    }
+    hint.textContent = message;
+    hint.hidden = false;
+    window.setTimeout(() => { hint!.hidden = true; }, 2400);
+  }
+
   private fitTerminal(id: string, focus: boolean): void {
     const instance = this.instances.get(id);
     if (!instance) return;
     try {
-      instance.fitAddon.fit();
-      this.rebindPromptMarker(instance);
-      instance.scroll.sync();
       const rect = instance.container.getBoundingClientRect();
+      const previous = this.lastFitSizes.get(id);
+      const sizeChanged = !previous
+        || Math.abs(rect.width - previous.w) > 1
+        || Math.abs(rect.height - previous.h) > 1;
+      const renderService = (instance.terminal as unknown as { _core?: { _renderService?: { dimensions?: unknown } } })._core?._renderService;
+      if ((sizeChanged || !instance.lastReportedSize) && renderService?.dimensions) {
+        try { instance.fitAddon.fit(); } catch { /* xterm may not have a renderer yet */ }
+      }
+      this.rebindPromptMarker(instance);
+      if (rect.width > 0 && rect.height > 0) instance.scroll.sync();
+      instance.historyLayer.setCols(instance.terminal.cols);
       this.lastFitSizes.set(id, { w: rect.width, h: rect.height });
       if (this.onResize) {
         const { cols, rows } = instance.terminal;
-        if (cols > 0 && rows > 0) this.onResize(instance.id, cols, rows);
+        const last = instance.lastReportedSize;
+        if (cols > 0 && rows > 0 && (!last || last.cols !== cols || last.rows !== rows)) {
+          instance.lastReportedSize = { cols, rows };
+          this.onResize(instance.id, cols, rows);
+        }
       }
-      if (focus && !instance.container.querySelector('.terminal-composer')?.contains(document.activeElement)) instance.terminal.focus();
     } catch {}
+    if (focus && this.activeId === id
+        && !instance.container.querySelector('.terminal-composer')?.contains(document.activeElement)) {
+      try { instance.terminal.focus(); } catch { /* ignore an unmounted renderer */ }
+    }
   }
 
   getActiveId(): string | null {

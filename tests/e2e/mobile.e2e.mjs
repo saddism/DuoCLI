@@ -82,9 +82,19 @@ const server = http.createServer((req, res) => {
     res.end(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'));
     return;
   }
+  if (p === '/api/lan-info') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ lanIps: ['127.0.0.1'], port: PORT, hostname: 'e2e' }));
+    return;
+  }
   if (p === '/api/sessions' && req.method !== 'DELETE') {
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify(mockSessions));
+    return;
+  }
+  if (p.startsWith('/api/sessions/') && p.endsWith('/seen') && req.method === 'POST') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
   if (p.startsWith('/api/sessions/') && req.method === 'DELETE') {
@@ -110,6 +120,11 @@ const server = http.createServer((req, res) => {
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="download.bin"; filename*=UTF-8''${encodeURIComponent(filename)}`);
     res.end(Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]));
+    return;
+  }
+  if (p.startsWith('/api/sessions/') && p.endsWith('/chat')) {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ supported: false, ready: false, messages: [] }));
     return;
   }
   if (p.startsWith('/api/sessions/') && p.endsWith('/file-preview')) {
@@ -156,6 +171,16 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(mockCustomPresets));
     return;
   }
+  if (p === '/api/mac-desktop/screenshot') {
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('X-DuoCLI-Device-Width', '100');
+    res.setHeader('X-DuoCLI-Device-Height', '100');
+    res.end(Buffer.from(
+      '/9j/4AAQSkZJRgABAQAAAQABAAD/2wAAAAD/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAb/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAGf/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQARAAAPwP/Z',
+      'base64',
+    ));
+    return;
+  }
   if (p === '/api/android/devices') {
     res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ devices: [] }));
@@ -189,7 +214,34 @@ wss.on('connection', (sock) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.type === 'subscribe') {
-      sock.send(JSON.stringify({ type: 'replay', data: sessionBuffer }));
+      sock.send(JSON.stringify({
+        type: 'replay',
+        data: sessionBuffer,
+        capabilityVersion: 2,
+        historyHasMore: true,
+        hasMoreHistory: true,
+        historyCursor: '1:100',
+        epoch: 1,
+        scrollback: 0,
+      }));
+    } else if (msg.type === 'historyBefore') {
+      const items = Array.from({ length: 24 }, (_, i) => ({
+        epoch: 1,
+        lineId: 70 + i,
+        part: 0,
+        text: `history-line-${70 + i} older-output`,
+        wraps: [],
+        styles: [],
+      }));
+      sock.send(JSON.stringify({
+        type: 'historyPage',
+        items,
+        nextCursor: '1:70',
+        hasMore: true,
+        stale: false,
+        requestId: msg.requestId || '',
+        epoch: 1,
+      }));
     } else if (msg.type === 'ping') {
       sock.send(JSON.stringify({ type: 'pong' }));
     } else if (msg.type === 'input_b64') {
@@ -233,6 +285,19 @@ async function main() {
 
   // 进入会话详情页
   await page.waitForFunction(() => document.querySelector('.session-card'), { timeout: 8000 });
+  const netMode = await page.evaluate(() => {
+    const btn = document.getElementById('net-mode-btn');
+    return {
+      hidden: !btn || btn.style.display === 'none',
+      text: btn?.textContent?.replace(/\s+/g, '') || '',
+      className: btn?.className || '',
+      aria: btn?.getAttribute('aria-label') || '',
+      hasIcon: Boolean(btn?.querySelector('svg')),
+    };
+  });
+  check('局域网模式下显示网络状态',
+    !netMode.hidden && netMode.className.includes('lan') && netMode.hasIcon && netMode.aria === '局域网' && !netMode.text.includes('局域网'),
+    JSON.stringify(netMode));
   await page.click('.session-card');
   await page.waitForFunction(() => term && term.cols > 0, { timeout: 8000 });
   await sleep(500);
@@ -250,6 +315,139 @@ async function main() {
   check('打开会话后显示服务端最近在说',
     !remoteBanner.hidden && remoteBanner.text.includes('修好远程镜像交互') && remoteBanner.parent === 'detail-page',
     JSON.stringify(remoteBanner));
+  const detailNetMode = await page.evaluate(() => {
+    const btn = document.getElementById('net-mode-btn');
+    const host = document.getElementById('detail-net-mode-host');
+    return {
+      parent: btn?.parentElement?.id || '',
+      hidden: !btn || btn.style.display === 'none' || getComputedStyle(btn).display === 'none',
+      visible: !!(btn && btn.offsetParent),
+      aria: btn?.getAttribute('aria-label') || '',
+      hasIcon: Boolean(btn?.querySelector('svg')),
+      inHost: !!(host && btn && host.contains(btn)),
+      planVisible: getComputedStyle(document.getElementById('detail-ac-label')).display !== 'none',
+    };
+  });
+  check('竖屏对话内不显示网络切换',
+    !detailNetMode.inHost && !detailNetMode.visible && detailNetMode.parent === 'main-net-mode-host',
+    JSON.stringify(detailNetMode));
+  check('计划设置胶囊已收进三点菜单', !detailNetMode.planVisible, JSON.stringify(detailNetMode));
+
+  // Exercise native hit testing and focus, not programmatic textarea.value writes.
+  await page.click('#msg-input');
+  await page.keyboard.type('composer click draft');
+  const composerClick = await page.$eval('#msg-input', input => {
+    const rect = input.getBoundingClientRect();
+    return {
+      focused: document.activeElement === input,
+      value: input.value,
+      hit: document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)?.id,
+    };
+  });
+  check('自定义输入框可点击聚焦并输入草稿',
+    composerClick.focused && composerClick.value === 'composer click draft' && composerClick.hit === 'msg-input',
+    JSON.stringify(composerClick));
+  const historyOverlay = await page.evaluate(() => {
+    const input = document.getElementById('msg-input');
+    const layer = document.querySelector('.terminal-history-layer');
+    const rect = input.getBoundingClientRect();
+    return {
+      hidden: layer?.hidden ?? null,
+      display: layer ? getComputedStyle(layer).display : null,
+      inert: layer?.hasAttribute('inert') ?? null,
+      hit: document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)?.id,
+    };
+  });
+  check('历史层默认不挡住输入框',
+    historyOverlay.hidden && historyOverlay.display === 'none' && historyOverlay.hit === 'msg-input',
+    JSON.stringify(historyOverlay));
+  const historyShownHit = await page.evaluate(() => {
+    const input = document.getElementById('msg-input');
+    const layer = document.querySelector('.terminal-history-layer');
+    if (layer) {
+      layer.hidden = false;
+      layer.removeAttribute('inert');
+    }
+    const rect = input.getBoundingClientRect();
+    const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)?.id;
+    if (layer) {
+      layer.hidden = true;
+      layer.setAttribute('inert', '');
+    }
+    return hit;
+  });
+  check('历史层打开时仍能点输入框', historyShownHit === 'msg-input', historyShownHit);
+  await page.$eval('#msg-input', input => { input.value = ''; input.dispatchEvent(new Event('input', { bubbles: true })); input.blur(); });
+
+  mockSessions = [
+    {
+      id: 's1', title: 'e2e-session', status: 'running',
+      cwd: '/tmp/e2e-proj', presetCommand: 'claude', createdAt: Date.now(),
+      lastUserPrompt: '修好远程镜像交互',
+    },
+    {
+      id: 's2', title: 'other-session', status: 'idle',
+      cwd: '/tmp/e2e-other', presetCommand: 'claude', createdAt: Date.now(),
+      lastUserPrompt: '另一个对话里的话',
+    },
+    {
+      id: 's3', title: 'fresh-session', status: 'running',
+      cwd: '/tmp/e2e-fresh', presetCommand: 'claude', createdAt: Date.now(),
+      lastUserPrompt: '',
+    },
+  ];
+  pushSessionsEvent();
+  await page.evaluate(() => {
+    // Simulate a recycled-id leftover that must not leak into a fresh session.
+    globalThis.DuoUserPromptBanner.writeStoredPrompt('s3', '别的对话里的脏缓存');
+  });
+  await page.evaluate(() => openSession('s2'));
+  await page.waitForFunction(() => currentSessionId === 's2' && term && term.cols > 0, { timeout: 8000 });
+  await sleep(300);
+  const switchedBanner = await page.evaluate(() => {
+    const el = document.getElementById('user-prompt-banner');
+    return { hidden: el?.hidden ?? true, text: el?.querySelector('.user-prompt-text')?.textContent || '' };
+  });
+  check('切换对话后横幅跟着当前会话走',
+    !switchedBanner.hidden && switchedBanner.text.includes('另一个对话里的话'),
+    JSON.stringify(switchedBanner));
+
+  await page.evaluate(() => openSession('s3'));
+  await page.waitForFunction(() => currentSessionId === 's3' && term && term.cols > 0, { timeout: 8000 });
+  await sleep(300);
+  const freshBanner = await page.evaluate(() => {
+    const el = document.getElementById('user-prompt-banner');
+    return {
+      hidden: el?.hidden ?? true,
+      text: el?.querySelector('.user-prompt-text')?.textContent || '',
+      stored: globalThis.DuoUserPromptBanner.readStoredPrompt('s3'),
+    };
+  });
+  check('新对话不会挂上别的会话的最近在说',
+    freshBanner.hidden && !freshBanner.text && !freshBanner.stored,
+    JSON.stringify(freshBanner));
+
+  await page.evaluate(() => openSession('s1'));
+  await page.waitForFunction(() => currentSessionId === 's1' && term && term.cols > 0, { timeout: 8000 });
+  await sleep(300);
+
+  const jumpStay = await page.evaluate(async () => {
+    enterTerminalHistory();
+    writeTerminalOutput(`\r\nlate-output ${'w'.repeat(20)}\r\n`, !isUserScrolling);
+    await terminalWriteQueue;
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return {
+      historyVisible: Boolean(terminalHistoryLayer?.isVisible()),
+      isUserScrolling,
+      viewportY: term.buffer.active.viewportY,
+      baseY: term.buffer.active.baseY,
+    };
+  });
+  check('回看历史时新输出不会把画面拽回最新',
+    jumpStay.historyVisible === true
+      && jumpStay.isUserScrolling === true
+      && jumpStay.viewportY === jumpStay.baseY,
+    JSON.stringify(jumpStay));
 
   // ===== Test 0: 长回放在平滑滚动配置下也必须瞬时到末尾 =====
   // 某些移动端/缓存中的 xterm 会把公开 scrollToBottom() 变成平滑动画。
@@ -282,17 +480,85 @@ async function main() {
   const snapshotScroll = await page.evaluate(async () => {
     const history = Array.from({ length: 500 }, (_, i) => `snap-${i} ${'y'.repeat(24)}\r\n`).join('');
     isUserScrolling = true;
+    // 模拟脏配置：若跟尾走错 API，会沿 scrollback 播很久。
+    term.options.smoothScrollDuration = 1200;
     restoreTerminalSnapshot({ data: `\r\n${history}` });
     await terminalWriteQueue;
-    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     return {
       viewportY: term.buffer.active.viewportY,
       baseY: term.buffer.active.baseY,
+      smoothScrollDuration: term.options.smoothScrollDuration,
+      revealPending: document.getElementById('terminal-container')?.classList.contains('terminal-reveal-pending') || false,
+      loadingHidden: document.getElementById('terminal-loading')?.classList.contains('hidden') || false,
     };
   });
   check('切换会话回放后立刻停在最新输出',
-    snapshotScroll.viewportY === snapshotScroll.baseY,
+    snapshotScroll.viewportY === snapshotScroll.baseY
+      && snapshotScroll.smoothScrollDuration === 0
+      && snapshotScroll.revealPending === false
+      && snapshotScroll.loadingHidden === true,
     JSON.stringify(snapshotScroll));
+
+  const revealGate = await page.evaluate(async () => {
+    const history = Array.from({ length: 400 }, (_, i) => `gate-${i} ${'w'.repeat(28)}\r\n`).join('');
+    let sawPendingWhileWriting = false;
+    const originalWrite = term.write.bind(term);
+    term.write = (data, cb) => originalWrite(data, () => {
+      sawPendingWhileWriting = document.getElementById('terminal-container')?.classList.contains('terminal-reveal-pending') || false;
+      if (typeof cb === 'function') cb();
+    });
+    restoreTerminalSnapshot({ data: `\r\n${history}` });
+    await terminalWriteQueue;
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    term.write = originalWrite;
+    return {
+      sawPendingWhileWriting,
+      viewportY: term.buffer.active.viewportY,
+      baseY: term.buffer.active.baseY,
+      revealPending: document.getElementById('terminal-container')?.classList.contains('terminal-reveal-pending') || false,
+    };
+  });
+  check('长回放写盘期间保持遮罩，完成后再露出最新行',
+    revealGate.sawPendingWhileWriting === true
+      && revealGate.viewportY === revealGate.baseY
+      && revealGate.revealPending === false,
+    JSON.stringify(revealGate));
+
+  const geometryRestore = await page.evaluate(async () => {
+    const sourceCols = Math.max(term.cols + 48, 120);
+    const sourceRows = Math.max(term.rows + 24, 48);
+    const lines = Array.from({ length: sourceRows }, (_, i) => {
+      const tag = i === sourceRows - 1 ? 'LATEST-LINE' : `old-${String(i).padStart(3, '0')}`;
+      return `${tag} ${'x'.repeat(Math.max(8, sourceCols - tag.length - 2))}\r\n`;
+    }).join('');
+    isUserScrolling = false;
+    restoreTerminalSnapshot({ data: `\r\n${lines}`, cols: sourceCols, rows: sourceRows });
+    await terminalWriteQueue;
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(resolve)))));
+    const buf = term.buffer.active;
+    const visible = [];
+    for (let y = buf.viewportY; y < buf.viewportY + term.rows; y++) {
+      visible.push(buf.getLine(y)?.translateToString(true) || '');
+    }
+    return {
+      viewportY: buf.viewportY,
+      baseY: buf.baseY,
+      cols: term.cols,
+      rows: term.rows,
+      sourceCols,
+      sourceRows,
+      seesLatest: visible.some(line => line.includes('LATEST-LINE')),
+      seesOldest: visible.some(line => line.includes('old-000')),
+      unreadHidden: document.getElementById('terminal-scroll-bottom-btn')?.hidden !== false,
+    };
+  });
+  check('打开对话按桌面尺寸还原后再 fit，仍停在最新一行',
+    geometryRestore.viewportY === geometryRestore.baseY
+      && geometryRestore.seesLatest === true
+      && geometryRestore.seesOldest === false
+      && geometryRestore.unreadHidden === true,
+    JSON.stringify(geometryRestore));
 
   // ===== Test 1: spinner wrap 不累积空白行 =====
   // CLI must move back over wrapped rows before repainting. Erase-line alone
@@ -442,13 +708,16 @@ async function main() {
       text: term.getSelection(),
       handles: [...document.querySelectorAll('.terminal-select-handle')].filter(el => !el.hidden).length,
       copyButton: !document.getElementById('terminal-copy-selection-btn').hidden,
+      cells: getSelectionCells(), metrics: getTerminalCellMetrics(),
+      viewport: term.buffer.active.viewportY, rows: term.rows,
+      pendingHandleFrame: selectHandlesRaf,
     }));
     await page.touchscreen.touchEnd();
     await sleep(250);
     const clipAfterPress = await page.evaluate(() => navigator.clipboard.readText());
     check('长按只选中手指下的字，并给出复制入口',
       pressed.text === '工' && pressed.handles === 2 && pressed.copyButton,
-      `selected=${JSON.stringify(pressed.text)} handles=${pressed.handles} copyButton=${pressed.copyButton}`);
+      JSON.stringify(pressed));
     check('长按不再自动写剪贴板', clipAfterPress === clipBefore, `clip=${JSON.stringify(clipAfterPress)}`);
 
     for (const [which, target] of [['start', tui.paragraphStart], ['end', tui.paragraphEnd]]) {
@@ -487,37 +756,85 @@ async function main() {
       `copied=${JSON.stringify(tuiClip)} toast="${afterCopy.toastShown}" cleared=${!afterCopy.selected}`);
   }
 
-  // ===== Test 4b: 未长按的单指拖动＝回看滚动，不能被抢成选区 =====
+  // ===== Test 4b: 实时区只留几屏，上滑先滚本地；到顶再懒加载历史层 =====
   pushOutput('\r\n' + Array.from({ length: 80 }, (_, i) => `scrollback-line-${i}`).join('\r\n') + '\r\n');
   await sleep(400);
   const pan = await page.evaluate(() => {
     term.clearSelection();
-    term.scrollToBottom();
+    jumpTerminalToLatest();
     const grid = document.getElementById('terminal-container').querySelector('.xterm-rows').getBoundingClientRect();
     return {
       x: grid.left + grid.width / 2,
       y: grid.top + grid.height * 0.4,
+      liveScrollback: term.options.scrollback,
       viewportY: term.buffer.active.viewportY,
-      length: term.buffer.active.length,
-      rows: term.rows,
+      baseY: term.buffer.active.baseY,
     };
   });
+  check('实时区只缓存最近几屏', pan.liveScrollback === 80, JSON.stringify(pan));
   await page.touchscreen.touchStart(pan.x, pan.y);
-  // 分段快速下拉：每段都远超长按判定位移，但整段耗时远小于长按阈值
   for (let i = 1; i <= 6; i++) {
     await page.touchscreen.touchMove(pan.x, pan.y + i * 30);
   }
   await page.touchscreen.touchEnd();
-  await sleep(300);
-  const panResult = await page.evaluate(() => ({
+  await sleep(200);
+  const panLocal = await page.evaluate(() => ({
     selected: term.hasSelection(),
-    text: term.getSelection(),
     handles: [...document.querySelectorAll('.terminal-select-handle')].filter(el => !el.hidden).length,
+    historyVisible: Boolean(terminalHistoryLayer?.isVisible()),
     viewportY: term.buffer.active.viewportY,
   }));
-  check('未长按的单指拖动只滚动，不触发选中',
-    !panResult.selected && panResult.handles === 0 && panResult.viewportY < pan.viewportY,
-    `viewportY ${pan.viewportY}->${panResult.viewportY} buf=${pan.length}/${pan.rows} selected=${JSON.stringify(panResult.text)} handles=${panResult.handles}`);
+  check('未到顶时手指滚动实时区，不打开历史层',
+    !panLocal.selected
+      && panLocal.handles === 0
+      && panLocal.historyVisible === false
+      && panLocal.viewportY < pan.viewportY,
+    JSON.stringify({ pan, panLocal }));
+
+  await page.evaluate(() => {
+    term.scrollToLine(0);
+    isUserScrolling = true;
+    terminalFirstLatestPaint = true;
+  });
+  const topPan = await page.evaluate(() => {
+    const grid = document.getElementById('terminal-container').querySelector('.xterm-rows').getBoundingClientRect();
+    return { x: grid.left + grid.width / 2, y: grid.top + grid.height * 0.4 };
+  });
+  await page.touchscreen.touchStart(topPan.x, topPan.y);
+  for (let i = 1; i <= 6; i++) {
+    await page.touchscreen.touchMove(topPan.x, topPan.y + i * 30);
+  }
+  await page.touchscreen.touchEnd();
+  await sleep(400);
+  const panHistory = await page.evaluate(() => {
+    const scroller = document.querySelector('.terminal-history-scroller');
+    if (scroller) scroller.scrollTop = 0;
+    return {
+      historyVisible: Boolean(terminalHistoryLayer?.isVisible()),
+      historyItems: terminalHistoryLayer?.getItems?.().length || 0,
+    };
+  });
+  check('滚到顶部后再上滑，懒加载历史层',
+    panHistory.historyVisible === true && panHistory.historyItems > 0,
+    JSON.stringify(panHistory));
+
+  const stayUp = await page.evaluate(async () => {
+    terminalFirstLatestPaint = true;
+    syncTerminalToViewport();
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return { historyVisible: Boolean(terminalHistoryLayer?.isVisible()) };
+  });
+  check('fit 不会关掉正在回看的历史层', stayUp.historyVisible === true, JSON.stringify(stayUp));
+  const backToLive = await page.evaluate(() => {
+    document.querySelector('.terminal-history-live-btn')?.click();
+    return {
+      historyVisible: Boolean(terminalHistoryLayer?.isVisible()),
+      isUserScrolling,
+    };
+  });
+  check('点回到最新会关掉历史层并跟尾',
+    backToLive.historyVisible === false && backToLive.isUserScrolling === false,
+    JSON.stringify(backToLive));
 
   // ===== Test 5: 跨 TUI 硬行的带空格路径仍可点击 =====
   const hardPrefix = '  ' + 'x'.repeat(Math.max(1, cols - 18));
@@ -563,7 +880,7 @@ async function main() {
     };
   });
   check('详情页更多入口展开三项菜单',
-    !menuState.hidden && menuState.items === '项目文件,计划设置,手机设备' && menuState.expanded === 'true',
+    !menuState.hidden && menuState.items === '项目文件,计划设置,手机设备,关闭对话' && menuState.expanded === 'true',
     JSON.stringify(menuState));
 
   await page.click('#detail-menu-plan-btn');
@@ -589,8 +906,32 @@ async function main() {
   await sleep(150);
   await page.click('#detail-menu-device-btn');
   await sleep(300);
-  const deviceOpen = await page.evaluate(() => document.getElementById('device-page').classList.contains('active'));
-  check('更多菜单可打开手机设备', deviceOpen, `active=${deviceOpen}`);
+  const deviceOpen = await page.evaluate(() => {
+    const sel = document.getElementById('device-select');
+    return {
+      active: document.getElementById('device-page').classList.contains('active'),
+      options: [...(sel?.options || [])].map((option) => ({ value: option.value, text: option.textContent })),
+      value: sel?.value || '',
+    };
+  });
+  check('更多菜单可打开手机设备', deviceOpen.active, JSON.stringify(deviceOpen));
+  check('设备下拉包含电脑入口',
+    deviceOpen.options.some((option) => option.value === 'duocli-computer' && option.text.includes('电脑')),
+    JSON.stringify(deviceOpen));
+  const computerTap = await page.evaluate(() => {
+    document.getElementById('device-select').value = 'duocli-computer';
+    applySelectedDevice();
+    const screen = document.getElementById('device-screen');
+    screen.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 1, pointerType: 'touch', clientX: 40, clientY: 80, buttons: 1 }));
+    screen.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 1, pointerType: 'touch', clientX: 40, clientY: 80 }));
+    return {
+      controlId: androidControlDeviceId(),
+      computerActive: document.body.classList.contains('computer-desktop-active'),
+    };
+  });
+  check('选电脑后点击画面不会走 ADB',
+    computerTap.controlId === '' && computerTap.computerActive,
+    JSON.stringify(computerTap));
   await page.click('#device-back-btn');
   await sleep(200);
 
@@ -634,8 +975,14 @@ async function main() {
   check('Ctrl + / 只发送控制字符',
     receivedInputs.length === 1 && receivedInputs[0] === '\x1f',
     `received=${JSON.stringify(receivedInputs)}`);
+  receivedInputs.length = 0;
+  await page.click('#ctrl-o-key');
+  await sleep(200);
+  check('Ctrl + O 只发送控制字符',
+    receivedInputs.length === 1 && receivedInputs[0] === '\x0f',
+    `received=${JSON.stringify(receivedInputs)}`);
   const lastShortcutId = await page.evaluate(() => document.getElementById('shortcut-bar').lastElementChild?.id);
-  check('Ctrl + / 位于快捷键栏最后', lastShortcutId === 'ctrl-slash-key', `last=${lastShortcutId}`);
+  check('Ctrl + O 位于快捷键栏最后', lastShortcutId === 'ctrl-o-key', `last=${lastShortcutId}`);
 
   // ===== Test 7: 发送后输入框清空且只发一次 =====
   receivedInputs.length = 0;
@@ -673,6 +1020,16 @@ async function main() {
 
   await page.setViewport({ width: 1024, height: 700, isMobile: false, hasTouch: true });
   await sleep(200);
+  await page.click('#msg-input');
+  await page.keyboard.type('desktop draft');
+  const desktopComposer = await page.$eval('#msg-input', input => {
+    const rect = input.getBoundingClientRect();
+    return { focused: document.activeElement === input, value: input.value,
+      hit: document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)?.id };
+  });
+  check('电脑网页输入框可点击输入', desktopComposer.focused && desktopComposer.value === 'desktop draft'
+    && desktopComposer.hit === 'msg-input', JSON.stringify(desktopComposer));
+  await page.$eval('#msg-input', input => { input.value = ''; input.dispatchEvent(new Event('input', { bubbles: true })); input.blur(); });
   const landscapeDrawer = await page.evaluate(() => ({
     workspace: document.body.classList.contains('landscape-workspace'),
     detail: document.getElementById('detail-page').classList.contains('active'),
@@ -684,6 +1041,12 @@ async function main() {
     sessionsButton: getComputedStyle(document.querySelector('#detail-header .landscape-sessions-toggle')).display,
     deviceButton: getComputedStyle(document.querySelector('#detail-header .landscape-device-toggle')).display,
     devicePull: getComputedStyle(document.getElementById('landscape-device-pull')).display,
+    netModeParent: document.getElementById('net-mode-btn')?.parentElement?.id || '',
+    netModeHidden: !document.getElementById('net-mode-btn')
+      || document.getElementById('net-mode-btn').style.display === 'none'
+      || getComputedStyle(document.getElementById('net-mode-btn')).display === 'none',
+    netModeAria: document.getElementById('net-mode-btn')?.getAttribute('aria-label') || '',
+    netModeHasIcon: Boolean(document.getElementById('net-mode-btn')?.querySelector('svg')),
   }));
   check('电脑横屏默认左侧列表 + 中间 CLI，隐藏返回/收起箭头',
     landscapeDrawer.workspace
@@ -696,6 +1059,12 @@ async function main() {
       && landscapeDrawer.sessionsButton !== 'none'
       && landscapeDrawer.deviceButton !== 'none'
       && landscapeDrawer.devicePull === 'none',
+    JSON.stringify(landscapeDrawer));
+  check('电脑横屏左侧列表打开时仍能在工作区左上角切换网络',
+    landscapeDrawer.netModeParent === 'detail-net-mode-host'
+      && !landscapeDrawer.netModeHidden
+      && landscapeDrawer.netModeHasIcon
+      && (landscapeDrawer.netModeAria === '局域网' || landscapeDrawer.netModeAria.includes('云端')),
     JSON.stringify(landscapeDrawer));
   await page.click('#detail-header .landscape-device-toggle');
   await sleep(200);
@@ -907,17 +1276,25 @@ async function main() {
       && document.getElementById('detail-name')?.textContent,
     { timeout: 5000 }
   );
-  await page.click('#delete-btn');
+  const openCloseFromMenu = async () => {
+    await page.evaluate(() => {
+      const menu = document.getElementById('detail-more-menu');
+      if (menu?.hidden) document.getElementById('detail-more-btn')?.click();
+    });
+    await page.waitForFunction(() => !document.getElementById('detail-more-menu')?.hidden);
+    await page.evaluate(() => document.getElementById('delete-btn')?.click());
+  };
+  await openCloseFromMenu();
   await answerCloseConfirm(false);
   await sleep(300);
   check('对话页关闭取消后仍停留在当前会话',
     receivedDeletes.length === 0
       && await page.evaluate(() => document.getElementById('detail-page')?.classList.contains('active')),
     `deletes=${JSON.stringify(receivedDeletes)}`);
-  await page.click('#delete-btn');
+  await openCloseFromMenu();
   await answerCloseConfirm(true);
   await sleep(400);
-  check('对话页右上角关闭确认后结束会话',
+  check('对话页菜单关闭确认后结束会话',
     receivedDeletes.length === 1 && receivedDeletes[0] === 's1'
       && await page.evaluate(() => document.getElementById('main-page')?.classList.contains('active')),
     `deletes=${JSON.stringify(receivedDeletes)}`);
@@ -1221,29 +1598,52 @@ async function main() {
     ]),
     JSON.stringify(navKeys));
 
-  const quickResult = await page.evaluate(async () => {
+  const quickPrepared = await page.evaluate(async () => {
     currentSessionId = 's1';
     localStorage.setItem(QCMD_STORAGE_KEY, JSON.stringify(['/迁移', '/help']));
     await syncQuickCommands();
     await updateQuickCommands({ action: 'add', command: '/review' });
+    await updateQuickCommands({ action: 'add', command: '/unicloud-log-viewer' });
+    await updateQuickCommands({ action: 'add', command: '这是一条很长的快捷命令用来测试截断' });
     const input = document.getElementById('msg-input');
     input.value = '前文后文';
     input.focus();
     input.setSelectionRange(2, 2);
-    let submissions = 0;
-    const original = requestSubmission;
-    requestSubmission = () => { submissions++; return Promise.resolve(); };
-    try {
-      [...document.querySelectorAll('#quick-commands button')].find(button => button.textContent === '/review').click();
-    } finally { requestSubmission = original; }
-    return { value: input.value, cursor: input.selectionStart, submissions, commands: (await api('/api/quick-commands')).commands };
+    const review = [...document.querySelectorAll('#quick-commands [data-command]')].find(button => button.dataset.command === '/review');
+    const long = [...document.querySelectorAll('#quick-commands [data-command]')].find(button => button.dataset.command === '/unicloud-log-viewer');
+    const extra = [...document.querySelectorAll('#quick-commands [data-command]')].find(button => button.dataset.command === '这是一条很长的快捷命令用来测试截断');
+    return {
+      commands: (await api('/api/quick-commands')).commands,
+      reviewLabel: review?.textContent,
+      longLabel: long?.textContent,
+      extraLabel: extra?.textContent,
+    };
   });
-  check('快捷命令迁移到服务端并插入光标位置，不发送',
-    quickResult.value === '前文/review后文' && quickResult.cursor === 9 && quickResult.submissions === 0
+  check('快捷命令胶囊只显示前 10 个字',
+    quickPrepared.reviewLabel === '/review'
+      && quickPrepared.longLabel === '/unicloud-…'
+      && quickPrepared.extraLabel === '这是一条很长的快捷命…',
+    JSON.stringify(quickPrepared));
+  await page.evaluate(() => {
+    const reviewBtn = [...document.querySelectorAll('#quick-commands [data-command]')].find(button => button.dataset.command === '/review');
+    const pointer = { bubbles: true, button: 0, clientX: 8, clientY: 8, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    reviewBtn.dispatchEvent(new PointerEvent('pointerdown', pointer));
+    reviewBtn.dispatchEvent(new PointerEvent('pointerup', pointer));
+  });
+  await page.waitForSelector('#mobile-confirm-dialog [data-confirm="yes"]', { timeout: 3000 });
+  const confirmText = await page.$eval('#mobile-confirm-dialog .quick-command-confirm-text', el => el.textContent);
+  check('快捷命令确认框显示全文', confirmText === '/review', confirmText);
+  await page.click('#mobile-confirm-dialog [data-confirm="yes"]');
+  const quickResult = await page.evaluate(async () => {
+    const input = document.getElementById('msg-input');
+    return { value: input.value, cursor: input.selectionStart, commands: (await api('/api/quick-commands')).commands };
+  });
+  check('快捷命令迁移到服务端并确认后插入光标位置，不发送',
+    quickResult.value === '前文/review后文' && quickResult.cursor === 9
       && quickResult.commands.includes('/迁移') && quickResult.commands.includes('/review'), JSON.stringify(quickResult));
   quickCommandStore.update({ action: 'remove', command: '/review' });
   if (sseClient) sseClient.write(`event: quick-commands\ndata: ${JSON.stringify(quickCommandStore.read())}\n\n`);
-  await page.waitForFunction(() => ![...document.querySelectorAll('#quick-commands button')].some(button => button.textContent === '/review'));
+  await page.waitForFunction(() => ![...document.querySelectorAll('#quick-commands [data-command]')].some(button => button.dataset.command === '/review'));
   check('其他终端删除快捷命令通过 SSE 更新当前手机', true);
   await page.evaluate(() => { showPage('detail-page'); });
   await page.screenshot({ path: '/tmp/duocli-mobile-quick-commands.png' });

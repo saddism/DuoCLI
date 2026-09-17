@@ -6,6 +6,7 @@ import * as crypto from 'crypto';
 import { execSync } from 'child_process';
 import { requestTitleFromConfiguredAI, cleanGeneratedTitle, TitleAIConfig } from './title-ai';
 import { TerminalState, TerminalSnapshot } from './terminal-state';
+import { HISTORY_PAGE_ROWS, type HistoryPage } from './terminal-history';
 import {
   findNewAutoResponseRule,
   TerminalAutoResponseConfig,
@@ -56,6 +57,7 @@ export interface PtySession {
   resumeId: string | null;    // 捕获的 resume session ID (UUID)
   resumeCommand: string | null; // 完整 resume 命令 (如 "claude --resume xxx")
   resumeSource: ResumeCapture['source'] | null;
+  resumeLookupAt: number;
   closing: boolean;
   closePromise?: Promise<ResumeCapture | null>;
   launchSentAt: number | null;
@@ -295,7 +297,6 @@ export function getDisplayName(presetCommand: string): string {
 
 export class PtyManager {
   private sessions: Map<string, PtySession> = new Map();
-  private nextId = 1;
   private events: PtyManagerEvents;
   private getTitleAIConfig?: TitleAIConfigProvider;
   private getTerminalAutoResponseConfig?: TerminalAutoResponseConfigProvider;
@@ -317,7 +318,8 @@ export class PtyManager {
   }
 
   create(cwd: string, presetCommand: string, themeId: string, envOverrides?: Record<string, string>): PtySession {
-    const id = `term-${this.nextId++}`;
+    // Stable unique ids: recycled term-1/term-2 keys reused localStorage prompt banners across restarts.
+    const id = `term-${crypto.randomUUID()}`;
     const cliKind = identifyCli(presetCommand);
     let launchCommand = presetCommand;
     let initialResume: ResumeCapture | null = parseResumeCommandLine(presetCommand);
@@ -394,6 +396,7 @@ export class PtyManager {
       resumeId: initialResume?.sessionId || null,
       resumeCommand: initialResume?.resumeCommand || null,
       resumeSource: initialResume?.source || null,
+      resumeLookupAt: 0,
       closing: false,
       launchSentAt: null,
       launchCommandEchoed: false,
@@ -639,10 +642,41 @@ export class PtyManager {
     return result;
   }
 
-  snapshot(id: string, consume: (snapshot: TerminalSnapshot) => void): Promise<void> {
+  snapshot(
+    id: string,
+    consume: (snapshot: TerminalSnapshot) => void,
+    options?: { scrollback?: number },
+  ): Promise<void> {
     const session = this.sessions.get(id);
     if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
-    return session.terminalState.snapshot(consume);
+    return session.terminalState.snapshot(snapshot => {
+      consume({ ...snapshot, sessionId: id });
+    }, options);
+  }
+
+  historyBefore(id: string, query: {
+    beforeCursor?: string | null;
+    limitRows?: number;
+    requestId?: string;
+    epoch?: number;
+  } = {}): Promise<HistoryPage> {
+    const session = this.sessions.get(id);
+    if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
+    return session.terminalState.historyBefore({
+      ...query,
+      limitRows: query.limitRows ?? HISTORY_PAGE_ROWS,
+    });
+  }
+
+  historyMeta(id: string): Promise<{
+    epoch: number;
+    historyCursor: string | null;
+    historyHasMore: boolean;
+    truncated: boolean;
+  }> {
+    const session = this.sessions.get(id);
+    if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
+    return session.terminalState.historyMeta();
   }
 
   resize(id: string, cols: number, rows: number, source: PtyInputSource = 'desktop', force = false): void {
@@ -734,6 +768,30 @@ export class PtyManager {
 
   getSession(id: string): PtySession | undefined {
     return this.sessions.get(id);
+  }
+
+  /** Fill resumeId from PTY output or the live Codex lock. Chat UI needs this
+   *  while the session is still running; Codex often never prints the id until exit. */
+  ensureResumeId(id: string, now = Date.now()): string | null {
+    const session = this.sessions.get(id);
+    if (!session || session.closing) return session?.resumeId ?? null;
+    if (session.resumeId) return session.resumeId;
+    this.captureResumeFromBuffer(id);
+    if (session.resumeId) return session.resumeId;
+    if (session.resumeLookupAt && now - session.resumeLookupAt < 3000) return null;
+    session.resumeLookupAt = now;
+    const resolved = resolveSessionId(
+      session.cliKind,
+      session.cwd,
+      session.createdAt,
+      session.presetCommand,
+      session.ptyProcess.pid,
+    );
+    if (!resolved) return null;
+    session.resumeId = resolved.sessionId;
+    session.resumeCommand = resolved.resumeCommand;
+    session.resumeSource = resolved.source;
+    return session.resumeId;
   }
 
   getLaunchStatus(id: string): { sentAt: number | null; commandEchoed: boolean; output: string; returnedToShell: boolean } | null {

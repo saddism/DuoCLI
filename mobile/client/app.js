@@ -6,6 +6,7 @@ const API = location.origin;
 const urlParams = new URLSearchParams(location.search);
 const urlToken = urlParams.get('token');
 const urlCloudOrigin = urlParams.get('cloud');
+const urlFromLan = urlParams.get('from') === 'lan';
 let pendingSessionToOpen = urlParams.get('session');
 if (urlToken) {
   localStorage.setItem('duocli_token', urlToken);
@@ -18,7 +19,7 @@ if (urlCloudOrigin) {
     }
   } catch { /* ignore an invalid handoff origin */ }
 }
-if (urlToken || urlCloudOrigin || pendingSessionToOpen) {
+if (urlToken || urlCloudOrigin || pendingSessionToOpen || urlFromLan) {
   // 清除 URL 参数，避免暴露 token 或连接交接信息
   history.replaceState({ duocliRoot: true }, '', location.pathname);
 } else if (!history.state?.duocliRoot && !history.state?.duocliSession) {
@@ -52,6 +53,22 @@ let activeSessionsCache = [];
 let closedSessions = [];
 let closedSessionsCollapsed = true;
 const restoringClosedSessionIds = new Set();
+let macDesktopClient = null;
+let macDesktopEnabled = false;
+const COMPUTER_DEVICE_ID = 'duocli-computer';
+
+function isComputerDevice(id) {
+  return id === COMPUTER_DEVICE_ID;
+}
+
+function isComputerSelected() {
+  return isComputerDevice($('device-select')?.value);
+}
+
+function androidControlDeviceId() {
+  const id = androidMirrorDevice || $('device-select')?.value || '';
+  return id && !isComputerDevice(id) ? id : '';
+}
 
 // xterm.js 相关
 let term = null;
@@ -66,6 +83,12 @@ let wsReplayRetryTimer = null;
 let wsReplayRetryCount = 0;
 let wsConnectionGeneration = 0;
 let terminalInputReady = false;
+let sessionViewMode = 'terminal';
+let currentSessionChatCapable = false;
+let chatPollTimer = null;
+let chatPollGeneration = 0;
+const nativeChatView = globalThis.DuoNativeChatView;
+const CHAT_VIEW_PREF_KEY = 'duocli_mobile_chat_view';
 let composerSubmission = null;
 let copyToastTimer = null;
 let isUserScrolling = false;
@@ -75,8 +98,21 @@ let terminalOutputWriteCount = 0;
 let terminalWriteQueue = Promise.resolve();
 let terminalSequence = -1;
 let pendingRecreateViewport = null;
-// 不同 xterm 版本的滚动回调可能在同步代码之后触发，
-// 用布尔标志会被竞态误判。改用时间戳窗口标记程序化滚动。
+let terminalHistoryScrollback = 0;
+let terminalHasMoreHistory = false;
+let terminalHistoryLoading = false;
+let terminalHistoryLayer = null;
+let terminalCapabilityVersion = 1;
+let terminalEpoch = 1;
+let terminalHistoryCursor = null;
+let terminalFirstLatestPaint = false;
+let terminalConnectingHintTimer = null;
+let terminalHistoryGestureAccum = 0;
+let terminalHistoryIntent = false;
+let terminalResyncing = false;
+let terminalOpenGeneration = 0;
+// 仅用于跟尾（jumpTerminalToLatest）。回看/跳到历史位置绝不能开这个窗口，
+// 否则 onScroll 会把 isUserScrolling 清掉，新输出再把视口拽回底部。
 let programmaticScrollUntil = 0;
 let sseReconnectTimer = null;
 let sseReconnectAttempt = 0;
@@ -155,11 +191,20 @@ function saveMobilePendingSubmissions() {
 loadMobileDrafts();
 loadMobilePendingSubmissions();
 const terminalScrollHelpers = globalThis.DuoTerminalScrollHelpers || {
+  LIVE_TERMINAL_SCROLLBACK: 80,
   isAtBottom(viewportY, baseY) { return viewportY >= baseY; },
+  isAtHistoryEdge(input) { return Boolean(input?.noLocalHistory || (input?.viewportY ?? 0) <= 3); },
   shouldFollowOutput(wasAtBottom, touchActive, startInteraction, currentInteraction) {
     return wasAtBottom && !touchActive && startInteraction === currentInteraction;
   },
+  isHistoryDirection(deltaY) { return deltaY < 0; },
+  shouldRequestHistory() { return false; },
+  shouldFollowAfterLayout(input) {
+    return !input?.userScrolling && !input?.touchActive && !input?.historyVisible
+      && !input?.alreadyAtBottom && !input?.firstLatestPaint;
+  },
 };
+const terminalHistoryLayerApi = globalThis.DuoTerminalHistoryLayer;
 const spinnerInterceptor = globalThis.DuoSpinnerInterceptor || {
   intercept(data) { return typeof data === 'string' && data.length ? data : null; },
 };
@@ -255,7 +300,7 @@ function ensureWeakNetworkPrompt() {
     if (!weakNetworkMode) {
       setWeakNetworkMode(true);
       showCopyToast('已切到弱网模式，正在重连');
-      if (currentSessionId && $('detail-page').classList.contains('active')) {
+      if (currentSessionId && $('detail-page').classList.contains('active') && sessionViewMode !== 'chat') {
         connectWebSocket(currentSessionId);
       }
       if ($('main-page').classList.contains('active') && token) {
@@ -307,10 +352,12 @@ function shortenPath(p, maxLen = 30) {
 }
 
 // CLI Logo 来自 cli-logos.js，桌面端用的也是同一份
-const { getLogoUrl, getDefaultLogoUrl, hasLogo } = globalThis.DuoCliLogos || {
+const { getLogoUrl, getDefaultLogoUrl, getLetterLogoUrl, hasLogo, logoNeedsInvert } = globalThis.DuoCliLogos || {
   getLogoUrl: () => '',
   getDefaultLogoUrl: () => '',
+  getLetterLogoUrl: () => '',
   hasLogo: () => false,
+  logoNeedsInvert: () => false,
 };
 
 function setDetailCliLogo(displayName) {
@@ -321,35 +368,58 @@ function setDetailCliLogo(displayName) {
     img.hidden = true;
     img.removeAttribute('src');
     img.removeAttribute('title');
+    img.classList.remove('cli-logo-invert');
     return;
   }
-  const fallback = typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : getLogoUrl(name);
+  const fallback = (typeof getLetterLogoUrl === 'function' ? getLetterLogoUrl(name) : '')
+    || (typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : getLogoUrl(name));
   img.onerror = () => {
-    if (img.src !== fallback) img.src = fallback;
+    if (img.src !== fallback) {
+      img.src = fallback;
+      img.classList.remove('cli-logo-invert');
+    }
   };
   img.src = getLogoUrl(name);
+  img.classList.toggle('cli-logo-invert', Boolean(logoNeedsInvert?.(name)));
   img.title = name;
   img.hidden = false;
 }
 
 function hideTerminalLoading() {
+  if (terminalConnectingHintTimer) {
+    clearTimeout(terminalConnectingHintTimer);
+    terminalConnectingHintTimer = null;
+  }
   const el = $('terminal-loading');
   if (el && !el.classList.contains('hidden')) {
     el.classList.add('hidden');
   }
 }
 
-function showTerminalLoading() {
+function showTerminalLoading(labelText = '正在连接…') {
   const el = $('terminal-loading');
   if (!el) return;
   el.classList.remove('hidden');
   const label = el.querySelector('span');
-  if (label) label.textContent = '终端连接中…';
+  if (label) label.textContent = labelText;
   const spinner = el.querySelector('.loading-spinner');
   if (spinner) spinner.style.display = '';
 }
 
+function armConnectingPlaceholder() {
+  hideTerminalLoading();
+  setTerminalRevealPending(true);
+  terminalFirstLatestPaint = false;
+  terminalConnectingHintTimer = setTimeout(() => {
+    terminalConnectingHintTimer = null;
+    if (!terminalFirstLatestPaint) showTerminalLoading('正在连接…');
+  }, 150);
+}
+
 function isTerminalInputReady() {
+  if (sessionViewMode === 'chat') {
+    return terminalInputReady && navigator.onLine !== false && !!currentSessionId;
+  }
   return terminalInputReady
     && navigator.onLine !== false
     && !!ws
@@ -368,9 +438,10 @@ function updateComposerAvailability() {
     sendButton.title = ready ? '发送' : '终端连接中，请稍候';
     sendButton.dataset.terminalReady = String(ready);
   }
-  // 保留输入框可编辑，让用户可以先写好消息；只拦截发送动作。
   if (input) {
-    input.placeholder = ready ? '输入终端消息或命令...' : '终端连接中，请稍候...';
+    input.placeholder = ready
+      ? (sessionViewMode === 'chat' ? '输入跟进…' : '输入终端消息或命令...')
+      : '终端连接中，请稍候...';
     input.dataset.terminalReady = String(ready);
   }
 }
@@ -471,6 +542,7 @@ function scheduleLandscapeWorkspaceResize() {
 function applyLandscapeWorkspaceChrome() {
   const workspace = supportsLandscapeWorkspace() && $('detail-page').classList.contains('active');
   document.body.classList.toggle('landscape-workspace', workspace);
+  placeNetModeButton();
   if (!workspace) {
     if (!supportsLandscapePanels()) closeLandscapePanels();
     else syncLandscapePanelButtons();
@@ -492,12 +564,18 @@ function syncCurrentSessionCard() {
 }
 
 function showLandscapeEmptyTerminal() {
+  stopNativeChatPolling();
+  currentSessionChatCapable = false;
+  applySessionViewMode('terminal');
   currentSessionId = null;
   closeTerminal();
   setTerminalInputReady(false);
   if ($('detail-name')) $('detail-name').textContent = '未选择会话';
   setDetailCliLogo('');
   if ($('detail-status')) $('detail-status').className = 'status-dot inactive';
+  mobilePromptExpanded = false;
+  mobilePromptMarker = null;
+  renderMobilePromptBanner();
   const loading = $('terminal-loading');
   if (!loading) return;
   loading.classList.remove('hidden');
@@ -557,6 +635,7 @@ async function toggleLandscapeDevicePanel() {
     $('device-page').classList.remove('landscape-drawer-open');
     document.body.classList.remove('landscape-device-open');
     stopAndroidMirror();
+    hideComputerDesktop();
     syncLandscapePanelButtons();
     scheduleLandscapeWorkspaceResize();
     return;
@@ -595,6 +674,16 @@ function openDevicePanel(panel = 'device') {
   }
 }
 
+function placeNetModeButton() {
+  const btn = $('net-mode-btn');
+  if (!btn) return;
+  // 竖屏对话内不占顶栏；只在会话列表、或横屏工作区左上角显示。
+  const useDetail = document.body.classList.contains('landscape-workspace')
+    && $('detail-page')?.classList.contains('active');
+  const host = $(useDetail ? 'detail-net-mode-host' : 'main-net-mode-host');
+  if (host && btn.parentElement !== host) host.appendChild(btn);
+}
+
 function showPage(id) {
   if (id === 'main-page' && supportsLandscapeWorkspace() && token) {
     id = 'detail-page';
@@ -612,6 +701,7 @@ function showPage(id) {
   } else {
     applyLandscapeWorkspaceChrome();
   }
+  placeNetModeButton();
 }
 
 function formatTime(ts) {
@@ -733,11 +823,12 @@ async function showAutoContinueConfigModal(sessionId) {
 
 function updateDetailAutoContinueUI(config) {
   const label = $('detail-ac-label');
-  if (label) {
-    const enabled = config && config.enabled;
-    label.textContent = '设';
-    label.className = 'ac-label' + (enabled ? ' enabled' : '');
-    label.title = enabled ? '计划已开启，点击设置' : '计划设置';
+  if (label) label.hidden = true;
+  const menu = $('detail-menu-plan-btn');
+  if (menu) {
+    const enabled = Boolean(config && config.enabled);
+    menu.textContent = enabled ? '计划设置 · 已开' : '计划设置';
+    menu.classList.toggle('is-enabled', enabled);
   }
 }
 
@@ -854,7 +945,210 @@ function markUserScrolling() {
   if (!term) return;
   terminalScrollInteractionRevision++;
   isUserScrolling = !isAtBottom();
-  if (!isUserScrolling) setTerminalUnreadOutput(false);
+  if (!isUserScrolling) {
+    setTerminalUnreadOutput(false);
+    exitTerminalHistory();
+  }
+}
+
+const TERMINAL_HISTORY_CHUNK = 80;
+const LIVE_TERMINAL_SCROLLBACK = terminalScrollHelpers.LIVE_TERMINAL_SCROLLBACK || 80;
+
+function noteTerminalHistoryMeta(msg) {
+  if (Number.isInteger(msg?.scrollback)) terminalHistoryScrollback = Math.max(0, msg.scrollback);
+  if (typeof msg?.historyHasMore === 'boolean') terminalHasMoreHistory = msg.historyHasMore;
+  else if (typeof msg?.hasMoreHistory === 'boolean') terminalHasMoreHistory = msg.hasMoreHistory;
+  if (Number.isInteger(msg?.epoch)) terminalEpoch = msg.epoch;
+  if (typeof msg?.historyCursor === 'string' || msg?.historyCursor === null) {
+    terminalHistoryCursor = msg.historyCursor;
+  }
+  if (Number.isInteger(msg?.capabilityVersion)) terminalCapabilityVersion = msg.capabilityVersion;
+}
+
+function usesPagedHistory() {
+  return terminalCapabilityVersion >= 2 && terminalHistoryLayerApi;
+}
+
+let terminalHistoryPendingRequest = null;
+let terminalHistoryRequestTimer = null;
+
+function cancelTerminalHistoryRequest() {
+  clearTimeout(terminalHistoryRequestTimer);
+  terminalHistoryRequestTimer = null;
+  terminalHistoryPendingRequest = null;
+  terminalHistoryLoading = false;
+  terminalHistoryLayer?.setLoading(false);
+}
+
+function requestHistoryPage(query = {}) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    terminalHistoryLayer?.setLoading(false);
+    return;
+  }
+  if (terminalHistoryLoading) return;
+  if (!terminalHasMoreHistory && !query.force) {
+    terminalHistoryLayer?.setLoading(false);
+    return;
+  }
+  terminalHistoryLoading = true;
+  terminalHistoryLayer?.setLoading(true);
+  const requestId = query.requestId || `m${Date.now()}`;
+  const pending = { requestId, sessionId: currentSessionId, generation: terminalOpenGeneration };
+  terminalHistoryPendingRequest = pending;
+  clearTimeout(terminalHistoryRequestTimer);
+  terminalHistoryRequestTimer = setTimeout(() => {
+    if (terminalHistoryPendingRequest !== pending) return;
+    cancelTerminalHistoryRequest();
+    terminalHistoryLayer?.setError?.('加载超时，继续向上滚动重试');
+  }, 10000);
+  if (usesPagedHistory()) {
+    wsSend({
+      type: 'historyBefore',
+      sessionId: currentSessionId,
+      epoch: terminalEpoch,
+      requestId,
+      beforeCursor: query.beforeCursor !== undefined ? query.beforeCursor : terminalHistoryCursor,
+      limitRows: TERMINAL_HISTORY_CHUNK,
+    });
+    return;
+  }
+  wsSend({
+    type: 'history',
+    scrollback: terminalHistoryScrollback + TERMINAL_HISTORY_CHUNK,
+  });
+}
+
+function maybeRequestTerminalHistory(explicitIntent = false) {
+  if (!term || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!terminalFirstLatestPaint) return;
+  const buffer = term.buffer.active;
+  const should = terminalScrollHelpers.shouldRequestHistory({
+    explicitIntent,
+    hasMore: terminalHasMoreHistory,
+    loading: terminalHistoryLoading,
+    touchActive: terminalTouchActive,
+    bufferType: buffer.type,
+    noLocalHistory: buffer.baseY <= 0,
+    viewportY: buffer.viewportY,
+  });
+  if (!should) return;
+  if (usesPagedHistory()) {
+    enterTerminalHistory();
+    return;
+  }
+  requestHistoryPage({ force: true });
+}
+
+function enterTerminalHistory() {
+  if (!terminalHistoryLayer) return;
+  isUserScrolling = true;
+  if (!terminalHistoryLayer.isVisible()) {
+    // The server may have archived new lines since the initial one-screen
+    // snapshot. A fresh top page must start at the current live boundary.
+    cancelTerminalHistoryRequest();
+    terminalHistoryLayer.reset();
+    terminalHistoryCursor = null;
+  }
+  terminalHistoryLayer.show({
+    hasMore: terminalHasMoreHistory,
+    nextCursor: terminalHistoryCursor,
+  });
+  if (term?.cols) terminalHistoryLayer.setCols(term.cols);
+}
+
+function handlePagedHistoryPan(deltaY, event) {
+  if (!usesPagedHistory() || !terminalHistoryLayer || !terminalFirstLatestPaint) return false;
+  if (terminalHistoryLayer.isVisible()) {
+    if (event?.cancelable) event.preventDefault();
+    if (terminalHistoryLayer.getItems().length) terminalHistoryLayer.scrollByPixels(deltaY);
+    return true;
+  }
+  const towardHistory = terminalScrollHelpers.isHistoryDirection(deltaY);
+  if (!towardHistory) return false;
+  const buffer = term?.buffer?.active;
+  if (!buffer || buffer.type === 'alternate') return false;
+  const atEdge = terminalScrollHelpers.isAtHistoryEdge({
+    noLocalHistory: buffer.baseY <= 0,
+    viewportY: buffer.viewportY,
+  });
+  if (!atEdge || !terminalHasMoreHistory) return false;
+  terminalHistoryIntent = true;
+  terminalHistoryGestureAccum += deltaY;
+  enterTerminalHistory();
+  if (event?.cancelable) event.preventDefault();
+  if (terminalHistoryLayer.getItems().length) terminalHistoryLayer.scrollByPixels(deltaY);
+  return true;
+}
+
+function exitTerminalHistory() {
+  if (!terminalHistoryLayer) return;
+  const wasVisible = terminalHistoryLayer.isVisible();
+  terminalHistoryLayer.hide();
+  if (wasVisible) jumpTerminalToLatest();
+}
+
+function applyTerminalHistoryPage(msg, generation) {
+  if (generation !== terminalOpenGeneration || currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) return;
+  const pending = terminalHistoryPendingRequest;
+  if (msg.requestId && (!pending || msg.requestId !== pending.requestId
+      || pending.sessionId !== currentSessionId || pending.generation !== generation)) return;
+  if (!terminalHistoryLayer) return;
+  const result = terminalHistoryLayer.prepend(msg);
+  if (result?.ignored) return;
+  cancelTerminalHistoryRequest();
+  if (msg.stale) {
+    noteTerminalHistoryMeta(msg);
+    terminalHistoryCursor = msg.nextCursor ?? null;
+    if (typeof msg.hasMore === 'boolean') terminalHasMoreHistory = msg.hasMore;
+  }
+  // The overlay alone owns nextCursor/hasMore for older pages. Exhausting
+  // that direction must not overwrite the live session's history boundary.
+}
+
+function applyTerminalHistorySnapshot(msg) {
+  cancelTerminalHistoryRequest();
+  if (usesPagedHistory()) {
+    applyTerminalHistoryPage({
+      items: [],
+      stale: false,
+      hasMore: msg.hasMoreHistory,
+      nextCursor: terminalHistoryCursor,
+    }, terminalOpenGeneration);
+    return;
+  }
+  const activeTerm = term;
+  const generation = terminalOpenGeneration;
+  if (!activeTerm || !msg?.data) {
+    terminalHistoryLoading = false;
+    noteTerminalHistoryMeta(msg);
+    return;
+  }
+  const fromBottom = activeTerm.buffer.active.baseY - activeTerm.buffer.active.viewportY;
+  setTerminalRevealPending(true);
+  terminalWriteQueue = terminalWriteQueue.then(() => new Promise(resolve => {
+    if (term !== activeTerm || generation !== terminalOpenGeneration) {
+      terminalHistoryLoading = false;
+      setTerminalRevealPending(false);
+      resolve();
+      return;
+    }
+    activeTerm.reset();
+    activeTerm.write(msg.data || '', () => {
+      if (term === activeTerm && generation === terminalOpenGeneration) {
+        noteTerminalHistoryMeta(msg);
+        const target = Math.max(0, activeTerm.buffer.active.baseY - fromBottom);
+        try {
+          if (activeTerm.options) activeTerm.options.smoothScrollDuration = 0;
+        } catch {}
+        activeTerm.scrollToLine(target);
+        isUserScrolling = !isAtBottom();
+        setTerminalUnreadOutput(!isAtBottom());
+      }
+      terminalHistoryLoading = false;
+      setTerminalRevealPending(false);
+      resolve();
+    });
+  }));
 }
 
 function ensureTerminalScrollButton() {
@@ -877,28 +1171,125 @@ function setTerminalUnreadOutput(hasUnread) {
 }
 
 let scrollToBottomRaf = 0;
+
+function setTerminalRevealPending(pending) {
+  const container = $('terminal-container');
+  if (!container) return;
+  container.classList.toggle('terminal-reveal-pending', Boolean(pending));
+}
+
+function followAfterTerminalLayout() {
+  return terminalScrollHelpers.shouldFollowAfterLayout({
+    userScrolling: isUserScrolling,
+    touchActive: terminalTouchActive,
+    historyVisible: terminalHistoryLayer?.isVisible(),
+    alreadyAtBottom: isAtBottom(),
+    firstLatestPaint: terminalFirstLatestPaint,
+  });
+}
+
+function terminalCellHeight() {
+  const height = term?._core?._renderService?.dimensions?.css?.cell?.height;
+  return Number.isFinite(height) && height > 0 ? height : 0;
+}
+
+/** Buffer-level scroll. Pixel scrollTop is unreliable with the virtual scrollbar. */
+function scrollTerminalBufferToLine(line, immediate = false) {
+  if (!term) return;
+  const target = Math.max(0, Math.min(line | 0, term.buffer.active.baseY));
+  const current = term.buffer.active.viewportY;
+  const delta = target - current;
+  if (delta === 0) return;
+  try {
+    if (term.options) term.options.smoothScrollDuration = 0;
+  } catch {}
+  const core = term._core;
+  if (core && typeof core.scrollLines === 'function') {
+    try {
+      // Source 1 = viewport request: update ydisp immediately, skip pixel animation.
+      core.scrollLines(delta, immediate, 1);
+    } catch {
+      try { core.scrollLines(delta, immediate); } catch { term.scrollLines(delta); }
+    }
+  } else {
+    term.scrollToLine(target);
+  }
+  const viewport = core && core._viewport;
+  // cellHeight 为 0 时按像素跳底会把 ydisp 写回 0，反而离开最新行。
+  if (immediate && terminalCellHeight() > 0 && viewport && typeof viewport.scrollToLine === 'function') {
+    viewport.scrollToLine(target, true);
+  }
+  if (viewport && typeof viewport.syncScrollArea === 'function') {
+    viewport.syncScrollArea(true);
+  }
+}
+
 /** 即时跳到底部（无平滑动画），用于 replay 回话与高频输出跟尾。 */
 function jumpTerminalToLatest() {
   if (!term) return;
   isUserScrolling = false;
   resetScrollAccum();
-  setTerminalUnreadOutput(false);
-  programmaticScrollUntil = Date.now() + 250;
-  // xterm 的公开 Terminal.scrollToBottom() 不接收参数，传入 false 也会被
-  // 丢掉；启用平滑滚动时它会沿着整个 scrollback 播放动画。内核方法的
-  // 第二个参数才是“立即滚动”，同时把选项固定为 0 兼容不同 xterm 版本。
   try {
-    if (term.options && term.options.smoothScrollDuration !== 0) {
-      term.options.smoothScrollDuration = 0;
-    }
+    if (term.options) term.options.smoothScrollDuration = 0;
   } catch {}
-  const core = term._core;
-  if (core && typeof core.scrollToBottom === 'function') core.scrollToBottom(true);
-  else term.scrollToBottom();
+  if (isAtBottom()) {
+    setTerminalUnreadOutput(false);
+    return;
+  }
+  programmaticScrollUntil = Date.now() + 250;
+  // xterm 公开 scrollToBottom() 不支持“立即”；scrollLines 在平滑滚动开启时
+  // 会沿整段 scrollback 播动画。先改 ydisp，再同步虚拟滚动条。
+  scrollTerminalBufferToLine(term.buffer.active.baseY, true);
+  setTerminalUnreadOutput(!isAtBottom());
+}
+
+/**
+ * 回放/切换会话：在遮罩下完成 fit + 跳底，确认贴底后再露出。
+ * 否则横幅显隐或 fit 重排会把视口打回顶部，露出来就像“从顶上慢慢滚到最新”。
+ */
+function revealTerminalAtLatest(activeTerm, hasReplayBody, preserveGeometry = false) {
+  const generation = terminalOpenGeneration;
+  const connection = wsConnectionGeneration;
+  const interaction = terminalScrollInteractionRevision;
+  const isCurrent = () => activeTerm && term === activeTerm
+    && generation === terminalOpenGeneration && connection === wsConnectionGeneration;
+  const mayFollow = () => isCurrent() && interaction === terminalScrollInteractionRevision
+    && !terminalTouchActive && !isUserScrolling && !terminalHistoryLayer?.isVisible();
+  const finish = () => {
+    // Old animation frames cannot dismiss a new session's loading indicator.
+    if (!isCurrent()) return;
+    terminalFirstLatestPaint = true;
+    setTerminalRevealPending(false);
+    hideTerminalLoading();
+    if (mayFollow()) jumpTerminalToLatest();
+  };
+  if (!isCurrent()) return;
+  if (terminalResizeFrame !== null) {
+    cancelAnimationFrame(terminalResizeFrame);
+    terminalResizeFrame = null;
+  }
+  if (mayFollow()) jumpTerminalToLatest();
+  requestAnimationFrame(() => {
+    if (!isCurrent()) return;
+    // A preserveViewport replay is also an acknowledged PTY geometry. Fitting
+    // it again silently changes wrapping/cursor coordinates on this side only.
+    if (!preserveGeometry && fitAddon) {
+      try { fitAddon.fit(); } catch {}
+      const container = $('terminal-container');
+      if (container) lastTerminalSize = `${container.clientWidth}x${container.clientHeight}`;
+      handleResize();
+    }
+    if (mayFollow()) jumpTerminalToLatest();
+    requestAnimationFrame(finish);
+  });
 }
 
 function scrollTerminalToBottom() {
   if (!term) return;
+  if (terminalHistoryLayer?.isVisible()) {
+    exitTerminalHistory();
+    return;
+  }
   isUserScrolling = false;
   resetScrollAccum();
   setTerminalUnreadOutput(false);
@@ -916,6 +1307,7 @@ function scrollTerminalToBottom() {
 }
 
 function resetTerminalScrollState() {
+  cancelTerminalHistoryRequest();
   isUserScrolling = false;
   terminalTouchActive = false;
   terminalScrollInteractionRevision = 0;
@@ -924,6 +1316,18 @@ function resetTerminalScrollState() {
   terminalSequence = -1;
   pendingRecreateViewport = null;
   programmaticScrollUntil = 0;
+  terminalHistoryScrollback = 0;
+  terminalHasMoreHistory = false;
+  terminalHistoryLoading = false;
+  terminalCapabilityVersion = 1;
+  terminalEpoch = 1;
+  terminalHistoryCursor = null;
+  terminalHistoryGestureAccum = 0;
+  terminalHistoryIntent = false;
+  terminalResyncing = false;
+  terminalFirstLatestPaint = false;
+  terminalHistoryLayer?.reset();
+  setTerminalRevealPending(false);
   if (scrollToBottomRaf) {
     cancelAnimationFrame(scrollToBottomRaf);
     scrollToBottomRaf = 0;
@@ -942,6 +1346,7 @@ function writeTerminalOutput(data, wasAtBottom = !isUserScrolling) {
     activeTerm.write(data, () => {
       if (term === activeTerm) {
         terminalOutputWriteCount--;
+        if (usesPagedHistory() && activeTerm.buffer.normal.baseY > 0) terminalHasMoreHistory = true;
         if (terminalScrollHelpers.shouldFollowOutput(wasAtBottom, terminalTouchActive,
             startInteraction, terminalScrollInteractionRevision)) {
           scrollTerminalToBottom();
@@ -955,10 +1360,17 @@ function writeTerminalOutput(data, wasAtBottom = !isUserScrolling) {
 
 function restoreTerminalSnapshot(msg) {
   const activeTerm = term;
+  const generation = terminalOpenGeneration;
+  const connection = wsConnectionGeneration;
   const hasReplayBody = Boolean((msg.data || '').length);
-  if (hasReplayBody) showTerminalLoading();
+  // 回放长历史时 xterm 会边写边往下刷，看起来像“滚很久才到末尾”。
+  // 遮罩 + 隐藏画布，写完并瞬时跳底后再露出。
+  if (hasReplayBody) setTerminalRevealPending(true);
   terminalWriteQueue = terminalWriteQueue.then(() => new Promise(resolve => {
-    if (term !== activeTerm) { resolve(); return; }
+    if (term !== activeTerm || generation !== terminalOpenGeneration || connection !== wsConnectionGeneration) {
+      resolve();
+      return;
+    }
     const recreateViewport = pendingRecreateViewport;
     // 切换会话/首次回放必须跟尾。断线重连、iOS 重建终端及尺寸确认快照
     // 都要恢复用户明确停留的历史位置。
@@ -969,44 +1381,50 @@ function restoreTerminalSnapshot(msg) {
     const revision = terminalScrollInteractionRevision;
     terminalOutputWriteCount++;
     activeTerm.reset();
-    // A resize-triggered snapshot is the acknowledgement of this browser's
-    // requested PTY geometry. Initial/reconnect replays may contain the
-    // desktop pane size, so only apply dimensions when the server marks the
-    // snapshot as preserving the remote viewport.
-    if (msg.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
+    // Restore at the source geometry first, then apply the local viewport
+    // strategy after parse. SerializeAddon snapshots assume the original size.
+    if (Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
         && msg.cols >= 2 && msg.rows > 0) {
       activeTerm.resize(msg.cols, msg.rows);
     }
     activeTerm.write(msg.data || '', () => {
-      if (term === activeTerm) {
-        terminalOutputWriteCount--;
-        scheduleMobileLinkHighlights();
-        if (msg.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
-            && msg.cols >= 2 && msg.rows > 0) {
-          // The replay confirms the remote viewport we just requested. Keep
-          // that geometry while the terminal parses the snapshot; fitting
-          // here would immediately undo the acknowledgement on narrow views.
-          lastSentCols = msg.cols;
-          lastSentRows = msg.rows;
+      if (term !== activeTerm || generation !== terminalOpenGeneration || connection !== wsConnectionGeneration) {
+        resolve();
+        return;
+      }
+      terminalOutputWriteCount--;
+      scheduleMobileLinkHighlights();
+      if (msg.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
+          && msg.cols >= 2 && msg.rows > 0) {
+        lastSentCols = msg.cols;
+        lastSentRows = msg.rows;
+      } else {
+        syncTerminalToViewport();
+      }
+      rebindMobilePromptMarker();
+      renderMobilePromptBanner();
+      noteTerminalHistoryMeta(msg);
+      const finishReveal = () => {
+        if (term !== activeTerm || generation !== terminalOpenGeneration) return;
+        terminalFirstLatestPaint = true;
+        hideTerminalLoading();
+        setTerminalRevealPending(false);
+      };
+      if (revision === terminalScrollInteractionRevision && !terminalTouchActive) {
+        if (follow) {
+          // A new-session replay explicitly starts at latest. Only gestures
+          // newer than this snapshot may cancel the delayed follow frames.
+          if (!terminalHistoryLayer?.isVisible()) isUserScrolling = false;
+          revealTerminalAtLatest(activeTerm, hasReplayBody, Boolean(msg.preserveViewport));
         } else {
-          syncTerminalToViewport();
+          activeTerm.scrollToLine(Math.min(viewport, activeTerm.buffer.active.baseY));
+          isUserScrolling = true;
+          setTerminalUnreadOutput(!isAtBottom());
+          finishReveal();
         }
-        if (revision === terminalScrollInteractionRevision && !terminalTouchActive) {
-          if (follow) {
-            jumpTerminalToLatest();
-            requestAnimationFrame(() => {
-              if (term === activeTerm) jumpTerminalToLatest();
-            });
-          } else {
-            activeTerm.scrollToLine(Math.min(viewport, activeTerm.buffer.active.baseY));
-            isUserScrolling = true;
-            setTerminalUnreadOutput(!isAtBottom());
-          }
-          if (recreateViewport != null) pendingRecreateViewport = null;
-        }
-        rebindMobilePromptMarker();
-        renderMobilePromptBanner();
-        if (hasReplayBody) hideTerminalLoading();
+        if (recreateViewport != null) pendingRecreateViewport = null;
+      } else {
+        finishReveal();
       }
       resolve();
     });
@@ -1024,6 +1442,9 @@ function syncTerminalToViewport() {
   handleResize();
   rebindMobilePromptMarker();
   scheduleTerminalSelectHandlesUpdate();
+  // 桌面尺寸快照 fit 到手机后 ydisp 会停在顶部；跟尾时必须立刻贴底，
+  // 否则最新行还在本地 buffer 里，用户却滚不下去。
+  if (followAfterTerminalLayout()) jumpTerminalToLatest();
 }
 
 function applyTerminalSnapshotGeometry(msg) {
@@ -1082,6 +1503,8 @@ function scheduleTerminalResize() {
     terminalResizeFrame = null;
     const container = $('terminal-container');
     if (!term || !fitAddon || !container || container.clientWidth < 1 || container.clientHeight < 1) return;
+    // 回放遮罩期间由 revealTerminalAtLatest 自己 fit+跳底，这里再 fit 会露馅。
+    if (container.classList.contains('terminal-reveal-pending')) return;
     const size = `${container.clientWidth}x${container.clientHeight}`;
     if (size === lastTerminalSize) return;
     syncTerminalToViewport();
@@ -1288,6 +1711,9 @@ function logout() {
   localStorage.removeItem('duocli_token');
   terminalOpenRequest++;
   currentSessionId = null;
+  currentSessionChatCapable = false;
+  stopNativeChatPolling();
+  applySessionViewMode('terminal');
   stopSSE();
   closeTerminal();
   LanSwitcher.stop();
@@ -1295,65 +1721,88 @@ function logout() {
 }
 
 // ============================================================
-// 网络模式切换：CF Tunnel ⇄ LAN 直连
-// 背景：HTTPS 页面无法在浏览器侧探测 HTTP LAN（iOS Safari Mixed Content
-// 把所有子资源请求要么拦截要么强制升级到 HTTPS，<img>/<iframe>/fetch 全堵）。
-// 所以放弃自动探针，改成顶部常驻按钮：
-//   - CF 模式（HTTPS）：按钮显示"🟡 切局域网"，点击 → 拿 /api/lan-info →
-//     选 IP（上次成功优先；否则 192.168 > 10 > 172）→ location.replace 跳过去。
-//     跳过去打不开是用户自己的事（不在家就别点）。
-//   - LAN 模式（HTTP + 私有 IP）：按钮显示"🟢 局域网"，点击 → 跳回 CF。
-//     另外 5 秒一次 fetch /ping.png 自检，连续两次不通自动跳回 CF（HTTP→HTTP
-//     不受 Mixed Content 限制，这里用 fetch 比 <img> 更准）。
+// 网络模式只手动切换：点按钮才在局域网 / 云端之间跳。
+// 不再定时探测、回前台或恢复联网时自动改地址。
 // ============================================================
 const LanSwitcher = (() => {
+  const NM = globalThis.DuoNetworkMode || {};
   const PROBE_INTERVAL_LAN_MS = 5 * 1000;
-  const PROBE_TIMEOUT_MS = 2000;
-  const STORAGE_CLOUD_URL = 'duocli_cloud_url';   // 上次的 CF 入口（origin）
-  const STORAGE_LAST_LAN_IP = 'duocli_last_lan_ip'; // 上次成功用过的 LAN IP
+  const PROBE_INTERVAL_CF_MS = 5 * 1000;
+  const STORAGE_CLOUD_URL = 'duocli_cloud_url';
+  const STORAGE_LAST_LAN_IP = 'duocli_last_lan_ip';
+  const STORAGE_PIN_CLOUD_UNTIL = 'duocli_pin_cloud_until';
+  const STORAGE_SOFT_LAN_DISABLED = 'duocli_soft_lan_disabled';
 
   let probeTimer = null;
+  let firstProbeTimer = null;
   let switching = false;
-
-  function isPrivateIp(host) {
-    return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host);
-  }
-
-  function isLocalHostname(host) {
-    return host === 'localhost' || host.endsWith('.local');
-  }
+  let probeInFlight = false;
+  let lanFailCount = 0;
+  let softLanCount = 0;
+  let cooldownUntil = urlFromLan ? Date.now() + (NM.AFTER_LAN_FALLBACK_MS || 15000) : 0;
+  let softCooldownUntil = urlFromLan
+    ? Date.now() + (NM.AFTER_SOFT_LAN_COOLDOWN_MS || 120000)
+    : 0;
 
   function isLanMode() {
-    const host = location.hostname.toLowerCase();
-    return location.protocol === 'http:' && (isPrivateIp(host) || isLocalHostname(host));
+    return (NM.detectNetworkMode || (() => 'other'))(location) === 'lan';
   }
 
   function isCfMode() {
-    return location.protocol === 'https:';
+    return (NM.detectNetworkMode || (() => 'other'))(location) === 'cf';
   }
 
-  // 多 IP 选优：上次成功的 > 192.168 > 10 > 172 > 其它
-  function pickBestIp(ips) {
-    if (!ips || !ips.length) return null;
-    const last = localStorage.getItem(STORAGE_LAST_LAN_IP);
-    if (last && ips.includes(last)) return last;
-    const score = ip => {
-      if (ip.startsWith('192.168.')) return 3;
-      if (ip.startsWith('10.')) return 2;
-      if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return 1;
-      return 0;
-    };
-    return [...ips].sort((a, b) => score(b) - score(a))[0];
+  function rememberCloudOrigin() {
+    if (isCfMode()) {
+      localStorage.setItem(STORAGE_CLOUD_URL, location.origin);
+      return location.origin;
+    }
+    return cloudOrigin() || location.origin;
   }
 
-  // LAN 自检：HTTP 页面 fetch HTTP 不受 Mixed Content 限制
+  function cloudOrigin() {
+    return NM.parseTrustedOrigin
+      ? NM.parseTrustedOrigin(localStorage.getItem(STORAGE_CLOUD_URL))
+      : (localStorage.getItem(STORAGE_CLOUD_URL) || '');
+  }
+
+  function pinnedCloudUntil() {
+    return Number(localStorage.getItem(STORAGE_PIN_CLOUD_UNTIL) || 0);
+  }
+
+  function pinCloudTemporarily() {
+    const ms = NM.MANUAL_CLOUD_PIN_MS || 10 * 60 * 1000;
+    localStorage.setItem(STORAGE_PIN_CLOUD_UNTIL, String(Date.now() + ms));
+  }
+
+  function clearCloudPin() {
+    localStorage.removeItem(STORAGE_PIN_CLOUD_UNTIL);
+  }
+
+  function isSoftLanDisabled() {
+    return localStorage.getItem(STORAGE_SOFT_LAN_DISABLED) === '1';
+  }
+
+  function disableSoftLan() {
+    localStorage.setItem(STORAGE_SOFT_LAN_DISABLED, '1');
+  }
+
+  function enableSoftLan() {
+    localStorage.removeItem(STORAGE_SOFT_LAN_DISABLED);
+  }
+
+  function isCellular() {
+    const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    return NM.isCellularConnection ? NM.isCellularConnection(conn) : false;
+  }
+
   async function probeLanSelf() {
-    const url = `${location.origin}/ping.png?_=${Date.now()}`;
+    const ping = NM.pingUrl ? NM.pingUrl(location.origin) : `${location.origin}/ping.png?_=${Date.now()}`;
     try {
       const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+      const t = setTimeout(() => ctrl.abort(), NM.PROBE_TIMEOUT_MS || 1800);
       try {
-        const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
+        const res = await fetch(ping, { cache: 'no-store', signal: ctrl.signal, credentials: 'omit' });
         return res.ok;
       } finally {
         clearTimeout(t);
@@ -1363,16 +1812,32 @@ const LanSwitcher = (() => {
     }
   }
 
-  async function probeLanMode() {
-    if (await probeLanSelf()) return;
-    await new Promise(r => setTimeout(r, 1000));
-    if (await probeLanSelf()) return;
-    switchToCloud(true);
+  function goToLan(ip, port, toastText) {
+    if (switching || !token || !ip) return;
+    switching = true;
+    stop();
+    rememberCloudOrigin();
+    clearCloudPin();
+    softLanCount = 0;
+    localStorage.setItem(STORAGE_LAST_LAN_IP, ip);
+    const origin = NM.buildLanOrigin ? NM.buildLanOrigin(ip, port) : `http://${ip}:${port || 9800}`;
+    const cloud = rememberCloudOrigin();
+    const url = NM.buildHandoffUrl
+      ? NM.buildHandoffUrl(origin, {
+        token,
+        cloud,
+        session: currentSessionId || '',
+      })
+      : `${origin}/?token=${encodeURIComponent(token)}`;
+    showCopyToast(toastText || `已切到局域网 ${ip}:${port || 9800}`);
+    setTimeout(() => location.replace(url), 200);
   }
 
-  // CF → LAN：用户主动点
   async function switchToLan() {
     if (!token) return;
+    clearCloudPin();
+    enableSoftLan();
+    softLanCount = 0;
     let info;
     try {
       info = await api('/api/lan-info');
@@ -1380,50 +1845,146 @@ const LanSwitcher = (() => {
       showCopyToast('拿不到局域网信息（token 失效？）');
       return;
     }
-    const ip = pickBestIp(info && info.lanIps);
+    const lastIp = localStorage.getItem(STORAGE_LAST_LAN_IP);
+    const reachable = NM.findReachableLan
+      ? await NM.findReachableLan(info && info.lanIps, info && info.port, lastIp)
+      : null;
+    const ip = (reachable && reachable.ip)
+      || (NM.pickBestIp ? NM.pickBestIp(info && info.lanIps, lastIp) : null);
     if (!ip) {
       showCopyToast('电脑暂无可用局域网 IP');
       return;
     }
-    const port = info.port || 9800;
-    localStorage.setItem(STORAGE_CLOUD_URL, location.origin);
-    localStorage.setItem(STORAGE_LAST_LAN_IP, ip);
-    showCopyToast(`已切到局域网 ${ip}:${port}`);
-    const handoff = new URL(`http://${ip}:${port}/`);
-    handoff.searchParams.set('token', token);
-    handoff.searchParams.set('cloud', location.origin);
-    setTimeout(() => location.replace(handoff.toString()), 200);
+    goToLan(
+      ip,
+      (reachable && reachable.port) || info.port || 9800,
+      reachable
+        ? `已切到局域网 ${ip}:${info.port || 9800}`
+        : `正在尝试局域网 ${ip}:${info.port || 9800}`,
+    );
   }
 
-  // LAN → CF：用户点 或 自检失败（需曾通过公网入口访问过，才会写入 STORAGE_CLOUD_URL）
   function switchToCloud(auto) {
     if (switching) return;
-    const cloudUrl = localStorage.getItem(STORAGE_CLOUD_URL);
+    const cloudUrl = cloudOrigin();
     if (!cloudUrl) {
       if (!auto) showCopyToast('暂无云端地址，请先用公网链接打开一次');
       return;
     }
     switching = true;
     stop();
+    softLanCount = 0;
+    if (auto) disableSoftLan();
+    else pinCloudTemporarily();
     showCopyToast(auto ? '局域网失联，回到云端…' : '切到云端…');
-    setTimeout(() => location.replace(`${cloudUrl}/?token=${encodeURIComponent(token)}`), 200);
+    const url = NM.buildHandoffUrl
+      ? NM.buildHandoffUrl(cloudUrl, {
+        token,
+        session: currentSessionId || '',
+        from: auto ? 'lan' : '',
+      })
+      : `${cloudUrl}/?token=${encodeURIComponent(token)}`;
+    setTimeout(() => location.replace(url), 200);
+  }
+
+  async function probeLanMode() {
+    if (await probeLanSelf()) {
+      lanFailCount = 0;
+      return;
+    }
+    await (NM.delay ? NM.delay(800) : new Promise(r => setTimeout(r, 800)));
+    if (await probeLanSelf()) {
+      lanFailCount = 0;
+      return;
+    }
+    lanFailCount += 1;
+    const decision = NM.decideNetworkAction
+      ? NM.decideNetworkAction({
+        mode: 'lan',
+        lanReachable: false,
+        lanFailCount,
+        cloudUrl: cloudOrigin(),
+        now: Date.now(),
+      })
+      : { type: lanFailCount >= 3 && cloudOrigin() ? 'switch-cloud' : 'stay' };
+    if (decision.type === 'switch-cloud') switchToCloud(true);
+  }
+
+  async function probeCfMode() {
+    rememberCloudOrigin();
+    if (pinnedCloudUntil() > Date.now()) return;
+
+    let info;
+    try {
+      info = await api('/api/lan-info');
+    } catch {
+      softLanCount = 0;
+      return;
+    }
+    const lastIp = localStorage.getItem(STORAGE_LAST_LAN_IP);
+    const reachable = NM.findReachableLan
+      ? await NM.findReachableLan(info && info.lanIps, info && info.port, lastIp)
+      : null;
+    const softTarget = !reachable && NM.softLanTarget
+      ? NM.softLanTarget(info && info.lanIps, info && info.port, lastIp)
+      : null;
+    if (reachable) {
+      enableSoftLan();
+      softLanCount = 0;
+    } else if (softTarget) softLanCount += 1;
+    else softLanCount = 0;
+
+    const decision = NM.decideNetworkAction
+      ? NM.decideNetworkAction({
+        mode: 'cf',
+        lanReachable: Boolean(reachable),
+        lanTarget: reachable,
+        softLanTarget: softTarget,
+        softLanCount,
+        cloudUrl: rememberCloudOrigin(),
+        pinnedCloudUntil: pinnedCloudUntil(),
+        cooldownUntil,
+        softCooldownUntil,
+        softLanDisabled: isSoftLanDisabled(),
+        cellular: isCellular(),
+        now: Date.now(),
+      })
+      : { type: reachable ? 'switch-lan' : 'stay', target: reachable };
+    if (decision.type === 'switch-lan' && decision.target) {
+      const reason = decision.reason === 'lan-soft' ? '已自动尝试局域网' : '已自动切到局域网';
+      goToLan(decision.target.ip, decision.target.port, `${reason} ${decision.target.ip}`);
+    }
+  }
+
+  async function runProbeCycle() {
+    if (switching || probeInFlight || !token) return;
+    probeInFlight = true;
+    try {
+      if (isLanMode()) await probeLanMode();
+      else if (isCfMode()) await probeCfMode();
+    } finally {
+      probeInFlight = false;
+    }
   }
 
   function updateButton() {
     const btn = $('net-mode-btn');
     if (!btn) return;
+    placeNetModeButton();
     if (!token) { btn.style.display = 'none'; return; }
     btn.style.display = 'inline-flex';
     if (isLanMode()) {
-      setIconLabel(btn, 'wifi', '局域网', 13);
-      btn.title = '当前局域网直连，点击切回云端';
+      setIcon(btn, 'wifi', 16);
+      btn.title = '当前局域网直连。点击切到云端';
+      btn.setAttribute('aria-label', '局域网');
       btn.className = 'net-mode-btn lan';
       btn.onclick = () => switchToCloud(false);
     } else if (isCfMode()) {
-      setIconLabel(btn, 'cloud', '切局域网', 13);
-      btn.title = '在家时点击切到局域网直连，更快';
+      setIcon(btn, 'cloud', 16);
+      btn.title = '当前走云端。点击切到局域网（首次可能需允许“本地网络”）';
+      btn.setAttribute('aria-label', '云端');
       btn.className = 'net-mode-btn cf';
-      btn.onclick = switchToLan;
+      btn.onclick = () => { void switchToLan(); };
     } else {
       btn.style.display = 'none';
     }
@@ -1432,21 +1993,21 @@ const LanSwitcher = (() => {
   function start() {
     stop();
     updateButton();
-    if (!token) return;
-    if (isLanMode()) {
-      setTimeout(probeLanMode, 1000);
-      probeTimer = setInterval(probeLanMode, PROBE_INTERVAL_LAN_MS);
-    }
+    if (isCfMode()) rememberCloudOrigin();
   }
 
   function stop() {
+    if (firstProbeTimer) {
+      clearTimeout(firstProbeTimer);
+      firstProbeTimer = null;
+    }
     if (probeTimer) {
       clearInterval(probeTimer);
       probeTimer = null;
     }
   }
 
-  return { start, stop, switchToLan, switchToCloud, isLanMode, isCfMode };
+  return { start, stop, switchToLan, switchToCloud, isLanMode, isCfMode, probeNow: runProbeCycle };
 })();
 
 $('login-btn').onclick = async () => {
@@ -1471,11 +2032,13 @@ $('login-btn').onclick = async () => {
       $('login-error').textContent = '';
       enterMain();
     } else {
-      $('login-error').textContent = 'Token 错误';
+      $('login-error').textContent = 'Token 错误。请到电脑 DuoCLI 右侧「手机远程同步」里复制';
     }
   } catch (e) {
     if (timeout) clearTimeout(timeout);
-    $('login-error').textContent = e.name === 'AbortError' ? '连接超时，请检查网络' : '连接失败: ' + e.message;
+    $('login-error').textContent = e.name === 'AbortError'
+      ? '连接超时。请确认和电脑在同一 Wi-Fi，或改用电脑上显示的公网地址'
+      : '连接失败: ' + e.message;
   }
 };
 
@@ -1668,7 +2231,8 @@ function setAndroidVideoVisible(visible) {
 
 function startAndroidFallback() {
   if (androidFallbackTimer) return;
-  const fallbackDevice = androidMirrorDevice || $('device-select')?.value || '';
+  const fallbackDevice = androidControlDeviceId();
+  if (!fallbackDevice) return;
   if (typeof globalThis.DuoAndroidJpegClient === 'function' && fallbackDevice) {
     if (!androidJpeg) {
       androidJpeg = new globalThis.DuoAndroidJpegClient({
@@ -1910,7 +2474,7 @@ function ensureAndroidMirror() {
 
 function startAndroidMirror(deviceId) {
   const id = String(deviceId || '').trim();
-  if (!id) return;
+  if (!id || isComputerDevice(id)) return;
   if (androidMirrorDevice && androidMirrorDevice !== id) {
     // Invalidate the previous device's screenshot/JPEG work before starting a
     // new subscription. A slow ADB response or a late JPEG decode must never
@@ -1951,7 +2515,7 @@ function stopAndroidMirror() {
 }
 
 function legacyAndroidGesture(deviceId, start, end, duration = 300) {
-  if (!deviceId || !start || !end) return;
+  if (!deviceId || isComputerDevice(deviceId) || !start || !end) return;
   // ADB injects physical device pixels, which differ from the scrcpy control
   // space whenever a live mirror owns the surface.
   const from = { x: start.deviceX ?? start.x, y: start.deviceY ?? start.y };
@@ -1988,7 +2552,7 @@ function androidControlLease(deviceId) {
 async function sendAndroidNavKey(name) {
   const inputs = globalThis.DuoAndroidNavKeys?.buildAndroidNavKeyInputs?.(name) || [];
   if (!inputs.length) return;
-  const deviceId = androidMirrorDevice || $('device-select')?.value;
+  const deviceId = androidControlDeviceId();
   if (!deviceId) {
     showCopyToast('请先选择设备');
     return;
@@ -2159,7 +2723,7 @@ function bindAndroidPointerSurface(target, alwaysControl) {
       && androidMirror.width > 0 && androidMirror.height > 0;
     if (!(alwaysControl || remoteTapEnabled || !mirrorReady)
       || (event.pointerType === 'mouse' && event.button !== 0)) return;
-    const deviceId = androidMirrorDevice || $('device-select')?.value;
+    const deviceId = androidControlDeviceId();
     const controlSize = mirrorReady ? { width: androidMirror.width, height: androidMirror.height } : null;
     const mapSurface = resolveSurface();
     const point = imgToDevice(mapSurface, event.clientX, event.clientY, false, controlSize)
@@ -2208,7 +2772,7 @@ function bindAndroidPointerSurface(target, alwaysControl) {
     releaseCapture(event.pointerId, state);
     if (state.transport === 'legacy') {
       active.delete(event.pointerId);
-      if ((androidMirrorDevice || $('device-select')?.value) === state.deviceId) {
+      if (androidControlDeviceId() === state.deviceId) {
         legacyAndroidGesture(state.deviceId, state.start, point, performance.now() - state.startedAt);
       }
       return;
@@ -2267,6 +2831,7 @@ function copyAndroidCanvas(from, to) {
 }
 
 function openAndroidFullscreen() {
+  closeMacDesktopFullscreen();
   const fallbackSrc = $('device-preview')?.src || '';
   const live = Boolean(androidMirror?.hasFrame || androidJpeg?.hasFrame);
   if (fallbackSrc) $('fullscreen-preview').src = fallbackSrc;
@@ -2294,16 +2859,76 @@ function openAndroidFullscreen() {
   if (live || fallbackSrc) showCopyToast('拖动操控 · 输入文字');
 }
 
-async function showPhoneControl() {
-  openDevicePanel('device');
-  const ready = await refreshAndroidDevices();
-  if (!ready) {
-    showCopyToast('请先连接 Android 设备');
+function isMacDesktopFullscreenOpen() {
+  return document.body.classList.contains('computer-desktop-fullscreen')
+    && $('fullscreen-overlay')?.style.display === 'flex';
+}
+
+function ensureMacDesktopFullscreenPreviewEl() {
+  const screen = $('fullscreen-screen');
+  let img = $('mac-desktop-fullscreen-preview');
+  if (!img && screen) {
+    img = document.createElement('img');
+    img.id = 'mac-desktop-fullscreen-preview';
+    img.className = 'mac-desktop-fullscreen-preview';
+    img.alt = '电脑桌面';
+    screen.appendChild(img);
+  }
+  if (img) img.hidden = false;
+  return img;
+}
+
+function openMacDesktopFullscreen() {
+  if (!isComputerSelected()) {
+    showCopyToast('请先选择电脑');
     return;
   }
-  const deviceId = $('device-select')?.value;
-  if (deviceId) startAndroidMirror(deviceId);
-  remoteTapEnabled = true;
+  document.body.classList.add('computer-desktop-fullscreen');
+  const img = ensureMacDesktopFullscreenPreviewEl();
+  const inline = $('mac-desktop-preview');
+  if (img && inline?.src) {
+    img.src = inline.src;
+    writeSurfaceGeometry(img, 'fallback', readSurfaceGeometry(inline, 'fallback'));
+  }
+  bindMacDesktopPointer($('fullscreen-screen'));
+  $('fullscreen-overlay').style.display = 'flex';
+  void refreshMacDesktopScreenshot();
+  showCopyToast('全屏操控 · 点击即可操作');
+}
+
+function closeMacDesktopFullscreen() {
+  document.body.classList.remove('computer-desktop-fullscreen');
+  const img = $('mac-desktop-fullscreen-preview');
+  if (img) img.hidden = true;
+}
+
+function openDeviceFullscreen() {
+  if (isComputerSelected()) {
+    openMacDesktopFullscreen();
+    return;
+  }
+  openAndroidFullscreen();
+}
+
+function openMacDesktopWindow() {
+  if (!isComputerSelected()) {
+    showCopyToast('请先选择电脑');
+    return;
+  }
+  const url = new URL('mac-desktop-view.html', location.href);
+  if (token) url.searchParams.set('token', token);
+  const popup = window.open(url.toString(), 'duocli-mac-desktop', 'noopener,noreferrer');
+  if (!popup) {
+    showCopyToast('浏览器拦截了弹窗，请允许后重试');
+    return;
+  }
+  showCopyToast('已在新窗口打开桌面');
+}
+
+async function showPhoneControl() {
+  openDevicePanel('device');
+  await refreshAndroidDevices();
+  remoteTapEnabled = !isComputerDevice($('device-select')?.value);
 }
 
 function initDevicePage() {
@@ -2335,6 +2960,7 @@ function initDevicePage() {
   $('device-console-btn').onclick = () => { void showPhoneControl(); };
 
   $('device-back-btn').onclick = () => {
+    hideComputerDesktop();
     if ($('device-page').classList.contains('landscape-drawer-open')) {
       $('device-page').classList.remove('landscape-drawer-open');
       document.body.classList.remove('landscape-device-open');
@@ -2357,13 +2983,14 @@ function initDevicePage() {
     }
   };
   $('fullscreen-back-btn').onclick = () => {
+    closeMacDesktopFullscreen();
     $('fullscreen-overlay').style.display = 'none';
   };
   const sendTextToDevice = async () => {
     const text = $('fullscreen-text-input').value;
     if (!text) return;
-    const deviceId = $('device-select').value;
-    if (!deviceId) { showCopyToast('请先选择设备'); return; }
+    const deviceId = androidControlDeviceId();
+    if (!deviceId) { showCopyToast('请先选择 Android 设备'); return; }
     if (androidMirror?.isReady()) {
       const sequence = androidMirror.sendInput({ type: 'text', text });
       if (sequence != null) {
@@ -2413,7 +3040,8 @@ function initDevicePage() {
   $('fullscreen-text-send').onclick = sendTextToDevice;
   $('fullscreen-text-input').addEventListener('keydown', e => { if (e.key === 'Enter') void sendTextToDevice(); });
 
-  $('device-fullscreen-btn').onclick = openAndroidFullscreen;
+  $('device-fullscreen-btn').onclick = openDeviceFullscreen;
+  $('device-desktop-window-btn').onclick = openMacDesktopWindow;
 
   document.querySelectorAll('.android-nav-keys').forEach((nav) => {
     if (nav.dataset.bound) return;
@@ -2469,12 +3097,8 @@ function initDevicePage() {
   };
   $('device-select').onchange = () => {
     const id = $('device-select').value;
-    if (id) {
-      localStorage.setItem('duocli_android_device', id);
-      startAndroidMirror(id);
-    } else {
-      stopAndroidMirror();
-    }
+    if (id) localStorage.setItem('duocli_android_device', id);
+    applySelectedDevice();
   };
 }
 
@@ -2482,6 +3106,239 @@ function setDeviceHint(msg, notify = Boolean(msg)) {
   const hint = $('device-hint');
   if (hint) { hint.textContent = msg; hint.hidden = !msg; }
   if (notify && msg) showCopyToast(msg);
+}
+
+function appendComputerDeviceOption(sel) {
+  const opt = document.createElement('option');
+  opt.value = COMPUTER_DEVICE_ID;
+  opt.textContent = '电脑';
+  sel.appendChild(opt);
+}
+
+function applySelectedDevice() {
+  const id = $('device-select')?.value;
+  remoteTapEnabled = !isComputerDevice(id);
+  if (isComputerDevice(id)) {
+    stopAndroidMirror();
+    void showComputerDesktop();
+    return;
+  }
+  hideComputerDesktop();
+  if (id) startAndroidMirror(id);
+  else stopAndroidMirror();
+}
+
+async function ensureMacDesktopClient() {
+  if (macDesktopClient) return macDesktopClient;
+  if (typeof window.MacDesktopClient === 'undefined') {
+    showCopyToast('远程桌面组件未加载');
+    return null;
+  }
+  macDesktopClient = new window.MacDesktopClient({ api: location.origin });
+  if (typeof macDesktopClient.renderContainer === 'function') macDesktopClient.renderContainer();
+  if (typeof macDesktopClient.fetchCapabilities === 'function') {
+    await macDesktopClient.fetchCapabilities();
+  } else if (typeof macDesktopClient.init === 'function') {
+    await macDesktopClient.init();
+  }
+  window.macDesktopClient = macDesktopClient;
+  subscribeToMacDesktopCapabilities();
+  return macDesktopClient;
+}
+
+function setComputerDesktopMessage(message) {
+  const container = $('mac-desktop-container');
+  let status = container?.querySelector('.mac-desktop-inline-status');
+  if (container && !status) {
+    status = document.createElement('div');
+    status.className = 'mac-desktop-inline-status';
+    container.prepend(status);
+  }
+  if (status) {
+    status.textContent = message || '';
+    status.hidden = !message;
+  }
+  setDeviceHint(message, false);
+}
+
+let macDesktopPreviewTimer = null;
+let macDesktopPreviewRequest = 0;
+let macDesktopObjectUrl = '';
+let macDesktopPreviewInFlight = false;
+let macDesktopHintShown = false;
+
+function ensureMacDesktopPreviewEl() {
+  const container = $('mac-desktop-container');
+  if (!container) return null;
+  let img = $('mac-desktop-preview');
+  if (!img) {
+    img = document.createElement('img');
+    img.id = 'mac-desktop-preview';
+    img.alt = '电脑桌面';
+    container.appendChild(img);
+  }
+  return img;
+}
+
+async function refreshMacDesktopScreenshot() {
+  if (macDesktopPreviewInFlight || !isComputerSelected()) return;
+  const requestId = ++macDesktopPreviewRequest;
+  macDesktopPreviewInFlight = true;
+  const fullscreen = isMacDesktopFullscreenOpen();
+  const quality = fullscreen ? 72 : 55;
+  const scale = fullscreen ? 0.75 : 0.4;
+  try {
+    const res = await fetch(`${API}/api/mac-desktop/screenshot?quality=${quality}&scale=${scale}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    if (requestId !== macDesktopPreviewRequest || !isComputerSelected()) return;
+    const blob = await res.blob();
+    const nextUrl = URL.createObjectURL(blob);
+    const previousUrl = macDesktopObjectUrl;
+    macDesktopObjectUrl = nextUrl;
+    const img = ensureMacDesktopPreviewEl();
+    const fullscreenImg = fullscreen ? ensureMacDesktopFullscreenPreviewEl() : $('mac-desktop-fullscreen-preview');
+    if (!img) return;
+    const deviceWidth = Number(res.headers.get('X-DuoCLI-Device-Width')) || 0;
+    const deviceHeight = Number(res.headers.get('X-DuoCLI-Device-Height')) || 0;
+    const geometry = {
+      deviceWidth,
+      deviceHeight,
+      latest: 1,
+      presented: 1,
+    };
+    writeSurfaceGeometry(img, 'fallback', geometry);
+    if (fullscreenImg) writeSurfaceGeometry(fullscreenImg, 'fallback', geometry);
+    const applySrc = (target) => {
+      if (!target) return;
+      target.onload = () => {
+        if (previousUrl && target === img) URL.revokeObjectURL(previousUrl);
+        setComputerDesktopMessage('');
+      };
+      target.src = nextUrl;
+    };
+    applySrc(img);
+    if (fullscreen) applySrc(fullscreenImg);
+  } catch (error) {
+    if (requestId === macDesktopPreviewRequest) {
+      setComputerDesktopMessage(error?.message || '无法获取电脑画面');
+    }
+  } finally {
+    macDesktopPreviewInFlight = false;
+  }
+}
+
+function sendMacDesktopGesture(start, end, duration) {
+  if (!start || !end) return;
+  const moved = Math.hypot(end.x - start.x, end.y - start.y) > 8;
+  const headers = { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) };
+  const request = moved
+    ? fetch(`${API}/api/mac-desktop/swipe`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ x1: start.x, y1: start.y, x2: end.x, y2: end.y, duration }),
+    })
+    : fetch(`${API}/api/mac-desktop/tap`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ x: end.x, y: end.y }),
+    });
+  request.then(async (res) => {
+    if (res.ok) return;
+    const data = await res.json().catch(() => ({}));
+    setDeviceHint(data.error || '电脑操作失败', true);
+  }).catch((error) => {
+    setDeviceHint(error?.message || '电脑操作失败', true);
+  });
+}
+
+function bindMacDesktopPointer(target) {
+  if (!target || target.dataset.macPointerBound) return;
+  target.dataset.macPointerBound = '1';
+  target.style.touchAction = 'none';
+  let gesture = null;
+  const resolveSurface = () => {
+    if (isMacDesktopFullscreenOpen()) return $('mac-desktop-fullscreen-preview') || $('mac-desktop-preview');
+    return $('mac-desktop-preview');
+  };
+  target.addEventListener('pointerdown', (event) => {
+    if (!isComputerSelected() || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    const img = resolveSurface();
+    const point = img ? imgToDevice(img, event.clientX, event.clientY, false) : null;
+    if (!point) return;
+    event.preventDefault();
+    gesture = { start: point, last: point, at: performance.now(), pointerId: event.pointerId };
+    try { target.setPointerCapture?.(event.pointerId); } catch { /* ignore */ }
+  });
+  target.addEventListener('pointermove', (event) => {
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const img = resolveSurface();
+    const point = img ? imgToDevice(img, event.clientX, event.clientY, true) : null;
+    if (point) gesture.last = point;
+  });
+  const finish = (event) => {
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const current = gesture;
+    gesture = null;
+    try { target.releasePointerCapture?.(event.pointerId); } catch { /* ignore */ }
+    sendMacDesktopGesture(current.start, current.last, performance.now() - current.at);
+  };
+  target.addEventListener('pointerup', finish);
+  target.addEventListener('pointercancel', finish);
+}
+
+function startMacDesktopPreview() {
+  stopMacDesktopPreview();
+  const container = $('mac-desktop-container');
+  bindMacDesktopPointer(container);
+  setComputerDesktopMessage('正在获取电脑画面…');
+  const tick = async () => {
+    if (!isComputerSelected()) return;
+    await refreshMacDesktopScreenshot();
+    if (!isComputerSelected()) return;
+    macDesktopPreviewTimer = setTimeout(tick, 450);
+  };
+  macDesktopPreviewTimer = setTimeout(tick, 0);
+}
+
+function stopMacDesktopPreview() {
+  if (macDesktopPreviewTimer) clearTimeout(macDesktopPreviewTimer);
+  macDesktopPreviewTimer = null;
+  macDesktopPreviewRequest++;
+  macDesktopPreviewInFlight = false;
+  if (macDesktopObjectUrl) {
+    URL.revokeObjectURL(macDesktopObjectUrl);
+    macDesktopObjectUrl = '';
+  }
+}
+
+async function showComputerDesktop() {
+  document.body.classList.add('computer-desktop-active');
+  const container = $('mac-desktop-container');
+  if (container) container.classList.remove('mac-desktop-hidden');
+  setDeviceHint('', false);
+  startMacDesktopPreview();
+  if (!macDesktopHintShown) {
+    macDesktopHintShown = true;
+    showCopyToast('右上角 ··· → 全屏 / 新窗口');
+  }
+}
+
+function hideComputerDesktop() {
+  stopMacDesktopPreview();
+  if (isMacDesktopFullscreenOpen()) {
+    closeMacDesktopFullscreen();
+    $('fullscreen-overlay').style.display = 'none';
+  } else {
+    closeMacDesktopFullscreen();
+  }
+  document.body.classList.remove('computer-desktop-active');
+  setComputerDesktopMessage('');
+  $('mac-desktop-container')?.classList.add('mac-desktop-hidden');
 }
 
 async function refreshAndroidDevices() {
@@ -2492,6 +3349,7 @@ async function refreshAndroidDevices() {
     const data = await api('/api/android/devices');
     const saved = localStorage.getItem('duocli_android_device');
     sel.innerHTML = '';
+    appendComputerDeviceOption(sel);
     if (data.devices.length) {
       for (const d of data.devices) {
         // 用 DOM API 而非 innerHTML 拼接，避免 adb 输出里的 OEM 设备名注入 HTML
@@ -2501,29 +3359,33 @@ async function refreshAndroidDevices() {
         opt.disabled = d.available === false || !['device', ''].includes(state);
         const reason = state === 'unauthorized' ? '请在手机上允许 USB 调试' : state === 'offline' ? '设备离线，请重新连接' : state;
         opt.textContent = opt.disabled ? `${d.id}（${reason}）` : (d.info ? `${d.id} ${d.info}` : d.id);
-        if (d.id === saved && !opt.disabled) opt.selected = true;
         sel.appendChild(opt);
       }
-    } else {
-      const opt = document.createElement('option');
-      opt.value = '';
-      opt.textContent = '未找到设备';
-      sel.appendChild(opt);
     }
-    const usable = Array.from(sel.options).filter(option => option.value && !option.disabled);
-    if (!usable.some(option => option.selected)) sel.value = usable[0]?.value || '';
-    if (usable.length) {
-      startAndroidMirror(sel.value);
+    const androidUsable = Array.from(sel.options).filter(option => option.value && !option.disabled && !isComputerDevice(option.value));
+    if (saved && [...sel.options].some(option => option.value === saved && !option.disabled)) {
+      sel.value = saved;
+    } else if (androidUsable.length) {
+      sel.value = androidUsable[0].value;
+    } else {
+      sel.value = COMPUTER_DEVICE_ID;
+    }
+    applySelectedDevice();
+    if (isComputerDevice(sel.value)) {
       setDeviceHint('', false);
-    } else {
-      stopAndroidMirror();
-      setDeviceHint(data.devices.length ? '设备未就绪：请允许 USB 调试或重新连接离线设备' : '未找到已连接的 Android 设备');
+    } else if (androidUsable.length) {
+      setDeviceHint('', false);
+    } else if (data.devices.length) {
+      setDeviceHint('设备未就绪：请允许 USB 调试或重新连接离线设备');
     }
-    return usable.length > 0;
+    return true;
   } catch (e) {
-    sel.replaceChildren(new Option('设备检测失败，请刷新重试', ''));
-    setDeviceHint('获取设备失败: ' + (e.message || e));
-    return false;
+    sel.replaceChildren();
+    appendComputerDeviceOption(sel);
+    sel.value = COMPUTER_DEVICE_ID;
+    applySelectedDevice();
+    setDeviceHint('获取 Android 设备失败: ' + (e.message || e));
+    return true;
   } finally {
     sel.disabled = false;
   }
@@ -2533,9 +3395,45 @@ let androidFallbackInFlight = false;
 let androidScreenshotRequestId = 0;
 let androidScreenshotController = null;
 
+/**
+ * 获取 Mac 桌面能力信息
+ */
+async function fetchMacDesktopCapabilities() {
+  try {
+    const response = await fetch(`${API}/api/mac-desktop/capabilities`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    return data.success ? data : null;
+  } catch (error) {
+    console.error('[MacDesktop] Fetch capabilities failed:', error);
+    return null;
+  }
+}
+
+/**
+ * 获取并缓存能力状态
+ */
+async function fetchCapabilities() {
+  // 简化实现，返回默认能力对象
+  return {
+    enabled: macDesktopEnabled,
+    serviceReachable: true,
+    busy: false,
+    displayCount: 1,
+    status: macDesktopEnabled ? 'ready' : 'disabled',
+  };
+}
+
+
 async function refreshAndroidScreenshot(quality, scale, fallback = false) {
-  const deviceId = $('device-select').value;
-  if (!deviceId) { setDeviceHint('请先选择设备'); return; }
+  const deviceId = androidControlDeviceId();
+  if (!deviceId) { setDeviceHint('请先选择 Android 设备'); return; }
   if (fallback && androidFallbackInFlight) return;
   if (fallback) androidFallbackInFlight = true;
   const requestId = ++androidScreenshotRequestId;
@@ -2609,7 +3507,6 @@ async function enterMain() {
   renderPresetSelect();
   startSSE();
   subscribePush();
-  // 启动局域网探测（CF 模式提示切换；LAN 模式监控失联回退）
   LanSwitcher.start();
   const pending = pendingSessionToOpen;
   pendingSessionToOpen = null;
@@ -2641,14 +3538,32 @@ async function refreshSessions() {
 
 function cliTagHtml(dn) {
   const logoUrl = getLogoUrl(dn);
-  const fallback = typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : logoUrl;
-  return `<span class="cli-tag" title="${escHtml(dn)}"><img class="cli-logo-img" src="${logoUrl}" alt="" data-fallback="${fallback}" onerror="this.onerror=null;this.src=this.dataset.fallback||this.src"><span>${escHtml(dn)}</span></span>`;
+  const fallback = (typeof getLetterLogoUrl === 'function' ? getLetterLogoUrl(dn) : '')
+    || (typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : logoUrl);
+  const invertClass = logoNeedsInvert?.(dn) ? ' cli-logo-invert' : '';
+  return `<span class="cli-tag" title="${escHtml(dn)}"><img class="cli-logo-img${invertClass}" src="${logoUrl}" alt="" data-fallback="${fallback}" onerror="this.onerror=null;this.src=this.dataset.fallback||this.src"><span>${escHtml(dn)}</span></span>`;
 }
 
 function sessionProjectName(cwd) {
   const value = String(cwd || '').trim();
   if (!value) return '';
   return value.split(/[\\/]/).filter(Boolean).pop() || value;
+}
+
+const SESSION_THEME_COLORS = {
+  'vscode-dark': '#0078d4',
+  default: '#0078d4',
+  monokai: '#a6e22e',
+  dracula: '#bd93f9',
+  'solarized-dark': '#268bd2',
+  'one-dark': '#61afef',
+  nord: '#88c0d0',
+};
+
+function sessionThemeSwatchHtml(themeId) {
+  const color = SESSION_THEME_COLORS[String(themeId || '').trim()];
+  if (!color) return '';
+  return `<span class="session-color-dot" style="background:${color}" title="会话颜色"></span>`;
 }
 
 function renderClosedSessionCard(cs) {
@@ -2664,6 +3579,7 @@ function renderClosedSessionCard(cs) {
         <div class="session-info">
           <div class="session-title-row">
             <div class="session-title">${escHtml(cs.title || '新对话')}</div>
+            ${sessionThemeSwatchHtml(cs.themeId)}
           </div>
           <div class="session-meta">
             ${projectName ? `<span class="session-cwd">${escHtml(projectName)}</span>` : ''}
@@ -2886,6 +3802,8 @@ async function closeSessionFromList(id, title, options = {}) {
     savePinnedSessionIds();
     swipedSessionId = null;
     removeMobileDraft(id);
+    lastLocalPromptAtBySession.delete(id);
+    userPromptBanner?.writeStoredPrompt(id, '');
     const pending = mobilePendingSubmissions.get(id);
     if (pending) {
       mobilePendingSubmissions.delete(id);
@@ -2895,8 +3813,13 @@ async function closeSessionFromList(id, title, options = {}) {
     if (currentSessionId === id) {
       terminalOpenRequest++;
       currentSessionId = null;
+      currentSessionChatCapable = false;
+      stopNativeChatPolling();
+      applySessionViewMode('terminal');
       history.replaceState({ duocliRoot: true }, '', location.pathname);
       closeTerminal();
+      mobilePromptExpanded = false;
+      renderMobilePromptBanner();
       leaveToSessionList(id);
     } else {
       renderSessionList();
@@ -3054,6 +3977,20 @@ function bindSessionCard(card) {
   }
 }
 
+function statusAfterViewing(status) {
+  if (status === 'running') return 'running';
+  if (status === 'exited') return 'exited';
+  return 'inactive';
+}
+
+function markSessionSeenLocally(id) {
+  const s = activeSessionsCache.find(x => x.id === id);
+  if (s) s.status = statusAfterViewing(s.status);
+  if ($('detail-status') && currentSessionId === id) {
+    $('detail-status').className = `status-dot ${s ? statusAfterViewing(s.status) : 'inactive'}`;
+  }
+}
+
 function renderSessionList() {
   const list = $('session-list');
   const empty = $('empty-state');
@@ -3078,6 +4015,7 @@ function renderSessionList() {
           <div class="session-title-row">
             ${pinned ? `<span class="session-pin-badge" title="已置顶">${iconSvg('pin', 12)}</span>` : ''}
             <div class="session-title">${escHtml(s.title || s.presetCommand || '终端')}</div>
+            ${sessionThemeSwatchHtml(s.themeId)}
           </div>
           <div class="session-meta">
             ${projectName ? `<span class="session-cwd">${escHtml(projectName)}</span>` : ''}
@@ -3197,15 +4135,16 @@ function startSSE() {
   sseSource.addEventListener('sessions', e => {
     try {
       activeSessionsCache = JSON.parse(e.data);
-      if ($('main-page').classList.contains('active') || $('main-page').classList.contains('landscape-drawer-open')) {
-        renderSessionList();
-      }
-      if (currentSessionId) {
+      if (currentSessionId && $('detail-page')?.classList.contains('active')) {
         const s = activeSessionsCache.find(x => x.id === currentSessionId);
         if (s) {
+          s.status = statusAfterViewing(s.status);
           $('detail-status').className = `status-dot ${s.status}`;
           applyRemoteUserPrompt(s);
         }
+      }
+      if ($('main-page').classList.contains('active') || $('main-page').classList.contains('landscape-drawer-open')) {
+        renderSessionList();
       }
     } catch {}
   });
@@ -3766,7 +4705,8 @@ function createTerminal() {
       brightWhite: '#ffffff',
     },
     cursorBlink: true,
-    scrollback: 5000,
+    // 实时区只保留最近几屏。更早输出走历史层懒加载，手指/滚动条只滚这一小段。
+    scrollback: LIVE_TERMINAL_SCROLLBACK,
     convertEol: false,
     allowProposedApi: true,
     // 禁用光标样式同步，减少渲染
@@ -3793,13 +4733,20 @@ function createTerminal() {
   const loading = $('terminal-loading');
   container.innerHTML = '';
   if (loading) container.appendChild(loading);
-  // 显示 loading
-  if (loading) loading.classList.remove('hidden');
   term.open(container);
   ensureTerminalScrollButton();
   ensureTerminalCopyButton();
   ensureTerminalSelectHandles();
   registerMobileFileLinks();
+  if (terminalHistoryLayerApi) {
+    terminalHistoryLayer = terminalHistoryLayerApi.createHistoryLayer({
+      onRequest: (query) => requestHistoryPage(query),
+      onBackToLive: () => exitTerminalHistory(),
+      onSelectionLimit: () => showCopyToast('选择范围过大，已保留当前选区'),
+    });
+    container.appendChild(terminalHistoryLayer.root);
+  }
+  armConnectingPlaceholder();
 
   // 终端键盘输入 → WebSocket
   mobileTypedLine = '';
@@ -3824,9 +4771,14 @@ function createTerminal() {
 
   // 返回 Promise，确保终端完全 ready 后再做后续操作（如连接 WebSocket）
   // 双重 rAF 确保页面切换后 DOM 布局完成，避免 fit 算出 0 列 0 行
+  const creatingTerm = term;
+  const creatingFitAddon = fitAddon;
+  const creatingGeneration = terminalOpenGeneration;
   return new Promise((resolve) => {
     requestAnimationFrame(() => { requestAnimationFrame(() => {
-      fitAddon.fit();
+      if (term !== creatingTerm || fitAddon !== creatingFitAddon
+          || terminalOpenGeneration !== creatingGeneration) { resolve(); return; }
+      try { creatingFitAddon.fit(); } catch {}
       // 移动端：禁止点击终端区域弹出键盘
       const xtermTextarea = container.querySelector('.xterm-helper-textarea');
       if (xtermTextarea) {
@@ -3841,9 +4793,13 @@ function createTerminal() {
         // xterm v6 平滑滚动期间 onScroll 会异步多次触发，落在时间戳窗口内即视为程序化滚动。
         if (terminalTouchActive || terminalOutputWriteCount > 0) return;
         if (Date.now() < programmaticScrollUntil) {
-          isUserScrolling = false;
-          setTerminalUnreadOutput(false);
-          if (isAtBottom()) programmaticScrollUntil = 0;
+          // 跟尾窗口只在已经贴底时维持跟随。跳到历史位置时视口不在底部，
+          // 绝不能把 isUserScrolling 清掉，否则下一帧输出会把画面拽回去。
+          if (isAtBottom()) {
+            isUserScrolling = false;
+            setTerminalUnreadOutput(false);
+            programmaticScrollUntil = 0;
+          }
         } else if (terminalOutputWriteCount === 0) {
           markUserScrolling();
         } else if (isAtBottom()) {
@@ -3881,11 +4837,26 @@ function createTerminal() {
           if (!word) return;
           touchGesture.mode = 'word';
           touchGesture.startCell = word.start;
+          // The initial long-press affordance must not wait for a queued
+          // animation frame while a native touch gesture is still held.
+          updateTerminalSelectHandles();
+          updateTerminalCopyButton();
           if (navigator.vibrate) navigator.vibrate(15);
         }, LONG_PRESS_MS);
       };
 
+      const isHistoryLayerTouch = (event) => Boolean(
+        terminalHistoryLayer?.isVisible()
+        && event.target?.closest?.('.terminal-history-layer'),
+      );
+
       const onTouchStart = (e) => {
+        if (isHistoryLayerTouch(e)) {
+          clearLongPress();
+          touchGesture = null;
+          terminalTouchActive = false;
+          return;
+        }
         if (e.target?.closest?.('#terminal-copy-selection-btn')) {
           clearLongPress();
           touchGesture = null;
@@ -3935,6 +4906,8 @@ function createTerminal() {
         terminalTouchActive = true;
         terminalScrollInteractionRevision++;
         programmaticScrollUntil = 0;
+        terminalHistoryGestureAccum = 0;
+        terminalHistoryIntent = false;
         if (scrollToBottomRaf) {
           cancelAnimationFrame(scrollToBottomRaf);
           scrollToBottomRaf = 0;
@@ -3943,6 +4916,7 @@ function createTerminal() {
         armLongPress();
       };
       const onTouchMove = (e) => {
+        if (isHistoryLayerTouch(e)) return;
         if (!touchGesture) return;
         if (touchGesture.mode === 'handle') {
           if (e.touches.length !== 1) return;
@@ -3955,6 +4929,7 @@ function createTerminal() {
           const currentY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
           const deltaY = touchGesture.lastY - currentY;
           touchGesture.lastY = currentY;
+          if (handlePagedHistoryPan(deltaY, e)) return;
           if (e.cancelable) e.preventDefault();
           if (deltaY !== 0) scrollTerminalByPixels(deltaY);
           return;
@@ -3981,12 +4956,14 @@ function createTerminal() {
           return;
         }
         if (touchGesture.mode !== 'pan') return;
-        if (e.cancelable) e.preventDefault();
         const deltaY = touchGesture.lastY - t.clientY;
         touchGesture.lastY = t.clientY;
+        if (handlePagedHistoryPan(deltaY, e)) return;
+        if (e.cancelable) e.preventDefault();
         if (deltaY !== 0) scrollTerminalByPixels(deltaY);
       };
       const onTouchEnd = (e) => {
+        if (isHistoryLayerTouch(e)) return;
         clearLongPress();
         const mode = touchGesture?.mode;
         // 长按/拖手柄松手后，浏览器会补发 mousedown，xterm 收到就把刚选好的内容清掉。
@@ -3995,20 +4972,26 @@ function createTerminal() {
         if (mode === 'pending' && term?.hasSelection()) term.clearSelection();
         touchGesture = null;
         terminalTouchActive = false;
-        if (term && isAtBottom()) {
+        const historyIntent = terminalHistoryIntent || terminalHistoryGestureAccum < -8;
+        terminalHistoryIntent = false;
+        terminalHistoryGestureAccum = 0;
+        if (term && isAtBottom() && !historyIntent) {
           isUserScrolling = false;
           setTerminalUnreadOutput(false);
         } else if (term) {
           isUserScrolling = true;
         }
+        if (historyIntent) maybeRequestTerminalHistory(true);
       };
-      const onWheel = () => {
+      const onWheel = (event) => {
+        if (event.target?.closest?.('.terminal-history-layer')) return;
         terminalScrollInteractionRevision++;
         programmaticScrollUntil = 0;
         if (scrollToBottomRaf) {
           cancelAnimationFrame(scrollToBottomRaf);
           scrollToBottomRaf = 0;
         }
+        if (event?.deltaY < 0) maybeRequestTerminalHistory(true);
       };
 
       container.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
@@ -4086,21 +5069,22 @@ function createTerminal() {
 }
 
 function handleResize() {
-  if (!fitAddon || !term) return;
-  clearTimeout(resizeSendTimer);
-  // 在键盘/工具栏动画结束后请求最终行列数。实际尺寸由 PTY 快照确认，
-  // 避免客户端先 fit、CLI 仍按旧坐标重绘的窗口。
+  if (!fitAddon || !term || resizeSendTimer !== null) return;
+  const resizingTerm = term;
+  const resizingFit = fitAddon;
+  // Coalesce continuous keyboard/toolbar layout events without postponing
+  // the ACK indefinitely. Read the latest dimensions when the timer fires.
   resizeSendTimer = setTimeout(() => {
     resizeSendTimer = null;
-    if (!fitAddon || !term) return;
-    const dims = fitAddon.proposeDimensions();
+    if (term !== resizingTerm || fitAddon !== resizingFit) return;
+    const dims = resizingFit.proposeDimensions();
     if (!dims || dims.cols < 2 || dims.rows < 1) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (dims.cols === lastSentCols && dims.rows === lastSentRows) return;
     lastSentCols = dims.cols;
     lastSentRows = dims.rows;
     wsSend({ type: 'resize', cols: dims.cols, rows: dims.rows });
-  }, 250);
+  }, 100);
 }
 
 function closeTerminal() {
@@ -4139,6 +5123,7 @@ function interceptSpinnerData(rawData) {
 // ========== WebSocket ==========
 
 function connectWebSocket(sessionId) {
+  cancelTerminalHistoryRequest();
   if (pendingRecreateViewport == null && isUserScrolling && term && terminalSequence >= 0) {
     pendingRecreateViewport = term.buffer.active.viewportY;
   }
@@ -4161,7 +5146,7 @@ function connectWebSocket(sessionId) {
     wsLastPongAt = Date.now();
     // 保留旧屏幕直到快照到达，断网时不把用户视口重置到顶部。
     // 订阅会话
-    wsSend({ type: 'subscribe', sessionId });
+    wsSend({ type: 'subscribe', sessionId, requestId: `sub-${generation}` });
     // 发送当前终端尺寸（过滤无效值，避免 pty resize(0,0) 异常）
     if (term && term.cols > 0 && term.rows > 0) {
       console.log('[ws] sending resize', term.cols, term.rows);
@@ -4227,34 +5212,47 @@ function connectWebSocket(sessionId) {
         console.log('[ws] replay received, data length=', (msg.data || '').length);
         setTerminalInputReady(true);
         if (Number.isInteger(msg.sequence)) terminalSequence = msg.sequence;
+        noteTerminalHistoryMeta(msg);
+        terminalResyncing = false;
         if (msg.data) {
           restoreTerminalSnapshot(msg);
         } else {
-          hideTerminalLoading();
           applyTerminalSnapshotGeometry(msg);
-          if (wsReplayRetryTimer || wsReplayRetryCount >= 3) return;
-          // 新建会话 pty 刚启动时 buffer 可能仍为空，延迟重新订阅。
-          wsReplayRetryCount++;
-          wsReplayRetryTimer = setTimeout(() => {
-            wsReplayRetryTimer = null;
-            if (ws && ws.readyState === WebSocket.OPEN && currentSessionId === sessionId) {
-              wsSend({ type: 'subscribe', sessionId });
-            }
-          }, 800);
+          terminalFirstLatestPaint = true;
+          hideTerminalLoading();
+          setTerminalRevealPending(false);
         }
+      } else if (msg.type === 'historyPage') {
+        applyTerminalHistoryPage(msg, terminalOpenGeneration);
+      } else if (msg.type === 'history') {
+        if (Number.isInteger(msg.sequence)) terminalSequence = Math.max(terminalSequence, msg.sequence);
+        applyTerminalHistorySnapshot(msg);
       } else if (msg.type === 'output') {
-        if (Number.isInteger(msg.sequence)) {
-          if (msg.sequence <= terminalSequence) return;
-          terminalSequence = msg.sequence;
+        const toSeq = Number.isInteger(msg.toSequence) ? msg.toSequence : msg.sequence;
+        const fromSeq = Number.isInteger(msg.fromSequence) ? msg.fromSequence : toSeq;
+        if (Number.isInteger(toSeq) && toSeq <= terminalSequence) return;
+        if (terminalSequence >= 0 && Number.isInteger(fromSeq) && fromSeq > terminalSequence + 1) {
+          if (!terminalResyncing && ws && ws.readyState === WebSocket.OPEN) {
+            terminalResyncing = true;
+            wsSend({ type: 'subscribe', sessionId, requestId: `resync-${Date.now()}` });
+          }
+          return;
         }
+        if (Number.isInteger(toSeq)) terminalSequence = toSeq;
         hideTerminalLoading();
         hideWeakNetworkPrompt();
         setTerminalInputReady(true);
+        terminalFirstLatestPaint = true;
 
         let writeData = interceptSpinnerData(msg.data);
 
         if (writeData !== null) {
-          writeTerminalOutput(writeData, !isUserScrolling);
+          const follow = !isUserScrolling && !terminalHistoryLayer?.isVisible();
+          writeTerminalOutput(writeData, follow);
+          if (terminalHistoryLayer?.isVisible()) {
+            terminalHistoryLayer.setLiveUnread(true);
+            setTerminalUnreadOutput(true);
+          }
         }
       }
     } catch {}
@@ -4267,14 +5265,14 @@ function connectWebSocket(sessionId) {
     if (wsConnectTimeoutTimer) { clearTimeout(wsConnectTimeoutTimer); wsConnectTimeoutTimer = null; }
     if (navigator.onLine === false) return;
     // 如果还在详情页，尝试重连
-    if (currentSessionId === sessionId && $('detail-page').classList.contains('active')) {
+    if (currentSessionId === sessionId && $('detail-page').classList.contains('active') && sessionViewMode !== 'chat') {
       if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
       const delay = Math.min(profile.wsRetryBaseMs * Math.pow(2, wsReconnectAttempt), profile.wsRetryMaxMs) + Math.floor(Math.random() * 500);
       wsReconnectAttempt++;
       showWeakNetworkPrompt('连接中断，正在重试');
       wsReconnectTimer = setTimeout(() => {
         wsReconnectTimer = null;
-        if (currentSessionId === sessionId && $('detail-page').classList.contains('active')) {
+        if (currentSessionId === sessionId && $('detail-page').classList.contains('active') && sessionViewMode !== 'chat') {
           connectWebSocket(sessionId);
         }
       }, delay);
@@ -4336,11 +5334,90 @@ function wsSend(data) {
 
 // ========== 会话详情 ==========
 
+function sessionChatPrefKey(id) {
+  return `${CHAT_VIEW_PREF_KEY}:${id}`;
+}
+
+function sessionWantsChat(session) {
+  if (!session?.chatCapable) return false;
+  const pref = sessionStorage.getItem(sessionChatPrefKey(session.id));
+  if (pref === 'terminal') return false;
+  return true;
+}
+
+function stopNativeChatPolling() {
+  chatPollGeneration += 1;
+  if (chatPollTimer) clearInterval(chatPollTimer);
+  chatPollTimer = null;
+}
+
+function applySessionViewMode(mode) {
+  sessionViewMode = mode === 'chat' ? 'chat' : 'terminal';
+  const chat = $('chat-container');
+  const termEl = $('terminal-container');
+  const shortcut = $('shortcut-bar');
+  const toggle = $('detail-menu-view-btn');
+  document.body.classList.toggle('native-chat-mode', sessionViewMode === 'chat');
+  if (chat) chat.hidden = sessionViewMode !== 'chat';
+  if (termEl) termEl.hidden = sessionViewMode === 'chat';
+  if (shortcut) shortcut.hidden = sessionViewMode === 'chat';
+  if (toggle) {
+    toggle.hidden = !currentSessionChatCapable;
+    toggle.textContent = sessionViewMode === 'chat' ? '切换到终端' : '切换到对话';
+  }
+  updateComposerAvailability();
+}
+
+function isChatPinnedToBottom() {
+  const el = $('chat-transcript');
+  if (!el) return true;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+}
+
+async function refreshNativeChat(sessionId, generation) {
+  const snapshot = await api(`/api/sessions/${encodeURIComponent(sessionId)}/chat`);
+  if (generation !== chatPollGeneration || currentSessionId !== sessionId || sessionViewMode !== 'chat') return;
+  const stick = isChatPinnedToBottom();
+  nativeChatView?.render($('chat-transcript'), snapshot);
+  const scroller = $('chat-transcript');
+  if (stick && scroller) scroller.scrollTop = scroller.scrollHeight;
+}
+
+function startNativeChatPolling(sessionId) {
+  stopNativeChatPolling();
+  const generation = chatPollGeneration;
+  void refreshNativeChat(sessionId, generation).catch(() => {});
+  chatPollTimer = setInterval(() => {
+    void refreshNativeChat(sessionId, generation).catch(() => {});
+  }, 1500);
+}
+
+async function openNativeChatView(id) {
+  applySessionViewMode('chat');
+  closeTerminal();
+  setTerminalInputReady(true);
+  nativeChatView?.render($('chat-transcript'), null);
+  startNativeChatPolling(id);
+}
+
+async function openRawTerminalView(id, requestId) {
+  stopNativeChatPolling();
+  applySessionViewMode('terminal');
+  console.log('[openSession] creating terminal...');
+  await createTerminal();
+  if (requestId !== terminalOpenRequest || currentSessionId !== id) return;
+  console.log('[openSession] terminal ready, cols=', term?.cols, 'rows=', term?.rows);
+  connectWebSocket(id);
+}
+
 function leaveSessionDetail() {
   const endedId = currentSessionId;
   saveCurrentMobileDraft();
   terminalOpenRequest++;
   currentSessionId = null;
+  currentSessionChatCapable = false;
+  stopNativeChatPolling();
+  applySessionViewMode('terminal');
   closeTerminal();
   leaveToSessionList(endedId);
 }
@@ -4348,17 +5425,22 @@ function leaveSessionDetail() {
 async function openSession(id, fromHistory = false) {
   console.log('[openSession] start, id=', id);
   const requestId = ++terminalOpenRequest;
+  terminalOpenGeneration += 1;
   if (!fromHistory && history.state?.duocliSession !== id) {
     history.pushState({ duocliSession: id }, '', `${location.pathname}#session=${encodeURIComponent(id)}`);
   }
   saveCurrentMobileDraft();
   currentSessionId = id;
+  markSessionSeenLocally(id);
+  void api(`/api/sessions/${encodeURIComponent(id)}/seen`, { method: 'POST', body: '{}' }).catch(() => {});
   failedSubmission = mobilePendingSubmissions.get(id) || null;
   restoreMobileDraft(id);
   mobilePromptExpanded = false;
   mobilePromptMarker = null;
   mobileTypedLine = '';
-  applyRemoteUserPrompt(activeSessionsCache.find(x => x.id === id));
+  let sessionInfo = activeSessionsCache.find(x => x.id === id) || null;
+  if (sessionInfo) applyRemoteUserPrompt(sessionInfo);
+  else if (userPromptBanner) userPromptBanner.writeStoredPrompt(id, '');
   renderMobilePromptBanner();
   resetFileTreeState(mobileFileTree);
   resetFileTreeState(fileBrowseTree);
@@ -4366,31 +5448,39 @@ async function openSession(id, fromHistory = false) {
   showPage('detail-page');
   syncCurrentSessionCard();
 
-  // 更新标题（不阻塞 WebSocket 连接）
-  api('/api/sessions').then(sessions => {
-    const s = sessions.find(x => x.id === id);
-    if (s && currentSessionId === id) {
-      $('detail-name').textContent = s.title || s.presetCommand || '终端';
-      setDetailCliLogo(s.displayName || s.presetCommand || '');
-      $('detail-status').className = `status-dot ${s.status}`;
-      lastKnownSessionCwd = s.cwd || '';
-      applyRemoteUserPrompt(s);
-    } else if (Array.isArray(sessions) && !s && currentSessionId === id) {
-      showCopyToast('会话已结束，可在已关闭记录中恢复');
-      if (history.state?.duocliSession === id) history.replaceState({ duocliRoot: true }, '', location.pathname);
-      leaveSessionDetail();
+  try {
+    const sessions = await api('/api/sessions');
+    if (requestId !== terminalOpenRequest || currentSessionId !== id) return;
+    if (Array.isArray(sessions)) {
+      activeSessionsCache = sessions;
+      sessionInfo = sessions.find(x => x.id === id) || sessionInfo;
+      if (sessionInfo) {
+        $('detail-name').textContent = sessionInfo.title || sessionInfo.presetCommand || '终端';
+        setDetailCliLogo(sessionInfo.displayName || sessionInfo.presetCommand || '');
+        $('detail-status').className = `status-dot ${statusAfterViewing(sessionInfo.status)}`;
+        lastKnownSessionCwd = sessionInfo.cwd || '';
+        applyRemoteUserPrompt(sessionInfo);
+      } else {
+        showCopyToast('会话已结束，可在已关闭记录中恢复');
+        if (history.state?.duocliSession === id) history.replaceState({ duocliRoot: true }, '', location.pathname);
+        leaveSessionDetail();
+        return;
+      }
     }
-  }).catch(() => {});
-
-  // 创建终端并连接 WebSocket（等终端 ready 后再连，避免 replay 数据丢失）
-  console.log('[openSession] creating terminal...');
-  await createTerminal();
+  } catch {
+    if (sessionInfo && currentSessionId === id) {
+      $('detail-name').textContent = sessionInfo.title || sessionInfo.presetCommand || '终端';
+      setDetailCliLogo(sessionInfo.displayName || sessionInfo.presetCommand || '');
+    }
+  }
   if (requestId !== terminalOpenRequest || currentSessionId !== id) return;
-  console.log('[openSession] terminal ready, cols=', term?.cols, 'rows=', term?.rows);
-  connectWebSocket(id);
-  console.log('[openSession] connectWebSocket called');
+  currentSessionChatCapable = Boolean(sessionInfo?.chatCapable);
+  if (sessionWantsChat(sessionInfo)) {
+    await openNativeChatView(id);
+  } else {
+    await openRawTerminalView(id, requestId);
+  }
 
-  // 初始化催工 UI（从桌面端读取配置）
   getAutoContinueConfig(id).then(config => {
     if (requestId === terminalOpenRequest && currentSessionId === id) {
       updateDetailAutoContinueUI(config);
@@ -4542,6 +5632,13 @@ document.addEventListener('click', (event) => {
 $('detail-menu-files-btn').onclick = () => {
   openFileBrowse();
 };
+$('detail-menu-view-btn')?.addEventListener('click', () => {
+  if (!currentSessionId || !currentSessionChatCapable) return;
+  const next = sessionViewMode === 'chat' ? 'terminal' : 'chat';
+  sessionStorage.setItem(sessionChatPrefKey(currentSessionId), next);
+  if (next === 'chat') void openNativeChatView(currentSessionId);
+  else void openRawTerminalView(currentSessionId, terminalOpenRequest);
+});
 $('detail-session-picker-btn').onclick = () => { showSessionPicker(); };
 $('detail-menu-plan-btn').onclick = () => {
   if (currentSessionId) showAutoContinueConfigModal(currentSessionId);
@@ -4581,6 +5678,7 @@ window.addEventListener('resize', () => {
     closeLandscapePanels();
     document.body.classList.remove('landscape-workspace');
   }
+  if (!supportsLandscapeWorkspace()) placeNetModeButton();
   syncLandscapePanelButtons();
   requestAnimationFrame(fitAndroidSurfaces);
 });
@@ -4661,7 +5759,7 @@ let mobilePromptBanner = null;
 let mobilePromptExpanded = false;
 let mobilePromptMarker = null;
 let mobileTypedLine = '';
-let lastLocalPromptAt = 0;
+const lastLocalPromptAtBySession = new Map();
 
 function currentMobilePromptText() {
   return userPromptBanner?.readStoredPrompt(currentSessionId) || '';
@@ -4694,10 +5792,21 @@ function bindMobilePromptBanner() {
 }
 
 function applyRemoteUserPrompt(session) {
-  if (!userPromptBanner || !session?.id || !session.lastUserPrompt) return;
-  if (session.id === currentSessionId && Date.now() - lastLocalPromptAt < 3000) return;
+  if (!userPromptBanner || !session?.id) return;
   const incoming = userPromptBanner.normalizePrompt(session.lastUserPrompt);
-  if (!incoming || incoming === userPromptBanner.readStoredPrompt(session.id)) return;
+  // Server is source of truth: empty lastUserPrompt must clear recycled-id leftovers.
+  if (!incoming) {
+    if (!userPromptBanner.readStoredPrompt(session.id)) return;
+    userPromptBanner.writeStoredPrompt(session.id, '');
+    if (session.id === currentSessionId) {
+      mobilePromptExpanded = false;
+      renderMobilePromptBanner();
+    }
+    return;
+  }
+  const localAt = lastLocalPromptAtBySession.get(session.id) || 0;
+  if (session.id === currentSessionId && Date.now() - localAt < 3000) return;
+  if (incoming === userPromptBanner.readStoredPrompt(session.id)) return;
   userPromptBanner.writeStoredPrompt(session.id, incoming);
   if (session.id === currentSessionId) {
     mobilePromptExpanded = false;
@@ -4710,7 +5819,7 @@ function noteMobileUserPrompt(text) {
   const normalized = userPromptBanner.normalizePrompt(text);
   try { mobilePromptMarker?.dispose(); } catch {}
   mobilePromptExpanded = false;
-  lastLocalPromptAt = Date.now();
+  lastLocalPromptAtBySession.set(currentSessionId, Date.now());
   userPromptBanner.writeStoredPrompt(currentSessionId, normalized);
   mobilePromptMarker = term ? term.registerMarker(0) : null;
   renderMobilePromptBanner();
@@ -4726,6 +5835,16 @@ function rebindMobilePromptMarker() {
   mobilePromptMarker = userPromptBanner.markerAtLine(term, line);
 }
 
+function pauseOutputFollowForHistoryJump() {
+  terminalScrollInteractionRevision++;
+  programmaticScrollUntil = 0;
+  if (scrollToBottomRaf) {
+    cancelAnimationFrame(scrollToBottomRaf);
+    scrollToBottomRaf = 0;
+  }
+  isUserScrolling = true;
+}
+
 function jumpToMobileUserPrompt() {
   if (!term || !userPromptBanner) return;
   const text = currentMobilePromptText();
@@ -4733,12 +5852,19 @@ function jumpToMobileUserPrompt() {
   rebindMobilePromptMarker();
   const line = userPromptBanner.resolvePromptJumpLine(term.buffer.active, text, mobilePromptMarker);
   if (line < 0) {
-    showCopyToast('还没在记录里找到这句话');
+    const historyIndex = terminalHistoryLayer?.findText(text) ?? -1;
+    if (historyIndex >= 0) {
+      enterTerminalHistory();
+      terminalHistoryLayer.scrollToItem(historyIndex);
+      return;
+    }
+    showCopyToast('这段内容不在当前已加载范围');
     return;
   }
-  markUserScrolling();
-  programmaticScrollUntil = Date.now() + 400;
+  pauseOutputFollowForHistoryJump();
   userPromptBanner.scrollLineToTop(term, line);
+  isUserScrolling = true;
+  setTerminalUnreadOutput(!isAtBottom());
 }
 
 function requestSubmission(sessionId, text, id) {
@@ -4790,7 +5916,7 @@ async function sendMessage() {
   input.value = '';
   saveMobileDraft(sessionId, '');
   updateComposerAvailability();
-  scrollTerminalToBottom();
+  if (sessionViewMode !== 'chat') scrollTerminalToBottom();
   try {
     await requestSubmission(sessionId, text, id);
     failedSubmission = null;
@@ -4812,7 +5938,12 @@ async function sendMessage() {
     if (!keepKeyboard || currentSessionId !== sessionId) input.blur();
     else input.focus({ preventScroll: true });
     resetMobileKeyboardLayout();
-    scheduleDelayedTerminalResize();
+    if (sessionViewMode === 'chat') {
+      const generation = chatPollGeneration;
+      void refreshNativeChat(sessionId, generation).catch(() => {});
+    } else {
+      scheduleDelayedTerminalResize();
+    }
   }
 }
 
@@ -4951,45 +6082,201 @@ async function updateQuickCommands(operation) {
   } catch (error) { showCopyToast(error.message || '快捷命令保存失败'); }
 }
 
+function formatQuickCommandLabel(command) {
+  const text = String(command || '');
+  if (text.length <= 10) return text;
+  return `${text.slice(0, 10)}…`;
+}
+
+const QCMD_LONG_PRESS_MS = 420;
+const QCMD_MOVE_CANCEL_PX = 8;
+let quickCommandPointer = null;
+let quickCommandHandlersBound = false;
+
+function collectQuickCommandOrder(bar) {
+  return [...bar.querySelectorAll('[data-command]')]
+    .map(node => node.dataset.command || '')
+    .filter(Boolean);
+}
+
+function getQuickCommandAfterElement(bar, x) {
+  const items = [...bar.querySelectorAll('[data-command]:not(.dragging)')];
+  return items.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = x - box.left - box.width / 2;
+    if (offset < 0 && offset > closest.offset) return { offset, element: child };
+    return closest;
+  }, { offset: Number.NEGATIVE_INFINITY, element: null }).element;
+}
+
+function clearQuickCommandPointer(session, persist) {
+  if (!session) return;
+  if (session.timer != null) clearTimeout(session.timer);
+  session.button.classList.remove('dragging');
+  session.button.style.touchAction = '';
+  session.bar.classList.remove('is-sorting');
+  if (session.sorting && persist) void persistQuickCommandOrder(session.bar);
+  if (quickCommandPointer === session) quickCommandPointer = null;
+}
+
+async function persistQuickCommandOrder(bar) {
+  const commands = collectQuickCommandOrder(bar);
+  if (commands.length === quickCommandState.length && commands.every((command, index) => command === quickCommandState[index])) return;
+  try {
+    await updateQuickCommands({ action: 'reorder', commands });
+  } catch (error) {
+    showCopyToast('顺序保存失败');
+    void syncQuickCommands();
+  }
+}
+
+function confirmQuickCommandSend(command) {
+  return new Promise((resolve) => {
+    document.getElementById('mobile-confirm-dialog')?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'mobile-confirm-dialog';
+    overlay.className = 'modal active';
+    overlay.style.zIndex = '13000';
+    overlay.innerHTML = `
+      <div class="modal-content" role="dialog" aria-modal="true">
+        <h3>发送快捷命令</h3>
+        <p class="confirm-mobile-message"></p>
+        <pre class="quick-command-confirm-text"></pre>
+        <div class="modal-actions">
+          <button type="button" class="btn-secondary" data-confirm="delete">删除</button>
+          <button type="button" class="btn-secondary" data-confirm="no">取消</button>
+          <button type="button" class="btn-primary" data-confirm="yes">发送</button>
+        </div>
+      </div>`;
+    overlay.querySelector('.confirm-mobile-message').textContent = '是否将以下内容发送到当前会话？';
+    overlay.querySelector('.quick-command-confirm-text').textContent = command;
+    const finish = (action) => {
+      overlay.remove();
+      resolve(action);
+    };
+    overlay.addEventListener('click', (event) => {
+      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const button = target?.closest('[data-confirm]');
+      if (button) {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(button.getAttribute('data-confirm') || 'no');
+        return;
+      }
+      if (event.target === overlay) finish('no');
+    });
+    document.body.appendChild(overlay);
+  });
+}
+
+function applyQuickCommandToInput(command) {
+  const input = $('msg-input');
+  if (!input) return;
+  input.setRangeText(command, input.selectionStart, input.selectionEnd, 'end');
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.focus();
+}
+
+function bindQuickCommandSort(bar) {
+  if (quickCommandHandlersBound) return;
+  quickCommandHandlersBound = true;
+
+  const eventElement = (event) => {
+    const target = event.target;
+    return target instanceof Element ? target : target?.parentElement || null;
+  };
+
+  bar.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    const button = eventElement(event)?.closest('[data-command]');
+    if (!button || !bar.contains(button)) return;
+    if (event.pointerType === 'mouse') event.preventDefault();
+    clearQuickCommandPointer(quickCommandPointer, false);
+    const session = {
+      bar,
+      button,
+      command: button.dataset.command || '',
+      startX: event.clientX,
+      startY: event.clientY,
+      pointerId: event.pointerId,
+      sorting: false,
+      timer: setTimeout(() => {
+        if (quickCommandPointer !== session) return;
+        session.sorting = true;
+        session.button.classList.add('dragging');
+        session.button.style.touchAction = 'none';
+        bar.classList.add('is-sorting');
+        try { session.button.setPointerCapture(event.pointerId); } catch {}
+      }, QCMD_LONG_PRESS_MS),
+    };
+    quickCommandPointer = session;
+  });
+
+  bar.addEventListener('pointermove', (event) => {
+    if (!quickCommandPointer || quickCommandPointer.pointerId !== event.pointerId) return;
+    const dx = event.clientX - quickCommandPointer.startX;
+    const dy = event.clientY - quickCommandPointer.startY;
+    if (!quickCommandPointer.sorting) {
+      if (Math.hypot(dx, dy) > QCMD_MOVE_CANCEL_PX && quickCommandPointer.timer != null) {
+        clearTimeout(quickCommandPointer.timer);
+        quickCommandPointer.timer = null;
+      }
+      return;
+    }
+    event.preventDefault();
+    const after = getQuickCommandAfterElement(bar, event.clientX);
+    const add = bar.querySelector('.qcmd-add');
+    if (after) bar.insertBefore(quickCommandPointer.button, after);
+    else if (add) bar.insertBefore(quickCommandPointer.button, add);
+    else bar.appendChild(quickCommandPointer.button);
+  });
+
+  bar.addEventListener('pointerup', async (event) => {
+    if (!quickCommandPointer || quickCommandPointer.pointerId !== event.pointerId) return;
+    const session = quickCommandPointer;
+    const moved = Math.hypot(event.clientX - session.startX, event.clientY - session.startY) > QCMD_MOVE_CANCEL_PX;
+    const wasSorting = session.sorting;
+    clearQuickCommandPointer(session, wasSorting);
+    if (wasSorting || moved || !session.command) return;
+    const action = await confirmQuickCommandSend(session.command);
+    if (action === 'yes') applyQuickCommandToInput(session.command);
+    if (action === 'delete') void updateQuickCommands({ action: 'remove', command: session.command });
+  });
+
+  bar.addEventListener('pointercancel', (event) => {
+    if (!quickCommandPointer || quickCommandPointer.pointerId !== event.pointerId) return;
+    clearQuickCommandPointer(quickCommandPointer, quickCommandPointer.sorting);
+  });
+}
+
 function renderQuickCommands() {
   const bar = $('quick-commands');
   if (!bar) return;
+  clearQuickCommandPointer(quickCommandPointer, false);
   bar.innerHTML = '';
-  quickCommandState.forEach(cmd => {
+
+  quickCommandState.forEach((cmd, index) => {
     const btn = document.createElement('button');
     btn.className = 'qcmd-btn';
-    btn.textContent = cmd;
-    btn.title = '点击插入；长按或右键删除';
-    let suppressClick = false;
+    btn.dataset.command = cmd;
+    btn.dataset.index = String(index);
+    btn.textContent = formatQuickCommandLabel(cmd);
+    btn.title = cmd;
     btn.addEventListener('mousedown', e => e.preventDefault());
-    btn.onclick = () => {
-      if (suppressClick) { suppressClick = false; return; }
-      const input = $('msg-input');
-      input.setRangeText(cmd, input.selectionStart, input.selectionEnd, 'end');
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.focus();
-    };
-    const remove = () => {
-      suppressClick = true;
-      if (confirm(`删除快捷命令「${cmd}」？`)) void updateQuickCommands({ action: 'remove', command: cmd });
-    };
-    btn.oncontextmenu = e => { e.preventDefault(); remove(); };
-    let timer;
-    btn.addEventListener('touchstart', () => { suppressClick = false; timer = setTimeout(remove, 600); }, { passive: true });
-    for (const event of ['touchend', 'touchmove', 'touchcancel']) {
-      btn.addEventListener(event, () => clearTimeout(timer), { passive: true });
-    }
+    btn.oncontextmenu = e => e.preventDefault();
     bar.appendChild(btn);
   });
+
   const add = document.createElement('button');
   add.className = 'qcmd-btn qcmd-add';
   add.textContent = '+ 添加';
   add.disabled = !quickCommandsLoaded;
   add.onclick = () => {
-    const command = prompt('输入快捷命令（点击后插入输入框，不会发送）：');
+    const command = prompt('输入快捷命令（点击后确认，再发送到当前会话）：');
     if (command?.trim()) void updateQuickCommands({ action: 'add', command: command.trim() });
   };
   bar.appendChild(add);
+  bindQuickCommandSort(bar);
 }
 
 renderQuickCommands();
@@ -5565,15 +6852,40 @@ let isRecreating = false;
 async function forceTerminalRecreate() {
   // 只在会话详情页且有当前会话时才重建
   if (!currentSessionId || !$('detail-page').classList.contains('active')) return;
+  if (sessionViewMode === 'chat') return;
   if (isRecreating) return;
   isRecreating = true;
   console.log('[黑屏修复] 重建终端, session=', currentSessionId);
   const sid = currentSessionId;
   const viewport = isUserScrolling && term ? term.buffer.active.viewportY : null;
+  const history = terminalHistoryLayer?.isVisible() ? {
+    items: terminalHistoryLayer.getItems(),
+    anchor: terminalHistoryLayer.captureAnchor(),
+    nextCursor: terminalHistoryLayer.state.nextCursor,
+    hasMore: terminalHistoryLayer.state.hasMore,
+    truncated: terminalHistoryLayer.state.truncated,
+    liveUnread: terminalHistoryLayer.state.liveUnread,
+    epoch: terminalEpoch,
+    capabilityVersion: terminalCapabilityVersion,
+  } : null;
   try {
-    await createTerminal();
-    pendingRecreateViewport = viewport;
-    isUserScrolling = viewport != null;
+    const created = await createTerminal();
+    if (!created || term !== created || currentSessionId !== sid) return;
+    pendingRecreateViewport = history ? null : viewport;
+    isUserScrolling = Boolean(history) || viewport != null;
+    if (history && terminalHistoryLayer) {
+      terminalEpoch = history.epoch;
+      terminalCapabilityVersion = history.capabilityVersion;
+      terminalHasMoreHistory = history.items.length > 0 || history.hasMore;
+      // Rebuild the existing page chain without issuing a duplicate request.
+      // A logical line anchor survives a fresh one-screen xterm snapshot;
+      // the old xterm viewportY does not.
+      terminalHistoryLayer.show({ hasMore: false, nextCursor: history.nextCursor });
+      terminalHistoryLayer.prepend({ items: history.items, hasMore: history.hasMore,
+        nextCursor: history.nextCursor, truncated: history.truncated, stale: false });
+      terminalHistoryLayer.restoreAnchor(history.anchor);
+      terminalHistoryLayer.setLiveUnread(history.liveUnread);
+    }
     connectWebSocket(sid);
   } finally {
     isRecreating = false;
@@ -5601,6 +6913,7 @@ function isCanvasContextLost() {
 
 function recoverVisibleTerminal() {
   if (!currentSessionId || !$('detail-page').classList.contains('active')) return;
+  if (sessionViewMode === 'chat') return;
   if (term) term.refresh(0, term.rows - 1);
   if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
     connectWebSocket(currentSessionId);
@@ -5619,7 +6932,7 @@ function recoverVisibleTerminal() {
 }
 
 function recoverAndroidMedia() {
-  const deviceId = androidMirrorDevice || $('device-select')?.value || '';
+  const deviceId = androidControlDeviceId();
   const overlayOpen = $('fullscreen-overlay')?.style.display === 'flex';
   const deviceVisible = $('device-page')?.classList.contains('active')
     || $('device-page')?.classList.contains('landscape-drawer-open')
@@ -5738,7 +7051,7 @@ window.addEventListener('online', () => {
   if (($('main-page').classList.contains('active') || $('main-page').classList.contains('landscape-drawer-open')) && token && !sseSource) {
     startSSE();
   }
-  if (currentSessionId && $('detail-page').classList.contains('active')
+  if (currentSessionId && $('detail-page').classList.contains('active') && sessionViewMode !== 'chat'
       && (!ws || ws.readyState !== WebSocket.OPEN || !terminalInputReady)) {
     connectWebSocket(currentSessionId);
   }
@@ -5754,6 +7067,7 @@ window.addEventListener('offline', () => {
 
 async function init() {
   void loadServerInfo();
+  
   const savedToken = localStorage.getItem('duocli_token');
   if (!savedToken) {
     showPage('login-page');
@@ -5770,6 +7084,8 @@ async function init() {
     if (data.ok) {
       token = savedToken;
       enterMain();
+      
+      await initializeMacDesktop();
     } else {
       localStorage.removeItem('duocli_token');
       showPage('login-page');
@@ -5779,5 +7095,51 @@ async function init() {
     showPage('login-page');
   }
 }
+
+/**
+ * 初始化 Mac 远程桌面客户端（手机端设备列表里的「电脑」入口会用到）
+ */
+async function initializeMacDesktop() {
+  try {
+    // 等待 DOM 加载完成且 noVNC bundle 已加载
+    if (typeof window.MacDesktopClient === 'undefined') {
+      console.log('[MacDesktop] Waiting for noVNC to load...');
+      return;
+    }
+    
+    console.log('[MacDesktop] Creating client instance...');
+    macDesktopClient = new window.MacDesktopClient();
+    await macDesktopClient.init();
+    
+    // 订阅能力变化事件
+    subscribeToMacDesktopCapabilities();
+  } catch (error) {
+    console.error('[MacDesktop] Initialization failed:', error);
+  }
+}
+
+/**
+ * 订阅 Mac 桌面能力变化
+ */
+function subscribeToMacDesktopCapabilities() {
+  if (subscribeToMacDesktopCapabilities.bound) return;
+  subscribeToMacDesktopCapabilities.bound = true;
+  // 每 30 秒刷新一次能力状态
+  setInterval(() => {
+    if (macDesktopClient && macDesktopClient.state !== 'active') {
+      macDesktopClient.fetchCapabilities();
+    }
+  }, 30000);
+  
+  // 页面可见时尝试恢复连接
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && macDesktopClient) {
+      if (macDesktopClient.state === 'suspended') {
+        void macDesktopClient.resume();
+      }
+    }
+  });
+}
+
 
 init();

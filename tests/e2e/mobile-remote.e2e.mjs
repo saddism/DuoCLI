@@ -29,7 +29,7 @@ const origin = `http://127.0.0.1:${info.port}`;
 const browser = await puppeteer.launch({ executablePath: resolveChromeExecutable(), headless: true, args: ['--no-sandbox'] });
 const page = await browser.newPage();
 const errors = [];
-page.on('pageerror', e => errors.push(e.message));
+page.on('pageerror', e => { errors.push(e.message); console.error('BROWSER_ERROR', e.stack || e.message); });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const output = data => {
   // Match the real PTY callback order: rawBuffer is updated only after the
@@ -48,7 +48,7 @@ const settle = async () => {
 };
 const readBuffer = term => {
   const b = term.buffer.active;
-  return { lines: Array.from({ length: b.length }, (_, i) => b.getLine(i).translateToString(true)), cursor: [b.cursorX, b.cursorY], cols: term.cols, rows: term.rows };
+  return { lines: Array.from({ length: term.rows }, (_, i) => b.getLine(b.baseY + i).translateToString(true)), cursor: [b.cursorX, b.cursorY], cols: term.cols, rows: term.rows };
 };
 const results = [];
 async function check(name, run) {
@@ -62,6 +62,9 @@ try {
   await page.click('.session-card');
   await page.waitForFunction(() => term && terminalSequence >= 0);
   await sleep(600);
+  await check('embedded RFB is available without standalone noVNC UI startup', async () => {
+    assert.deepEqual(await page.evaluate(() => [typeof window.RFB, typeof window.NoVNC?.RFB]), ['function', 'function']);
+  });
   await check('initial geometry is acknowledged by the backend', async () => {
     assert.deepEqual(await page.evaluate(() => [term.cols, term.rows]), [state.terminal.cols, state.terminal.rows]);
   });
@@ -72,44 +75,76 @@ try {
       state.terminal.buffer.active.getLine(0).translateToString(true));
   });
   for (const name of ['qoder-cn', 'cursor', 'antigravity', 'codex']) {
-    await check(`${name}: live output equals canonical terminal`, async () => {
+    await check(`${name}: live screen equals canonical terminal`, async () => {
       // Recordings were captured at 43x33. Keep all parsers at that geometry.
-      manager.resize('test', 43, 33, 'mobile', true);
+      // Negotiate through the actual browser protocol. A direct manager call
+      // cannot stand in for the current resize ACK/snapshot handshake.
+      await page.evaluate(() => {
+        lastSentCols = 43; lastSentRows = 33;
+        wsSend({ type: 'resize', cols: 43, rows: 33 });
+      });
+      await page.waitForFunction(() => term.cols === 43 && term.rows === 33);
+      await page.evaluate(() => terminalWriteQueue);
       output('\x1bc');
       const fixture = JSON.parse(fs.readFileSync(new URL(`../fixtures/terminal/${name}.json`, import.meta.url)));
       for (const chunk of fixture.chunks) { output(chunk.data); await sleep(2); }
       await settle();
       assert.deepEqual(await page.evaluate(readBuffer => {
         const b = term.buffer.active;
-        return { lines: Array.from({ length: b.length }, (_, i) => b.getLine(i).translateToString(true)), cursor: [b.cursorX, b.cursorY], cols: term.cols, rows: term.rows };
+        return { lines: Array.from({ length: term.rows }, (_, i) => b.getLine(b.baseY + i).translateToString(true)), cursor: [b.cursorX, b.cursorY], cols: term.cols, rows: term.rows };
       }), readBuffer(state.terminal));
     });
   }
-  await check('reconnect during output neither loses nor duplicates history', async () => {
+  await check('reconnect preserves the history anchor and delivers every output line exactly once', async () => {
     output('\x1bc' + 'history 中文\r\n'.repeat(150));
     await settle();
-    await page.evaluate(() => { term.scrollToLine(20); isUserScrolling = true; connectWebSocket(currentSessionId); });
-    for (let i = 0; i < 60; i++) output(`line ${i}\r\n`);
+    await page.evaluate(() => enterTerminalHistory());
+    await page.waitForFunction(() => terminalHistoryLayer?.getItems().length > 0 && !terminalHistoryLoading);
+    const previous = await page.evaluate(() => {
+      const scroller = terminalHistoryLayer.root.querySelector('.terminal-history-scroller');
+      scroller.scrollTop = 180;
+      const anchor = terminalHistoryLayer.captureAnchor();
+      connectWebSocket(currentSessionId);
+      return anchor;
+    });
+    for (let i = 0; i < 60; i++) output('line ' + i + String.fromCharCode(13, 10));
     await sleep(400);
     await settle();
+    const current = await page.evaluate(() => terminalHistoryLayer.captureAnchor());
+    assert.equal(current.lineId, previous.lineId);
+    assert.ok(Math.abs(current.pixelOffset - previous.pixelOffset) < 2);
+    // Compare the current screen, not an intentionally discarded xterm
+    // scrollback. Verify the older part separately through real pagination.
     assert.deepEqual(await page.evaluate(() => {
       const b = term.buffer.active;
-      return { lines: Array.from({ length: b.length }, (_, i) => b.getLine(i).translateToString(true)), cursor: [b.cursorX, b.cursorY], cols: term.cols, rows: term.rows };
+      return { lines: Array.from({ length: term.rows }, (_, i) => b.getLine(b.baseY + i).translateToString(true)),
+        cursor: [b.cursorX, b.cursorY], cols: term.cols, rows: term.rows };
     }), readBuffer(state.terminal));
-    assert.equal(await page.evaluate(() => term.buffer.active.viewportY), 20);
+    await page.evaluate(() => { exitTerminalHistory(); enterTerminalHistory(); });
+    await page.waitForFunction(() => terminalHistoryLayer?.getItems().length > 0 && !terminalHistoryLoading);
+    const delivered = await page.evaluate(() => {
+      const b = term.buffer.active;
+      const visible = Array.from({ length: term.rows }, (_, i) => b.getLine(b.baseY + i).translateToString(true));
+      return [...terminalHistoryLayer.getItems().map(item => item.text), ...visible]
+        .filter(line => /^line \d+$/.test(line)).map(line => Number(line.slice(5)));
+    });
+    assert.deepEqual(delivered, Array.from({ length: 60 }, (_, i) => i));
   });
-  await check('canvas recreation preserves a history-reading viewport', async () => {
+  await check('canvas recreation preserves the paged history line and pixel anchor', async () => {
     const previous = await page.evaluate(() => {
       window.__previousTerm = term;
-      term.scrollToLine(18); isUserScrolling = true;
-      return term.buffer.active.viewportY;
+      terminalHistoryLayer.root.querySelector('.terminal-history-scroller').scrollTop = 180;
+      return terminalHistoryLayer.captureAnchor();
     });
-    assert.equal(previous, 18);
+    assert.ok(previous);
     await page.evaluate(() => forceTerminalRecreate());
     await page.waitForFunction(() => term !== window.__previousTerm && terminalSequence >= 0);
     await sleep(350);
     await page.evaluate(() => terminalWriteQueue);
-    assert.equal(await page.evaluate(() => term.buffer.active.viewportY), 18);
+    const current = await page.evaluate(() => ({ visible: terminalHistoryLayer.isVisible(), anchor: terminalHistoryLayer.captureAnchor() }));
+    assert.equal(current.visible, true);
+    assert.equal(current.anchor.lineId, previous.lineId);
+    assert.ok(Math.abs(current.anchor.pixelOffset - previous.pixelOffset) < 2);
   });
   await check('healthy BFCache pageshow refreshes without recreating the terminal', async () => {
     const same = await page.evaluate(async () => {
@@ -121,6 +156,8 @@ try {
     assert.equal(same, true);
   });
   await check('a wheel gesture cancels a pending follow-to-bottom frame', async () => {
+    await page.evaluate(() => exitTerminalHistory());
+    output('wheel prelude\r\n'.repeat(20)); await settle();
     await page.evaluate(() => {
       term.scrollToBottom();
       scrollTerminalToBottom();
@@ -133,6 +170,11 @@ try {
   await check('keyboard-height resize matches backend rows and columns', async () => {
     await page.setViewport({ width: 390, height: 500, isMobile: true, hasTouch: true });
     await sleep(900);
+    console.log('RESIZE_DIAGNOSTIC', JSON.stringify({ backend: [state.terminal.cols, state.terminal.rows],
+      browser: await page.evaluate(() => ({ size: [term.cols, term.rows], sent: [lastSentCols, lastSentRows],
+        proposed: fitAddon.proposeDimensions(), timer: resizeSendTimer !== null,
+        state: ws?.readyState, visibility: document.visibilityState,
+        pending: document.getElementById('terminal-container').classList.contains('terminal-reveal-pending') })) }));
     assert.deepEqual(await page.evaluate(() => [term.cols, term.rows]), [state.terminal.cols, state.terminal.rows]);
     assert.ok(state.terminal.rows < 33);
   });
@@ -149,10 +191,14 @@ try {
     output('\x1b[?2004h'); await settle();
     inputs.length = 0;
     const label = await page.evaluate(() => {
-      const btn = document.querySelector('.qcmd-btn');
-      btn.click();
-      return btn.textContent;
+      const btn = document.querySelector('.qcmd-btn[data-command]');
+      const pointer = { bubbles: true, button: 0, clientX: 8, clientY: 8, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      btn.dispatchEvent(new PointerEvent('pointerdown', pointer));
+      btn.dispatchEvent(new PointerEvent('pointerup', pointer));
+      return btn.dataset.command;
     });
+    await page.waitForSelector('#mobile-confirm-dialog [data-confirm="yes"]');
+    await page.click('#mobile-confirm-dialog [data-confirm="yes"]');
     assert.deepEqual(inputs, []);
     assert.equal(await page.$eval('#msg-input', input => input.value), label);
     await page.click('#send-btn');

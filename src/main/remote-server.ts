@@ -1,4 +1,6 @@
 import express from 'express';
+import { router as macDesktopRouter, handleMacDesktopWsUpgrade } from './mac-desktop-routes';
+import { macDesktopSessionManager } from './mac-desktop-session';
 import { quickCommands } from './quick-commands';
 import { sendFileDownload } from './file-download';
 import http from 'http';
@@ -29,6 +31,9 @@ import { resolvePresetEnv } from './preset-env';
 import { BUILTIN_PRESETS, getAvailableBuiltinPresets } from './cli-detect';
 import { buildResumeCommand } from './session-resume';
 import { ClosedSessionsManager, sortClosedSessionsByUpdatedAt } from './closed-sessions';
+import { resolveSessionUiStatus } from './session-status';
+import { HISTORY_PAGE_ROWS, TERMINAL_CAPABILITY_VERSION } from './terminal-history';
+import { isNativeChatSupportedCli, loadSessionChat } from './native-chat';
 
 // 缓存 ptyManager 和回调供远程创建使用（在 startRemoteServer 中设置）
 let cachedPtyManager: PtyManager | null = null;
@@ -438,6 +443,10 @@ export function startRemoteServer(
   }
 
   app.use('/api', authMiddleware);
+  
+  // Mac 桌面远程控制路由
+  app.use('/api/mac-desktop', macDesktopRouter);
+  
   app.get('/api/quick-commands', (_req, res) => {
     try { res.json(quickCommands.read()); }
     catch { res.status(500).json({ error: '快捷命令读取失败' }); }
@@ -460,16 +469,37 @@ export function startRemoteServer(
   const sseClients = new Set<import('express').Response>();
   const wsClients = new Map<string, Set<WebSocket>>();
   ptyManager.setRemoteSubscriberCheck((id) => (wsClients.get(id)?.size ?? 0) > 0);
+  function notifySessionRemoteView(id: string, info: { viewed?: boolean; viewing?: boolean }) {
+    const notify = (global as any).__notifySessionRemoteView;
+    if (typeof notify === 'function') notify(id, info);
+  }
   type RemoteWsChunk = { data: string; sequence: number };
   type RemoteWsState = {
     id: string;
+    subscriptionId: string;
+    requestId: string;
     ready: boolean;
     sequence: number;
     revision: number;
     sendQueue: Promise<void>;
     pending: RemoteWsChunk[];
+    /** Scrollback rows currently loaded on this mobile client. */
+    historyScrollback: number;
   };
+  const snapshotEnvelope = (
+    state: RemoteWsState,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    sessionId: state.id,
+    subscriptionId: state.subscriptionId,
+    requestId: state.requestId,
+    capabilityVersion: TERMINAL_CAPABILITY_VERSION,
+    ...extra,
+  });
   const remoteStates = new Map<WebSocket, RemoteWsState>();
+  // First paint: current viewport only. Older rows load when the user scrolls up.
+  const INITIAL_REPLAY_SCROLLBACK = 0;
+  const HISTORY_CHUNK_ROWS = 80;
   const enqueueWsSend = (ws: WebSocket, state: RemoteWsState, payload: string) => {
     const operation = state.sendQueue.then(() => new Promise<void>((resolve, reject) => {
       if (ws.readyState !== WebSocket.OPEN || remoteStates.get(ws) !== state) {
@@ -498,7 +528,8 @@ export function startRemoteServer(
     state.ready = false;
     state.sequence = sequence;
     state.pending = [];
-    void enqueueWsSend(ws, state, JSON.stringify({
+    const history = session.terminalState?.history;
+    void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
       type: 'replay',
       data: session.rawBuffer || '',
       cols: session.currentCols,
@@ -508,25 +539,61 @@ export function startRemoteServer(
       // otherwise the first live flush sends the replayed bytes a second time.
       sequence,
       preserveViewport,
-    })).then(() => {
+      // Fallback path dumps the raw ANSI tail; treat it as a complete paint.
+      scrollback: 0,
+      scrollbackTotal: 0,
+      hasMoreHistory: Boolean(history?.hasMore),
+      epoch: history?.epoch ?? 1,
+      geometryRevision: 0,
+      historyCursor: history?.historyCursor ?? null,
+      historyHasMore: Boolean(history?.hasMore),
+      earliestAvailable: Boolean(history && !history.truncated && !history.hasMore),
+      truncated: Boolean(history?.truncated),
+      fallback: 'raw',
+    }))).then(() => {
       if (remoteStates.get(ws) === state) {
         state.ready = true;
+        state.historyScrollback = 0;
         // Output can arrive while the replay is in flight. Flush the queued
         // tail now that this connection has a stable replay cursor.
         flushClientPending(ws, state);
       }
     }).catch(() => closeBrokenRemoteSocket(ws, state));
   };
-  const sendSnapshot = (ws: WebSocket, id: string, preserveViewport = false) => {
+  const sendSnapshot = (
+    ws: WebSocket,
+    id: string,
+    preserveViewport = false,
+    options?: { scrollback?: number; messageType?: 'replay' | 'history'; requestId?: string },
+  ) => {
     const state = remoteStates.get(ws);
     if (!state || state.id !== id) return;
     const session = ptyManager.getSession(id);
+    const messageType = options?.messageType || 'replay';
+    if (options?.requestId) state.requestId = String(options.requestId);
     if (!session || session.closing) {
       if (ws.readyState === WebSocket.OPEN) {
         state.ready = false;
         state.sequence = 0;
         state.pending = [];
-        void enqueueWsSend(ws, state, JSON.stringify({ type: 'replay', data: '', cols: 80, rows: 24, sequence: 0, preserveViewport })).then(() => {
+        state.historyScrollback = 0;
+        void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+          type: messageType,
+          data: '',
+          cols: 80,
+          rows: 24,
+          sequence: 0,
+          scrollback: 0,
+          scrollbackTotal: 0,
+          hasMoreHistory: false,
+          epoch: 1,
+          geometryRevision: 0,
+          historyCursor: null,
+          historyHasMore: false,
+          earliestAvailable: true,
+          truncated: false,
+          preserveViewport,
+        }))).then(() => {
           if (remoteStates.get(ws) === state) {
             state.ready = true;
             flushClientPending(ws, state);
@@ -541,16 +608,28 @@ export function startRemoteServer(
     state.ready = false;
     state.pending = [];
     const revision = ++state.revision;
+    const snapshotOptions = options?.scrollback === undefined
+      ? undefined
+      : { scrollback: options.scrollback };
     void ptyManager.snapshot(id, snapshot => {
       if (remoteStates.get(ws) !== state || state.revision !== revision || ws.readyState !== WebSocket.OPEN) return;
       state.sequence = snapshot.sequence;
-      void enqueueWsSend(ws, state, JSON.stringify({ type: 'replay', ...snapshot, preserveViewport })).then(() => {
-        if (remoteStates.get(ws) === state) {
+      state.historyScrollback = snapshot.scrollback;
+      void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+        type: messageType,
+        ...snapshot,
+        preserveViewport,
+      }))).then(() => {
+        if (remoteStates.get(ws) === state && state.revision === revision) {
           state.ready = true;
           flushClientPending(ws, state);
         }
       }).catch(() => closeBrokenRemoteSocket(ws, state));
-    }).catch(() => sendRawReplay(ws, state, session, preserveViewport));
+    }, snapshotOptions).catch(() => {
+      if (remoteStates.get(ws) === state && state.revision === revision) {
+        sendRawReplay(ws, state, session, preserveViewport);
+      }
+    });
   };
   type AliveWebSocket = WebSocket & { isAlive?: boolean };
 
@@ -594,36 +673,122 @@ export function startRemoteServer(
         const data = JSON.parse(msg.toString());
 
         if (data.type === 'subscribe' && data.sessionId) {
-          if (subscribedSession) wsClients.get(subscribedSession)?.delete(ws);
+          if (subscribedSession) {
+            wsClients.get(subscribedSession)?.delete(ws);
+            if (subscribedSession !== data.sessionId && (wsClients.get(subscribedSession)?.size ?? 0) === 0) {
+              notifySessionRemoteView(subscribedSession, { viewing: false });
+            }
+          }
           subscribedSession = data.sessionId;
           pendingSizeClaim = true;
           const state: RemoteWsState = {
             id: data.sessionId,
+            subscriptionId: crypto.randomUUID(),
+            requestId: typeof data.requestId === 'string' ? data.requestId : '',
             ready: false,
             sequence: 0,
             revision: 0,
             sendQueue: Promise.resolve(),
             pending: [],
+            historyScrollback: 0,
           };
           remoteStates.set(ws, state);
           if (!wsClients.has(data.sessionId)) wsClients.set(data.sessionId, new Set());
           wsClients.get(data.sessionId)!.add(ws);
+          notifySessionRemoteView(data.sessionId, { viewed: true, viewing: true });
 
-          // 订阅先同步回放 rawBuffer，保证手机端立刻收到 replay 并停止重连。
+          // First paint: only the latest screen. Older scrollback is fetched
+          // on demand when the mobile client scrolls near the top.
           const session = ptyManager.getSession(data.sessionId);
           if (session && !session.closing) {
-            // Once a mobile client owns the PTY geometry, reconnecting that
-            // client should restore the acknowledged mobile size as well.
-            // A desktop-owned session still lets the browser fit locally.
-            sendRawReplay(ws, state, session, session.sizeOwner === 'mobile');
+            sendSnapshot(
+              ws,
+              data.sessionId,
+              session.sizeOwner === 'mobile',
+              { scrollback: INITIAL_REPLAY_SCROLLBACK },
+            );
           } else if (ws.readyState === WebSocket.OPEN) {
-            void enqueueWsSend(ws, state, JSON.stringify({ type: 'replay', data: '', cols: 80, rows: 24, sequence: 0 })).then(() => {
+            void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+              type: 'replay',
+              data: '',
+              cols: 80,
+              rows: 24,
+              sequence: 0,
+              scrollback: 0,
+              scrollbackTotal: 0,
+              hasMoreHistory: false,
+              epoch: 1,
+              geometryRevision: 0,
+              historyCursor: null,
+              historyHasMore: false,
+              earliestAvailable: true,
+              truncated: false,
+            }))).then(() => {
               if (remoteStates.get(ws) === state) {
                 state.ready = true;
                 flushClientPending(ws, state);
               }
             }).catch(() => closeBrokenRemoteSocket(ws, state));
           }
+        }
+
+        if (data.type === 'historyBefore' && subscribedSession) {
+          const state = remoteStates.get(ws);
+          if (!state || state.id !== subscribedSession) return;
+          const requestId = typeof data.requestId === 'string' ? data.requestId : '';
+          const limitRows = Number.isFinite(Number(data.limitRows))
+            ? Math.max(1, Math.min(200, Math.floor(Number(data.limitRows))))
+            : HISTORY_PAGE_ROWS;
+          void ptyManager.historyBefore(subscribedSession, {
+            epoch: Number.isInteger(data.epoch) ? data.epoch : undefined,
+            requestId,
+            beforeCursor: typeof data.beforeCursor === 'string' ? data.beforeCursor : null,
+            limitRows,
+          }).then(page => {
+            if (remoteStates.get(ws) !== state || ws.readyState !== WebSocket.OPEN) return;
+            void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+              type: 'historyPage',
+              ...page,
+              requestId,
+            })));
+          }).catch(() => {
+            if (remoteStates.get(ws) !== state || ws.readyState !== WebSocket.OPEN) return;
+            void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+              type: 'historyPage',
+              items: [],
+              nextCursor: null,
+              hasMore: false,
+              earliestAvailable: false,
+              truncated: false,
+              stale: true,
+              requestId,
+              epoch: Number.isInteger(data.epoch) ? data.epoch : 0,
+            })));
+          });
+        }
+
+        if (data.type === 'history' && subscribedSession) {
+          const state = remoteStates.get(ws);
+          if (!state || state.id !== subscribedSession) return;
+          const requested = Number(data.scrollback);
+          const nextScrollback = Number.isFinite(requested)
+            ? Math.max(state.historyScrollback, Math.min(5000, Math.floor(requested)))
+            : state.historyScrollback + HISTORY_CHUNK_ROWS;
+          if (nextScrollback <= state.historyScrollback) {
+            void enqueueWsSend(ws, state, JSON.stringify({
+              type: 'history',
+              data: '',
+              scrollback: state.historyScrollback,
+              scrollbackTotal: state.historyScrollback,
+              hasMoreHistory: false,
+              sequence: state.sequence,
+            }));
+            return;
+          }
+          sendSnapshot(ws, subscribedSession, true, {
+            scrollback: nextScrollback,
+            messageType: 'history',
+          });
         }
 
         if (data.type === 'submit' && subscribedSession && typeof data.id === 'string' && data.id.length <= 128
@@ -650,11 +815,19 @@ export function startRemoteServer(
         // 首次（订阅后）force 接管；其余走仲裁，避免和桌面端抢尺寸导致
         // TUI 反复重绘、滚动区堆残帧。
         if (data.type === 'resize' && subscribedSession && data.cols && data.rows) {
-          const initialClaim = pendingSizeClaim;
           ptyManager.resize(subscribedSession, data.cols, data.rows, 'mobile', pendingSizeClaim);
           pendingSizeClaim = false;
-          // 订阅后的首次 resize 紧跟 raw replay，跳过 snapshot，避免首屏连续多帧。
-          if (!initialClaim) sendSnapshot(ws, subscribedSession, true);
+          // Initial resize also needs an ordered acknowledgement. Otherwise a
+          // reconnect can apply the pre-resize snapshot while new output is
+          // already being parsed at the newly claimed geometry. Snapshot
+          // revisions suppress obsolete work; skipping the ACK is not safe.
+          const state = remoteStates.get(ws);
+          sendSnapshot(
+            ws,
+            subscribedSession,
+            true,
+            { scrollback: state?.historyScrollback ?? INITIAL_REPLAY_SCROLLBACK },
+          );
         }
 
         // 心跳 ping，忽略即可
@@ -671,6 +844,7 @@ export function startRemoteServer(
       if (subscribedSession) {
         wsClients.get(subscribedSession)?.delete(ws);
         if ((wsClients.get(subscribedSession)?.size ?? 0) === 0) {
+          notifySessionRemoteView(subscribedSession, { viewing: false });
           const session = ptyManager.getSession(subscribedSession);
           const desktop = session?.sizeBySource.desktop;
           if (session && desktop && session.sizeOwner === 'mobile') {
@@ -1268,6 +1442,11 @@ export function startRemoteServer(
       });
       return;
     }
+    // Mac 桌面远程控制 WS 路由
+    if (pathname === '/mac-desktop-ws') {
+      handleMacDesktopWsUpgrade(wss, request);
+      return;
+    }
     socket.destroy();
   });
 
@@ -1293,11 +1472,14 @@ export function startRemoteServer(
     // and send the same tail twice. If the socket fails, reconnect replay is
     // authoritative and will recover from rawBuffer.
     state.sequence = sequence;
-    void enqueueWsSend(ws, state, JSON.stringify({
+    const fromSequence = fresh[0].sequence;
+    void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
       type: 'output',
       data: fresh.map(chunk => chunk.data).join(''),
+      fromSequence,
+      toSequence: sequence,
       sequence,
-    })).catch(() => closeBrokenRemoteSocket(ws, state));
+    }))).catch(() => closeBrokenRemoteSocket(ws, state));
   };
 
   const flushClientPending = (ws: WebSocket, state: RemoteWsState): void => {
@@ -1441,15 +1623,28 @@ export function startRemoteServer(
     res.json({ lanIps, port: PORT, hostname: os.hostname() });
   });
 
-  // 1x1 透明 PNG，给手机端 <img> 探针用（HTTPS 页面下 fetch HTTP 会被
-  // Mixed Content 拦截，但 <img> 跨协议加载不被拦，可用 onload 判通断）
-  // 注意：不挂在 /api 下，避免 token 限制——这是公开探针端点
+  // 1x1 透明 PNG，给网页端探测局域网是否可达。
+  // Chromium Local Network Access 可用 fetch(私有 IP) 豁免 Mixed Content；
+  // 其它浏览器退回 <img> 跨协议加载。不挂 /api，避免 token 限制。
   const PING_PNG = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
     'base64'
   );
-  app.get('/ping.png', (_req, res) => {
+  // Private Network Access（旧 Chromium）会对跨网段请求发 OPTIONS 预检；
+  // 缺 Allow-Private-Network 时探针永远失败，表现为「永远切不到局域网」。
+  const setPingCors = (res: import('express').Response) => {
     res.set('Cache-Control', 'no-store');
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    res.set('Access-Control-Allow-Private-Network', 'true');
+  };
+  app.options('/ping.png', (_req, res) => {
+    setPingCors(res);
+    res.status(204).end();
+  });
+  app.get('/ping.png', (_req, res) => {
+    setPingCors(res);
     res.type('png').send(PING_PNG);
   });
 
@@ -1502,11 +1697,13 @@ export function startRemoteServer(
     res.json({ ok: true });
   });
 
-  // 获取会话的 UI 状态（busy/unread/idle），由 renderer 同步到 main
+  // 绿=进行中，黄=已停止未查看，灰=已查看。未同步时不能默认黄。
   function getSessionStatus(id: string, ptyProcess: any): string {
-    if (ptyProcess.exitState) return 'exited';
     const statuses = (global as any).__sessionStatuses || {};
-    return statuses[id] || 'idle';
+    return resolveSessionUiStatus(statuses[id], {
+      exited: Boolean(ptyProcess?.exitState),
+      viewing: (wsClients.get(id)?.size ?? 0) > 0,
+    });
   }
 
   function mapSessionToApi(s: any) {
@@ -1522,6 +1719,10 @@ export function startRemoteServer(
       provider: s.provider,
       status: getSessionStatus(s.id, s.ptyProcess),
       createdAt: s.createdAt || Date.now(),
+      themeId: s.themeId || '',
+      cli: s.cliKind || '',
+      resumeId: s.resumeId || null,
+      chatCapable: isNativeChatSupportedCli(s.cliKind),
       lastUserPrompt: userPromptBanner.lastUserPromptFrom(s.accumulatedInputs),
     };
   }
@@ -1530,6 +1731,20 @@ export function startRemoteServer(
   app.get('/api/sessions', (_req, res) => {
     const sessions = ptyManager.getAllSessions().map(s => mapSessionToApi(s));
     res.json(sessions);
+  });
+
+  app.get('/api/sessions/:id/chat', async (req, res) => {
+    const session = ptyManager.getSession(String(req.params.id));
+    if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
+    try {
+      ptyManager.ensureResumeId(session.id);
+      const snapshot = await loadSessionChat(session.cliKind, session.resumeId, session.cwd);
+      const { filePath: _ignored, ...publicSnapshot } = snapshot;
+      void _ignored;
+      res.json(publicSnapshot);
+    } catch (error: any) {
+      res.status(500).json({ error: error?.message || '读取对话失败' });
+    }
   });
 
   const sendSessionFileDownload = (req: express.Request, res: express.Response) => {
@@ -1739,6 +1954,17 @@ export function startRemoteServer(
     } catch (e: any) {
       res.status(500).json({ error: '创建失败: ' + (e.message || e) });
     }
+  });
+
+  // 手机点进会话 = 已查看（黄→灰）；进行中绿点仍由桌面端同步
+  app.post('/api/sessions/:id/seen', (req, res) => {
+    const id = String(req.params.id || '');
+    if (!id || !ptyManager.getSession(id)) {
+      res.status(404).json({ error: '会话不存在' });
+      return;
+    }
+    notifySessionRemoteView(id, { viewed: true });
+    res.json({ ok: true });
   });
 
   // 输入

@@ -29,6 +29,8 @@ export class QuickCommandStore {
     } else if (operation.action === 'remove') {
       this.validate([operation.command]);
       commands = commands.filter(command => command !== operation.command);
+    } else if (operation.action === 'reorder') {
+      commands = this.validate(operation.commands || []);
     } else {
       throw new Error('未知快捷命令操作');
     }

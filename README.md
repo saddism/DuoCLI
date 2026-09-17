@@ -45,6 +45,51 @@ DuoCLI 把这些琐事收进一个侧边栏：
 
 [查看 v1.4.0 中英双语更新说明](./docs/updates/v1.4.0-release-notes.md)
 
+## v1.5.0：手机直接操控 Mac 桌面 🎉 (NEW!)
+
+**Mac 远程控制全新上线！** 现在可以用 iPhone 或 Android 手机直接查看并操作你当前的 Mac 桌面，就像用 VNC 一样，但完全不需要安装额外的软件：
+
+### 核心功能（v1.5.0）
+- ✅ **屏幕实时流**: 通过 macOS Screen Sharing + noVNC 获取当前桌面画面
+- ✅ **触控板模式**: 单指滑动移动光标，双指滚动页面内容
+- ✅ **虚拟键盘**: 输入文字、发送快捷键（⌘C/V/A/Z/Tab/ESC 等）
+- ✅ **安全认证**: 一次性票据验证，30 秒有效期，单次连接
+- ✅ **状态管理**: 连接/断开/挂起/恢复完整生命周期控制
+
+### 快速开始
+```bash
+# 1. 确保 Screen Sharing 已启用
+# System Settings → Sharing → Screen Sharing → ON
+
+# 2. 启动 DuoCLI
+npm start
+
+# 3. 手机浏览器访问
+# http://<mac-ip>:port/mobile/client/index.html
+
+# 4. 点击「这台 Mac」→「连接」
+```
+
+详细使用说明请查阅：[`docs/mac-desktop-quickstart-guide.md`](./docs/mac-desktop-quickstart-guide.md)  
+技术架构文档：[`docs/mac-desktop-architecture-reference.md`](./docs/mac-desktop-architecture-reference.md)
+
+### 技术亮点
+- 🚀 **零依赖**: 使用 macOS 原生 Screen Sharing 服务，无需安装任何组件
+- 🔒 **安全可靠**: Token-based authentication, Origin validation, one-time tickets
+- ⚡ **高性能**: 60fps 动画，GPU 加速渲染，渐进式 JPEG 编码
+- 📱 **移动端优化**: 虚拟键盘滑出动画，呼吸状态效果，触摸反馈增强
+
+### 适用场景
+- 临时需要打开浏览器、Finder 或系统对话框（无需回到电脑前）
+- 演示 Mac 应用给远程同事（分享当前桌面视图）
+- 测试移动端网页在不同 Mac 环境下的显示效果
+- 在会议中快速切换应用而不中断工作
+
+> **注意**: 首版仅支持单显示器配置，多屏将在后续版本支持。中文输入法需要通过 Extended Clipboard 方案实现，已在测试中验证可用性。
+
+[查看 v1.5.0 完整功能清单](./docs/mac-desktop-final-delivery-report.md)
+[验收测试指南](./docs/mac-desktop-test-plan.md)
+
 ## 核心体验
 
 ### 一键多开，不再找窗口
@@ -61,7 +106,7 @@ AI 配置主要用于整理会话历史和自动生成对话标题，不参与�
 
 ### 手机远程开发
 
-在电脑前启动 DuoCLI，离开工位后仍可通过手机查看终端、发送输入、切换会话。局域网和互联网连接状态会在桌面端明确显示，异常时支持自动恢复和手动重试。
+在电脑前启动 DuoCLI，离开工位后仍可通过手机查看终端、发送输入、切换会话。局域网和互联网连接状态会在桌面端明确显示，异常时支持自动恢复和手动重试。右侧「手机远程同步」卡片可复制地址和 Token；点「怎么连」可按步骤配置局域网和固定公网域名。
 
 ## 下载
 

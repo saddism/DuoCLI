@@ -134,6 +134,11 @@
     if (!terminal?.scrollToLine || !Number.isInteger(line) || line < 0) return -1;
     const buffer = terminal.buffer.active;
     const target = Math.min(Math.max(0, line), Math.max(0, buffer.baseY));
+    try {
+      if (terminal.options && terminal.options.smoothScrollDuration !== 0) {
+        terminal.options.smoothScrollDuration = 0;
+      }
+    } catch { /* ignore read-only options */ }
     terminal.scrollToLine(target);
     const viewport = terminal._core?._viewport;
     if (typeof viewport?.syncScrollArea === 'function') viewport.syncScrollArea(true);

@@ -1276,6 +1276,105 @@ html, body {
   overflow-y: auto !important;
 }
 
+.terminal-container.terminal-reveal-pending .terminal-surface .xterm,
+.terminal-container.terminal-reveal-pending .terminal-surface .xterm-viewport {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.terminal-container.terminal-connecting::after {
+  content: '正在连接…';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary, #9aa4b2);
+  font-size: 13px;
+  z-index: 12;
+  pointer-events: none;
+}
+
+.terminal-surface.is-history .xterm {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.terminal-history-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary, #1e1e1e);
+  color: var(--text-primary, #ccc);
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+.terminal-history-layer[hidden] {
+  display: none !important;
+  pointer-events: none !important;
+}
+
+.terminal-history-hint {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.72);
+}
+
+.terminal-history-hint[hidden] {
+  display: none;
+}
+
+.terminal-history-scroller {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: auto;
+  overflow-anchor: none;
+}
+
+.terminal-history-window {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+}
+
+.terminal-history-row {
+  font-family: Menlo, Monaco, "Courier New", monospace;
+  font-size: 14px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  padding: 0 6px;
+}
+
+.terminal-history-live-btn,
+.terminal-jump-miss {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 11;
+  border: 1px solid var(--border-light, #333);
+  border-radius: 999px;
+  background: rgba(22, 27, 34, 0.92);
+  color: #e2e8f0;
+  font-size: 12px;
+  padding: 6px 12px;
+}
+
+.terminal-history-live-btn {
+  bottom: 18px;
+}
+
+.terminal-jump-miss {
+  top: 16px;
+}
+
 .scroll-bottom-btn {
   position: absolute;
   right: 20px;
@@ -1366,8 +1465,15 @@ html, body {
   gap: 6px;
 }
 
-.remote-info-retry {
+.remote-info-header-actions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.remote-info-guide,
+.remote-info-retry {
   padding: 2px 8px;
   font-size: 10px;
   line-height: 1.4;
@@ -1378,6 +1484,7 @@ html, body {
   cursor: pointer;
 }
 
+.remote-info-guide:hover,
 .remote-info-retry:hover {
   background: rgba(255, 255, 255, 0.1);
   border-color: var(--border-light);
@@ -1597,6 +1704,208 @@ html, body {
   color: var(--success, #3dd68c);
 }
 
+.remote-info-guide-hint {
+  margin-top: 2px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+}
+
+.remote-info-guide-hint:hover {
+  color: var(--accent-hover);
+}
+
+.empty-remote-guide-btn {
+  margin-top: 16px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--accent-hover);
+  background: transparent;
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.empty-remote-guide-btn:hover {
+  background: rgba(59, 130, 246, 0.12);
+}
+
+.remote-guide-dialog {
+  width: min(560px, calc(100vw - 40px));
+  max-height: min(88vh, 780px);
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.remote-guide-dialog .new-session-header {
+  padding: 16px 18px 12px;
+}
+
+.remote-guide-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.remote-guide-status {
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.remote-guide-status strong {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.remote-guide-status.is-ok {
+  border-color: rgba(61, 214, 140, 0.35);
+}
+
+.remote-guide-status.is-warn {
+  border-color: rgba(245, 166, 35, 0.35);
+}
+
+.remote-guide-status.is-error {
+  border-color: rgba(255, 95, 87, 0.35);
+}
+
+.remote-guide-section h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.remote-guide-section p,
+.remote-guide-section li {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.remote-guide-section ol,
+.remote-guide-section ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.remote-guide-section li + li {
+  margin-top: 8px;
+}
+
+.remote-guide-kv {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 10px;
+  min-width: 0;
+}
+
+.remote-guide-k {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.remote-guide-kv code,
+.remote-guide-cmd-row code,
+.remote-guide-path,
+.remote-guide-section code {
+  font-family: 'SF Mono', 'Menlo', monospace;
+  font-size: 11px;
+  color: var(--accent-hover);
+  word-break: break-all;
+}
+
+.remote-guide-actions,
+.remote-guide-cmd-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.remote-guide-actions .toolbar-btn,
+.remote-guide-copy-cmd,
+.remote-guide-footer .toolbar-btn {
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+.remote-guide-copy-cmd {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.remote-guide-copy-cmd:hover {
+  color: var(--text-primary);
+  border-color: var(--border-light);
+}
+
+.remote-guide-note {
+  margin-top: 8px;
+}
+
+.remote-guide-path {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+}
+
+.remote-guide-checklist {
+  list-style: none;
+  padding-left: 0;
+  margin: 10px 0 0;
+}
+
+.remote-guide-checklist li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.remote-guide-check {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  border-radius: 50%;
+  border: 1px solid var(--border-light);
+}
+
+.remote-guide-check.is-done {
+  background: var(--success, #3dd68c);
+  border-color: var(--success, #3dd68c);
+}
+
+.remote-guide-footer {
+  padding: 10px 18px 16px;
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 #session-list {
   flex: 1;
   overflow-y: auto;
@@ -1649,6 +1958,30 @@ html, body {
   border-left-color: transparent;
 }
 
+.session-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.session-status-dot.running {
+  background: #73c991;
+  box-shadow: 0 0 8px rgba(115, 201, 145, 0.55);
+  animation: session-status-pulse 2s infinite ease-in-out;
+}
+.session-status-dot.idle {
+  background: #e5a100;
+  box-shadow: 0 0 6px rgba(229, 161, 0, 0.45);
+}
+.session-status-dot.inactive,
+.session-status-dot.exited {
+  background: #64748b;
+}
+@keyframes session-status-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.15); opacity: 0.75; }
+}
+
 .session-color-dot {
   width: 10px;
   height: 10px;
@@ -1682,6 +2015,7 @@ html, body {
   flex-shrink: 0;
   display: inline-block;
   cursor: pointer;
+  margin-left: 4px;
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.3),
     0 0 0 2px rgba(0, 0, 0, 0.28);
@@ -1725,7 +2059,8 @@ html, body {
   color: #94a3b8;
   cursor: pointer;
   font-size: 11px;
-  opacity: 0.9;
+  opacity: 0;
+  pointer-events: none;
   transition: opacity 0.15s ease, color 0.15s ease, background 0.15s ease;
   flex-shrink: 0;
   display: inline-flex;
@@ -1783,6 +2118,10 @@ html, body {
   flex-shrink: 0;
 }
 
+.cli-logo.cli-logo-invert {
+  filter: invert(1);
+}
+
 /* 模型提供商标签（显示在 CLI 标签右侧） */
 .session-provider-tag {
   font-size: 9px;
@@ -1821,14 +2160,21 @@ html, body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  opacity: 0.88;
+  opacity: 0;
+  pointer-events: none;
   flex-shrink: 0;
   padding: 0;
   transition: all 0.15s ease;
 }
 
-.session-item:hover .session-close {
+.session-item:hover .session-close,
+.session-item:hover .session-edit-btn,
+.session-item:focus-within .session-close,
+.session-item:focus-within .session-edit-btn,
+.session-close:focus-visible,
+.session-edit-btn:focus-visible {
   opacity: 0.96;
+  pointer-events: auto;
 }
 
 .session-close:hover {
@@ -1906,7 +2252,17 @@ html, body {
   color: #aaa;
   flex-shrink: 0;
   align-self: center;
-  transition: background 0.2s, color 0.2s;
+  opacity: 0;
+  pointer-events: none;
+  transition: background 0.2s, color 0.2s, opacity 0.15s;
+}
+
+.session-item:hover .session-auto-continue-label,
+.session-item:focus-within .session-auto-continue-label,
+.session-auto-continue-label:focus-visible,
+.session-auto-continue-label.enabled {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .session-auto-continue-label.enabled {
@@ -1956,8 +2312,11 @@ html, body {
   flex-shrink: 0;
 }
 
-.session-item:hover .session-pin {
+.session-item:hover .session-pin,
+.session-item:focus-within .session-pin,
+.session-pin:focus-visible {
   opacity: 0.6;
+  pointer-events: auto;
 }
 
 .session-pin.pinned {
@@ -3206,8 +3565,10 @@ textarea:focus-visible,
   line-height: 1;
 }
 
-.session-item.active .session-edit-btn,
-.session-item.active .session-close {
+.session-item.active:hover .session-edit-btn,
+.session-item.active:hover .session-close,
+.session-item.active:focus-within .session-edit-btn,
+.session-item.active:focus-within .session-close {
   color: #dbeafe;
   opacity: 0.96;
 }
@@ -3263,19 +3624,33 @@ textarea:focus-visible,
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
 }
 
-@media (max-width: 980px) {
+@media (max-width: 1280px) {
   :root {
     --file-tree-width: 200px;
-    --sidebar-width: 245px;
-  }
-
-  .session-item {
-    margin-left: 6px;
-    margin-right: 6px;
+    --sidebar-width: 210px;
   }
 }
 
-/* Every terminal keeps its own draft; quick commands come from the shared host. */
+body.layout-compact #sidebar {
+  min-width: 188px;
+}
+
+body.layout-compact #sidebar-topbar {
+  padding: 8px 8px;
+}
+
+body.layout-compact .remote-server-info {
+  margin: 6px 6px;
+  padding: 8px 8px;
+}
+
+body.layout-compact .session-item {
+  margin-left: 5px;
+  margin-right: 5px;
+  padding: 7px 8px;
+}
+
+/* Quick commands and shortcut keys sit under the terminal; they write into the CLI. */
 .pane-body > .terminal-container,
 .terminal-container.active { display: flex; flex-direction: column; }
 .user-prompt-banner {
@@ -3324,13 +3699,57 @@ textarea:focus-visible,
 }
 .user-prompt-more { margin-top: 3px; }
 .user-prompt-jump { align-self: center; }
-.terminal-surface { position: relative; flex: 1; min-height: 0; overflow: hidden; }
-.terminal-composer { flex: none; padding: 8px 2px 2px; border-top: 1px solid var(--border-color, #333); }
-.terminal-compose-row { display: flex; gap: 8px; }
-.terminal-compose-row textarea { flex: 1; min-width: 0; resize: none; padding: 8px; color: var(--text-primary, #ddd); background: var(--bg-primary, #1e1e1e); border: 1px solid var(--border-color, #444); border-radius: 6px; font: inherit; }
+.terminal-surface { position: relative; z-index: 0; isolation: isolate; flex: 1; min-height: 0; overflow: hidden; }
+.terminal-composer { position: relative; z-index: 10; flex: none; padding: 8px 2px 2px; border-top: 1px solid var(--border-color, #333); }
 .terminal-composer button { color: var(--text-primary, #ddd); background: var(--bg-secondary, #292929); border: 1px solid var(--border-color, #444); border-radius: 5px; padding: 5px 9px; cursor: pointer; }
+.desktop-shortcut-bar { display: flex; justify-content: flex-end; gap: 6px; overflow-x: auto; padding-top: 7px; }
+.desktop-shortcut-bar button { flex-shrink: 0; font-family: 'SF Mono', 'Menlo', monospace; font-size: 12px; }
 .desktop-quick-commands { display: flex; gap: 6px; overflow-x: auto; padding-top: 7px; }
-.desktop-quick-commands button { flex-shrink: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.desktop-quick-commands button {
+  flex-shrink: 0;
+  max-width: 7.5em;
+  min-width: 48px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  border-radius: 999px;
+  user-select: none;
+}
+.desktop-quick-commands button.qcmd-add {
+  max-width: none;
+  min-width: 0;
+  border-radius: 999px;
+  border-style: dashed;
+}
+.desktop-quick-commands button.dragging {
+  opacity: 0.5;
+  transform: scale(0.95);
+}
+.desktop-quick-commands.is-sorting button[data-command] {
+  cursor: grabbing;
+}
+.quick-command-confirm-text {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  max-height: 12em;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'SF Mono', 'Menlo', monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-primary, #e2e8f0);
+  background: rgba(148, 163, 184, 0.08);
+  border-radius: 6px;
+}
+.btn-confirm-send {
+  background: var(--accent, #3b82f6);
+  color: #fff;
+}
+.btn-confirm-send:hover {
+  opacity: 0.85;
+}
 .quick-command-editor:not([hidden]) { display: flex; gap: 6px; padding-top: 6px; }
 .quick-command-editor input { flex: 1; min-width: 0; }
 .compose-status:empty { display: none; }

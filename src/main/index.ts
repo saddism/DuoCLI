@@ -191,6 +191,70 @@ let isQuitting = false;
 let quitConfirmed = false;
 let quitDialogOpen = false;
 let ignoreActivateUntil = 0;
+
+/** LaunchAgent KeepAlive 守护：用户主动退出时写暂停标记，避免 Cmd+Q 后又被拉起。 */
+const KEEP_ALIVE_LABEL = 'com.kaifeng.duocli-app';
+const KEEP_ALIVE_DIR = path.join(os.homedir(), '.config', 'duocli-tunnel');
+const KEEP_ALIVE_PAUSE_PATH = path.join(KEEP_ALIVE_DIR, 'app-keep.paused');
+const KEEP_ALIVE_PLIST_PATH = path.join(
+  os.homedir(),
+  'Library',
+  'LaunchAgents',
+  `${KEEP_ALIVE_LABEL}.plist`,
+);
+
+function clearKeepAlivePause(): void {
+  if (process.platform !== 'darwin') return;
+  try {
+    if (fs.existsSync(KEEP_ALIVE_PAUSE_PATH)) fs.unlinkSync(KEEP_ALIVE_PAUSE_PATH);
+  } catch {
+    // ignore
+  }
+}
+
+/** Cmd+Q / 菜单退出：暂停守护，进程退出后再 bootout，防止 KeepAlive 立刻重开。 */
+function pauseKeepAliveDaemon(): void {
+  if (process.platform !== 'darwin') return;
+  try {
+    fs.mkdirSync(KEEP_ALIVE_DIR, { recursive: true });
+    fs.writeFileSync(KEEP_ALIVE_PAUSE_PATH, `${new Date().toISOString()}\n`);
+  } catch {
+    // ignore
+  }
+  try {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (uid == null) return;
+    const pid = process.pid;
+    spawn(
+      'bash',
+      [
+        '-c',
+        `while kill -0 ${pid} 2>/dev/null; do sleep 0.2; done; ` +
+          `launchctl bootout gui/${uid}/${KEEP_ALIVE_LABEL} >/dev/null 2>&1 || true`,
+      ],
+      { detached: true, stdio: 'ignore' },
+    ).unref();
+  } catch {
+    // ignore
+  }
+}
+
+/** 用户再次主动打开应用时恢复守护（若本机已安装对应 LaunchAgent）。 */
+function resumeKeepAliveDaemon(): void {
+  if (process.platform !== 'darwin') return;
+  clearKeepAlivePause();
+  if (!fs.existsSync(KEEP_ALIVE_PLIST_PATH)) return;
+  try {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (uid == null) return;
+    spawn('launchctl', ['bootstrap', `gui/${uid}`, KEEP_ALIVE_PLIST_PATH], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref();
+  } catch {
+    // already loaded / unavailable — ignore
+  }
+}
 const aiConfigManager = new AIConfigManager();
 let cloudflaredManager: CloudflaredManager | null = null;
 let cachedRemoteServerInfo: any = null;
@@ -522,6 +586,7 @@ function setupPtyManager(): void {
     },
     onRawData: (id, data, sequence) => {
       pushRawDataToRemote(id, data, sequence);
+      safeSend('pty:parsed', id, data, sequence);
     },
     onTitleUpdate: (id, title) => {
       safeSend('pty:title-update', id, title);
@@ -629,6 +694,25 @@ function registerIPC(): void {
   ipcMain.handle('pty:resize', (_e, id: string, cols: number, rows: number) => {
     ptyManager.resize(id, cols, rows);
     return true;
+  });
+
+  ipcMain.handle('pty:snapshot', (_e, id: string, options?: { scrollback?: number }) => {
+    return new Promise((resolve, reject) => {
+      ptyManager.snapshot(id, snapshot => resolve(snapshot), options).catch(reject);
+    });
+  });
+
+  ipcMain.handle('pty:history-before', (_e, id: string, query?: {
+    beforeCursor?: string | null;
+    limitRows?: number;
+    requestId?: string;
+    epoch?: number;
+  }) => {
+    return ptyManager.historyBefore(id, query || {});
+  });
+
+  ipcMain.handle('pty:history-meta', (_e, id: string) => {
+    return ptyManager.historyMeta(id);
   });
 
   // 销毁终端
@@ -1257,6 +1341,20 @@ function registerIPC(): void {
     return result;
   });
   ipcMain.handle('remote:generate-token', () => generateAccessToken());
+  ipcMain.handle('remote:prepare-tunnel-config', () => {
+    const result = cloudflaredManager?.prepareUserConfig()
+      ?? { ok: false as const, error: '远程隧道未初始化' };
+    if (result.ok && cachedRemoteServerInfo && cloudflaredManager) {
+      const tunnel = cloudflaredManager.getStatus();
+      cachedRemoteServerInfo = {
+        ...cachedRemoteServerInfo,
+        publicUrl: tunnel.url || undefined,
+        tunnel,
+      };
+      safeSend('remote:server-info', cachedRemoteServerInfo);
+    }
+    return result;
+  });
 
   // ========== 催工配置 IPC ==========
   // 配置与调度由 main 进程负责，renderer 只负责设置和展示；这样重载页面、隐藏窗口
@@ -1304,12 +1402,22 @@ function registerIPC(): void {
     safeSend('auto-continue:set', sessionId, config);
   };
 
-  // 供 remote-server 调用：读取会话状态（busy/unread/idle）
+  // 供 remote-server 调用：读取会话状态（running/idle/inactive）
   // renderer 通过 IPC 同步状态到这里
   (global as any).__sessionStatuses = {} as Record<string, string>;
   ipcMain.on('session:sync-status', (_e, statuses: Record<string, string>) => {
     (global as any).__sessionStatuses = statuses;
   });
+  (global as any).__notifySessionRemoteView = (id: string, info: { viewed?: boolean; viewing?: boolean }) => {
+    if (info?.viewed) {
+      const statuses = { ...((global as any).__sessionStatuses || {}) } as Record<string, string>;
+      if (statuses[id] === 'idle') {
+        statuses[id] = 'inactive';
+        (global as any).__sessionStatuses = statuses;
+      }
+    }
+    safeSend('session:remote-view', id, info);
+  };
 
 }
 
@@ -1335,6 +1443,8 @@ app.whenReady().then(async () => {
 
   registerIPC();
   cloudflaredManager = new CloudflaredManager(path.join(__dirname, '../..'));
+  // 用户主动打开应用：清掉 Cmd+Q 留下的暂停标记，并恢复 KeepAlive（若已安装）。
+  resumeKeepAliveDaemon();
   createWindow(appIcon);
 
   remoteSyncMonitor = new RemoteSyncMonitor(
@@ -1372,6 +1482,8 @@ app.on('activate', () => {
 });
 
 function cleanupForQuit(): void {
+  // 必须先于进程退出：否则 LaunchAgent KeepAlive 会马上再 exec Electron。
+  pauseKeepAliveDaemon();
   globalShortcut.unregisterAll();
   autoContinueManager?.stop();
   autoContinueManager = null;
