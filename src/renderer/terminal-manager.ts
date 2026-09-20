@@ -567,6 +567,10 @@ export class TerminalManager {
         terminal.focus();
       },
     });
+    const showComposerError = (message: string) => {
+      const status = composer.element.querySelector('.compose-status');
+      if (status) status.textContent = message;
+    };
     container.appendChild(composer.element);
     terminal.onData((data) => {
       this.trackTypedPrompt(id, data);
@@ -623,6 +627,7 @@ export class TerminalManager {
     container.addEventListener('paste', async (e: ClipboardEvent) => {
       if ((e.target as Element)?.closest('.terminal-composer')) return;
       if (!e.clipboardData) return;
+      const fallbackText = e.clipboardData.getData('text/plain');
       const hasImage = Array.from(e.clipboardData.items).some(
         (item) => item.type.startsWith('image/')
       );
@@ -635,20 +640,29 @@ export class TerminalManager {
           if (filePath) {
             onData(filePath);
           }
-        } catch { /* 静默失败 */ }
+        } catch (error) {
+          showComposerError(`图片粘贴失败：${error instanceof Error ? error.message : String(error)}`);
+        }
         return;
       }
       // 尝试处理文件（从剪贴板获取文件路径）
+      // Stop xterm before awaiting the native clipboard; otherwise the browser
+      // inserts the text once and this handler inserts the resolved path again.
+      e.preventDefault();
+      e.stopPropagation();
       try {
         const filePath = await (window as any).duocli.clipboardGetFilePath();
         if (filePath) {
-          e.preventDefault();
-          e.stopPropagation();
           // 对路径进行 shell 转义
           const escapedPath = filePath.includes("'") ? `"${filePath.replace(/"/g, '\\"')}"` : `'${filePath}'`;
           onData(escapedPath + ' ');
+        } else if (fallbackText) {
+          terminal.paste(fallbackText);
         }
-      } catch { /* 静默失败 */ }
+      } catch {
+        if (fallbackText) terminal.paste(fallbackText);
+        else showComposerError('读取剪贴板文件失败');
+      }
     }, true);
 
     // 拦截复制事件：将 isWrapped 的软换行合并为连贯文本

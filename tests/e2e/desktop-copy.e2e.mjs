@@ -79,10 +79,11 @@ async function main() {
   // 2) 建真终端实例
   await page.evaluate(() => {
     window.__opened = [];
+    window.__inputs = [];
     window.duocli = { filewatcherOpen: (value) => window.__opened.push(value) };
     const area = document.getElementById('area');
     const mgr = new DuoTerminal.TerminalManager(area);
-    mgr.create('t1', 'vscode-dark', '/tmp/proj', () => {});
+    mgr.create('t1', 'vscode-dark', '/tmp/proj', data => window.__inputs.push(data));
     mgr.mountTo('t1', area);
     const inst = mgr.instances.get('t1');
     window.__t = inst.terminal;
@@ -234,6 +235,26 @@ async function main() {
   await sleep(150);
   const copiedByShortcut = await page.evaluate(() => navigator.clipboard.readText());
   check('Command+C：将终端选区写入剪贴板', copiedByShortcut === 'LATEST', `copied=${JSON.stringify(copiedByShortcut)}`);
+
+  if (process.env.DUOCLI_INPUT_AUDIT === '1') {
+    const paste = await page.evaluate(async () => {
+      window.__inputs.length = 0;
+      window.duocli.clipboardGetFilePath = async () => {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        return '/tmp/audit file.txt';
+      };
+      const data = new DataTransfer();
+      data.setData('text/plain', '/tmp/audit file.txt');
+      const target = window.__c.querySelector('.xterm-helper-textarea');
+      target.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+      await new Promise(resolve => setTimeout(resolve, 50));
+      return { id: 'INPUT-05', writes: window.__inputs.slice() };
+    });
+    console.log('DESKTOP_INPUT_AUDIT', JSON.stringify(paste));
+    check('桌面文件粘贴只写入一次转义路径',
+      paste.writes.length === 1 && paste.writes[0] === "'/tmp/audit file.txt' ",
+      JSON.stringify(paste));
+  }
 
   await browser.close();
   server.close();

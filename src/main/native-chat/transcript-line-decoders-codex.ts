@@ -65,7 +65,7 @@ function codexResponseItem(
     if (!role) {
       return null
     }
-    const decodedBlocks = claudeContentBlocks(payload.content)
+    const decodedBlocks = codexTurnItemBlocks(payload.content)
     const blocks =
       role === 'user' ? decodedBlocks.filter((block) => !isSkillContext(block)) : decodedBlocks
     if (blocks.length === 0) {
@@ -104,10 +104,11 @@ function codexResponseItem(
     }
   }
   if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+    const callId = extractString(payload.call_id)
     return {
       id,
       role: 'tool',
-      blocks: [codexToolResult(payload.output)],
+      blocks: [{ ...codexToolResult(payload.output), ...(callId ? { callId } : {}) }],
       timestamp,
       source: 'transcript'
     }
@@ -225,7 +226,7 @@ function codexCallInput(payload: Record<string, unknown>): unknown {
   return payload.input ?? payload.action ?? null
 }
 
-function codexToolResult(output: unknown): NativeChatBlock {
+function codexToolResult(output: unknown): Extract<NativeChatBlock, { type: 'tool-result' }> {
   const record = asRecord(output)
   const isError = record?.success === false || record?.is_error === true
   return {

@@ -34,6 +34,7 @@ export type NativeChatToolResultBlock = {
   type: 'tool-result';
   output: string;
   isError?: boolean;
+  callId?: string;
   editPatch?: NativeChatEditPatch;
 };
 
@@ -65,6 +66,7 @@ export type NativeChatBlock =
 
 export type NativeChatMessage = {
   id: string;
+  submissionId?: string;
   role: NativeChatRole;
   blocks: NativeChatBlock[];
   timestamp: number | null;

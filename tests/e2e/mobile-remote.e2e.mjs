@@ -187,6 +187,12 @@ try {
     await page.evaluate(() => sendMessage());
     assert.deepEqual(inputs, ['\x1b[200~你好 Cursor\x1b[201~', '\r']);
   });
+  await check('WebSocket rejects a submission for a session other than its subscription', async () => {
+    inputs.length = 0;
+    await page.evaluate(() => wsSend({ type: 'submit', sessionId: 'other-session', id: 'wrong-target', text: 'must not run' }));
+    await sleep(100);
+    assert.deepEqual(inputs, []);
+  });
   await check('quick command inserts a draft and explicit send submits once', async () => {
     output('\x1b[?2004h'); await settle();
     inputs.length = 0;

@@ -1,6 +1,6 @@
 // DuoCLI Mobile - Service Worker
 
-const CACHE_NAME = 'duocli-v72';
+const CACHE_NAME = 'duocli-v81';
 const ASSETS = [
   '/',
   '/index.html',

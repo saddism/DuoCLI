@@ -32,8 +32,11 @@ export interface PtySession {
   rawBuffer: string;          // 完整 ANSI 输出，用于远程终端回放
   lastSequence: number;       // rawBuffer 对应的终端解析序号
   terminalState: TerminalState;
-  submissions: Map<string, { text: string; result: Promise<void>; settled: boolean }>;
+  submissions: Map<string, { text: string; result: Promise<void>; settled: boolean; createdAt: number; phase: 'queued' | 'text' | 'entered' }>;
   submitQueue: Promise<void>;
+  inputTransaction: boolean;
+  inputTransactionCount: number;
+  queuedInputs: Array<{ data: string; source: PtyInputSource }>;
   userInputs: string[];
   commandCount: number;
   title: string;
@@ -80,7 +83,7 @@ export interface PtySession {
   lastInputAt: Record<PtyInputSource, number>;
 }
 
-export type PtyInputSource = 'desktop' | 'mobile';
+export type PtyInputSource = 'desktop' | 'mobile' | 'chat';
 
 interface PtyManagerEvents {
   onData: (id: string, data: string) => void;
@@ -374,6 +377,9 @@ export class PtyManager {
       terminalState: new TerminalState(),
       submissions: new Map(),
       submitQueue: Promise.resolve(),
+      inputTransaction: false,
+      inputTransactionCount: 0,
+      queuedInputs: [],
       userInputs: [],
       commandCount: 0,
       title: '新会话',
@@ -410,9 +416,9 @@ export class PtyManager {
       autoResponseTimers: new Set(),
       currentCols: 80,
       currentRows: 24,
-      sizeBySource: { desktop: null, mobile: null },
+      sizeBySource: { desktop: null, mobile: null, chat: null },
       sizeOwner: 'desktop',
-      lastInputAt: { desktop: 0, mobile: 0 },
+      lastInputAt: { desktop: 0, mobile: 0, chat: 0 },
       disposables: [],
     };
 
@@ -556,9 +562,14 @@ export class PtyManager {
     return session;
   }
 
-  write(id: string, data: string, source: PtyInputSource = 'desktop'): void {
+  write(id: string, data: string, source: PtyInputSource = 'desktop', insideTransaction = false): void {
     const session = this.sessions.get(id);
     if (!session || session.closing) return;
+    if (session.inputTransaction && !insideTransaction) {
+      session.queuedInputs ??= [];
+      session.queuedInputs.push({ data, source });
+      return;
+    }
     // 终端能力/光标报告不是用户输入，不能触发尺寸接管或取消任务。
     if (/^(?:\x1b\[[?>]?[\d;:]*c|\x1b\[\d+n|\x1b\[\??\d+;\d+R|\x1b\[\?[\d;]+\$y|\x1b\](?:10|11|12);[^\x07\x1b]*(?:\x07|\x1b\\))+$/.test(data)) {
       if (session.sizeOwner === source) session.ptyProcess.write(data);
@@ -567,7 +578,7 @@ export class PtyManager {
 
     session.lastInputAt[source] = Date.now();
     session.updatedAt = session.lastInputAt[source];
-    if (session.sizeOwner !== source) {
+    if (source !== 'chat' && session.sizeOwner !== source) {
       session.sizeOwner = source;
       // 接管终端的那一端立刻拿回自己上次 fit 出的尺寸
       const own = session.sizeBySource[source];
@@ -611,34 +622,56 @@ export class PtyManager {
     session.ptyProcess.write(data);
   }
 
-  submit(id: string, submissionId: string, text: string, enterDelayMs = 50): Promise<void> {
+  submit(id: string, submissionId: string, text: string, enterDelayMs = 50, source: PtyInputSource = 'mobile'): Promise<void> {
     const session = this.sessions.get(id);
     if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
     const existing = session.submissions.get(submissionId);
     if (existing) return existing.text === text ? existing.result : Promise.reject(new Error('提交编号重复'));
+    const entry = { text, result: Promise.resolve(), settled: false, createdAt: Date.now(), phase: 'queued' as const } as {
+      text: string; result: Promise<void>; settled: boolean; createdAt: number; phase: 'queued' | 'text' | 'entered';
+    };
+    session.inputTransactionCount = (session.inputTransactionCount || 0) + 1;
+    session.inputTransaction = true;
     const result = session.submitQueue.then(async () => {
       if (this.sessions.get(id) !== session) throw new Error('会话已结束');
-      let bracketed = false;
-      await session.terminalState.snapshot(() => { bracketed = session.terminalState.terminal.modes.bracketedPasteMode; });
-      const normalized = text.replace(/\r\n?/g, '\n');
-      this.write(id, bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized, 'mobile');
-      // TUI 输入状态需要完成一次更新；回车不能与粘贴被识别成同一次 paste。
-      await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(120_000, enterDelayMs))));
-      if (this.sessions.get(id) !== session) throw new Error('会话已结束');
-      this.write(id, '\r', 'mobile');
+      try {
+        let bracketed = false;
+        await session.terminalState.snapshot(() => { bracketed = session.terminalState.terminal.modes.bracketedPasteMode; });
+        const normalized = text.replace(/\r\n?/g, '\n');
+        entry.phase = 'text';
+        this.write(id, bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized, source, true);
+        // TUI 输入状态需要 complete one update before Enter.
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(120_000, enterDelayMs))));
+        if (this.sessions.get(id) !== session) throw new Error('会话已结束');
+        this.write(id, '\r', source, true);
+        entry.phase = 'entered';
+      } finally {
+        session.inputTransactionCount = Math.max(0, (session.inputTransactionCount || 1) - 1);
+        session.inputTransaction = session.inputTransactionCount > 0;
+        if (!session.inputTransaction) {
+          const queued = session.queuedInputs?.splice(0) || [];
+          for (const pending of queued) this.write(id, pending.data, pending.source);
+        }
+      }
     });
     session.submitQueue = result.catch(() => {});
-    const entry = { text, result, settled: false };
+    entry.result = result;
     session.submissions.set(submissionId, entry);
     const prune = () => {
       entry.settled = true;
       for (const [key, value] of session.submissions) {
-        if (session.submissions.size <= 256) break;
+        if (session.submissions.size <= 4096) break;
         // Never evict an in-flight ID: an HTTP retry may still be on its way.
-        if (value.settled) session.submissions.delete(key);
+        if (value.settled && Date.now() - (value.createdAt || 0) > 24 * 60 * 60 * 1000) session.submissions.delete(key);
       }
     };
-    void result.then(prune, prune);
+    void result.then(prune, () => {
+      prune();
+      // A failure before any bytes were written is safe to retry with the same ID.
+      if (entry.phase === 'queued' && session.submissions.get(submissionId) === entry) {
+        session.submissions.delete(submissionId);
+      }
+    });
     return result;
   }
 

@@ -120,6 +120,71 @@ test('duplicate submission IDs emit one paste and one Enter; separate submission
   await assert.rejects(manager.submit('test', 'one', 'different'), /提交编号重复/);
 });
 
+test('composer submission keeps concurrent terminal input after its Enter', async t => {
+  const manager = new PtyManager({ onData() {}, onTitleUpdate() {}, onExit() {} });
+  const state = new TerminalState();
+  t.after(() => state.dispose());
+  state.write('\x1b[?2004h', () => {});
+  const writes = [];
+  manager.sessions.set('test', {
+    terminalState: state, submissions: new Map(), submitQueue: Promise.resolve(),
+    inputTransaction: false, inputTransactionCount: 0, queuedInputs: [],
+    ptyProcess: { write: data => writes.push(data) }, sizeBySource: { desktop: null, mobile: null },
+    sizeOwner: null, lastInputAt: { desktop: 0, mobile: 0 }, currentLine: '', accumulatedInputs: [],
+    titleInputRevision: 0, titleSegmentCount: 0, titleGenerated: true, titleLocked: false,
+    autoResponseTimers: new Set(), updatedAt: 0,
+  });
+  const sending = manager.submit('test', 'atomic', 'composer text', 20);
+  manager.write('test', 'desktop text', 'desktop');
+  await sending;
+  assert.deepEqual(writes, ['\x1b[200~composer text\x1b[201~', '\r', 'desktop text']);
+});
+
+test('submission can retry the same ID after a failure before writing', async t => {
+  const manager = new PtyManager({ onData() {}, onTitleUpdate() {}, onExit() {} });
+  const state = new TerminalState();
+  t.after(() => state.dispose());
+  const originalSnapshot = state.snapshot.bind(state);
+  let first = true;
+  state.snapshot = async (...args) => {
+    if (first) { first = false; throw new Error('snapshot unavailable'); }
+    return originalSnapshot(...args);
+  };
+  const writes = [];
+  manager.sessions.set('test', {
+    terminalState: state, submissions: new Map(), submitQueue: Promise.resolve(),
+    inputTransaction: false, inputTransactionCount: 0, queuedInputs: [],
+    ptyProcess: { write: data => writes.push(data) }, sizeBySource: { desktop: null, mobile: null },
+    sizeOwner: null, lastInputAt: { desktop: 0, mobile: 0 }, currentLine: '', accumulatedInputs: [],
+    titleInputRevision: 0, titleSegmentCount: 0, titleGenerated: true, titleLocked: false,
+    autoResponseTimers: new Set(), updatedAt: 0,
+  });
+  await assert.rejects(manager.submit('test', 'retry', 'safe retry', 0), /snapshot unavailable/);
+  await new Promise(resolve => setImmediate(resolve));
+  await manager.submit('test', 'retry', 'safe retry', 0);
+  assert.deepEqual(writes, ['safe retry', '\r']);
+});
+
+test('chat submission does not claim terminal geometry', async t => {
+  const manager = new PtyManager({ onData() {}, onTitleUpdate() {}, onExit() {} });
+  const state = new TerminalState();
+  t.after(() => state.dispose());
+  const writes = [];
+  const session = {
+    terminalState: state, submissions: new Map(), submitQueue: Promise.resolve(),
+    inputTransaction: false, inputTransactionCount: 0, queuedInputs: [],
+    ptyProcess: { write: data => writes.push(data), resize() { throw new Error('chat must not resize'); } },
+    sizeBySource: { desktop: { cols: 100, rows: 40 }, mobile: { cols: 40, rows: 20 }, chat: null },
+    sizeOwner: 'desktop', lastInputAt: { desktop: 0, mobile: 0, chat: 0 }, currentLine: '', accumulatedInputs: [],
+    titleInputRevision: 0, titleSegmentCount: 0, titleGenerated: true, titleLocked: false,
+    autoResponseTimers: new Set(), updatedAt: 0, currentCols: 100, currentRows: 40,
+  };
+  manager.sessions.set('test', session);
+  await manager.submit('test', 'chat', 'follow up', 0, 'chat');
+  assert.equal(session.sizeOwner, 'desktop');
+  assert.deepEqual(writes, ['follow up', '\r']);
+});
+
 test('device discovery distinguishes usable, unauthorized and offline devices', () => {
   const rows = parseAndroidDevices('List of devices attached\r\nready device product:test\nlocked unauthorized\nasleep offline\n');
   assert.deepEqual(rows.map(row => [row.id, row.state, row.available]), [['ready', 'device', true], ['locked', 'unauthorized', false], ['asleep', 'offline', false]]);

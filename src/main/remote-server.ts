@@ -791,7 +791,8 @@ export function startRemoteServer(
           });
         }
 
-        if (data.type === 'submit' && subscribedSession && typeof data.id === 'string' && data.id.length <= 128
+        if (data.type === 'submit' && subscribedSession && data.sessionId === subscribedSession
+            && typeof data.id === 'string' && data.id.length <= 128
             && typeof data.text === 'string' && data.text.length > 0 && data.text.length <= 100000) {
           const sessionId = subscribedSession;
           void ptyManager.submit(sessionId, data.id, data.text).then(() => {
@@ -799,6 +800,8 @@ export function startRemoteServer(
           }).catch((e: Error) => {
             if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'submitted', id: data.id, error: e.message }));
           });
+        } else if (data.type === 'submit' && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'submitted', id: data.id, error: '提交目标与当前会话不一致' }));
         }
 
         if (data.type === 'input' && subscribedSession) {
@@ -1739,9 +1742,54 @@ export function startRemoteServer(
     try {
       ptyManager.ensureResumeId(session.id);
       const snapshot = await loadSessionChat(session.cliKind, session.resumeId, session.cwd);
+      const trackedSubmissions = [...session.submissions.entries()]
+        .filter(([, entry]) => entry.phase === 'entered')
+        .sort((a, b) => a[1].createdAt - b[1].createdAt);
+      const submissionByMessage = new Map<number, string>();
+      const claimedMessageIndexes = new Set<number>();
+      for (let submissionIndex = trackedSubmissions.length - 1; submissionIndex >= 0; submissionIndex--) {
+        const [submissionId, entry] = trackedSubmissions[submissionIndex];
+        for (let messageIndex = snapshot.messages.length - 1; messageIndex >= 0; messageIndex--) {
+          const message = snapshot.messages[messageIndex];
+          if (claimedMessageIndexes.has(messageIndex) || message.role !== 'user') continue;
+          const text = message.blocks
+            .flatMap(block => block.type === 'text' ? [block.text] : [])
+            .join('\n')
+            .trim();
+          if (text !== entry.text.trim()) continue;
+          submissionByMessage.set(messageIndex, submissionId);
+          claimedMessageIndexes.add(messageIndex);
+          break;
+        }
+      }
+      const messages = snapshot.messages.map((message, index) => submissionByMessage.has(index)
+        ? { ...message, submissionId: submissionByMessage.get(index) }
+        : message);
+      const knownRevision = typeof req.query.revision === 'string' ? req.query.revision : '';
+      if (knownRevision && snapshot.revision && knownRevision === snapshot.revision) {
+        res.json({ supported: true, unchanged: true, revision: snapshot.revision });
+        return;
+      }
+      const requestedBefore = Number(req.query.before);
+      const endIndex = Number.isFinite(requestedBefore)
+        ? Math.max(0, Math.min(messages.length, Math.floor(requestedBefore)))
+        : messages.length;
+      const requestedLimit = Number(req.query.limit);
+      const pageLimit = Number.isFinite(requestedLimit)
+        ? Math.max(50, Math.min(500, Math.floor(requestedLimit)))
+        : 300;
+      const startIndex = Math.max(0, endIndex - pageLimit);
       const { filePath: _ignored, ...publicSnapshot } = snapshot;
       void _ignored;
-      res.json(publicSnapshot);
+      res.json({
+        ...publicSnapshot,
+        messages: messages.slice(startIndex, endIndex),
+        paged: true,
+        submissionTracking: true,
+        totalMessages: messages.length,
+        startIndex,
+        hasMore: startIndex > 0,
+      });
     } catch (error: any) {
       res.status(500).json({ error: error?.message || '读取对话失败' });
     }
@@ -1969,14 +2017,14 @@ export function startRemoteServer(
 
   // 输入
   app.post('/api/sessions/:id/input', async (req, res) => {
-    const { input, submissionId } = req.body;
+    const { input, submissionId, source } = req.body;
     if (typeof input !== 'string') { res.status(400).json({ error: '缺少 input' }); return; }
     if (submissionId !== undefined) {
       if (typeof submissionId !== 'string' || submissionId.length > 128 || !input || input.length > 100000) {
         res.status(400).json({ error: '无效的提交' }); return;
       }
       try {
-        await ptyManager.submit(req.params.id, submissionId, input);
+        await ptyManager.submit(req.params.id, submissionId, input, 50, source === 'chat' ? 'chat' : 'mobile');
         res.json({ ok: true, id: submissionId });
       } catch (e: any) { res.status(409).json({ error: e.message }); }
       return;
@@ -1988,9 +2036,9 @@ export function startRemoteServer(
 
   // 原始键码
   app.post('/api/sessions/:id/key', (req, res) => {
-    const { key } = req.body;
+    const { key, source } = req.body;
     if (typeof key !== 'string') { res.status(400).json({ error: '缺少 key' }); return; }
-    ptyManager.write(req.params.id, key, 'mobile');
+    ptyManager.write(req.params.id, key, source === 'chat' ? 'chat' : 'mobile');
     res.json({ ok: true });
   });
 

@@ -15,6 +15,7 @@ export type NativeChatSnapshot = {
   agent: string | null;
   sessionId: string | null;
   filePath?: string;
+  revision?: string;
   messages: NativeChatMessage[];
 };
 
@@ -55,6 +56,7 @@ export async function loadSessionChat(
     agent,
     sessionId: resumeId,
     filePath: result.filePath,
+    revision: result.revision,
     messages: result.messages,
   };
 }

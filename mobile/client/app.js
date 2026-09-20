@@ -82,14 +82,22 @@ let wsLastPongAt = 0;
 let wsReplayRetryTimer = null;
 let wsReplayRetryCount = 0;
 let wsConnectionGeneration = 0;
+let wsSessionId = null;
 let terminalInputReady = false;
 let sessionViewMode = 'terminal';
+let sessionViewGeneration = 0;
 let currentSessionChatCapable = false;
 let chatPollTimer = null;
 let chatPollGeneration = 0;
+let chatRefreshRequest = 0;
+let chatPollFailures = 0;
+const chatSnapshots = new Map();
+const chatLocalMessages = new Map();
+const chatOlderLoads = new Set();
 const nativeChatView = globalThis.DuoNativeChatView;
 const CHAT_VIEW_PREF_KEY = 'duocli_mobile_chat_view';
 let composerSubmission = null;
+const composerSubmissions = new Map();
 let copyToastTimer = null;
 let isUserScrolling = false;
 let terminalTouchActive = false;
@@ -121,6 +129,7 @@ const MOBILE_LAST_CWD_KEY = 'duocli_mobile_last_cwd';
 const MOBILE_LAST_PRESET_KEY = 'duocli_mobile_last_preset';
 const MOBILE_DRAFTS_KEY = 'duocli_mobile_drafts_v1';
 const MOBILE_PENDING_SUBMISSIONS_KEY = 'duocli_mobile_pending_submissions_v1';
+const MAX_SUBMISSION_LENGTH = 100_000;
 let weakNetworkMode = localStorage.getItem(WEAK_NETWORK_STORAGE_KEY) === '1';
 const mobileDrafts = new Map();
 const mobilePendingSubmissions = new Map();
@@ -163,7 +172,9 @@ function saveCurrentMobileDraft() {
 function restoreMobileDraft(sessionId) {
   const input = $('msg-input');
   if (!input) return;
-  input.value = mobileDrafts.get(sessionId) || '';
+  const pending = mobilePendingSubmissions.get(sessionId);
+  input.value = mobileDrafts.get(sessionId) || pending?.text || '';
+  resizeComposer();
 }
 
 function loadMobilePendingSubmissions() {
@@ -172,11 +183,12 @@ function loadMobilePendingSubmissions() {
     if (!value || typeof value !== 'object') return;
     for (const [id, item] of Object.entries(value)) {
       if (!item || typeof item !== 'object' || typeof item.sessionId !== 'string'
-          || typeof item.text !== 'string' || item.text.length > 200_000) continue;
+          || typeof item.text !== 'string' || item.text.length > MAX_SUBMISSION_LENGTH) continue;
       mobilePendingSubmissions.set(item.sessionId, {
         id: typeof item.id === 'string' ? item.id : id,
         sessionId: item.sessionId,
         text: item.text,
+        retryCount: Number.isInteger(item.retryCount) ? item.retryCount : 0,
       });
     }
   } catch { /* ignore malformed local state */ }
@@ -418,18 +430,20 @@ function armConnectingPlaceholder() {
 
 function isTerminalInputReady() {
   if (sessionViewMode === 'chat') {
-    return terminalInputReady && navigator.onLine !== false && !!currentSessionId;
+    return navigator.onLine !== false && !!currentSessionId;
   }
   return terminalInputReady
     && navigator.onLine !== false
     && !!ws
-    && ws.readyState === WebSocket.OPEN;
+    && ws.readyState === WebSocket.OPEN
+    && wsSessionId === currentSessionId;
 }
 
 function updateComposerAvailability() {
   const sendButton = $('send-btn');
   const input = $('msg-input');
   const ready = isTerminalInputReady();
+  composerSubmission = currentSessionId ? composerSubmissions.get(currentSessionId) || null : null;
   const disabled = !ready || !!composerSubmission;
 
   if (sendButton) {
@@ -437,13 +451,24 @@ function updateComposerAvailability() {
     sendButton.setAttribute('aria-disabled', String(disabled));
     sendButton.title = ready ? '发送' : '终端连接中，请稍候';
     sendButton.dataset.terminalReady = String(ready);
+    const label = sendButton.querySelector('span');
+    if (label) label.textContent = composerSubmission ? '发送中…' : '发送';
   }
   if (input) {
     input.placeholder = ready
       ? (sessionViewMode === 'chat' ? '输入跟进…' : '输入终端消息或命令...')
       : '终端连接中，请稍候...';
     input.dataset.terminalReady = String(ready);
+    resizeComposer();
   }
+}
+
+function resizeComposer() {
+  const input = $('msg-input');
+  if (!input) return;
+  input.style.height = '42px';
+  input.style.height = `${Math.min(160, Math.max(42, input.scrollHeight + 2))}px`;
+  input.style.overflowY = input.scrollHeight > 160 ? 'auto' : 'hidden';
 }
 
 function setTerminalInputReady(ready) {
@@ -841,6 +866,14 @@ function quotePathForShell(filePath) {
 function insertPathToTerminal(filePath) {
   if (!currentSessionId || !isTerminalInputReady()) {
     showCopyToast('终端连接中，请稍候再发送');
+    return;
+  }
+  if (sessionViewMode === 'chat') {
+    const input = $('msg-input');
+    const value = String(filePath || '');
+    input.setRangeText(value, input.selectionStart, input.selectionEnd, 'end');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.focus({ preventScroll: true });
     return;
   }
   sendInputWithHexEnter(`${quotePathForShell(filePath)} `);
@@ -5137,6 +5170,7 @@ function connectWebSocket(sessionId) {
   const wsUrl = `${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`;
   const socket = new WebSocket(wsUrl);
   ws = socket;
+  wsSessionId = sessionId;
 
   socket.onopen = () => {
     if (generation !== wsConnectionGeneration || ws !== socket) return;
@@ -5298,6 +5332,7 @@ function closeWebSocket() {
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
   if (wsReplayRetryTimer) { clearTimeout(wsReplayRetryTimer); wsReplayRetryTimer = null; }
   wsReplayRetryCount = 0;
+  wsSessionId = null;
   if (ws) {
     // close() 是异步的，关闭过程中已在路上的帧仍会调用旧 ws 的 onmessage，
     // 全置 null 避免会话切换时旧 session 的输出写入新 term
@@ -5338,16 +5373,23 @@ function sessionChatPrefKey(id) {
   return `${CHAT_VIEW_PREF_KEY}:${id}`;
 }
 
-function sessionWantsChat(session) {
-  if (!session?.chatCapable) return false;
-  const pref = sessionStorage.getItem(sessionChatPrefKey(session.id));
-  if (pref === 'terminal') return false;
-  return true;
+function sessionChatPref(id) {
+  return sessionStorage.getItem(sessionChatPrefKey(id));
+}
+
+async function sessionHasChatMessages(sessionId) {
+  try {
+    const snapshot = await api(`/api/sessions/${encodeURIComponent(sessionId)}/chat`);
+    if (snapshot?.supported) chatSnapshots.set(sessionId, snapshot);
+    return Array.isArray(snapshot?.messages) && snapshot.messages.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 function stopNativeChatPolling() {
   chatPollGeneration += 1;
-  if (chatPollTimer) clearInterval(chatPollTimer);
+  if (chatPollTimer) clearTimeout(chatPollTimer);
   chatPollTimer = null;
 }
 
@@ -5374,38 +5416,173 @@ function isChatPinnedToBottom() {
   return el.scrollHeight - el.scrollTop - el.clientHeight < 96;
 }
 
+function captureChatScrollAnchor() {
+  const scroller = $('chat-transcript');
+  if (!scroller) return null;
+  const top = scroller.getBoundingClientRect().top;
+  const node = [...scroller.querySelectorAll('.native-chat-msg')]
+    .find(item => item.getBoundingClientRect().bottom > top);
+  return node ? { key: node.dataset.chatKey, offset: node.getBoundingClientRect().top - top } : null;
+}
+
+function restoreChatScrollAnchor(anchor) {
+  if (!anchor?.key) return;
+  const scroller = $('chat-transcript');
+  const node = [...(scroller?.querySelectorAll('.native-chat-msg') || [])]
+    .find(item => item.dataset.chatKey === anchor.key);
+  if (!scroller || !node) return;
+  scroller.scrollTop += node.getBoundingClientRect().top - scroller.getBoundingClientRect().top - anchor.offset;
+}
+
 async function refreshNativeChat(sessionId, generation) {
-  const snapshot = await api(`/api/sessions/${encodeURIComponent(sessionId)}/chat`);
   if (generation !== chatPollGeneration || currentSessionId !== sessionId || sessionViewMode !== 'chat') return;
+  const request = ++chatRefreshRequest;
+  const previous = chatSnapshots.get(sessionId);
+  const revisionQuery = previous?.revision ? `?revision=${encodeURIComponent(previous.revision)}` : '';
+  const slowStatusTimer = setTimeout(() => {
+    if (request === chatRefreshRequest && generation === chatPollGeneration) setChatStatus('正在检查对话更新…', 'loading');
+  }, 250);
+  let snapshot;
+  try {
+    snapshot = await api(`/api/sessions/${encodeURIComponent(sessionId)}/chat${revisionQuery}`);
+  } catch (error) {
+    clearTimeout(slowStatusTimer);
+    if (request === chatRefreshRequest && generation === chatPollGeneration) {
+      setChatStatus('对话更新失败，正在重试：' + (error.message || error), 'error');
+    }
+    chatPollFailures++;
+    return false;
+  }
+  clearTimeout(slowStatusTimer);
+  if (request !== chatRefreshRequest || generation !== chatPollGeneration || currentSessionId !== sessionId || sessionViewMode !== 'chat') return;
+  if (snapshot.error && !snapshot.notFound) {
+    setChatStatus('对话更新失败，正在重试：' + snapshot.error, 'error');
+    chatPollFailures++;
+    return false;
+  }
+  chatPollFailures = 0;
+  const syncTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const localDeliveryState = () => {
+    const local = chatLocalMessages.get(sessionId) || [];
+    if (local.some(item => /未确认|失败/.test(item.status || ''))) return 'error';
+    if (local.some(item => /发送中|等待/.test(item.status || ''))) return 'updating';
+    return 'synced';
+  };
+  const updateSyncStatus = label => {
+    const state = localDeliveryState();
+    if (state === 'error') setChatStatus('有消息发送状态未确认，原文已保留', 'error');
+    else if (state === 'updating') setChatStatus('正在更新对话，等待新内容…', 'updating');
+    else setChatStatus(`${label} ${syncTime}`, 'success');
+  };
+  if (snapshot.unchanged) {
+    updateSyncStatus('已同步');
+    return true;
+  }
   const stick = isChatPinnedToBottom();
-  nativeChatView?.render($('chat-transcript'), snapshot);
+  const anchor = stick ? null : captureChatScrollAnchor();
+  const previousCount = Array.isArray(previous?.messages) ? previous.messages.length : 0;
+  if (previous?.paged && snapshot.paged && previous.startIndex < snapshot.startIndex) {
+    const retainedCount = Math.max(0, snapshot.startIndex - previous.startIndex);
+    snapshot = {
+      ...snapshot,
+      startIndex: previous.startIndex,
+      hasMore: previous.hasMore,
+      messages: (previous.messages || []).slice(0, retainedCount).concat(snapshot.messages || []),
+    };
+  }
+  chatSnapshots.set(sessionId, snapshot);
+  renderCurrentChat(sessionId);
+  updateSyncStatus('内容已更新');
   const scroller = $('chat-transcript');
   if (stick && scroller) scroller.scrollTop = scroller.scrollHeight;
+  else restoreChatScrollAnchor(anchor);
+  const newButton = $('chat-new-messages');
+  if (newButton) newButton.hidden = stick || (snapshot.messages?.length || 0) <= previousCount;
+  return true;
+}
+
+function renderCurrentChat(sessionId) {
+  if (sessionId !== currentSessionId || sessionViewMode !== 'chat' || !nativeChatView) return;
+  const result = nativeChatView.mergeLocalMessages(chatSnapshots.get(sessionId), chatLocalMessages.get(sessionId) || []);
+  chatLocalMessages.set(sessionId, result.pending);
+  nativeChatView.render($('chat-transcript'), result.snapshot);
+}
+
+async function loadOlderChatMessages(sessionId) {
+  const current = chatSnapshots.get(sessionId);
+  if (!current?.paged || !current.hasMore || chatOlderLoads.has(sessionId)) return;
+  chatOlderLoads.add(sessionId);
+  const scroller = $('chat-transcript');
+  const beforeHeight = scroller?.scrollHeight || 0;
+  const beforeTop = scroller?.scrollTop || 0;
+  setChatStatus('正在加载更早消息…', 'loading');
+  try {
+    const older = await api(`/api/sessions/${encodeURIComponent(sessionId)}/chat?before=${current.startIndex}&limit=300`);
+    if (currentSessionId !== sessionId || sessionViewMode !== 'chat') return;
+    chatSnapshots.set(sessionId, {
+      ...current,
+      ...older,
+      messages: (older.messages || []).concat(current.messages || []),
+    });
+    renderCurrentChat(sessionId);
+    if (scroller) scroller.scrollTop = beforeTop + scroller.scrollHeight - beforeHeight;
+    setChatStatus(`已加载更早消息 · 共 ${chatSnapshots.get(sessionId)?.messages?.length || 0} 条`, 'success');
+  } catch (error) {
+    setChatStatus('加载更早消息失败：' + (error.message || error), 'error');
+  } finally {
+    chatOlderLoads.delete(sessionId);
+  }
 }
 
 function startNativeChatPolling(sessionId) {
   stopNativeChatPolling();
   const generation = chatPollGeneration;
-  void refreshNativeChat(sessionId, generation).catch(() => {});
-  chatPollTimer = setInterval(() => {
-    void refreshNativeChat(sessionId, generation).catch(() => {});
-  }, 1500);
+  const poll = async () => {
+    if (!document.hidden) await refreshNativeChat(sessionId, generation);
+    if (generation === chatPollGeneration) {
+      const delay = document.hidden ? 5000 : Math.min(8000, 1000 * Math.pow(2, chatPollFailures));
+      chatPollTimer = setTimeout(poll, delay);
+    }
+  };
+  void poll();
+}
+
+function setChatStatus(text, state) {
+  const status = $('chat-status');
+  if (!status) return;
+  status.textContent = text;
+  const inferredState = /失败|错误/.test(text) ? 'error'
+    : /正在|等待|发送/.test(text) ? 'updating'
+      : /已同步|已加载|已上传|已更新/.test(text) ? 'success' : 'info';
+  status.dataset.state = state || inferredState;
+  status.hidden = !text;
 }
 
 async function openNativeChatView(id) {
+  const viewRequest = ++sessionViewGeneration;
   applySessionViewMode('chat');
   closeTerminal();
-  setTerminalInputReady(true);
-  nativeChatView?.render($('chat-transcript'), null);
+  if (viewRequest !== sessionViewGeneration || currentSessionId !== id) return;
+  renderCurrentChat(id);
+  setChatStatus('');
   startNativeChatPolling(id);
 }
 
+function switchCurrentSessionView(mode) {
+  if (!currentSessionId || !currentSessionChatCapable) return;
+  sessionStorage.setItem(sessionChatPrefKey(currentSessionId), mode);
+  if (mode === 'chat') void openNativeChatView(currentSessionId);
+  else void openRawTerminalView(currentSessionId, terminalOpenRequest);
+}
+
 async function openRawTerminalView(id, requestId) {
+  const viewRequest = ++sessionViewGeneration;
   stopNativeChatPolling();
   applySessionViewMode('terminal');
   console.log('[openSession] creating terminal...');
   await createTerminal();
-  if (requestId !== terminalOpenRequest || currentSessionId !== id) return;
+  if (requestId !== terminalOpenRequest || viewRequest !== sessionViewGeneration
+      || currentSessionId !== id || sessionViewMode !== 'terminal') return;
   console.log('[openSession] terminal ready, cols=', term?.cols, 'rows=', term?.rows);
   connectWebSocket(id);
 }
@@ -5414,6 +5591,7 @@ function leaveSessionDetail() {
   const endedId = currentSessionId;
   saveCurrentMobileDraft();
   terminalOpenRequest++;
+  sessionViewGeneration++;
   currentSessionId = null;
   currentSessionChatCapable = false;
   stopNativeChatPolling();
@@ -5426,15 +5604,29 @@ async function openSession(id, fromHistory = false) {
   console.log('[openSession] start, id=', id);
   const requestId = ++terminalOpenRequest;
   terminalOpenGeneration += 1;
+  sessionViewGeneration += 1;
   if (!fromHistory && history.state?.duocliSession !== id) {
     history.pushState({ duocliSession: id }, '', `${location.pathname}#session=${encodeURIComponent(id)}`);
   }
   saveCurrentMobileDraft();
+  // Freeze the old route before the UI starts representing the new session.
+  closeWebSocket();
+  setTerminalInputReady(false);
+  composerComposing = false;
+  submitAfterComposition = null;
   currentSessionId = id;
   markSessionSeenLocally(id);
   void api(`/api/sessions/${encodeURIComponent(id)}/seen`, { method: 'POST', body: '{}' }).catch(() => {});
   failedSubmission = mobilePendingSubmissions.get(id) || null;
+  composerSubmission = composerSubmissions.get(id) || null;
   restoreMobileDraft(id);
+  const recovered = mobilePendingSubmissions.get(id);
+  if (recovered && nativeChatView) {
+    chatLocalMessages.set(id, [{
+      id: recovered.id, text: recovered.text, occurrence: 1,
+      status: '上次发送未确认，编辑后可重试',
+    }]);
+  }
   mobilePromptExpanded = false;
   mobilePromptMarker = null;
   mobileTypedLine = '';
@@ -5475,7 +5667,18 @@ async function openSession(id, fromHistory = false) {
   }
   if (requestId !== terminalOpenRequest || currentSessionId !== id) return;
   currentSessionChatCapable = Boolean(sessionInfo?.chatCapable);
-  if (sessionWantsChat(sessionInfo)) {
+  const viewPref = sessionChatPref(id);
+  let hasMessages = false;
+  if (currentSessionChatCapable && viewPref !== 'chat' && viewPref !== 'terminal' && sessionInfo?.resumeId) {
+    hasMessages = await sessionHasChatMessages(id);
+  }
+  if (requestId !== terminalOpenRequest || currentSessionId !== id) return;
+  const viewMode = nativeChatView?.chooseSessionViewMode({
+    chatCapable: currentSessionChatCapable,
+    pref: viewPref,
+    hasMessages,
+  }) || 'terminal';
+  if (viewMode === 'chat') {
     await openNativeChatView(id);
   } else {
     await openRawTerminalView(id, requestId);
@@ -5635,9 +5838,42 @@ $('detail-menu-files-btn').onclick = () => {
 $('detail-menu-view-btn')?.addEventListener('click', () => {
   if (!currentSessionId || !currentSessionChatCapable) return;
   const next = sessionViewMode === 'chat' ? 'terminal' : 'chat';
-  sessionStorage.setItem(sessionChatPrefKey(currentSessionId), next);
-  if (next === 'chat') void openNativeChatView(currentSessionId);
-  else void openRawTerminalView(currentSessionId, terminalOpenRequest);
+  switchCurrentSessionView(next);
+});
+$('chat-terminal-action')?.addEventListener('click', () => switchCurrentSessionView('terminal'));
+$('chat-stop-btn')?.addEventListener('click', async () => {
+  const sessionId = currentSessionId;
+  if (!sessionId || sessionViewMode !== 'chat') return;
+  try {
+    await api(`/api/sessions/${encodeURIComponent(sessionId)}/key`, {
+      method: 'POST', body: JSON.stringify({ key: '\u0003', source: 'chat' }),
+    });
+    setChatStatus('已发送停止指令，等待状态更新…');
+  } catch (error) {
+    setChatStatus('停止失败：' + (error.message || error));
+  }
+});
+$('chat-new-messages')?.addEventListener('click', () => {
+  const scroller = $('chat-transcript');
+  if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  $('chat-new-messages').hidden = true;
+});
+$('chat-transcript')?.addEventListener('scroll', () => {
+  if (isChatPinnedToBottom()) $('chat-new-messages').hidden = true;
+}, { passive: true });
+$('chat-transcript')?.addEventListener('duocli-chat-file', event => {
+  const filePath = event.detail?.path;
+  if (filePath) openFilePreview(filePath);
+});
+$('chat-transcript')?.addEventListener('duocli-chat-older', () => {
+  if (currentSessionId) void loadOlderChatMessages(currentSessionId);
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && currentSessionId && sessionViewMode === 'chat') {
+    const generation = chatPollGeneration;
+    void refreshNativeChat(currentSessionId, generation);
+  }
 });
 $('detail-session-picker-btn').onclick = () => { showSessionPicker(); };
 $('detail-menu-plan-btn').onclick = () => {
@@ -5750,7 +5986,7 @@ $('ac-save').onclick = async () => {
 
 // 点击与键盘共用一次提交；回车快捷键仍可单独发送原始 Enter。
 let composerComposing = false;
-let submitAfterComposition = false;
+let submitAfterComposition = null;
 let allowComposerLineBreak = false;
 let failedSubmission = null;
 const pendingSubmissions = new Map();
@@ -5867,7 +6103,7 @@ function jumpToMobileUserPrompt() {
   setTerminalUnreadOutput(!isAtBottom());
 }
 
-function requestSubmission(sessionId, text, id) {
+function requestSubmission(sessionId, text, id, sourceMode = sessionViewMode) {
   return new Promise((resolve, reject) => {
     const fallback = () => {
       pendingSubmissions.delete(id);
@@ -5875,73 +6111,138 @@ function requestSubmission(sessionId, text, id) {
         reject(new Error('终端连接已中断，请稍后重试'));
         return;
       }
-      api(`/api/sessions/${sessionId}/input`, {
-        method: 'POST', body: JSON.stringify({ input: text, submissionId: id }),
+      api(`/api/sessions/${encodeURIComponent(sessionId)}/input`, {
+        method: 'POST', body: JSON.stringify({
+          input: text, submissionId: id, source: sourceMode === 'chat' ? 'chat' : 'mobile',
+        }),
       }).then(resolve, reject);
     };
-    if (!ws || ws.readyState !== WebSocket.OPEN) { fallback(); return; }
+    if (!ws || ws.readyState !== WebSocket.OPEN || wsSessionId !== sessionId) { fallback(); return; }
     const timer = setTimeout(fallback, 5000);
     pendingSubmissions.set(id, {
       resolve: () => { clearTimeout(timer); pendingSubmissions.delete(id); resolve(); },
       reject: error => { clearTimeout(timer); pendingSubmissions.delete(id); reject(error); },
     });
-    wsSend({ type: 'submit', id, text });
+    wsSend({ type: 'submit', sessionId, id, text });
+  });
+}
+
+function waitForComposerPaint() {
+  return new Promise(resolve => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve();
+    };
+    const timeout = setTimeout(done, 80);
+    requestAnimationFrame(done);
   });
 }
 
 async function sendMessage() {
   const input = $('msg-input');
-  if (!currentSessionId || composerSubmission) return;
+  const sessionId = currentSessionId;
+  const viewGeneration = sessionViewGeneration;
+  const sourceMode = sessionViewMode;
+  if (!sessionId || composerSubmissions.has(sessionId)) return;
   if (!isTerminalInputReady()) {
     showCopyToast('终端连接中，请稍候再发送');
     updateComposerAvailability();
     return;
   }
   if (composerComposing) {
-    submitAfterComposition = true;
+    submitAfterComposition = { sessionId, viewGeneration };
     input.blur(); // 让输入法提交组合文字后，再读取最终文本。
     return;
   }
   const text = input.value.replace(/\r\n?/g, '\n');
   if (!text.trim()) return;
-  noteMobileUserPrompt(text);
+  if (text.length > MAX_SUBMISSION_LENGTH) {
+    showCopyToast(`消息不能超过 ${MAX_SUBMISSION_LENGTH} 个字符`);
+    return;
+  }
   const keepKeyboard = document.activeElement === input;
-  const sessionId = currentSessionId;
   const savedFailure = mobilePendingSubmissions.get(sessionId);
-  const retry = savedFailure?.text === text;
+  const retry = savedFailure?.text === text && (savedFailure.retryCount || 0) < 2;
   const id = retry ? savedFailure.id : (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  composerSubmission = { id, sessionId };
-  mobilePendingSubmissions.set(sessionId, { id, sessionId, text });
+  const submission = { id, sessionId, viewGeneration };
+  composerSubmissions.set(sessionId, submission);
+  composerSubmission = submission;
+  mobilePendingSubmissions.set(sessionId, {
+    id, sessionId, text, retryCount: retry ? savedFailure.retryCount || 0 : 0,
+  });
   saveMobilePendingSubmissions();
   input.value = '';
   saveMobileDraft(sessionId, '');
   updateComposerAvailability();
+  let paintPromise = Promise.resolve();
+  if (sourceMode === 'chat' && nativeChatView) {
+    const pending = chatLocalMessages.get(sessionId) || [];
+    const occurrence = nativeChatView.countUserText(chatSnapshots.get(sessionId)?.messages, text)
+      + pending.filter(item => item.text.trim() === text.trim()).length + 1;
+    const existingLocal = pending.find(item => item.id === id);
+    if (existingLocal) {
+      existingLocal.text = text;
+      existingLocal.status = '发送中…';
+    } else {
+      pending.push({ id, text, occurrence, status: '发送中…' });
+    }
+    chatLocalMessages.set(sessionId, pending);
+    renderCurrentChat(sessionId);
+    const scroller = $('chat-transcript');
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    setChatStatus('正在发送消息…', 'loading');
+    paintPromise = waitForComposerPaint();
+  }
   if (sessionViewMode !== 'chat') scrollTerminalToBottom();
   try {
-    await requestSubmission(sessionId, text, id);
+    const request = requestSubmission(sessionId, text, id, sourceMode).then(
+      () => ({ ok: true }),
+      error => ({ ok: false, error }),
+    );
+    await paintPromise;
+    const outcome = await request;
+    if (!outcome.ok) throw outcome.error;
+    const local = chatLocalMessages.get(sessionId)?.find(item => item.id === id);
+    if (local) local.status = '已送达终端，等待对话记录更新…';
+    renderCurrentChat(sessionId);
+    if (currentSessionId === sessionId && sessionViewMode === 'chat') setChatStatus('正在更新对话，等待新内容…', 'updating');
     failedSubmission = null;
+    noteMobileUserPrompt(text);
     mobilePendingSubmissions.delete(sessionId);
     saveMobilePendingSubmissions();
     if (currentSessionId === sessionId) saveMobileDraft(sessionId, input.value);
+    if (sourceMode === 'chat' && /^\/model\s*$/i.test(text) && currentSessionId === sessionId && sessionViewMode === 'chat') {
+      showCopyToast('模型选择需要终端交互：请选择数字，完成后可切回对话');
+      void openRawTerminalView(sessionId, terminalOpenRequest);
+    }
   } catch (error) {
-    failedSubmission = { id, sessionId, text };
+    const local = (chatLocalMessages.get(sessionId) || []).find(item => item.id === id);
+    if (local) local.status = '发送状态未确认 · 原文已保留';
+    renderCurrentChat(sessionId);
+    const retryCount = (retry ? savedFailure.retryCount || 0 : 0) + 1;
+    failedSubmission = { id, sessionId, text, retryCount };
     saveMobileDraft(sessionId, currentSessionId === sessionId && input.value ? input.value : text);
     if (currentSessionId === sessionId && !input.value) input.value = text;
-    mobilePendingSubmissions.set(sessionId, { id, sessionId, text });
+    mobilePendingSubmissions.set(sessionId, { id, sessionId, text, retryCount });
     saveMobilePendingSubmissions();
-    showCopyToast('发送未确认：' + (error.message || error));
+    if (currentSessionId === sessionId && sessionViewMode === 'chat') setChatStatus('消息发送状态未确认，请检查后重试', 'error');
+    showCopyToast((retryCount >= 2 ? '状态仍未确认；再次点击会作为新消息发送：' : '发送未确认：') + (error.message || error));
   } finally {
-    if (composerSubmission?.id === id) {
+    if (composerSubmissions.get(sessionId)?.id === id) composerSubmissions.delete(sessionId);
+    const stillCurrent = currentSessionId === sessionId && sessionViewGeneration === viewGeneration;
+    if (stillCurrent) {
       composerSubmission = null;
       updateComposerAvailability();
+      if (keepKeyboard) input.focus({ preventScroll: true });
+      resetMobileKeyboardLayout();
     }
-    if (!keepKeyboard || currentSessionId !== sessionId) input.blur();
-    else input.focus({ preventScroll: true });
-    resetMobileKeyboardLayout();
-    if (sessionViewMode === 'chat') {
+    if (stillCurrent && sessionViewMode === 'chat') {
       const generation = chatPollGeneration;
       void refreshNativeChat(sessionId, generation).catch(() => {});
-    } else {
+    } else if (stillCurrent) {
       scheduleDelayedTerminalResize();
     }
   }
@@ -5961,12 +6262,21 @@ $('send-btn').addEventListener('touchend', event => {
   void sendMessage();
 });
 $('send-btn').onclick = () => { void sendMessage(); };
+$('newline-btn')?.addEventListener('click', () => {
+  const input = $('msg-input');
+  input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end');
+  input.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: '\n', bubbles: true }));
+  input.focus({ preventScroll: true });
+});
 $('msg-input').addEventListener('compositionstart', () => { composerComposing = true; });
 $('msg-input').addEventListener('compositionend', () => {
   composerComposing = false;
-  if (submitAfterComposition) {
-    submitAfterComposition = false;
-    queueMicrotask(() => { void sendMessage(); });
+  const intent = submitAfterComposition;
+  submitAfterComposition = null;
+  if (intent && intent.sessionId === currentSessionId && intent.viewGeneration === sessionViewGeneration) {
+    queueMicrotask(() => {
+      if (intent.sessionId === currentSessionId && intent.viewGeneration === sessionViewGeneration) void sendMessage();
+    });
   }
 });
 $('msg-input').addEventListener('keydown', event => {
@@ -5975,6 +6285,9 @@ $('msg-input').addEventListener('keydown', event => {
   if (event.shiftKey) return;
   event.preventDefault();
   void sendMessage();
+});
+$('msg-input').addEventListener('keyup', event => {
+  if (event.key === 'Enter' || event.key === 'Shift') allowComposerLineBreak = false;
 });
 $('msg-input').addEventListener('beforeinput', event => {
   if (!['insertLineBreak', 'insertParagraph'].includes(event.inputType) || event.isComposing || composerComposing) return;
@@ -5985,6 +6298,7 @@ $('msg-input').addEventListener('beforeinput', event => {
   }
 });
 $('msg-input').addEventListener('input', event => {
+  resizeComposer();
   saveCurrentMobileDraft();
   if (!['insertLineBreak', 'insertParagraph'].includes(event.inputType) || event.isComposing || composerComposing) return;
   // 部分软键盘只发 input；只移除此次插入的换行，不破坏粘贴的多行文字。
@@ -6321,7 +6635,8 @@ $('file-input').onchange = async (e) => {
       if (data.ok) {
         // 在终端显示上传成功提示
         if (currentSessionId === targetSessionId) {
-          writeTerminalOutput(`\r\n\x1b[32m✓ 已上传: ${file.name} (${formatSize(data.size)})\x1b[0m\r\n`);
+          if (sessionViewMode === 'chat') setChatStatus(`已上传 ${file.name}（${formatSize(data.size)}）`);
+          else writeTerminalOutput(`\r\n\x1b[32m✓ 已上传: ${file.name} (${formatSize(data.size)})\x1b[0m\r\n`);
         }
         // 把文件路径填入输入框，方便用户直接发送给 AI
         if (data.path) {
@@ -6331,19 +6646,24 @@ $('file-input').onchange = async (e) => {
             const input = $('msg-input');
             if (renderedDraft === null || input.value === renderedDraft) {
               input.value = targetDraft;
+              resizeComposer();
               renderedDraft = targetDraft;
             }
           }
         }
       } else {
         if (currentSessionId === targetSessionId) {
-          writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${data.error || '未知错误'}\x1b[0m\r\n`);
+          const message = `上传失败：${file.name} - ${data.error || '未知错误'}`;
+          if (sessionViewMode === 'chat') setChatStatus(message);
+          else writeTerminalOutput(`\r\n\x1b[31m✗ ${message}\x1b[0m\r\n`);
         }
       }
     } catch (err) {
       if (uploadTimeout) clearTimeout(uploadTimeout);
       if (currentSessionId === targetSessionId) {
-        writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${err.name === 'AbortError' ? '上传超时' : err.message}\x1b[0m\r\n`);
+        const message = `上传失败：${file.name} - ${err.name === 'AbortError' ? '上传超时' : err.message}`;
+        if (sessionViewMode === 'chat') setChatStatus(message);
+        else writeTerminalOutput(`\r\n\x1b[31m✗ ${message}\x1b[0m\r\n`);
       }
     }
   }

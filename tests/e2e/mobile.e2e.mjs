@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import puppeteer from 'puppeteer-core';
 import { resolveChromeExecutable } from './chrome-path.mjs';
+import { runInputChatAudit } from './input-chat-audit-probes.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_DIR = path.resolve(__dirname, '../../mobile/client');
@@ -41,6 +42,9 @@ let mockSessions = [{
   cwd: '/tmp/e2e-proj', presetCommand: 'claude', createdAt: Date.now(),
   lastUserPrompt: '修好远程镜像交互',
 }];
+let mockChatById = {};
+let mockChatInputDelay = 0;
+let mockChatInputFailure = false;
 
 // 新建会话面板的数据源：内置预制 / 自定义预设 / 最近目录 / 预设使用次数
 const mockBuiltinPresets = [
@@ -123,8 +127,20 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (p.startsWith('/api/sessions/') && p.endsWith('/chat')) {
+    const id = decodeURIComponent(p.slice('/api/sessions/'.length, -'/chat'.length));
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ supported: false, ready: false, messages: [] }));
+    res.end(JSON.stringify(mockChatById[id] || { supported: false, ready: false, messages: [] }));
+    return;
+  }
+  if (p.startsWith('/api/sessions/') && p.endsWith('/input') && req.method === 'POST') {
+    void readJsonBody(req).then(body => {
+      receivedSubmissions.push(body.input);
+      setTimeout(() => {
+        res.setHeader('Content-Type', 'application/json');
+        res.statusCode = mockChatInputFailure ? 503 : 200;
+        res.end(JSON.stringify(mockChatInputFailure ? { error: 'test offline' } : { ok: true }));
+      }, mockChatInputDelay);
+    });
     return;
   }
   if (p.startsWith('/api/sessions/') && p.endsWith('/file-preview')) {
@@ -210,10 +226,12 @@ let sessionBuffer = '\x1b[1;32me2e-shell\x1b[0m $ ';
 const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', (sock) => {
   wsClient = sock;
+  let subscribedSessionId = null;
   sock.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.type === 'subscribe') {
+      subscribedSessionId = msg.sessionId;
       sock.send(JSON.stringify({
         type: 'replay',
         data: sessionBuffer,
@@ -247,6 +265,10 @@ wss.on('connection', (sock) => {
     } else if (msg.type === 'input_b64') {
       receivedInputs.push(Buffer.from(msg.data, 'base64').toString('utf8'));
     } else if (msg.type === 'submit') {
+      if (msg.sessionId !== subscribedSessionId) {
+        sock.send(JSON.stringify({ type: 'submitted', id: msg.id, error: 'wrong session' }));
+        return;
+      }
       receivedSubmissions.push(msg.text);
       sock.send(JSON.stringify({ type: 'submitted', id: msg.id }));
     }
@@ -427,9 +449,254 @@ async function main() {
     freshBanner.hidden && !freshBanner.text && !freshBanner.stored,
     JSON.stringify(freshBanner));
 
+  mockSessions = [
+    ...mockSessions,
+    {
+      id: 's-codex-new', title: 'Codex', status: 'running',
+      cwd: '/tmp/e2e-codex', presetCommand: 'codex', cli: 'codex',
+      chatCapable: true, resumeId: null, createdAt: Date.now(),
+    },
+    {
+      id: 's-codex-chat', title: 'Codex聊天', status: 'running',
+      cwd: '/tmp/e2e-codex2', presetCommand: 'codex', cli: 'codex',
+      chatCapable: true, resumeId: 'resume-codex-1', createdAt: Date.now(),
+    },
+    {
+      id: 's-codex-empty', title: 'Codex空记录', status: 'running',
+      cwd: '/tmp/e2e-codex3', presetCommand: 'codex', cli: 'codex',
+      chatCapable: true, resumeId: 'resume-codex-empty', createdAt: Date.now(),
+    },
+  ];
+  mockChatById = {
+    's-codex-new': { supported: true, ready: false, notFound: true, messages: [] },
+    's-codex-empty': { supported: true, ready: false, notFound: true, messages: [] },
+    's-codex-chat': {
+      supported: true,
+      ready: true,
+      messages: [{ role: 'user', blocks: [{ type: 'text', text: 'ship it' }] }],
+    },
+  };
+  await page.evaluate(() => openSession('s-codex-new'));
+  await page.waitForFunction(() => currentSessionId === 's-codex-new' && term && term.cols > 0, { timeout: 8000 });
+  const newCodexView = await page.evaluate(() => ({
+    mode: sessionViewMode,
+    chatHidden: document.getElementById('chat-container')?.hidden !== false,
+    termHidden: document.getElementById('terminal-container')?.hidden === true,
+    emptyText: document.getElementById('chat-transcript')?.textContent || '',
+  }));
+  check('新建 Codex 没有对话记录时打开终端而不是空对话',
+    newCodexView.mode === 'terminal' && newCodexView.chatHidden && !newCodexView.termHidden
+      && !newCodexView.emptyText.includes('还没有对话'),
+    JSON.stringify(newCodexView));
+
+  await page.evaluate(() => openSession('s-codex-chat'));
+  await page.waitForFunction(() => currentSessionId === 's-codex-chat' && sessionViewMode === 'chat', { timeout: 8000 });
+  await page.waitForFunction(() => document.getElementById('chat-transcript').textContent.includes('ship it'));
+  const existingCodexView = await page.evaluate(() => ({
+    mode: sessionViewMode,
+    chatHidden: document.getElementById('chat-container')?.hidden !== false,
+    termHidden: document.getElementById('terminal-container')?.hidden === true,
+    text: document.getElementById('chat-transcript')?.textContent || '',
+  }));
+  check('已有 Codex 对话记录时打开对话视图',
+    existingCodexView.mode === 'chat' && !existingCodexView.chatHidden && existingCodexView.termHidden
+      && existingCodexView.text.includes('ship it'),
+    JSON.stringify(existingCodexView));
+
+  const chatDom = await page.evaluate(() => {
+    stopNativeChatPolling();
+    const root = document.getElementById('chat-transcript');
+    const snapshot = { supported: true, messages: [
+      { id: 'tool', role: 'assistant', blocks: [{ type: 'tool-call', input: { command: 'pwd' } }] },
+      { id: 'answer', role: 'assistant', blocks: [{ type: 'text', text: 'old' }] },
+    ] };
+    DuoNativeChatView.render(root, snapshot);
+    const tool = root.firstElementChild;
+    tool.querySelector('details').open = true;
+    snapshot.messages[1].blocks[0].text = 'new';
+    DuoNativeChatView.render(root, snapshot);
+    const result = { sameNode: root.firstElementChild === tool, open: tool.querySelector('details').open, text: root.textContent };
+    snapshot.messages.push({ id: 'answer', role: 'assistant', blocks: [{ type: 'text', text: 'second record' }] });
+    DuoNativeChatView.render(root, snapshot);
+    snapshot.messages[1].blocks[0].text = 'updated';
+    DuoNativeChatView.render(root, snapshot);
+    result.repeatedIdPreserved = root.children.length === 3 && root.textContent.includes('updated') && root.textContent.includes('second record');
+    return result;
+  });
+  check('对话等长更新且保留未变消息、工具展开和同 ID 记录', chatDom.sameNode && chatDom.open && chatDom.text.includes('new') && chatDom.repeatedIdPreserved, JSON.stringify(chatDom));
+
+  const longChat = await page.evaluate(() => {
+    const root = document.getElementById('chat-transcript');
+    const snapshot = { supported: true, messages: Array.from({ length: 350 }, (_, i) => ({
+      id: `long-${i}`, role: 'assistant', blocks: [{ type: 'text', text: `message ${i}` }],
+    })) };
+    DuoNativeChatView.render(root, snapshot);
+    const before = root.querySelectorAll('.native-chat-msg').length;
+    root.querySelector('.native-chat-load-older').click();
+    return { before, after: root.querySelectorAll('.native-chat-msg').length };
+  });
+  check('长对话限制初始 DOM 并可加载更早消息', longChat.before === 300 && longChat.after === 350, JSON.stringify(longChat));
+
+  const pagedChat = await page.evaluate(async () => {
+    const sessionId = currentSessionId;
+    const root = document.getElementById('chat-transcript');
+    const originalApi = api;
+    try {
+      chatSnapshots.set(sessionId, {
+        supported: true, ready: true, paged: true, hasMore: true, startIndex: 2, totalMessages: 4,
+        messages: [
+          { id: 'page-2', role: 'assistant', blocks: [{ type: 'text', text: 'newer 2' }] },
+          { id: 'page-3', role: 'assistant', blocks: [{ type: 'text', text: 'newer 3' }] },
+        ],
+      });
+      renderCurrentChat(sessionId);
+      api = async path => {
+        if (!path.includes('before=2')) throw new Error(`unexpected path: ${path}`);
+        return {
+          supported: true, ready: true, paged: true, hasMore: false, startIndex: 0, totalMessages: 4,
+          messages: [
+            { id: 'page-0', role: 'assistant', blocks: [{ type: 'text', text: 'older 0' }] },
+            { id: 'page-1', role: 'assistant', blocks: [{ type: 'text', text: 'older 1' }] },
+          ],
+        };
+      };
+      root.querySelector('.native-chat-load-older').click();
+      for (let i = 0; i < 20 && root.querySelectorAll('.native-chat-msg').length !== 4; i++) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      return { count: root.querySelectorAll('.native-chat-msg').length, text: root.textContent };
+    } finally {
+      api = originalApi;
+    }
+  });
+  check('长对话从服务端加载更早分页并合并', pagedChat.count === 4 && pagedChat.text.indexOf('older 0') < pagedChat.text.indexOf('newer 2'), JSON.stringify(pagedChat));
+  await page.evaluate(() => renderCurrentChat(currentSessionId));
+
+  mockChatInputDelay = 400;
+  await page.evaluate(() => {
+    const input = document.getElementById('msg-input');
+    input.value = '第一行\n第二行\n第三行\n第四行';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  const composerHeight = await page.$eval('#msg-input', el => el.getBoundingClientRect().height);
+  check('多行输入框自动增高', composerHeight > 60, String(composerHeight));
+  await page.click('#send-btn');
+  const pendingChat = await page.evaluate(() => ({
+    text: document.getElementById('chat-transcript').textContent,
+    disabled: document.getElementById('send-btn').disabled,
+    deliveryState: document.querySelector('.native-chat-delivery')?.className || '',
+    syncState: document.getElementById('chat-status').dataset.state,
+  }));
+  check('点击发送后立即显示带状态的本地气泡', pendingChat.disabled && pendingChat.text.includes('第二行')
+    && pendingChat.text.includes('发送中') && pendingChat.deliveryState.includes('state-sending')
+    && pendingChat.syncState === 'loading', JSON.stringify(pendingChat));
+  await page.waitForFunction(() => !document.getElementById('send-btn').disabled);
+  mockChatById['s-codex-chat'].messages.push({ id: 'sent', role: 'user', blocks: [{ type: 'text', text: '第一行\n第二行\n第三行\n第四行' }] });
+  await page.evaluate(() => refreshNativeChat(currentSessionId, chatPollGeneration));
+  const reconciled = await page.$eval('#chat-transcript', el => ({ count: el.textContent.split('第二行').length - 1, pending: !!el.querySelector('.native-chat-delivery') }));
+  check('服务端记录到达后本地消息不重复', reconciled.count === 1 && !reconciled.pending, JSON.stringify(reconciled));
+
+  const refreshRace = await page.evaluate(async () => {
+    const originalApi = api;
+    const replies = [];
+    try {
+      api = () => new Promise(resolve => replies.push(resolve));
+      const older = refreshNativeChat(currentSessionId, chatPollGeneration);
+      const newer = refreshNativeChat(currentSessionId, chatPollGeneration);
+      const snapshot = text => ({ supported: true, ready: true, messages: [{ id: 'race', role: 'assistant', blocks: [{ type: 'text', text }] }] });
+      replies[1](snapshot('最新回复'));
+      await newer;
+      replies[0](snapshot('过期回复'));
+      await older;
+      const text = document.getElementById('chat-transcript').textContent;
+      api = async () => { throw new Error('fixture timeout'); };
+      await refreshNativeChat(currentSessionId, chatPollGeneration);
+      return { text, preserved: document.getElementById('chat-transcript').textContent === text, status: document.getElementById('chat-status').textContent };
+    } finally { api = originalApi; }
+  });
+  check('迟到响应不覆盖新消息，更新失败保留正文并显示重试状态', refreshRace.text.includes('最新回复') && !refreshRace.text.includes('过期回复') && refreshRace.preserved && refreshRace.status.includes('重试'), JSON.stringify(refreshRace));
+  await page.evaluate(() => refreshNativeChat(currentSessionId, chatPollGeneration));
+
+  mockChatInputFailure = true;
+  await page.evaluate(() => { document.getElementById('msg-input').value = '失败后保留'; void sendMessage(); });
+  await page.waitForFunction(() => !document.getElementById('send-btn').disabled);
+  const failedChat = await page.evaluate(() => ({
+    draft: document.getElementById('msg-input').value,
+    text: document.getElementById('chat-transcript').textContent,
+    deliveryState: document.querySelector('.native-chat-delivery:last-child')?.className || '',
+    syncState: document.getElementById('chat-status').dataset.state,
+  }));
+  check('对话发送失败保留草稿和未确认气泡', failedChat.draft === '失败后保留'
+    && failedChat.text.includes('发送状态未确认') && failedChat.deliveryState.includes('state-error')
+    && failedChat.syncState === 'error', JSON.stringify(failedChat));
+  mockChatInputDelay = 0;
+  mockChatInputFailure = false;
+  await page.screenshot({ path: '/tmp/duocli-chat-input-20260920.png' });
+
+  const codeVisual = await page.evaluate(() => {
+    const root = document.getElementById('chat-transcript');
+    DuoNativeChatView.render(root, { supported: true, messages: [{
+      id: 'visual-code', role: 'assistant', blocks: [
+        { type: 'text', text: '正在检查这段代码：\n```ts\nconst answer: number = 42;\n// keep the state visible\nreturn answer;\n```' },
+        { type: 'tool-call', name: '检查类型', state: 'running', input: { command: 'npm run build:ts' } },
+      ],
+    }] });
+    setChatStatus('正在更新对话，等待新内容…', 'updating');
+    return {
+      language: root.querySelector('.native-chat-code-head span')?.textContent,
+      keywords: root.querySelectorAll('.tok-keyword').length,
+      toolState: root.querySelector('.native-chat-tool-state')?.textContent,
+      syncState: document.getElementById('chat-status').dataset.state,
+    };
+  });
+  check('代码染色、工具进行中和更新状态均有独立视觉标识', codeVisual.language === 'TypeScript'
+    && codeVisual.keywords >= 2 && codeVisual.toolState === '进行中' && codeVisual.syncState === 'updating', JSON.stringify(codeVisual));
+  await page.screenshot({ path: '/tmp/duocli-chat-code-status-20260920.png' });
+  await page.evaluate(() => renderCurrentChat(currentSessionId));
+
+  await page.evaluate(() => {
+    const input = document.getElementById('msg-input');
+    globalThis.__modelPrefBefore = sessionStorage.getItem(sessionChatPrefKey(currentSessionId));
+    input.value = '/model';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    void sendMessage();
+  });
+  await page.waitForFunction(() => sessionViewMode === 'terminal' && term, { timeout: 8000 });
+  const modelInteraction = await page.evaluate(() => ({
+    mode: sessionViewMode,
+    toast: document.getElementById('copy-toast')?.textContent || '',
+    pref: sessionStorage.getItem(sessionChatPrefKey(currentSessionId)),
+    prefBefore: globalThis.__modelPrefBefore,
+  }));
+  check('/model 送达后打开同会话终端选择且不改默认模式', modelInteraction.mode === 'terminal'
+    && modelInteraction.toast.includes('请选择数字') && modelInteraction.pref === modelInteraction.prefBefore, JSON.stringify(modelInteraction));
+
+  await page.evaluate(() => openSession('s-codex-empty'));
+  await page.waitForFunction(() => currentSessionId === 's-codex-empty' && term && term.cols > 0, { timeout: 8000 });
+  const emptyResumeView = await page.evaluate(() => ({
+    mode: sessionViewMode,
+    chatHidden: document.getElementById('chat-container')?.hidden !== false,
+    termHidden: document.getElementById('terminal-container')?.hidden === true,
+  }));
+  check('Codex 已有 resumeId 但还没有对话时仍打开终端',
+    emptyResumeView.mode === 'terminal' && emptyResumeView.chatHidden && !emptyResumeView.termHidden,
+    JSON.stringify(emptyResumeView));
+
+  mockSessions = mockSessions.filter(s => s.id === 's1' || s.id === 's2' || s.id === 's3');
+  mockChatById = {};
   await page.evaluate(() => openSession('s1'));
   await page.waitForFunction(() => currentSessionId === 's1' && term && term.cols > 0, { timeout: 8000 });
   await sleep(300);
+
+  if (process.env.DUOCLI_INPUT_AUDIT === '1') {
+    const audit = await runInputChatAudit(page);
+    const byId = Object.fromEntries(audit.map(item => [item.id, item]));
+    check('切换会话时旧连接不可发送', !byId['INPUT-01'].readyDuringSwitch && byId['INPUT-01'].writes.length === 0, JSON.stringify(byId['INPUT-01']));
+    check('组合输入结束不会发送新会话草稿', byId['INPUT-02'].writes.length === 0, JSON.stringify(byId['INPUT-02']));
+    check('旧会话确认不抢新会话输入焦点', byId['INPUT-03'].focusedBeforeAck && byId['INPUT-03'].focusedAfterAck, JSON.stringify(byId['INPUT-03']));
+    check('未确认提交可恢复到输入框', byId['INPUT-04'].restoredInput === byId['INPUT-04'].pendingText, JSON.stringify(byId['INPUT-04']));
+    check('迟到的终端创建不会覆盖对话模式', byId['CHAT-01'].connections.length === 0, JSON.stringify(byId['CHAT-01']));
+  }
 
   const jumpStay = await page.evaluate(async () => {
     enterTerminalHistory();
@@ -879,8 +1146,8 @@ async function main() {
       expanded: document.getElementById('detail-more-btn').getAttribute('aria-expanded'),
     };
   });
-  check('详情页更多入口展开三项菜单',
-    !menuState.hidden && menuState.items === '项目文件,计划设置,手机设备,关闭对话' && menuState.expanded === 'true',
+  check('详情页更多入口展开完整菜单',
+    !menuState.hidden && menuState.items === '项目文件,切换到对话,计划设置,手机设备,关闭对话' && menuState.expanded === 'true',
     JSON.stringify(menuState));
 
   await page.click('#detail-menu-plan-btn');

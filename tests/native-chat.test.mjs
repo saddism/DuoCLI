@@ -74,6 +74,35 @@ test('codex JSONL event_msg user_message decodes', () => {
   assert.equal(message.blocks[0].text, 'ship the patch');
 });
 
+test('codex response_item decodes input/output text and correlates tool results', () => {
+  const user = decodeCodexTranscriptLine(JSON.stringify({ type: 'response_item', payload: {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text: 'from input block' }],
+  } }), 'u');
+  const assistant = decodeCodexTranscriptLine(JSON.stringify({ type: 'response_item', payload: {
+    type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'from output block' }],
+  } }), 'a');
+  const result = decodeCodexTranscriptLine(JSON.stringify({ type: 'response_item', payload: {
+    type: 'function_call_output', call_id: 'call-1', output: 'done',
+  } }), 'r');
+  assert.equal(user.blocks[0].text, 'from input block');
+  assert.equal(assistant.blocks[0].text, 'from output block');
+  assert.equal(result.blocks[0].callId, 'call-1');
+});
+
+test('transcript reader appends complete records and waits for a partial tail', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'duocli-chat-incremental-'));
+  const file = path.join(root, 'incremental.jsonl');
+  const first = JSON.stringify({ type: 'user', uuid: 'u1', message: { content: 'first' } });
+  const second = JSON.stringify({ type: 'assistant', uuid: 'a1', message: { content: 'second' } });
+  fs.writeFileSync(file, `${first}\n${second.slice(0, 20)}`);
+  const initial = await readNativeChatTranscript('claude', 'ignored', { filePath: file });
+  assert.equal(initial.messages.length, 1);
+  fs.appendFileSync(file, `${second.slice(20)}\n`);
+  const appended = await readNativeChatTranscript('claude', 'ignored', { filePath: file });
+  assert.deepEqual(appended.messages.map(message => message.blocks[0].text), ['first', 'second']);
+  assert.notEqual(appended.revision, initial.revision);
+});
+
 test('resolver uses the Claude cwd slug before walking other projects', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'duocli-chat-slug-'));
   const cwd = '/Users/demo/app';
