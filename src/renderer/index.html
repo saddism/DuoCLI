@@ -54,21 +54,38 @@
 
         <label>配色</label>
         <div class="new-session-row">
-          <div id="theme-select" class="custom-select">
-            <div class="custom-select-display" id="theme-display">
-              <span class="theme-dot" style="background:#0078d4"></span>VS Code Dark
-            </div>
-            <div class="custom-select-dropdown" id="theme-dropdown">
-              <div class="custom-select-option" data-value="auto"><span class="theme-dot" style="background:conic-gradient(#e06c75,#e5c07b,#98c379,#56b6c2,#61afef,#c678dd,#e06c75)"></span>自动配色</div>
-              <div class="custom-select-option" data-value="vscode-dark"><span class="theme-dot" style="background:#0078d4"></span>VS Code Dark</div>
-              <div class="custom-select-option" data-value="monokai"><span class="theme-dot" style="background:#a6e22e"></span>Monokai</div>
-              <div class="custom-select-option" data-value="dracula"><span class="theme-dot" style="background:#bd93f9"></span>Dracula</div>
-              <div class="custom-select-option" data-value="solarized-dark"><span class="theme-dot" style="background:#268bd2"></span>Solarized Dark</div>
-              <div class="custom-select-option" data-value="one-dark"><span class="theme-dot" style="background:#61afef"></span>One Dark</div>
-              <div class="custom-select-option" data-value="nord"><span class="theme-dot" style="background:#88c0d0"></span>Nord</div>
-            </div>
+          <div id="theme-select" class="theme-swatch-row" role="listbox" aria-label="终端配色">
+            <button type="button" class="theme-swatch theme-swatch-auto selected" data-value="auto" title="自动配色" aria-label="自动配色"></button>
+            <button type="button" class="theme-swatch" data-value="vscode-dark" title="VS Code Dark" aria-label="VS Code Dark" style="background:#0078d4"></button>
+            <button type="button" class="theme-swatch" data-value="monokai" title="Monokai" aria-label="Monokai" style="background:#a6e22e"></button>
+            <button type="button" class="theme-swatch" data-value="dracula" title="Dracula" aria-label="Dracula" style="background:#bd93f9"></button>
+            <button type="button" class="theme-swatch" data-value="solarized-dark" title="Solarized Dark" aria-label="Solarized Dark" style="background:#268bd2"></button>
+            <button type="button" class="theme-swatch" data-value="one-dark" title="One Dark" aria-label="One Dark" style="background:#61afef"></button>
+            <button type="button" class="theme-swatch" data-value="nord" title="Nord" aria-label="Nord" style="background:#88c0d0"></button>
           </div>
         </div>
+
+        <label class="task-plan-toggle"><input id="task-plan-enabled" type="checkbox" /> 加入计划任务队列</label>
+        <section id="task-plan-fields" class="task-plan-fields" hidden>
+          <label>首条任务指令<textarea id="task-plan-instruction" rows="4" maxlength="100000" placeholder="终端启动后自动发送的指令"></textarea></label>
+          <div class="task-plan-name-row">
+            <span>任务名称（根据指令自动生成）</span>
+            <div id="task-plan-name-preview" class="task-plan-name-preview">填写指令后自动生成</div>
+            <input id="task-plan-name" type="hidden" maxlength="120" />
+          </div>
+          <div class="task-plan-grid">
+            <label>开始时间（可选）
+              <span class="ac-field-hint">延迟分钟，留空表示立即</span>
+              <div class="task-plan-time-row">
+                <input id="task-plan-delay" type="number" min="0" step="1" placeholder="例如 5" />
+                <button type="button" id="task-plan-delay-clear" class="task-plan-time-clear" title="清空时间">×</button>
+              </div>
+            </label>
+            <label>前置任务（可选）<select id="task-plan-dependency"><option value="">无</option></select></label>
+            <label>静止完成（秒）<input id="task-plan-quiet" type="number" min="1" max="3600" value="10" /></label>
+          </div>
+          <p>连续静止即完成。黄色和灰色都表示已停止，都会启动后续任务。</p>
+        </section>
       </div>
 
       <div class="confirm-buttons">
@@ -98,19 +115,6 @@
               <span class="ac-field-hint">延迟分钟，0 表示立即</span>
               <input id="auto-continue-initial-delay" type="number" min="0" value="0" placeholder="0" />
             </label>
-          </div>
-        </section>
-
-        <section class="ac-config-group">
-          <div class="ac-config-group-title">循环设置</div>
-          <div class="ac-config-grid">
-            <label class="ac-config-field">计划间隔（分钟）
-              <input id="auto-continue-interval" type="number" min="1" placeholder="分钟" />
-            </label>
-            <label class="ac-config-field">循环次数
-              <span class="ac-field-hint">-1 表示不限制</span>
-              <input id="auto-continue-max-loops" type="number" min="-1" value="-1" placeholder="-1" />
-            </label>
             <label class="ac-config-field">命令间隔（秒）
               <input id="auto-continue-command-interval" type="number" min="0" value="2" placeholder="秒" />
             </label>
@@ -118,6 +122,24 @@
               <span class="ac-field-hint">文字写入后等待多久再发送回车</span>
               <input id="auto-continue-send-delay" type="number" min="0" value="2" placeholder="秒" />
             </label>
+          </div>
+        </section>
+
+        <section class="ac-config-group">
+          <label class="ac-config-toggle">
+            <input id="auto-continue-loop-enabled" type="checkbox" />
+            启用循环
+          </label>
+          <div id="auto-continue-loop-fields" class="ac-loop-fields" hidden>
+            <div class="ac-config-grid">
+              <label class="ac-config-field">计划间隔（分钟）
+                <input id="auto-continue-interval" type="number" min="1" placeholder="分钟" />
+              </label>
+              <label class="ac-config-field">循环次数
+                <span class="ac-field-hint">-1 表示不限制</span>
+                <input id="auto-continue-max-loops" type="number" min="-1" value="-1" placeholder="-1" />
+              </label>
+            </div>
           </div>
         </section>
 
@@ -377,6 +399,7 @@
           <span>新建终端</span>
           <span class="btn-kbd-hint">⌘N</span>
         </button>
+        <button id="task-queue-btn" class="toolbar-btn" title="查看计划任务">任务队列</button>
       </div>
       <!-- 远程服务器连接信息 -->
       <div id="remote-server-info" class="remote-server-info" style="display: none;">
@@ -428,6 +451,16 @@
         <div class="footer-line"><a id="footer-github" href="#">GitHub</a></div>
         <div class="footer-tip">如果你喜欢这个软件，只需关注公众号「壮哥的壮」，然后心中默念"大壮好大"，每天祈祷 +1</div>
       </div>
+    </div>
+  </div>
+
+  <div id="task-queue-overlay" class="new-session-overlay">
+    <div class="new-session-dialog task-queue-dialog">
+      <div class="new-session-header">
+        <h3>终端任务队列</h3>
+        <button id="task-queue-close" class="new-session-close" title="关闭">×</button>
+      </div>
+      <div id="task-queue-list" class="task-queue-list"></div>
     </div>
   </div>
 

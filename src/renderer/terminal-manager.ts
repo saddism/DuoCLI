@@ -11,6 +11,7 @@ const terminalContentHelpers = require('../../mobile/client/terminal-content-hel
 };
 const terminalScrollHelpers = require('../../mobile/client/terminal-scroll-helpers.js') as {
   LIVE_TERMINAL_SCROLLBACK: number;
+  HISTORY_EDGE_LINES: number;
 };
 const terminalHistoryLayer = require('../../mobile/client/terminal-history-layer.js') as {
   createHistoryLayer: (options?: Record<string, unknown>) => {
@@ -21,10 +22,16 @@ const terminalHistoryLayer = require('../../mobile/client/terminal-history-layer
     prepend: (page: unknown) => { applied: boolean; stale?: boolean };
     setCols: (cols: number) => void;
     setLiveUnread: (value: boolean) => void;
+    noteLiveOutput: () => void;
     setLoading: (value: boolean) => void;
     isVisible: () => boolean;
+    getSelectionText: () => string;
     findText: (text: string) => number;
     scrollToItem: (index: number) => boolean;
+    seekText: (text: string) => Promise<number>;
+    isSeeking: () => boolean;
+    abandonSeek: () => void;
+    requestMore: () => void;
   };
   shouldEnterHistory: (input: Record<string, unknown>) => boolean;
 };
@@ -33,6 +40,7 @@ const userPromptBanner = require('../../mobile/client/user-prompt-banner.js') as
   normalizePrompt: (text: string) => string;
   findPromptLine: (buffer: any, text: string) => number;
   promptBlockStartLine: (buffer: any, text: string) => number;
+  findPromptItemIndex: (items: Array<{ text?: string }>, text: string) => number;
   resolvePromptJumpLine: (buffer: any, text: string, marker?: { line: number; isDisposed: boolean } | null) => number;
   scrollLineToTop: (terminal: Terminal, line: number) => number;
   consumeTypedInput: (currentLine: string, data: string) => { line: string; segments: string[] };
@@ -407,17 +415,23 @@ function attachCursorKeyBindings(
 
     const isCopy = e.key.toLowerCase() === 'c' && !e.altKey
       && ((e.metaKey && !e.ctrlKey) || (e.ctrlKey && e.shiftKey && !e.metaKey));
-    if (isCopy && terminal.hasSelection()) {
-      const position = terminal.getSelectionPosition();
-      if (position) {
-        const text = terminalContentHelpers.getSelectionText(terminal.buffer.active, position);
-        // xterm selections are not DOM selections, so the browser may not
-        // dispatch a native copy event for the hidden input's shortcut.
-        void navigator.clipboard.writeText(text).catch(() => {
-          document.execCommand('copy');
-        });
-        e.preventDefault();
-        return false;
+    if (isCopy) {
+      const historyText = window.getSelection?.()?.toString()?.replace(/\u00a0/g, ' ') || '';
+      const historyLayer = (e.target as Element | null)?.closest?.('.terminal-history-layer')
+        || document.querySelector('.terminal-history-layer:not([hidden])');
+      if (historyText && historyLayer) return true;
+      if (terminal.hasSelection()) {
+        const position = terminal.getSelectionPosition();
+        if (position) {
+          const text = terminalContentHelpers.getSelectionText(terminal.buffer.active, position);
+          // xterm selections are not DOM selections, so the browser may not
+          // dispatch a native copy event for the hidden input's shortcut.
+          void navigator.clipboard.writeText(text).catch(() => {
+            document.execCommand('copy');
+          });
+          e.preventDefault();
+          return false;
+        }
       }
     }
 
@@ -665,20 +679,6 @@ export class TerminalManager {
       }
     }, true);
 
-    // 拦截复制事件：将 isWrapped 的软换行合并为连贯文本
-    container.addEventListener('copy', (e: ClipboardEvent) => {
-      if ((e.target as Element)?.closest('.terminal-composer')) return;
-      if (!terminal.hasSelection()) return;
-      const selPos = terminal.getSelectionPosition();
-      if (!selPos) return;
-
-      const result = terminalContentHelpers.getSelectionText(terminal.buffer.active, selPos);
-
-      e.preventDefault();
-      e.stopPropagation();
-      e.clipboardData?.setData('text/plain', result);
-    }, true);
-
     // 浮动"滚到底部"按钮
     const scrollBtn = document.createElement('button');
     scrollBtn.className = 'scroll-bottom-btn';
@@ -692,10 +692,35 @@ export class TerminalManager {
         void this.requestHistory(id, query);
       },
       onBackToLive: () => this.exitHistory(id),
+      getTerminal: () => terminal,
+      findIndex: (items: Array<{ text?: string }>, text: string) => userPromptBanner.findPromptItemIndex(items, text),
+      onResumeLive: ({ viewportY, deltaY, rowHeight }: { viewportY: number; deltaY: number; rowHeight: number }) => {
+        const instance = this.instances.get(id);
+        if (!instance) return;
+        surface.classList.remove('is-history');
+        instance.scroll.scrollToLine(viewportY + Math.ceil(deltaY / rowHeight));
+        if (terminal.buffer.active.viewportY >= terminal.buffer.active.baseY) instance.scroll.follow();
+      },
     });
     surface.appendChild(historyLayer.root);
-    const scroll = new TerminalScrollController(terminal, container, scrollBtn, () => {
-      this.maybeEnterHistory(id);
+    container.addEventListener('copy', (e: ClipboardEvent) => {
+      if ((e.target as Element)?.closest('.terminal-composer')) return;
+      const historyText = historyLayer.getSelectionText?.() || '';
+      if (historyText) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.clipboardData?.setData('text/plain', historyText);
+        return;
+      }
+      if (!terminal.hasSelection()) return;
+      const selPos = terminal.getSelectionPosition();
+      if (!selPos) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.clipboardData?.setData('text/plain', terminalContentHelpers.getSelectionText(terminal.buffer.active, selPos));
+    }, true);
+    const scroll = new TerminalScrollController(terminal, container, scrollBtn, (deltaY) => {
+      this.maybeEnterHistory(id, deltaY);
     });
     const instance: TermInstance = {
       id,
@@ -731,7 +756,7 @@ export class TerminalManager {
       this.renderPromptBanner(instance);
       this.fitTerminal(id, false);
     });
-    promptBanner.jumpBtn.addEventListener('click', () => this.jumpToUserPrompt(id));
+    promptBanner.jumpBtn.addEventListener('click', () => { void this.jumpToUserPrompt(id); });
     this.instances.set(id, instance);
     this.renderPromptBanner(instance);
     this.rebindPromptMarker(instance);
@@ -832,11 +857,12 @@ export class TerminalManager {
     }
     inst.appliedSeq = sequence;
     this.write(id, data);
-    if (inst.historyLayer.isVisible()) inst.historyLayer.setLiveUnread(true);
   }
 
   notifyInput(id: string): void {
-    this.instances.get(id)?.scroll.follow();
+    const instance = this.instances.get(id);
+    if (!instance || instance.historyLayer.isVisible()) return;
+    instance.scroll.follow();
   }
 
   private trackTypedPrompt(id: string, data: string): void {
@@ -876,27 +902,40 @@ export class TerminalManager {
     instance.promptMarker = userPromptBanner.markerAtLine(instance.terminal, line);
   }
 
-  private jumpToUserPrompt(id: string): void {
+  private async jumpToUserPrompt(id: string): Promise<void> {
     const instance = this.instances.get(id);
     if (!instance?.promptText) return;
+    const prompt = instance.promptText;
     this.rebindPromptMarker(instance);
     const line = userPromptBanner.resolvePromptJumpLine(
       instance.terminal.buffer.active,
-      instance.promptText,
+      prompt,
       instance.promptMarker,
     );
-    if (line < 0) {
-      const historyIndex = instance.historyLayer.findText(instance.promptText);
+    if (line >= 0) {
+      instance.scroll.scrollToLine(line);
+      userPromptBanner.scrollLineToTop(instance.terminal, line);
+      return;
+    }
+    if (instance.historyLayer.isVisible()) {
+      const historyIndex = instance.historyLayer.findText(prompt);
       if (historyIndex >= 0) {
-        this.enterHistory(id);
         instance.historyLayer.scrollToItem(historyIndex);
         return;
       }
+    } else {
+      await this.refreshHistoryMeta(instance);
+      if (this.instances.get(id) !== instance || instance.promptText !== prompt) return;
+    }
+    if (!instance.historyLayer.isVisible() && !instance.historyHasMore) {
       this.showJumpMiss(instance, '这段内容不在当前已加载范围');
       return;
     }
-    instance.scroll.scrollToLine(line);
-    userPromptBanner.scrollLineToTop(instance.terminal, line);
+    this.enterHistory(id);
+    const found = await instance.historyLayer.seekText(prompt);
+    if (this.instances.get(id) !== instance) return;
+    if (found >= 0 || instance.historyLayer.isSeeking() || !instance.historyLayer.isVisible()) return;
+    this.showJumpMiss(instance, '这段内容不在当前已加载范围');
   }
 
   destroy(id: string): string | null {
@@ -949,7 +988,11 @@ export class TerminalManager {
   private fitVisibleIfSizeChanged(): void {
     for (const [id, instance] of this.instances) {
       if (instance.container.classList.contains('pane-detached')) continue;
-      const rect = instance.container.getBoundingClientRect();
+      // The prompt and composer can resize the surface without changing
+      // the outer pane. FitAddon measures this same parent of .xterm.
+      const surface = instance.terminal.element?.parentElement;
+      if (!surface) continue;
+      const rect = surface.getBoundingClientRect();
       const previous = this.lastFitSizes.get(id) || { w: 0, h: 0 };
       if (Math.abs(rect.width - previous.w) > 1 || Math.abs(rect.height - previous.h) > 1) {
         this.fitTerminal(id, false);
@@ -967,7 +1010,7 @@ export class TerminalManager {
         if (inst.promptText && (!inst.promptMarker || inst.promptMarker.isDisposed)) {
           this.rebindPromptMarker(inst);
         }
-        if (inst.historyLayer.isVisible()) inst.historyLayer.setLiveUnread(true);
+        if (inst.historyLayer.isVisible()) inst.historyLayer.noteLiveOutput();
         resolve();
       });
     });
@@ -1017,14 +1060,13 @@ export class TerminalManager {
       instance.container.classList.remove('terminal-reveal-pending');
       instance.container.classList.remove('terminal-connecting');
       if (focus) {
-        // Focus on the next visible frame, not an arbitrary delayed timer.
-        // A later switch or detach must invalidate this pending focus.
-        requestAnimationFrame(() => {
-          if (this.isRevealStale(instance, generation) || this.activeId !== instance.id
-              || this.isDetached(instance)) return;
-          if (instance.container.querySelector('.terminal-composer')?.contains(document.activeElement)) return;
+        // The view is now visible. Deliver focus in this transaction rather
+        // than leaving the keyboard on <body> until another animation frame.
+        if (!this.isRevealStale(instance, generation) && this.activeId === instance.id
+            && !this.isDetached(instance)
+            && !instance.container.querySelector('.terminal-composer')?.contains(document.activeElement)) {
           try { instance.terminal.focus(); } catch { /* ignore an unmounted renderer */ }
-        });
+        }
       }
     })();
     instance.revealPromise = work;
@@ -1053,7 +1095,7 @@ export class TerminalManager {
       for (let attempt = 0; attempt < 3; attempt++) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         const snapshot = await Promise.race([
-          api.snapshotPty(instance.id, { scrollback: 0 }),
+          api.snapshotPty(instance.id, { scrollback: terminalScrollHelpers.LIVE_TERMINAL_SCROLLBACK }),
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => reject(new Error('Terminal snapshot timed out')), 8000);
           }),
@@ -1130,11 +1172,11 @@ export class TerminalManager {
     } catch { /* overlay can retry on the next gesture */ }
   }
 
-  private maybeEnterHistory(id: string): void {
-    void this.maybeEnterHistoryAsync(id);
+  private maybeEnterHistory(id: string, deltaY = 0): void {
+    void this.maybeEnterHistoryAsync(id, deltaY);
   }
 
-  private async maybeEnterHistoryAsync(id: string): Promise<void> {
+  private async maybeEnterHistoryAsync(id: string, deltaY = 0): Promise<void> {
     const instance = this.instances.get(id);
     if (!instance || instance.historyLayer.isVisible()) return;
     const gesture = instance.scroll.gestureVersion();
@@ -1152,15 +1194,18 @@ export class TerminalManager {
       bufferType: buffer.type,
       noLocalHistory: buffer.baseY <= 0,
       viewportY: buffer.viewportY,
+      edgeLines: terminalScrollHelpers.HISTORY_EDGE_LINES,
     })) return;
-    this.enterHistory(id);
+    this.enterHistory(id, deltaY);
   }
 
-  private enterHistory(id: string): void {
+  private enterHistory(id: string, deltaY = 0): void {
     const instance = this.instances.get(id);
     if (!instance) return;
+    instance.scroll.stopFollowing();
     instance.container.querySelector('.terminal-surface')?.classList.add('is-history');
     instance.historyLayer.show({
+      deltaY,
       hasMore: instance.historyHasMore,
       nextCursor: instance.historyCursor,
     });
@@ -1182,6 +1227,7 @@ export class TerminalManager {
     } }).duocli;
     if (!instance || !api?.historyBeforePty) {
       instance?.historyLayer.setLoading(false);
+      instance?.historyLayer.abandonSeek?.();
       return;
     }
     const revision = ++instance.historyRequestId;
@@ -1210,7 +1256,8 @@ export class TerminalManager {
       // An older request must not unlock a newer request or overwrite its UI.
       if (isCurrent()) {
         instance.historyLayer.setLoading(false);
-        this.showJumpMiss(instance, '历史加载中断，继续向上滚动重试');
+        if (instance.historyLayer.isSeeking?.()) instance.historyLayer.requestMore?.();
+        else this.showJumpMiss(instance, '历史加载中断，继续向上滚动重试');
       }
     } finally {
       clearTimeout(timer);
@@ -1233,13 +1280,25 @@ export class TerminalManager {
     const instance = this.instances.get(id);
     if (!instance) return;
     try {
-      const rect = instance.container.getBoundingClientRect();
+      // The prompt and composer can resize the surface without changing
+      // the outer pane. FitAddon measures this same parent of .xterm.
+      const surface = instance.terminal.element?.parentElement;
+      if (!surface) return;
+      const rect = surface.getBoundingClientRect();
       const previous = this.lastFitSizes.get(id);
       const sizeChanged = !previous
         || Math.abs(rect.width - previous.w) > 1
         || Math.abs(rect.height - previous.h) > 1;
+      // A replay can temporarily restore the remote PTY's larger geometry and
+      // a font/DPR change alters FitAddon's calculation without resizing the
+      // pane. In both cases the terminal must be returned to the surface it
+      // actually occupies, otherwise its final input row sits under the
+      // composer and quick-command bars.
+      const proposed = instance.fitAddon.proposeDimensions();
+      const geometryChanged = !!proposed
+        && (proposed.cols !== instance.terminal.cols || proposed.rows !== instance.terminal.rows);
       const renderService = (instance.terminal as unknown as { _core?: { _renderService?: { dimensions?: unknown } } })._core?._renderService;
-      if ((sizeChanged || !instance.lastReportedSize) && renderService?.dimensions) {
+      if ((sizeChanged || geometryChanged || !instance.lastReportedSize) && renderService?.dimensions) {
         try { instance.fitAddon.fit(); } catch { /* xterm may not have a renderer yet */ }
       }
       this.rebindPromptMarker(instance);

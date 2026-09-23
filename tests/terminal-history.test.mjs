@@ -5,9 +5,12 @@ import {
   decodeHistoryCursor,
   encodeHistoryCursor,
   fragmentHistoryLine,
+  normalizeColorMode,
   overlapLogicalCount,
   readLogicalScrollback,
+  readPhysicalStyles,
   sameLogicalTexts,
+  XTERM_CM_P16,
 } from '../dist/main/terminal-history.js';
 import { TerminalState } from '../dist/main/terminal-state.js';
 
@@ -133,4 +136,44 @@ test('clear screen keeps archived lines and resize does not duplicate them', asy
   const after = state.history.getLines().map(line => line.text);
   assert.ok(before.every(text => after.includes(text)));
   assert.equal(after.filter(text => text === before[0]).length, 1);
+});
+
+test('physical styles keep xterm palette colors instead of dropping them', () => {
+  assert.equal(normalizeColorMode(XTERM_CM_P16), 1);
+  const line = {
+    length: 3,
+    getCell(x) {
+      return {
+        getChars: () => 'red'[x],
+        getWidth: () => 1,
+        getFgColor: () => 1,
+        getBgColor: () => 0,
+        getFgColorMode: () => XTERM_CM_P16,
+        getBgColorMode: () => 0,
+        isBold: () => false,
+        isUnderline: () => false,
+        isDim: () => false,
+        isInverse: () => false,
+        isItalic: () => false,
+      };
+    },
+  };
+  const physical = readPhysicalStyles(line);
+  assert.equal(physical.text, 'red');
+  assert.equal(physical.styles[0].fg, 1);
+  assert.equal(physical.styles[0].fgMode, 1);
+});
+
+test('archived ANSI colors survive a history page', async t => {
+  const state = new TerminalState();
+  t.after(() => state.dispose());
+  state.resize(40, 4);
+  state.write('\x1b[31mred-line\x1b[0m\r\n' + Array.from({ length: 8 }, (_, i) => `push-${i}\r\n`).join(''), () => {});
+  await state.snapshot(() => {});
+  const colored = state.history.getLines().find(line => line.text.includes('red-line'));
+  assert.ok(colored, `history lines: ${state.history.getLines().map(line => line.text).join(' | ')}`);
+  assert.ok(colored.styles.some(run => run.fg === 1 && run.fgMode === 1));
+  const page = await state.historyBefore({ limitRows: 20, requestId: 'color' });
+  const item = page.items.find(line => line.text.includes('red-line'));
+  assert.ok(item?.styles?.some(run => run.fg === 1 && run.fgMode === 1));
 });

@@ -50,11 +50,12 @@ let mobileFilePreviewRequest = 0;
 let currentDevicePanel = 'device';
 let devicePanelReturnPage = 'main-page';
 let activeSessionsCache = [];
+let terminalTaskSnapshot = { revision: 0, tasks: [] };
 let closedSessions = [];
 let closedSessionsCollapsed = true;
 const restoringClosedSessionIds = new Set();
 let macDesktopClient = null;
-let macDesktopEnabled = false;
+const macDesktopEnabled = false;
 const COMPUTER_DEVICE_ID = 'duocli-computer';
 
 function isComputerDevice(id) {
@@ -203,7 +204,7 @@ function saveMobilePendingSubmissions() {
 loadMobileDrafts();
 loadMobilePendingSubmissions();
 const terminalScrollHelpers = globalThis.DuoTerminalScrollHelpers || {
-  LIVE_TERMINAL_SCROLLBACK: 80,
+  LIVE_TERMINAL_SCROLLBACK: 120,
   isAtBottom(viewportY, baseY) { return viewportY >= baseY; },
   isAtHistoryEdge(input) { return Boolean(input?.noLocalHistory || (input?.viewportY ?? 0) <= 3); },
   shouldFollowOutput(wasAtBottom, touchActive, startInteraction, currentInteraction) {
@@ -507,9 +508,7 @@ function api(path, opts = {}) {
       let data = {};
       try {
         data = await r.json();
-      } catch {
-        data = {};
-      }
+      } catch {}
       if (!r.ok) {
         const message = data && typeof data.error === 'string' && data.error.trim()
           ? data.error.trim()
@@ -829,7 +828,14 @@ async function showAutoContinueConfigModal(sessionId) {
   $('ac-initial-delay').value = String(Math.round((config.initialDelayMs || 0) / 60000));
   $('ac-cmd-interval').value = String(Math.round((config.commandIntervalMs || 2000) / 1000));
   $('ac-send-delay').value = String(config.sendDelaySec ?? 2);
-  $('ac-max-loops').value = String(config.maxLoops ?? -1);
+  const loopEnabled = typeof config.loopEnabled === 'boolean'
+    ? config.loopEnabled
+    : (config.maxLoops === -1 || (typeof config.maxLoops === 'number' && config.maxLoops > 1));
+  $('ac-loop-enabled').checked = loopEnabled;
+  $('ac-max-loops').value = String(loopEnabled
+    ? ((config.maxLoops === 1 ? -1 : (config.maxLoops ?? -1)))
+    : -1);
+  $('ac-loop-fields').hidden = !loopEnabled;
   $('ac-auto-agree').checked = config.autoAgree !== false;
   $('ac-agree-delay').value = String(config.autoAgreeDelaySec ?? 5);
   $('ac-agree-delay-row').style.display = $('ac-auto-agree').checked ? '' : 'none';
@@ -985,7 +991,7 @@ function markUserScrolling() {
 }
 
 const TERMINAL_HISTORY_CHUNK = 80;
-const LIVE_TERMINAL_SCROLLBACK = terminalScrollHelpers.LIVE_TERMINAL_SCROLLBACK || 80;
+const LIVE_TERMINAL_SCROLLBACK = terminalScrollHelpers.LIVE_TERMINAL_SCROLLBACK || 120;
 
 function noteTerminalHistoryMeta(msg) {
   if (Number.isInteger(msg?.scrollback)) terminalHistoryScrollback = Math.max(0, msg.scrollback);
@@ -1016,11 +1022,13 @@ function cancelTerminalHistoryRequest() {
 function requestHistoryPage(query = {}) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     terminalHistoryLayer?.setLoading(false);
+    terminalHistoryLayer?.abandonSeek?.();
     return;
   }
   if (terminalHistoryLoading) return;
   if (!terminalHasMoreHistory && !query.force) {
     terminalHistoryLayer?.setLoading(false);
+    terminalHistoryLayer?.abandonSeek?.();
     return;
   }
   terminalHistoryLoading = true;
@@ -1031,8 +1039,10 @@ function requestHistoryPage(query = {}) {
   clearTimeout(terminalHistoryRequestTimer);
   terminalHistoryRequestTimer = setTimeout(() => {
     if (terminalHistoryPendingRequest !== pending) return;
+    const seeking = terminalHistoryLayer?.isSeeking?.();
     cancelTerminalHistoryRequest();
-    terminalHistoryLayer?.setError?.('加载超时，继续向上滚动重试');
+    if (seeking) terminalHistoryLayer.requestMore();
+    else terminalHistoryLayer?.setError?.('加载超时，继续向上滚动重试');
   }, 10000);
   if (usesPagedHistory()) {
     wsSend({
@@ -1051,7 +1061,7 @@ function requestHistoryPage(query = {}) {
   });
 }
 
-function maybeRequestTerminalHistory(explicitIntent = false) {
+function maybeRequestTerminalHistory(explicitIntent = false, deltaY = 0) {
   if (!term || !ws || ws.readyState !== WebSocket.OPEN) return;
   if (!terminalFirstLatestPaint) return;
   const buffer = term.buffer.active;
@@ -1066,13 +1076,13 @@ function maybeRequestTerminalHistory(explicitIntent = false) {
   });
   if (!should) return;
   if (usesPagedHistory()) {
-    enterTerminalHistory();
+    enterTerminalHistory(deltaY);
     return;
   }
   requestHistoryPage({ force: true });
 }
 
-function enterTerminalHistory() {
+function enterTerminalHistory(deltaY = 0) {
   if (!terminalHistoryLayer) return;
   isUserScrolling = true;
   if (!terminalHistoryLayer.isVisible()) {
@@ -1083,6 +1093,7 @@ function enterTerminalHistory() {
     terminalHistoryCursor = null;
   }
   terminalHistoryLayer.show({
+    deltaY,
     hasMore: terminalHasMoreHistory,
     nextCursor: terminalHistoryCursor,
   });
@@ -1093,7 +1104,7 @@ function handlePagedHistoryPan(deltaY, event) {
   if (!usesPagedHistory() || !terminalHistoryLayer || !terminalFirstLatestPaint) return false;
   if (terminalHistoryLayer.isVisible()) {
     if (event?.cancelable) event.preventDefault();
-    if (terminalHistoryLayer.getItems().length) terminalHistoryLayer.scrollByPixels(deltaY);
+    terminalHistoryLayer.scrollByPixels(deltaY);
     return true;
   }
   const towardHistory = terminalScrollHelpers.isHistoryDirection(deltaY);
@@ -1107,9 +1118,8 @@ function handlePagedHistoryPan(deltaY, event) {
   if (!atEdge || !terminalHasMoreHistory) return false;
   terminalHistoryIntent = true;
   terminalHistoryGestureAccum += deltaY;
-  enterTerminalHistory();
+  enterTerminalHistory(deltaY);
   if (event?.cancelable) event.preventDefault();
-  if (terminalHistoryLayer.getItems().length) terminalHistoryLayer.scrollByPixels(deltaY);
   return true;
 }
 
@@ -1437,6 +1447,7 @@ function restoreTerminalSnapshot(msg) {
       rebindMobilePromptMarker();
       renderMobilePromptBanner();
       noteTerminalHistoryMeta(msg);
+      terminalHistoryLayer?.refreshLivePreview?.();
       const finishReveal = () => {
         if (term !== activeTerm || generation !== terminalOpenGeneration) return;
         terminalFirstLatestPaint = true;
@@ -1772,8 +1783,8 @@ const LanSwitcher = (() => {
   let probeInFlight = false;
   let lanFailCount = 0;
   let softLanCount = 0;
-  let cooldownUntil = urlFromLan ? Date.now() + (NM.AFTER_LAN_FALLBACK_MS || 15000) : 0;
-  let softCooldownUntil = urlFromLan
+  const cooldownUntil = urlFromLan ? Date.now() + (NM.AFTER_LAN_FALLBACK_MS || 15000) : 0;
+  const softCooldownUntil = urlFromLan
     ? Date.now() + (NM.AFTER_SOFT_LAN_COOLDOWN_MS || 120000)
     : 0;
 
@@ -2272,8 +2283,10 @@ function startAndroidFallback() {
         getToken: () => token,
         getTicket: requestAndroidMediaTicket,
         onStatus: (message) => {
-          if (message.status === 'error') setDeviceHint(`${message.error || '兼容画面暂不可用'}，正在重试`, false);
-          else if (message.status === 'disconnected') setDeviceHint('兼容画面连接中断，正在恢复…', false);
+          if (message.status === 'error') {
+            const detail = humanizeDeviceCaptureError(message.error) || '兼容画面暂不可用';
+            setDeviceHint(`${detail}，正在重试`, false);
+          } else if (message.status === 'disconnected') setDeviceHint('兼容画面连接中断，正在恢复…', false);
         },
         onMeta: (meta) => {
           for (const id of ['device-video', 'fullscreen-video']) {
@@ -3141,6 +3154,14 @@ function setDeviceHint(msg, notify = Boolean(msg)) {
   if (notify && msg) showCopyToast(msg);
 }
 
+function humanizeDeviceCaptureError(error) {
+  const text = String(error || '').trim();
+  if (!text) return '';
+  if (/unsupported image format|Input buffer contains/i.test(text)) return '截图格式异常';
+  if (/VipsJpeg|VipsPng|libvips|\bsharp\b/i.test(text)) return '截图处理失败';
+  return text;
+}
+
 function appendComputerDeviceOption(sel) {
   const opt = document.createElement('option');
   opt.value = COMPUTER_DEVICE_ID;
@@ -3557,16 +3578,125 @@ async function enterMain() {
 
 async function refreshSessions() {
   try {
-    const [sessions, closed] = await Promise.all([
+    const [sessions, closed, tasks] = await Promise.all([
       api('/api/sessions'),
       api('/api/closed-sessions').catch(() => []),
+      api('/api/tasks').catch(() => ({ revision: 0, tasks: [] })),
     ]);
     activeSessionsCache = Array.isArray(sessions) ? sessions : [];
     closedSessions = Array.isArray(closed) ? closed : [];
+    if (Array.isArray(tasks?.tasks) && (tasks.revision || 0) >= terminalTaskSnapshot.revision) terminalTaskSnapshot = tasks;
     renderSessionList();
+    if ($('task-queue-modal')?.classList.contains('active')) renderTaskQueue();
   } catch (e) {
     console.error('刷新会话失败', e);
   }
+}
+
+function taskStatusLabel(status) {
+  return ({ pending: '等待中', paused: '已暂停', starting: '启动中', running: '执行中', completed: '已完成', failed: '失败', cancelled: '已取消', blocked: '受阻', needs_attention: '待确认' })[status] || status;
+}
+
+function renderTaskDependencyOptions() {
+  const select = $('new-task-dependency');
+  if (!select) return;
+  const selected = select.value;
+  select.innerHTML = '<option value="">无</option>';
+  for (const task of (terminalTaskSnapshot.tasks || []).filter(task => !['cancelled', 'failed'].includes(task.status))) {
+    const option = document.createElement('option');
+    option.value = `task:${task.id}`;
+    option.textContent = `任务：${task.name}（${taskStatusLabel(task.status)}）`;
+    select.appendChild(option);
+  }
+  for (const session of activeSessionsCache) {
+    const option = document.createElement('option');
+    option.value = `session:${session.id}`;
+    option.textContent = `终端：${session.title || session.displayName || '终端'}`;
+    select.appendChild(option);
+  }
+  if ([...select.options].some(option => option.value === selected)) select.value = selected;
+}
+
+function renderTaskQueue() {
+  const list = $('task-queue-list');
+  if (!list) return;
+  if (!terminalTaskSnapshot.tasks?.length) {
+    list.innerHTML = '<div class="task-queue-empty">还没有计划任务</div>';
+    return;
+  }
+  const byId = new Map(terminalTaskSnapshot.tasks.map(task => [task.id, task]));
+  list.innerHTML = [...terminalTaskSnapshot.tasks].reverse().map(task => {
+    const dependency = task.dependency?.kind === 'task'
+      ? `前置：${byId.get(task.dependency.id)?.name || '任务'}`
+      : task.dependency?.kind === 'session' ? '前置：已有终端停止' : '无前置任务';
+    const time = task.notBefore ? ` · ${new Date(task.notBefore).toLocaleString()}` : '';
+    const canRunNow = ['pending', 'paused', 'blocked'].includes(task.status);
+    const canPause = ['pending', 'blocked'].includes(task.status);
+    const canResume = task.status === 'paused';
+    const canCancel = ['starting', 'running'].includes(task.status);
+    const canComplete = ['running', 'needs_attention'].includes(task.status);
+    const canEdit = ['pending', 'paused', 'blocked'].includes(task.status);
+    return `<div class="task-queue-item" data-task-id="${escHtml(task.id)}">
+      <div class="task-queue-title"><span>${escHtml(task.name)}</span><span class="task-queue-state">${escHtml(taskStatusLabel(task.status))}</span></div>
+      <div class="task-queue-meta">${escHtml(dependency + time + ` · 静止 ${Math.round(task.quietMs / 1000)} 秒` + (task.error ? ` · ${task.error}` : ''))}</div>
+      <div class="task-queue-actions">
+        ${task.sessionId ? '<button data-action="view">查看终端</button>' : ''}
+        ${canRunNow ? '<button data-action="run-now">立即执行</button>' : ''}
+        ${canPause ? '<button data-action="pause">暂停</button>' : ''}
+        ${canResume ? '<button data-action="resume">继续</button>' : ''}
+        ${canCancel ? '<button data-action="cancel">取消</button>' : ''}
+        ${canEdit ? '<button data-action="edit">修改</button>' : ''}
+        ${canComplete ? '<button data-action="complete">确认完成</button>' : ''}
+        <button data-action="remove" class="danger">删除</button>
+      </div>
+    </div>`;
+  }).join('');
+  list.querySelectorAll('.task-queue-item').forEach(item => {
+    const task = terminalTaskSnapshot.tasks.find(value => value.id === item.dataset.taskId);
+    if (!task) return;
+    item.querySelector('[data-action="view"]')?.addEventListener('click', () => {
+      $('task-queue-modal').classList.remove('active');
+      if (task.sessionId) void openSession(task.sessionId);
+    });
+    item.querySelector('[data-action="run-now"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/run-now`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="pause"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/pause`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="resume"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/resume`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="cancel"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/cancel`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="complete"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/confirm-complete`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="edit"]')?.addEventListener('click', async () => {
+      const name = prompt('任务名称', task.name);
+      if (name === null) return;
+      const instruction = prompt('首条任务指令', task.instruction);
+      if (instruction === null) return;
+      const quiet = prompt('静止完成秒数', String(Math.round(task.quietMs / 1000)));
+      if (quiet === null) return;
+      await api(`/api/tasks/${encodeURIComponent(task.id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ expectedRevision: task.revision, name, instruction, quietMs: Number(quiet) * 1000 }),
+      });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="remove"]')?.addEventListener('click', async () => {
+      if (!confirm(`确定删除任务「${task.name}」？`)) return;
+      await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: 'DELETE' });
+      await refreshSessions();
+    });
+  });
 }
 
 function cliTagHtml(dn) {
@@ -4189,6 +4319,14 @@ function startSSE() {
       }
     } catch {}
   });
+  sseSource.addEventListener('tasks', e => {
+    try {
+      const snapshot = JSON.parse(e.data);
+      if (!Array.isArray(snapshot?.tasks) || (snapshot.revision || 0) < terminalTaskSnapshot.revision) return;
+      terminalTaskSnapshot = snapshot;
+      if ($('task-queue-modal')?.classList.contains('active')) renderTaskQueue();
+    } catch {}
+  });
   sseSource.onerror = () => {
     stopSSE();
     if (navigator.onLine === false) return;
@@ -4775,6 +4913,25 @@ function createTerminal() {
     terminalHistoryLayer = terminalHistoryLayerApi.createHistoryLayer({
       onRequest: (query) => requestHistoryPage(query),
       onBackToLive: () => exitTerminalHistory(),
+      onKeepLiveFocus: () => {
+        const input = $('msg-input');
+        if (input && (document.activeElement === input || input.contains(document.activeElement))) return;
+        try { term?.focus?.(); } catch { /* unmounted terminal */ }
+      },
+      getTerminal: () => term,
+      findIndex: (items, text) => userPromptBanner?.findPromptItemIndex(items, text) ?? -1,
+      onResumeLive: ({ viewportY, deltaY, rowHeight }) => {
+        cancelTerminalHistoryRequest();
+        terminalScrollInteractionRevision++;
+        if (!term) return;
+        term.scrollToLine(Math.min(term.buffer.active.baseY, viewportY + Math.ceil(deltaY / rowHeight)));
+        isUserScrolling = !isAtBottom();
+        terminalHistoryIntent = false;
+        terminalHistoryGestureAccum = 0;
+        resetScrollAccum();
+        if (!isUserScrolling) jumpTerminalToLatest();
+        setTerminalUnreadOutput(isUserScrolling);
+      },
       onSelectionLimit: () => showCopyToast('选择范围过大，已保留当前选区'),
     });
     container.appendChild(terminalHistoryLayer.root);
@@ -5024,14 +5181,20 @@ function createTerminal() {
           cancelAnimationFrame(scrollToBottomRaf);
           scrollToBottomRaf = 0;
         }
-        if (event?.deltaY < 0) maybeRequestTerminalHistory(true);
+        if (event?.deltaY < 0 && terminalHistoryLayerApi) {
+          const pixels = terminalHistoryLayerApi.wheelPixels(event, terminalRowHeight(), container.clientHeight);
+          // At the archive boundary the history layer owns the rest of the gesture.
+          // Leaving it passive lets xterm scroll the same distance again.
+          if (handlePagedHistoryPan(pixels, event)) return;
+          maybeRequestTerminalHistory(true, pixels);
+        }
       };
 
       container.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
       container.addEventListener('touchmove', onTouchMove, { passive: false, capture: true });
       container.addEventListener('touchend', onTouchEnd, { passive: false, capture: true });
       container.addEventListener('touchcancel', onTouchEnd, { passive: false, capture: true });
-      container.addEventListener('wheel', onWheel, { passive: true, capture: true });
+      container.addEventListener('wheel', onWheel, { passive: false, capture: true });
       terminalTouchCleanup = () => {
         clearLongPress();
         container.removeEventListener('touchstart', onTouchStart, true);
@@ -5278,14 +5441,14 @@ function connectWebSocket(sessionId) {
         setTerminalInputReady(true);
         terminalFirstLatestPaint = true;
 
-        let writeData = interceptSpinnerData(msg.data);
+        const writeData = interceptSpinnerData(msg.data);
 
         if (writeData !== null) {
           const follow = !isUserScrolling && !terminalHistoryLayer?.isVisible();
           writeTerminalOutput(writeData, follow);
           if (terminalHistoryLayer?.isVisible()) {
-            terminalHistoryLayer.setLiveUnread(true);
-            setTerminalUnreadOutput(true);
+            terminalHistoryLayer.noteLiveOutput();
+            if (!terminalHistoryLayer.viewingLiveEdge?.()) setTerminalUnreadOutput(true);
           }
         }
       }
@@ -5930,6 +6093,14 @@ $('ac-auto-agree').onchange = () => {
   $('ac-agree-delay-row').style.display = $('ac-auto-agree').checked ? '' : 'none';
 };
 
+$('ac-loop-enabled').onchange = () => {
+  const enabled = $('ac-loop-enabled').checked;
+  $('ac-loop-fields').hidden = !enabled;
+  if (enabled && (!$('ac-max-loops').value || $('ac-max-loops').value === '1')) {
+    $('ac-max-loops').value = '-1';
+  }
+};
+
 // 催工配置弹窗：取消
 $('ac-cancel').onclick = () => {
   $('auto-continue-modal').classList.remove('active');
@@ -5954,18 +6125,24 @@ $('ac-save').onclick = async () => {
   if (!currentSessionId) return;
   const msgs = $('ac-message').value.split('\n').map(m => m.trim()).filter(Boolean);
   if (!msgs.length) { $('ac-message').focus(); return; }
-  const intervalMinutes = parseInt($('ac-interval').value, 10);
-  if (isNaN(intervalMinutes) || intervalMinutes < 1) { $('ac-interval').focus(); return; }
+  const loopEnabled = $('ac-loop-enabled').checked;
+  let intervalMinutes = parseInt($('ac-interval').value, 10);
+  let maxLoops = parseInt($('ac-max-loops')?.value || '-1', 10);
+  if (loopEnabled) {
+    if (isNaN(intervalMinutes) || intervalMinutes < 1) { $('ac-interval').focus(); return; }
+    if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { $('ac-max-loops').focus(); return; }
+  } else {
+    if (isNaN(intervalMinutes) || intervalMinutes < 1) intervalMinutes = 10;
+    maxLoops = -1;
+  }
   const initialDelayMinutes = parseInt($('ac-initial-delay').value || '0', 10);
   if (isNaN(initialDelayMinutes) || initialDelayMinutes < 0) { $('ac-initial-delay').focus(); return; }
   const agreeDelay = parseInt($('ac-agree-delay').value, 10);
   const cmdIntervalSec = parseInt($('ac-cmd-interval')?.value || '2', 10);
   const sendDelaySec = parseInt($('ac-send-delay')?.value || '2', 10);
-  const maxLoops = parseInt($('ac-max-loops')?.value || '-1', 10);
   if ($('ac-auto-agree').checked && (isNaN(agreeDelay) || agreeDelay < 0)) { $('ac-agree-delay').focus(); return; }
   if (isNaN(cmdIntervalSec) || cmdIntervalSec < 0) { $('ac-cmd-interval').focus(); return; }
   if (isNaN(sendDelaySec) || sendDelaySec < 0) { $('ac-send-delay').focus(); return; }
-  if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { $('ac-max-loops').focus(); return; }
 
   const config = {
     enabled: true,
@@ -5974,6 +6151,7 @@ $('ac-save').onclick = async () => {
     initialDelayMs: initialDelayMinutes * 60000,
     commandIntervalMs: cmdIntervalSec * 1000,
     sendDelaySec,
+    loopEnabled,
     maxLoops,
     autoAgree: $('ac-auto-agree').checked,
     autoAgreeDelaySec: isNaN(agreeDelay) ? 5 : agreeDelay,
@@ -6023,7 +6201,7 @@ function bindMobilePromptBanner() {
     mobilePromptExpanded = !mobilePromptExpanded;
     renderMobilePromptBanner();
   });
-  mobilePromptBanner?.jumpBtn?.addEventListener('click', () => jumpToMobileUserPrompt());
+  mobilePromptBanner?.jumpBtn?.addEventListener('click', () => { void jumpToMobileUserPrompt(); });
   renderMobilePromptBanner();
 }
 
@@ -6081,26 +6259,39 @@ function pauseOutputFollowForHistoryJump() {
   isUserScrolling = true;
 }
 
-function jumpToMobileUserPrompt() {
+async function jumpToMobileUserPrompt() {
   if (!term || !userPromptBanner) return;
   const text = currentMobilePromptText();
   if (!text) return;
   rebindMobilePromptMarker();
   const line = userPromptBanner.resolvePromptJumpLine(term.buffer.active, text, mobilePromptMarker);
-  if (line < 0) {
-    const historyIndex = terminalHistoryLayer?.findText(text) ?? -1;
+  if (line >= 0) {
+    pauseOutputFollowForHistoryJump();
+    userPromptBanner.scrollLineToTop(term, line);
+    isUserScrolling = true;
+    setTerminalUnreadOutput(!isAtBottom());
+    return;
+  }
+  if (!usesPagedHistory() || !terminalHistoryLayer) {
+    showCopyToast('这段内容不在当前已加载范围');
+    return;
+  }
+  if (terminalHistoryLayer.isVisible()) {
+    const historyIndex = terminalHistoryLayer.findText(text);
     if (historyIndex >= 0) {
-      enterTerminalHistory();
+      pauseOutputFollowForHistoryJump();
       terminalHistoryLayer.scrollToItem(historyIndex);
       return;
     }
+  } else if (!terminalHasMoreHistory) {
     showCopyToast('这段内容不在当前已加载范围');
     return;
   }
   pauseOutputFollowForHistoryJump();
-  userPromptBanner.scrollLineToTop(term, line);
-  isUserScrolling = true;
-  setTerminalUnreadOutput(!isAtBottom());
+  enterTerminalHistory();
+  const found = await terminalHistoryLayer.seekText(text);
+  if (found >= 0 || terminalHistoryLayer.isSeeking() || !terminalHistoryLayer.isVisible()) return;
+  showCopyToast('这段内容不在当前已加载范围');
 }
 
 function requestSubmission(sessionId, text, id, sourceMode = sessionViewMode) {
@@ -6196,7 +6387,7 @@ async function sendMessage() {
     setChatStatus('正在发送消息…', 'loading');
     paintPromise = waitForComposerPaint();
   }
-  if (sessionViewMode !== 'chat') scrollTerminalToBottom();
+  if (sessionViewMode !== 'chat' && !terminalHistoryLayer?.isVisible()) scrollTerminalToBottom();
   try {
     const request = requestSubmission(sessionId, text, id, sourceMode).then(
       () => ({ ok: true }),
@@ -7083,6 +7274,8 @@ async function openNewSessionModal() {
   const themeSelect = $('new-theme');
   if (themeSelect) themeSelect.value = localStorage.getItem(MOBILE_THEME_KEY) || 'default';
   $('new-session-modal').classList.add('active');
+  await refreshSessions();
+  renderTaskDependencyOptions();
 }
 
 $('new-session-btn').onclick = () => { void openNewSessionModal(); };
@@ -7100,9 +7293,38 @@ $('modal-create').onclick = async () => {
   const preset = $('new-preset').value;
   const themeId = $('new-theme')?.value || 'default';
   localStorage.setItem(MOBILE_THEME_KEY, themeId);
-  $('new-session-modal').classList.remove('active');
 
   try {
+    if ($('new-task-enabled')?.checked) {
+      const name = $('new-task-name').value.trim();
+      const instruction = $('new-task-instruction').value.trim();
+      if (!name) throw new Error('请输入任务名称');
+      if (!instruction) throw new Error('请输入首条任务指令');
+      const dependency = $('new-task-dependency').value;
+      const timeValue = $('new-task-time').value;
+      await api('/api/tasks', {
+        method: 'POST',
+        body: JSON.stringify({
+          requestId: crypto.randomUUID(),
+          name,
+          cwd: cwd || undefined,
+          presetCommand: preset,
+          themeId,
+          instruction,
+          notBefore: timeValue ? new Date(timeValue).getTime() : undefined,
+          dependsOnTaskId: dependency.startsWith('task:') ? dependency.slice(5) : undefined,
+          dependsOnSessionId: dependency.startsWith('session:') ? dependency.slice(8) : undefined,
+          quietMs: Math.round(Number($('new-task-quiet').value || '10') * 1000),
+        }),
+      });
+      $('new-session-modal').classList.remove('active');
+      $('new-task-name').value = '';
+      $('new-task-instruction').value = '';
+      await refreshSessions();
+      showCopyToast('已加入任务队列');
+      return;
+    }
+    $('new-session-modal').classList.remove('active');
     const session = await api('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({ cwd: cwd || undefined, presetCommand: preset, themeId }),
@@ -7114,6 +7336,20 @@ $('modal-create').onclick = async () => {
   } catch (e) {
     alert('创建失败: ' + e.message);
   }
+};
+
+$('new-task-enabled').onchange = () => {
+  $('new-task-fields').hidden = !$('new-task-enabled').checked;
+  $('modal-create').textContent = $('new-task-enabled').checked ? '加入队列' : '创建';
+};
+$('task-queue-btn').onclick = async () => {
+  await refreshSessions();
+  renderTaskQueue();
+  $('task-queue-modal').classList.add('active');
+};
+$('task-queue-close').onclick = () => $('task-queue-modal').classList.remove('active');
+$('task-queue-modal').onclick = (event) => {
+  if (event.target === $('task-queue-modal')) $('task-queue-modal').classList.remove('active');
 };
 
 $('new-session-modal').onclick = (e) => {

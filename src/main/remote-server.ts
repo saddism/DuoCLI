@@ -11,6 +11,8 @@ import os from 'os';
 import { execFileSync } from 'child_process';
 import { parseAndroidDevices, runAdb } from './android-devices';
 import { AndroidMirrorClient, AndroidMirrorInput, AndroidMirrorManager, validateAndroidMirrorInput } from './android-mirror';
+import { humanizeAndroidImageError, prepareAdbScreenshot } from './android-screencap';
+import type { TerminalTaskScheduler } from './terminal-task-scheduler';
 import { AndroidScreenshotManager } from './android-screenshot';
 import { AndroidJpegClient, AndroidJpegManager } from './android-jpeg';
 import { resolveAndroidMediaHelper } from './android-media-helper';
@@ -45,6 +47,9 @@ const HOST = process.env.DUOCLI_REMOTE_HOST || '0.0.0.0';
 const DUOCLI_APP_ROOT = path.resolve(__dirname, '../..');
 const userPromptBanner = require(path.join(DUOCLI_APP_ROOT, 'mobile/client/user-prompt-banner.js')) as {
   lastUserPromptFrom: (segments: unknown) => string;
+};
+const { LIVE_TERMINAL_SCROLLBACK } = require(path.join(DUOCLI_APP_ROOT, 'mobile/client/terminal-scroll-helpers.js')) as {
+  LIVE_TERMINAL_SCROLLBACK: number;
 };
 
 function findLsof(): string | null {
@@ -407,6 +412,7 @@ export function startRemoteServer(
   onSessionClosed?: (session: { title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; resumeSource?: any; updatedAt?: number }) => void,
   closedSessionsManager?: ClosedSessionsManager,
   userDataPath?: string, // 新增参数：用户数据目录
+  terminalTaskScheduler?: TerminalTaskScheduler,
 ): http.Server {
   // 缓存供 Bridge 事件使用
   cachedPtyManager = ptyManager;
@@ -446,6 +452,51 @@ export function startRemoteServer(
   
   // Mac 桌面远程控制路由
   app.use('/api/mac-desktop', macDesktopRouter);
+
+  app.get('/api/tasks', (_req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    res.json(terminalTaskScheduler.snapshot());
+  });
+  app.post('/api/tasks', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.create({ ...req.body, cwd: req.body?.cwd || os.homedir() })); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.patch('/api/tasks/:id', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.update(String(req.params.id || ''), req.body)); }
+    catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/cancel', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.cancel(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/pause', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.pause(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/resume', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.resume(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/run-now', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.runNow(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.delete('/api/tasks/:id', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.remove(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/confirm-complete', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.confirmComplete(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
   
   app.get('/api/quick-commands', (_req, res) => {
     try { res.json(quickCommands.read()); }
@@ -497,8 +548,9 @@ export function startRemoteServer(
     ...extra,
   });
   const remoteStates = new Map<WebSocket, RemoteWsState>();
-  // First paint: current viewport only. Older rows load when the user scrolls up.
-  const INITIAL_REPLAY_SCROLLBACK = 0;
+  // First paint includes the live local window (~3 desktop screens). Older rows
+  // still load from the archive overlay after the user scrolls that window.
+  const INITIAL_REPLAY_SCROLLBACK = LIVE_TERMINAL_SCROLLBACK;
   const HISTORY_CHUNK_ROWS = 80;
   const enqueueWsSend = (ws: WebSocket, state: RemoteWsState, payload: string) => {
     const operation = state.sendQueue.then(() => new Promise<void>((resolve, reject) => {
@@ -697,8 +749,8 @@ export function startRemoteServer(
           wsClients.get(data.sessionId)!.add(ws);
           notifySessionRemoteView(data.sessionId, { viewed: true, viewing: true });
 
-          // First paint: only the latest screen. Older scrollback is fetched
-          // on demand when the mobile client scrolls near the top.
+          // First paint: latest screen plus the live local window. Older
+          // archive pages load when the client scrolls to the top of that window.
           const session = ptyManager.getSession(data.sessionId);
           if (session && !session.closing) {
             sendSnapshot(
@@ -1946,7 +1998,7 @@ export function startRemoteServer(
       // 解析 bytes=start-end
       const m = /bytes=(\d*)-(\d*)/.exec(range);
       if (!m) { res.status(416).json({ error: 'Range 无效' }); return; }
-      let start = m[1] ? parseInt(m[1], 10) : 0;
+      const start = m[1] ? parseInt(m[1], 10) : 0;
       let end = m[2] ? parseInt(m[2], 10) : total - 1;
       if (isNaN(start) || isNaN(end)) { res.status(416).json({ error: 'Range 无效' }); return; }
       if (start < 0 || start >= total) { res.status(416).json({ error: 'Range 越界' }); return; }
@@ -2399,7 +2451,7 @@ export function startRemoteServer(
       args.push('exec-out', 'screencap', '-p');
       const png = deviceId
         ? await androidScreenshotManager.capture(deviceId, () => runAdb(args, { timeout: 4000, maxBuffer: 8 * 1024 * 1024 }))
-        : await runAdb(args, { timeout: 4000, maxBuffer: 8 * 1024 * 1024 });
+        : await prepareAdbScreenshot(await runAdb(args, { timeout: 4000, maxBuffer: 8 * 1024 * 1024 }));
       const meta = await sharp(png).metadata();
       let pipeline = sharp(png);
       if (scale < 1) {
@@ -2420,7 +2472,7 @@ export function startRemoteServer(
       }
       res.send(jpeg);
     } catch (e: any) {
-      res.status(500).json({ error: '截图失败: ' + (e.message || e) });
+      res.status(500).json({ error: '截图失败: ' + humanizeAndroidImageError(e) });
     }
   });
 
@@ -2454,7 +2506,7 @@ export function startRemoteServer(
       }
       res.send(jpeg);
     } catch (error) {
-      res.status(500).json({ error: '截图失败: ' + (error instanceof Error ? error.message : String(error)) });
+      res.status(500).json({ error: '截图失败: ' + humanizeAndroidImageError(error) });
     }
   });
 
@@ -2536,7 +2588,7 @@ export function startRemoteServer(
       if (!previousIme || previousIme === 'null' || previousIme === 'none') {
         throw new Error('无法读取手机当前默认输入法，已停止文字注入以避免修改系统设置');
       }
-      let helperIme = 'com.android.adbkeyboard/.AdbIME';
+      const helperIme = 'com.android.adbkeyboard/.AdbIME';
       try {
         await runAdb(['-s', deviceId, 'shell', 'ime', 'set', helperIme]);
         await runAdb(['-s', deviceId, 'shell', 'am', 'broadcast', '-a', 'ADB_INPUT_TEXT', '--es', 'msg', text]);
@@ -2582,6 +2634,7 @@ export function startRemoteServer(
     let lastSessionsPayload = '';
     let lastClosedPayload = '';
     let lastQuickCommandsPayload = '';
+    let lastTasksPayload = '';
     const sendSessions = () => {
       try {
         const payload = JSON.stringify(quickCommands.read());
@@ -2595,6 +2648,13 @@ export function startRemoteServer(
       if (sessions !== lastSessionsPayload) {
         lastSessionsPayload = sessions;
         res.write(`event: sessions\ndata: ${sessions}\n\n`);
+      }
+      if (terminalTaskScheduler) {
+        const tasks = JSON.stringify(terminalTaskScheduler.snapshot());
+        if (tasks !== lastTasksPayload) {
+          lastTasksPayload = tasks;
+          res.write(`event: tasks\ndata: ${tasks}\n\n`);
+        }
       }
       if (!closedSessionsManager) return;
       const closed = JSON.stringify(sortClosedSessionsByUpdatedAt(closedSessionsManager.list())

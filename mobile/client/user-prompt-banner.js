@@ -121,6 +121,46 @@
     return y;
   }
 
+  function findPromptItemIndex(items, text) {
+    if (!Array.isArray(items)) return -1;
+    const raw = normalizePrompt(text);
+    const needle = stripPromptChrome(searchNeedle(raw));
+    if (!raw && !needle) return -1;
+    const snippet = codePoints(needle).slice(0, Math.min(24, codePoints(needle).length)).join('');
+    const short = codePoints(snippet).slice(0, Math.min(12, codePoints(snippet).length)).join('');
+    let found = -1;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const line = String(items[i]?.text || '');
+      if ((raw && line.includes(raw)) || (needle && line.includes(needle))) {
+        found = i;
+        break;
+      }
+      const stripped = stripPromptChrome(line);
+      let joined = '';
+      for (let j = Math.max(0, i - 2); j <= Math.min(items.length - 1, i + 2); j++) {
+        joined += stripPromptChrome(items[j]?.text);
+      }
+      joined = joined.replace(/\s+/g, ' ').trim();
+      if (matchesPromptText(stripped, snippet, short) || matchesPromptText(joined, snippet, short)) {
+        found = i;
+        break;
+      }
+    }
+    if (found < 0) return -1;
+    let y = found;
+    while (y > 0) {
+      const prev = String(items[y - 1]?.text || '');
+      if (!prev.trim() || isPromptBottomLine(prev)) break;
+      const prevText = stripPromptChrome(prev);
+      if (isPromptChromeLine(prev) || (codePoints(prevText).length >= 2 && needle.includes(prevText))) {
+        y--;
+        continue;
+      }
+      break;
+    }
+    return y;
+  }
+
   function resolvePromptJumpLine(buffer, text, marker) {
     const fresh = promptBlockStartLine(buffer, text);
     if (fresh >= 0) return fresh;
@@ -297,6 +337,7 @@
     normalizePrompt,
     findPromptLine,
     promptBlockStartLine,
+    findPromptItemIndex,
     resolvePromptJumpLine,
     scrollLineToTop,
     lastUserPromptFrom,

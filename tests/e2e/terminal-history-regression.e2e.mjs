@@ -135,6 +135,50 @@ try {
     });
     assert.ok(result.before.length > 0); assert.equal(result.after, result.before);
   });
+  await run('desktop history text can be selected and copied', async () => {
+    await setup();
+    const result = await page.evaluate(async () => {
+      let focuses = 0;
+      const next = DuoTerminalHistoryLayer.createHistoryLayer({
+        cols: 80,
+        getTerminal: () => ({ focus() { focuses++; }, clearSelection() {}, element: null }),
+        onRequest: query => requests.push(query),
+      });
+      document.getElementById('terminal-container').appendChild(next.root);
+      next.show({ hasMore: true, nextCursor: '1:161' });
+      next.prepend(pageOf(81, 160));
+      await frames();
+      const row = next.root.querySelector('.terminal-history-row');
+      const style = getComputedStyle(row);
+      row.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0 }));
+      const range = document.createRange();
+      range.selectNodeContents(row);
+      getSelection().removeAllRanges();
+      getSelection().addRange(range);
+      let copied = '';
+      const copyEvent = new Event('copy', { bubbles: true, cancelable: true });
+      Object.defineProperty(copyEvent, 'clipboardData', {
+        value: { setData(_type, value) { copied = value; } },
+      });
+      document.dispatchEvent(copyEvent);
+      return {
+        focuses,
+        userSelect: style.userSelect,
+        cursor: style.cursor,
+        selected: getSelection().toString(),
+        api: next.getSelectionText(),
+        copied,
+        defaultPrevented: copyEvent.defaultPrevented,
+      };
+    });
+    assert.equal(result.focuses, 0, JSON.stringify(result));
+    assert.equal(result.userSelect, 'text');
+    assert.equal(result.cursor, 'text');
+    assert.ok(result.selected.length > 0, JSON.stringify(result));
+    assert.equal(result.api, result.selected);
+    assert.equal(result.copied, result.selected);
+    assert.equal(result.defaultPrevented, true);
+  });
   const setupManager = async () => {
     await setup();
     await page.evaluate(async () => {

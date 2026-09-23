@@ -95,3 +95,32 @@ test('auto-agree remains active when the renderer is unavailable', async () => {
   assert.equal(submitted[0][0], 'session');
   assert.equal(submitted[0][2], '1');
 });
+
+test('disabled loop sends once even when maxLoops is unlimited', async () => {
+  const filePath = makePath('no-loop');
+  const submitted = [];
+  const ptyManager = {
+    getSession: () => ({}),
+    submit: async (_id, _submissionId, text) => { submitted.push(text); },
+  };
+  const manager = new AutoContinueManager(ptyManager, filePath);
+  manager.syncAll({
+    session: {
+      enabled: true,
+      loopEnabled: false,
+      messages: ['只发一次'],
+      intervalMs: 60_000,
+      commandIntervalMs: 0,
+      sendDelaySec: 0,
+      maxLoops: -1,
+      nextRunAt: Date.now(),
+    },
+  });
+
+  await wait(1_150);
+  manager.stop();
+  assert.equal(submitted.length, 1);
+  assert.equal(submitted[0], '只发一次');
+  assert.equal(manager.get('session').enabled, false);
+  assert.equal(manager.get('session').loopEnabled, false);
+});

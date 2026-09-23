@@ -19,11 +19,11 @@ const VIDEO_HEADER_SIZE = 24;
 const MAX_VIDEO_PACKET_BYTES = 16 * 1024 * 1024;
 const MAX_VIDEO_BUFFER_BYTES = MAX_VIDEO_PACKET_BYTES + 1024 * 1024;
 const CONTROL_TEXT_MAX_BYTES = 300;
-// Phone/iPad preview does not need a desktop-sized encode. 800px long-edge at
-// 20fps / 1.5Mbps is sharp enough on Retina and much lighter on Wi-Fi / tunnels.
-const DEFAULT_MAX_SIZE = 800;
+// Desktop panes upscale this stream. An 800px long edge becomes unreadably soft
+// there; 1920 keeps phone text legible without encoding a full 1440p panel.
+const DEFAULT_MAX_SIZE = 1920;
 const DEFAULT_MAX_FPS = 30;
-const DEFAULT_VIDEO_BIT_RATE = '1500000';
+const DEFAULT_VIDEO_BIT_RATE = '8000000';
 const MIRROR_IDLE_TIMEOUT_MS = 30_000;
 const CONTROL_LEASE_MS = 6_000;
 // 交互式抢占等待窗口：owner 活跃指针在手时，挑战方需等它响应或超时。

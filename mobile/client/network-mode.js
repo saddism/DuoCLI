@@ -139,7 +139,7 @@
     if (!fetchFn) return false;
     const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
     const timer = setTimeout(() => {
-      try { ctrl && ctrl.abort(); } catch { /* ignore */ }
+      try { if (ctrl) ctrl.abort(); } catch { /* ignore */ }
     }, timeoutMs);
     try {
       // 必须用 cors：才能读到 ok，也才能在 Chromium 上正常弹出 Local Network Access。

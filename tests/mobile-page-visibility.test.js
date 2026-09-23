@@ -6,6 +6,19 @@ const path = require('node:path');
 const stylePath = path.join(__dirname, '..', 'mobile', 'client', 'style.css');
 const styleCss = fs.readFileSync(stylePath, 'utf8');
 
+test('empty file-preview media does not steal flex space from text', () => {
+  assert.match(
+    styleCss,
+    /\.mobile-file-preview-media:empty[\s\S]*?display:\s*none/,
+    'empty media slot must collapse so markdown/text can fill the preview panel',
+  );
+  assert.match(
+    styleCss,
+    /\.mobile-file-preview-content:empty[\s\S]*?display:\s*none/,
+    'empty text slot must collapse so images/video can fill the preview panel',
+  );
+});
+
 test('cc-chat page stays hidden until .active is applied', () => {
   assert.equal(
     /#cc-chat-page\.page\s*\{\s*display:\s*flex;/m.test(styleCss),
@@ -97,4 +110,10 @@ test('service worker precaches every mobile client script', () => {
   for (const script of scripts) {
     assert.ok(sw.includes(`'${script}'`), `sw.js must precache ${script}`);
   }
+});
+
+test('service worker skips push banners while a visible page is open', () => {
+  const sw = fs.readFileSync(path.join(__dirname, '..', 'mobile', 'client', 'sw.js'), 'utf8');
+  assert.match(sw, /visibilityState === 'visible'/);
+  assert.match(sw, /clients\.matchAll/);
 });

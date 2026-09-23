@@ -200,7 +200,45 @@ try {
     assert.deepEqual(result, { reveals: 1, follows: 0 });
   });
 
-  console.log(`SUMMARY ${10 - failures.length}/10 terminal history/recovery scenarios passed`);
+  await run('prompt jump loads older history pages until the text is visible', async page => {
+    const result = await page.evaluate(async () => {
+      await shortHistory();
+      const started = requests.length;
+      const pending = layer.seekText('line 3');
+      const afterSeek = requests.length;
+      layer.prepend(historyPage(3, requests.at(-1).requestId, false));
+      await frames();
+      const index = await pending;
+      return {
+        started,
+        afterSeek,
+        index,
+        scrollTop: scroller.scrollTop,
+        rowTop: layer.state.layout[index]?.top,
+        seeking: layer.isSeeking(),
+      };
+    });
+    assert.equal(result.started, 1);
+    assert.equal(result.afterSeek, 2);
+    assert.equal(result.index, 0);
+    assert.equal(result.scrollTop, result.rowTop);
+    assert.equal(result.seeking, false);
+  });
+
+  await run('prompt jump does not keep paging after the text is already loaded', async page => {
+    const result = await page.evaluate(async () => {
+      await shortHistory();
+      const before = requests.length;
+      const index = await layer.seekText('line 9');
+      return { before, after: requests.length, index, seeking: layer.isSeeking() };
+    });
+    assert.equal(result.before, 1);
+    assert.equal(result.after, 1);
+    assert.equal(result.index, 0);
+    assert.equal(result.seeking, false);
+  });
+
+  console.log(`SUMMARY ${12 - failures.length}/12 terminal history/recovery scenarios passed`);
   if (failures.length) process.exitCode = 1;
 } finally {
   if (browser) await browser.close();

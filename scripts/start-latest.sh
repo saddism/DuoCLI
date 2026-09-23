@@ -22,17 +22,43 @@ fi
 } >>"$LOG_PATH"
 
 # 1) 拉取远程最新（有本地改动时用 autostash，避免挡住启动）
+# GitHub SSH 卡住时不能挡住启动：SSH 连接超时 + 整段 fetch/pull 限时。
+GIT_TIMEOUT_SEC="${DUOCLI_GIT_TIMEOUT:-20}"
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=8 -o ConnectionAttempts=1 -o ServerAliveInterval=5 -o ServerAliveCountMax=2}"
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  "$@" &
+  local pid=$!
+  local elapsed=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$elapsed" -ge "$seconds" ]; then
+      echo "[start-latest] 命令超时 ${seconds}s，结束 PID $pid：$*" >>"$LOG_PATH"
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$pid" 2>/dev/null || true
+      pkill -P "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait "$pid"
+}
+
 if [ -d .git ]; then
-  echo "[start-latest] git fetch/pull..." | tee -a "$LOG_PATH"
-  if git fetch origin >>"$LOG_PATH" 2>&1; then
+  echo "[start-latest] git fetch/pull（最多 ${GIT_TIMEOUT_SEC}s）..." | tee -a "$LOG_PATH"
+  if run_with_timeout "$GIT_TIMEOUT_SEC" git fetch origin >>"$LOG_PATH" 2>&1; then
     BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
-    if ! git pull --rebase --autostash origin "$BRANCH" >>"$LOG_PATH" 2>&1; then
+    if ! run_with_timeout "$GIT_TIMEOUT_SEC" git pull --rebase --autostash origin "$BRANCH" >>"$LOG_PATH" 2>&1; then
       echo "[start-latest] git pull 未完全成功，继续用当前工作区源码启动（详见 $LOG_PATH）" | tee -a "$LOG_PATH"
     else
       echo "[start-latest] git: $(git rev-parse --short HEAD) ($BRANCH)" | tee -a "$LOG_PATH"
     fi
   else
-    echo "[start-latest] git fetch 失败（网络/权限），继续用本地源码启动" | tee -a "$LOG_PATH"
+    echo "[start-latest] git fetch 失败或超时，继续用本地源码启动" | tee -a "$LOG_PATH"
   fi
 fi
 

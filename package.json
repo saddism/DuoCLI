@@ -14,13 +14,15 @@
     "restart:latest": "bash scripts/restart-latest.sh",
     "rebuild": "electron-rebuild",
     "test:unit": "npm run build:main && node scripts/run-unit-tests.mjs",
-    "test:e2e": "node tests/e2e/mobile.e2e.mjs && node tests/e2e/desktop-copy.e2e.mjs && node tests/e2e/desktop-scroll.e2e.mjs && node tests/e2e/mobile-remote.e2e.mjs && node tests/e2e/quick-commands.e2e.mjs && node tests/e2e/terminal-history-recovery.e2e.mjs && node tests/e2e/terminal-history-regression.e2e.mjs",
-    "test:terminal": "npm run build:ts && node scripts/build-novnc.mjs && node --test tests/mobile-reveal-state.test.mjs && node tests/e2e/terminal-history-recovery.e2e.mjs && node tests/e2e/terminal-history-regression.e2e.mjs && node tests/e2e/mobile-remote.e2e.mjs && node tests/e2e/desktop-scroll.e2e.mjs && node tests/e2e/desktop-copy.e2e.mjs",
+    "test:e2e": "node tests/e2e/mobile.e2e.mjs && node tests/e2e/desktop-copy.e2e.mjs && node tests/e2e/desktop-scroll.e2e.mjs && node tests/e2e/mobile-remote.e2e.mjs && node tests/e2e/quick-commands.e2e.mjs && node tests/e2e/terminal-history-recovery.e2e.mjs && node tests/e2e/terminal-history-regression.e2e.mjs && node tests/e2e/terminal-continuity.e2e.mjs",
+    "test:terminal": "npm run build:ts && node scripts/build-novnc.mjs && node --test tests/mobile-reveal-state.test.mjs && node tests/e2e/terminal-history-recovery.e2e.mjs && node tests/e2e/terminal-history-regression.e2e.mjs && node tests/e2e/mobile-remote.e2e.mjs && node tests/e2e/desktop-scroll.e2e.mjs && node tests/e2e/desktop-copy.e2e.mjs && node tests/e2e/terminal-continuity.e2e.mjs",
     "test": "npm run test:unit && npm run test:e2e",
     "build": "npm run build:ts && npm run copy:html && electron-builder",
     "build:mac": "npm run build:ts && npm run copy:html && electron-builder --mac",
     "build:win": "npm run build:ts && npm run copy:html && electron-builder --win",
-    "build:linux": "npm run build:ts && npm run copy:html && electron-builder --linux"
+    "build:linux": "npm run build:ts && npm run copy:html && electron-builder --linux",
+    "lint": "eslint src mobile scripts tests",
+    "lint:fix": "eslint src mobile scripts tests --fix && prettier --write src mobile scripts"
   },
   "homepage": "https://github.com/saddism/DuoCLI",
   "repository": {
@@ -46,6 +48,7 @@
   "author": "大壮好大",
   "license": "MIT",
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/express": "^5.0.6",
     "@types/node": "^20.11.0",
     "@types/web-push": "^3.6.4",
@@ -54,9 +57,14 @@
     "electron-builder": "^25.1.8",
     "electron-rebuild": "^3.2.9",
     "esbuild": "^0.27.3",
+    "eslint": "^10.11.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.12.0",
     "png-to-ico": "^3.0.1",
+    "prettier": "^3.9.8",
     "puppeteer-core": "^22.15.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "typescript-eslint": "^8.70.0"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",

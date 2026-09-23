@@ -83,7 +83,7 @@ const MacDesktopKeyboard = {
       const charCode = char.charCodeAt(0);
       
       // Get appropriate key code for printable ASCII
-      let keyCode = '';
+      let keyCode;
       
       if (charCode >= 65 && charCode <= 90) { // A-Z
         keyCode = `Key${String.fromCharCode(charCode + 32)}`; // Convert to lowercase

@@ -9,6 +9,9 @@ import { WebSocketServer } from 'ws';
 import puppeteer from 'puppeteer-core';
 import { resolveChromeExecutable } from './chrome-path.mjs';
 import { runInputChatAudit } from './input-chat-audit-probes.mjs';
+import { createRequire } from 'node:module';
+
+const { LIVE_TERMINAL_SCROLLBACK } = createRequire(import.meta.url)('../../mobile/client/terminal-scroll-helpers.js');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_DIR = path.resolve(__dirname, '../../mobile/client');
@@ -1038,7 +1041,7 @@ async function main() {
       baseY: term.buffer.active.baseY,
     };
   });
-  check('实时区只缓存最近几屏', pan.liveScrollback === 80, JSON.stringify(pan));
+  check('实时区只缓存最近几屏', pan.liveScrollback === LIVE_TERMINAL_SCROLLBACK, JSON.stringify(pan));
   await page.touchscreen.touchStart(pan.x, pan.y);
   for (let i = 1; i <= 6; i++) {
     await page.touchscreen.touchMove(pan.x, pan.y + i * 30);

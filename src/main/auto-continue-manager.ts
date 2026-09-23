@@ -10,6 +10,7 @@ export interface AutoContinueConfigRecord {
   autoAgree: boolean;
   autoAgreeDelaySec: number;
   sendDelaySec: number;
+  loopEnabled: boolean;
   maxLoops: number;
   initialDelayMs: number;
   loopCount: number;
@@ -25,6 +26,7 @@ const DEFAULT_CONFIG: AutoContinueConfigRecord = {
   autoAgree: true,
   autoAgreeDelaySec: 5,
   sendDelaySec: 2,
+  loopEnabled: false,
   maxLoops: -1,
   initialDelayMs: 0,
   loopCount: 0,
@@ -34,6 +36,12 @@ const DEFAULT_CONFIG: AutoContinueConfigRecord = {
 function finiteNumber(value: unknown, fallback: number, min = 0): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
+}
+
+function inferLoopEnabled(source: Record<string, unknown>, maxLoops: number): boolean {
+  if (typeof source.loopEnabled === 'boolean') return source.loopEnabled;
+  if (!Object.prototype.hasOwnProperty.call(source, 'maxLoops')) return false;
+  return maxLoops === -1 || maxLoops > 1;
 }
 
 function normalizeConfig(value: unknown, now = Date.now()): AutoContinueConfigRecord {
@@ -54,6 +62,7 @@ function normalizeConfig(value: unknown, now = Date.now()): AutoContinueConfigRe
     autoAgree: source.autoAgree !== false,
     autoAgreeDelaySec: finiteNumber(source.autoAgreeDelaySec, DEFAULT_CONFIG.autoAgreeDelaySec),
     sendDelaySec: finiteNumber(source.sendDelaySec, DEFAULT_CONFIG.sendDelaySec),
+    loopEnabled: inferLoopEnabled(source, maxLoops),
     maxLoops,
     initialDelayMs: finiteNumber(source.initialDelayMs, DEFAULT_CONFIG.initialDelayMs),
     loopCount: Math.max(0, Math.floor(finiteNumber(source.loopCount, 0))),
@@ -226,7 +235,7 @@ export class AutoContinueManager {
     config.sending = true;
     config.loopCount += 1;
     config.nextRunAt = Date.now() + config.intervalMs;
-    const stopAfterCycle = config.maxLoops > 0 && config.loopCount >= config.maxLoops;
+    const stopAfterCycle = !config.loopEnabled || (config.maxLoops > 0 && config.loopCount >= config.maxLoops);
     this.persist();
 
     try {
@@ -243,11 +252,12 @@ export class AutoContinueManager {
     } catch (error) {
       console.warn('[AutoContinue] 会话 ' + sessionId + ' 执行失败:', error);
     } finally {
-      if (this.runVersions.get(sessionId) !== runVersion) return;
-      config.sending = false;
-      if (stopAfterCycle) config.enabled = false;
-      config.nextRunAt = Date.now() + config.intervalMs;
-      this.persist();
+      if (this.runVersions.get(sessionId) === runVersion) {
+        config.sending = false;
+        if (stopAfterCycle) config.enabled = false;
+        config.nextRunAt = Date.now() + config.intervalMs;
+        this.persist();
+      }
     }
   }
 

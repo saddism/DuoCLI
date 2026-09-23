@@ -1,0 +1,6 @@
+dist/
+release/
+node_modules/
+*.map
+mobile/client/novnc/
+mobile/client/xterm.js

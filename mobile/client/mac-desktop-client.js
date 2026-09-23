@@ -65,31 +65,6 @@ class MacDesktopClient {
   }
 
   /**
-   * 初始化并渲染 UI
-   */
-  async init() {
-    try {
-      this.renderContainer();
-      
-      // 手机端设备列表里的「电脑」入口会用到，不再按 UA 跳过
-      
-      // 暴露键盘辅助到全局，供外部调用
-      window.macDesktopClient = this;
-      
-      console.log('[MacDesktop] Initializing Mac desktop client...');
-      await this.fetchCapabilities();
-      
-      // 设置定期刷新（每 30 秒检查一次服务状态）
-      this.refreshInterval = setInterval(() => {
-        this.fetchCapabilities();
-      }, 30000); // 30 seconds
-    } catch (error) {
-      console.error('[MacDesktop] Initialization failed:', error);
-      this.updateStatus('初始化失败', true);
-    }
-  }
-
-  /**
    * 检查当前是否为 Mac 或移动设备
    */
   checkIsMacOrMobile() {
@@ -206,8 +181,8 @@ class MacDesktopClient {
    * 处理能力错误
    */
   handleCapabilityError(data) {
-    let message = '无法加载服务状态';
-    let state = 'disconnected';
+    let message;
+    let state;
 
     switch (data.code) {
       case 'SERVICE_DISABLED':

@@ -11,6 +11,19 @@ export const STYLE_DIM = 4;
 export const STYLE_INVERSE = 8;
 export const STYLE_ITALIC = 16;
 
+/** xterm `getFgColorMode()` returns CM_* bitmasks, not 0–3. */
+export const XTERM_CM_P16 = 0x1000000;
+export const XTERM_CM_P256 = 0x2000000;
+export const XTERM_CM_RGB = 0x3000000;
+export const XTERM_CM_MASK = 0x3000000;
+
+export function normalizeColorMode(mode: unknown): 0 | 1 | 2 | 3 {
+  const value = Number(mode);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  if (value <= 3) return value as 0 | 1 | 2 | 3;
+  return (((value >>> 0) & XTERM_CM_MASK) >>> 24) as 0 | 1 | 2 | 3;
+}
+
 export interface HistoryStyleRun {
   start: number;
   end: number;
@@ -138,8 +151,8 @@ export function readPhysicalStyles(line: HistoryBufferLine | undefined): { text:
     const styleKey = {
       fg: cell?.getFgColor?.(),
       bg: cell?.getBgColor?.(),
-      fgMode: cell?.getFgColorMode?.(),
-      bgMode: cell?.getBgColorMode?.(),
+      fgMode: normalizeColorMode(cell?.getFgColorMode?.()),
+      bgMode: normalizeColorMode(cell?.getBgColorMode?.()),
       flags: (cellFlag(cell?.isBold?.()) ? STYLE_BOLD : 0)
         | (cellFlag(cell?.isUnderline?.()) ? STYLE_UNDERLINE : 0)
         | (cellFlag(cell?.isDim?.()) ? STYLE_DIM : 0)

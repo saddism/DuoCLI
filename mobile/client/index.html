@@ -62,6 +62,7 @@
         </span>
       </div>
       <div class="header-right">
+        <button id="task-queue-btn" class="icon-btn" title="任务队列">队列</button>
         <button id="device-console-btn" class="icon-btn" title="手机设备">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg>
         </button>
@@ -258,10 +259,32 @@
         <option value="one-dark">One Dark</option>
         <option value="nord">Nord</option>
       </select>
+      <label class="task-plan-toggle"><input id="new-task-enabled" type="checkbox" /> 加入计划任务队列</label>
+      <div id="new-task-fields" class="task-plan-fields" hidden>
+        <label>任务名称</label>
+        <input id="new-task-name" type="text" maxlength="120" placeholder="例如：完成接口后运行测试" />
+        <label>首条任务指令</label>
+        <textarea id="new-task-instruction" rows="4" maxlength="100000" placeholder="终端启动后自动发送"></textarea>
+        <label>开始时间（可选）</label>
+        <input id="new-task-time" type="datetime-local" />
+        <label>前置任务（可选）</label>
+        <select id="new-task-dependency"><option value="">无</option></select>
+        <label>静止完成（秒）</label>
+        <input id="new-task-quiet" type="number" min="1" max="3600" value="10" />
+        <p>连续 10 秒没有新内容即完成；黄色和灰色都会启动后续任务。</p>
+      </div>
       <div class="modal-actions">
         <button id="modal-cancel" class="btn-secondary">取消</button>
         <button id="modal-create" class="btn-primary">创建</button>
       </div>
+    </div>
+  </div>
+
+  <div id="task-queue-modal" class="modal">
+    <div class="modal-content task-queue-modal-content">
+      <div class="modal-drag-handle"></div>
+      <div class="modal-header"><h3>终端任务队列</h3><button id="task-queue-close" class="modal-close">×</button></div>
+      <div id="task-queue-list" class="task-queue-list"></div>
     </div>
   </div>
 
@@ -285,18 +308,6 @@
               <span class="ac-field-hint">延迟分钟，0 表示立即</span>
               <input type="number" id="ac-initial-delay" min="0" value="0" placeholder="0" />
             </label>
-          </div>
-        </section>
-        <section class="ac-config-group">
-          <div class="ac-config-group-title">循环设置</div>
-          <div class="ac-config-grid">
-            <label class="ac-config-field">计划间隔（分钟）
-              <input type="number" id="ac-interval" min="1" placeholder="分钟" />
-            </label>
-            <label class="ac-config-field">循环次数
-              <span class="ac-field-hint">-1 表示不限制</span>
-              <input type="number" id="ac-max-loops" min="-1" value="-1" placeholder="-1" />
-            </label>
             <label class="ac-config-field">命令间隔（秒）
               <input type="number" id="ac-cmd-interval" min="0" value="2" placeholder="秒" />
             </label>
@@ -304,6 +315,23 @@
               <span class="ac-field-hint">文字写入后等待多久再发送回车</span>
               <input type="number" id="ac-send-delay" min="0" value="2" placeholder="秒" />
             </label>
+          </div>
+        </section>
+        <section class="ac-config-group">
+          <label class="ac-config-toggle">
+            <input type="checkbox" id="ac-loop-enabled" />
+            启用循环
+          </label>
+          <div id="ac-loop-fields" class="ac-loop-fields" hidden>
+            <div class="ac-config-grid">
+              <label class="ac-config-field">计划间隔（分钟）
+                <input type="number" id="ac-interval" min="1" placeholder="分钟" />
+              </label>
+              <label class="ac-config-field">循环次数
+                <span class="ac-field-hint">-1 表示不限制</span>
+                <input type="number" id="ac-max-loops" min="-1" value="-1" placeholder="-1" />
+              </label>
+            </div>
           </div>
         </section>
       <section class="ac-config-group">

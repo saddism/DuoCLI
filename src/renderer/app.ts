@@ -63,16 +63,50 @@ let remoteTokenValue = '';
 let remoteTokenEditing = false;
 let remoteTokenSaving = false;
 
+interface TerminalTaskView {
+  id: string;
+  revision: number;
+  name: string;
+  cwd: string;
+  presetCommand: string;
+  instruction: string;
+  status: string;
+  notBefore?: number;
+  dependency?: { kind: 'task' | 'session'; id: string; generation?: number };
+  quietMs: number;
+  sessionId?: string;
+  error?: string;
+  completedAt?: number;
+}
+
+interface TerminalTaskSnapshotView {
+  revision: number;
+  tasks: TerminalTaskView[];
+}
+
 declare global {
   interface Window {
     duocli: {
       setWindowTitle: (title: string) => void;
       createPty: (cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }>;
+      listTerminalTasks: () => Promise<TerminalTaskSnapshotView>;
+      createTerminalTask: (input: Record<string, unknown>) => Promise<TerminalTaskView>;
+      updateTerminalTask: (taskId: string, input: Record<string, unknown>) => Promise<TerminalTaskView>;
+      cancelTerminalTask: (taskId: string) => Promise<TerminalTaskView>;
+      pauseTerminalTask: (taskId: string) => Promise<TerminalTaskView>;
+      resumeTerminalTask: (taskId: string) => Promise<TerminalTaskView>;
+      runTerminalTaskNow: (taskId: string) => Promise<TerminalTaskView>;
+      removeTerminalTask: (taskId: string) => Promise<TerminalTaskSnapshotView>;
+      confirmTerminalTaskComplete: (taskId: string) => Promise<TerminalTaskView>;
+      onTerminalTasksChanged: (cb: (snapshot: TerminalTaskSnapshotView) => void) => void;
+      onSessionActivityChanged: (cb: (state: { sessionId: string; status: 'running' | 'stopped'; generation: number }) => void) => void;
+      onTaskPtyCreated: (cb: (sessionInfo: { id: string; title: string; themeId: string; cwd: string; displayName: string }, taskId: string) => void) => void;
       writePty: (id: string, data: string) => void;
       resizePty: (id: string, cols: number, rows: number) => void;
       destroyPty: (id: string) => Promise<boolean>;
       renamePty: (id: string, title: string) => void;
       regenerateTitle: (id: string) => Promise<void>;
+      suggestTitleFromText: (text: string) => Promise<string>;
       getSessions: () => Promise<Array<{ id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }>>;
       selectFolder: (currentPath?: string) => Promise<string | null>;
       fileTreeListDir: (dirPath: string) => Promise<Array<{ name: string; path: string; isDir: boolean }>>;
@@ -231,6 +265,7 @@ interface AutoContinueConfig {
   autoAgree: boolean;
   autoAgreeDelaySec: number;
   sendDelaySec: number;
+  loopEnabled: boolean;
   maxLoops: number;
   initialDelayMs: number;
   loopCount: number;
@@ -247,9 +282,16 @@ const AUTO_CONTINUE_DEFAULT_INTERVAL = 10 * 60 * 1000; // 10 分钟
 const AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL = 2000; // 命令间隔 2 秒
 const AUTO_AGREE_DEFAULT_DELAY_SEC = 5; // 自动同意默认延后 5 秒
 const AUTO_CONTINUE_SEND_DELAY_SEC = 2; // 发送回车前默认延迟 2 秒
-const AUTO_CONTINUE_DEFAULT_MAX_LOOPS = -1; // -1 表示不限制
+const AUTO_CONTINUE_DEFAULT_MAX_LOOPS = -1; // 启用循环时默认不限制
+const AUTO_CONTINUE_DEFAULT_LOOP_ENABLED = false;
 const AUTO_CONTINUE_DEFAULT_INITIAL_DELAY = 0; // 首次循环立即执行
 const AUTO_CONTINUE_STORAGE_KEY = 'duocli_auto_continue';
+
+function inferLoopEnabled(config: { loopEnabled?: boolean; maxLoops?: number } | null | undefined): boolean {
+  if (typeof config?.loopEnabled === 'boolean') return config.loopEnabled;
+  if (config?.maxLoops == null) return false;
+  return config.maxLoops === -1 || config.maxLoops > 1;
+}
 
 function hasSessionInUI(sessionId: string): boolean {
   return sessionTitles.has(sessionId);
@@ -272,6 +314,7 @@ function serializeAutoContinueConfig(config: AutoContinueConfig): Record<string,
     autoAgree: config.autoAgree,
     autoAgreeDelaySec: config.autoAgreeDelaySec,
     sendDelaySec: config.sendDelaySec,
+    loopEnabled: config.loopEnabled,
     maxLoops: config.maxLoops,
     initialDelayMs: config.initialDelayMs,
     loopCount: config.loopCount,
@@ -307,6 +350,7 @@ function hydrateAutoContinueConfig(sessionId: string, config: any): void {
     autoAgree: config?.autoAgree ?? true,
     autoAgreeDelaySec: config?.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC,
     sendDelaySec: config?.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC,
+    loopEnabled: inferLoopEnabled(config),
     maxLoops: config?.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
     initialDelayMs,
     loopCount: config?.loopCount ?? 0,
@@ -403,8 +447,10 @@ function initAutoContinueTimer(): void {
         return;
       }
       if (config.sending) return;
+      const looping = config.loopEnabled === true;
       const maxLoops = config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
-      if (maxLoops > 0 && config.loopCount >= maxLoops) {
+      const reachedLoopLimit = looping && maxLoops > 0 && config.loopCount >= maxLoops;
+      if ((!looping && config.loopCount >= 1) || reachedLoopLimit) {
         config.enabled = false;
         cancelAutoContinueRun(config);
         saveAutoContinueToStorage();
@@ -421,7 +467,7 @@ function initAutoContinueTimer(): void {
         config.sending = true;
         // 若本轮中途退出，重启后至少等待一个循环间隔再继续。
         config.nextRunAt = now + config.intervalMs;
-        const stopAfterCycle = maxLoops > 0 && config.loopCount >= maxLoops;
+        const stopAfterCycle = !looping || (maxLoops > 0 && config.loopCount >= maxLoops);
         saveAutoContinueToStorage();
         console.log(`[循环] 准备发送 ${messages.length} 条命令到会话 ${sessionId}`);
 
@@ -491,6 +537,7 @@ function toggleAutoContinue(sessionId: string, enabled: boolean): void {
       autoAgree: true,
       autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
       sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
+      loopEnabled: AUTO_CONTINUE_DEFAULT_LOOP_ENABLED,
       maxLoops: AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
       initialDelayMs: AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
       loopCount: 0,
@@ -524,6 +571,7 @@ function showAutoContinueConfigDialog(sessionId: string): void {
     autoAgree: true,
     autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
     sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
+    loopEnabled: AUTO_CONTINUE_DEFAULT_LOOP_ENABLED,
     maxLoops: AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
     initialDelayMs: AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
     loopCount: 0,
@@ -540,7 +588,10 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   const currentAutoAgree = config.autoAgree ?? true;
   const currentAutoAgreeDelay = config.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC;
   const currentSendDelay = config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC;
-  const currentMaxLoops = config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
+  const currentLoopEnabled = inferLoopEnabled(config);
+  const currentMaxLoops = currentLoopEnabled
+    ? (config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS)
+    : AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
   const currentInitialDelay = config.initialDelayMs ?? AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
 
   const overlay = document.getElementById('auto-continue-overlay')!;
@@ -551,12 +602,21 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   const autoAgreeDelayInput = document.getElementById('auto-continue-agree-delay') as HTMLInputElement;
   const autoAgreeDelayRow = document.getElementById('auto-agree-delay-row')!;
   const sendDelayInput = document.getElementById('auto-continue-send-delay') as HTMLInputElement;
+  const loopEnabledCheckbox = document.getElementById('auto-continue-loop-enabled') as HTMLInputElement;
+  const loopFields = document.getElementById('auto-continue-loop-fields')!;
   const maxLoopsInput = document.getElementById('auto-continue-max-loops') as HTMLInputElement;
   const initialDelayInput = document.getElementById('auto-continue-initial-delay') as HTMLInputElement;
   const saveBtn = document.getElementById('auto-continue-save')!;
   const stopBtn = document.getElementById('auto-continue-stop')!;
   const cancelBtn = document.getElementById('auto-continue-cancel')!;
   const closeBtn = document.getElementById('auto-continue-dialog-close')!;
+
+  function syncLoopFields(): void {
+    loopFields.hidden = !loopEnabledCheckbox.checked;
+    if (loopEnabledCheckbox.checked && (!maxLoopsInput.value || maxLoopsInput.value === '1')) {
+      maxLoopsInput.value = String(AUTO_CONTINUE_DEFAULT_MAX_LOOPS);
+    }
+  }
 
   messageInput.value = currentMessages.join('\n');
   messageInput.placeholder = '每行一条命令，按顺序发送';
@@ -566,8 +626,10 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   autoAgreeDelayInput.value = String(currentAutoAgreeDelay);
   autoAgreeDelayRow.style.display = currentAutoAgree ? '' : 'none';
   sendDelayInput.value = String(currentSendDelay);
+  loopEnabledCheckbox.checked = currentLoopEnabled;
   maxLoopsInput.value = String(currentMaxLoops);
   initialDelayInput.value = String(Math.round(currentInitialDelay / 60000));
+  syncLoopFields();
 
   // 根据当前状态设置按钮文字和显示
   if (config.enabled) {
@@ -581,6 +643,7 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   autoAgreeCheckbox.onchange = () => {
     autoAgreeDelayRow.style.display = autoAgreeCheckbox.checked ? '' : 'none';
   };
+  loopEnabledCheckbox.onchange = () => { syncLoopFields(); };
 
   overlay.classList.add('active');
   messageInput.focus();
@@ -592,22 +655,29 @@ function showAutoContinueConfigDialog(sessionId: string): void {
     cancelBtn.removeEventListener('click', close);
     closeBtn.removeEventListener('click', close);
     autoAgreeCheckbox.onchange = null;
+    loopEnabledCheckbox.onchange = null;
   }
 
   function onSave(): void {
     const messages = messageInput.value.split('\n').map(m => m.trim()).filter(Boolean);
     if (!messages.length) { messageInput.focus(); return; }
-    const intervalMinutes = parseInt(intervalInput.value, 10);
-    if (isNaN(intervalMinutes) || intervalMinutes < 1) { intervalInput.focus(); return; }
+
+    const loopEnabled = loopEnabledCheckbox.checked;
+    let intervalMinutes = parseInt(intervalInput.value, 10);
+    let maxLoops = parseInt(maxLoopsInput.value, 10);
+    if (loopEnabled) {
+      if (isNaN(intervalMinutes) || intervalMinutes < 1) { intervalInput.focus(); return; }
+      if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { maxLoopsInput.focus(); return; }
+    } else {
+      if (isNaN(intervalMinutes) || intervalMinutes < 1) intervalMinutes = Math.round(AUTO_CONTINUE_DEFAULT_INTERVAL / 60000);
+      maxLoops = AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
+    }
 
     const agreeDelay = parseInt(autoAgreeDelayInput.value, 10);
     if (autoAgreeCheckbox.checked && (isNaN(agreeDelay) || agreeDelay < 0)) { autoAgreeDelayInput.focus(); return; }
 
     const sendDelay = parseInt(sendDelayInput.value, 10);
     if (isNaN(sendDelay) || sendDelay < 0) { sendDelayInput.focus(); return; }
-
-    const maxLoops = parseInt(maxLoopsInput.value, 10);
-    if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { maxLoopsInput.focus(); return; }
 
     const initialDelayMinutes = parseInt(initialDelayInput.value, 10);
     if (isNaN(initialDelayMinutes) || initialDelayMinutes < 0) { initialDelayInput.focus(); return; }
@@ -623,6 +693,7 @@ function showAutoContinueConfigDialog(sessionId: string): void {
     config.autoAgree = autoAgreeCheckbox.checked;
     config.autoAgreeDelaySec = isNaN(agreeDelay) ? AUTO_AGREE_DEFAULT_DELAY_SEC : agreeDelay;
     config.sendDelaySec = sendDelay;
+    config.loopEnabled = loopEnabled;
     config.maxLoops = maxLoops;
     config.initialDelayMs = initialDelayMinutes * 60000;
     config.enabled = true;
@@ -1421,14 +1492,25 @@ const presetDropdown = document.getElementById('preset-dropdown')!;
 const presetAddBtn = document.getElementById('preset-add-btn')!;
 const presetManageBtn = document.getElementById('preset-manage-btn')!;
 const themeSelect = document.getElementById('theme-select')!;
-const themeDisplay = document.getElementById('theme-display')!;
-const themeDropdown = document.getElementById('theme-dropdown')!;
 const toolbarNewBtn = document.getElementById('toolbar-new-btn')!;
 const remoteServerInfoEl = document.getElementById('remote-server-info')!;
 const newSessionOverlay = document.getElementById('new-session-overlay')!;
 const newSessionCloseBtn = document.getElementById('new-session-close')!;
 const newSessionCancelBtn = document.getElementById('new-session-cancel')!;
 const newSessionCreateBtn = document.getElementById('new-session-create')!;
+const taskPlanEnabled = document.getElementById('task-plan-enabled') as HTMLInputElement;
+const taskPlanFields = document.getElementById('task-plan-fields')!;
+const taskPlanName = document.getElementById('task-plan-name') as HTMLInputElement;
+const taskPlanNamePreview = document.getElementById('task-plan-name-preview')!;
+const taskPlanInstruction = document.getElementById('task-plan-instruction') as HTMLTextAreaElement;
+const taskPlanDelay = document.getElementById('task-plan-delay') as HTMLInputElement;
+const taskPlanDelayClear = document.getElementById('task-plan-delay-clear')!;
+const taskPlanDependency = document.getElementById('task-plan-dependency') as HTMLSelectElement;
+const taskPlanQuiet = document.getElementById('task-plan-quiet') as HTMLInputElement;
+const taskQueueBtn = document.getElementById('task-queue-btn')!;
+const taskQueueOverlay = document.getElementById('task-queue-overlay')!;
+const taskQueueClose = document.getElementById('task-queue-close')!;
+const taskQueueList = document.getElementById('task-queue-list')!;
 const fileTreeList = document.getElementById('file-tree-list')!;
 const fileTreeRefreshBtn = document.getElementById('file-tree-refresh-btn')!;
 const fileTreeOpenBtn = document.getElementById('file-tree-open-btn')!;
@@ -1447,6 +1529,8 @@ const sessionList = document.getElementById('session-list')!;
 const sidebar = document.getElementById('sidebar')!;
 const sidebarToggle = document.getElementById('sidebar-toggle')!;
 const sidebarResizer = document.getElementById('sidebar-resizer')!;
+
+let terminalTaskSnapshot: TerminalTaskSnapshotView = { revision: 0, tasks: [] };
 
 // 文件状态栏 DOM
 const fileStatusbar = document.getElementById('file-statusbar')!;
@@ -1514,6 +1598,7 @@ function createSessionStatusDot(id: string, status?: 'running' | 'idle' | 'inact
   const kind = status || sessionStatusClass(id);
   const dot = document.createElement('span');
   dot.className = `session-status-dot ${kind}`;
+  dot.dataset.sessionStatus = id;
   dot.title = kind === 'running'
     ? '进行中'
     : kind === 'idle'
@@ -1522,6 +1607,23 @@ function createSessionStatusDot(id: string, status?: 'running' | 'idle' | 'inact
         ? '已关闭'
         : '已查看';
   return dot;
+}
+
+/** 只更新状态点，避免整表重建导致 hover 闪动、点击丢失 */
+function patchSessionStatusDot(id: string): void {
+  const dot = sessionList.querySelector(`.session-status-dot[data-session-status="${id}"]`) as HTMLElement | null;
+  if (!dot) {
+    renderSessionList();
+    return;
+  }
+  const kind = sessionStatusClass(id);
+  dot.className = `session-status-dot ${kind}`;
+  dot.dataset.sessionStatus = id;
+  dot.title = kind === 'running'
+    ? '进行中'
+    : kind === 'idle'
+      ? '已停止（未查看）'
+      : '已查看';
 }
 
 function createSessionColorDot(id: string, onPick: (el: HTMLElement) => void): HTMLSpanElement {
@@ -1542,7 +1644,7 @@ function syncSessionStatusToMain(): void {
   const statuses: Record<string, string> = {};
   for (const id of sessionTitles.keys()) {
     if (sessionBusy.has(id)) {
-      statuses[id] = 'running';   // 绿灯：进行中
+      statuses[id] = 'running';   // 绿三角：进行中
     } else if (sessionUnread.has(id) && !sessionIsBeingWatched(id)) {
       statuses[id] = 'idle';      // 黄灯：已停止未查看
     } else {
@@ -2218,46 +2320,26 @@ void (async () => {
   if (lastPreset) setPresetValue(lastPreset);
 })();
 
-// 自定义配色下拉组件
-const themeColorMap: Record<string, string> = {
-  'auto': '',
-  'vscode-dark': '#0078d4',
-  'monokai': '#a6e22e',
-  'dracula': '#bd93f9',
-  'solarized-dark': '#268bd2',
-  'one-dark': '#61afef',
-  'nord': '#88c0d0',
-};
+// 自定义配色：小方块选择
 let currentThemeId = 'auto';
 
 function setThemeValue(value: string): void {
   currentThemeId = value;
-  const opt = themeDropdown.querySelector(`[data-value="${value}"]`);
-  if (opt) {
-    themeDisplay.innerHTML = opt.innerHTML;
-  }
-  themeDropdown.querySelectorAll('.custom-select-option').forEach((el) => {
+  themeSelect.querySelectorAll('.theme-swatch').forEach((el) => {
     el.classList.toggle('selected', el.getAttribute('data-value') === value);
   });
 }
 
-themeDisplay.addEventListener('click', (e) => {
-  e.stopPropagation();
-  presetSelectWrap.classList.remove('open');
-  themeSelect.classList.toggle('open');
-});
-
-themeDropdown.addEventListener('click', (e) => {
-  const target = (e.target as HTMLElement).closest('.custom-select-option') as HTMLElement | null;
+themeSelect.addEventListener('click', (e) => {
+  const target = (e.target as HTMLElement).closest('.theme-swatch') as HTMLElement | null;
   if (!target) return;
+  e.stopPropagation();
   const value = target.getAttribute('data-value');
   if (value) setThemeValue(value);
-  themeSelect.classList.remove('open');
 });
 
 presetDisplay.addEventListener('click', (e) => {
   e.stopPropagation();
-  themeSelect.classList.remove('open');
   presetSelectWrap.classList.toggle('open');
 });
 
@@ -2270,7 +2352,6 @@ presetDropdown.addEventListener('click', (e) => {
 });
 
 document.addEventListener('click', () => {
-  themeSelect.classList.remove('open');
   presetSelectWrap.classList.remove('open');
 });
 
@@ -3606,7 +3687,7 @@ async function exportSessionContext(cs: ClosedSessionInfo): Promise<void> {
     );
     
     if (result && result.ok) {
-      shell.openExternal(`file://${result.filePath}`);
+      await window.duocli.openFile(result.filePath);
       alert('✅ 上下文已导出！\n\n文件位置：' + result.filePath + '\n\n您可以将此文件拖拽到其他 AI Agent（如 Cursor、Codex、Claude）中继续使用。');
     } else {
       alert('❌ 导出失败：' + (result?.error || '未知错误'));
@@ -3625,6 +3706,49 @@ async function createSession(): Promise<boolean> {
   const themeId = resolveThemeId(currentThemeId, currentCwd);
   lastPreset = preset;
   localStorage.setItem('duocli_preset', preset);
+  if (taskPlanEnabled.checked) {
+    const instruction = taskPlanInstruction.value.trim();
+    if (!instruction) { alert('请输入首条任务指令'); return false; }
+    let name = taskPlanName.value.trim();
+    if (!name) {
+      setTaskPlanNamePreview('正在生成名称…', false);
+      try {
+        name = await window.duocli.suggestTitleFromText(instruction);
+      } catch (error) {
+        console.warn('任务名称生成失败，使用指令截断:', error);
+      }
+      if (!name) {
+        name = instruction.replace(/\s+/g, ' ').trim().slice(0, 40) || '计划任务';
+      }
+      setTaskPlanNamePreview(name, true);
+      taskPlanName.value = name;
+    }
+    const dependency = taskPlanDependency.value;
+    const delayRaw = taskPlanDelay.value.trim();
+    let notBefore: number | undefined;
+    if (delayRaw !== '') {
+      const delayMin = Number(delayRaw);
+      if (!Number.isFinite(delayMin) || delayMin < 0) { alert('开始时间无效'); return false; }
+      if (delayMin > 0) notBefore = Date.now() + Math.round(delayMin * 60_000);
+    }
+    await window.duocli.createTerminalTask({
+      requestId: crypto.randomUUID(),
+      name,
+      cwd: currentCwd,
+      presetCommand: preset,
+      themeId,
+      instruction,
+      notBefore,
+      dependsOnTaskId: dependency.startsWith('task:') ? dependency.slice(5) : undefined,
+      dependsOnSessionId: dependency.startsWith('session:') ? dependency.slice(8) : undefined,
+      quietMs: Math.round(Number(taskPlanQuiet.value || '10') * 1000),
+    });
+    taskPlanInstruction.value = '';
+    taskPlanName.value = '';
+    taskPlanDelay.value = '';
+    setTaskPlanNamePreview('填写指令后自动生成', false);
+    return true;
+  }
   const result = await window.duocli.createPty(currentCwd, preset, themeId, resolvePresetEnv(getCustomPresets(), preset));
   const now = Date.now();
   sessionTitles.set(result.id, result.title);
@@ -3975,6 +4099,15 @@ function updatePanelToggleA11y(toggle: HTMLElement, collapsed: boolean, panelNam
 }
 
 function applyFileTreeCollapsed(collapsed: boolean): void {
+  // A collapsed tree must not leave a one-pixel resize target between the
+  // toggle and terminal. Hide the handle itself so it cannot be hovered or
+  // dragged while the tree is closed.
+  fileTreeResizer.hidden = collapsed;
+  fileTreeResizer.classList.remove('active');
+  if (collapsed && dragState.panel === fileTreePanel) {
+    dragState.isDragging = false;
+    dragState.panel = null;
+  }
   if (collapsed === fileTreeCollapsed && fileTreePanel.classList.contains('collapsed') === collapsed) {
     updatePanelToggleA11y(fileTreeToggle, collapsed, '目录树');
     syncPanelTogglePositions();
@@ -4255,6 +4388,109 @@ document.addEventListener('drop', (e) => {
   writePtyWithAutoReset(activeId, payload);
 });
 
+function taskStatusLabel(status: string): string {
+  return ({
+    pending: '等待中', paused: '已暂停', starting: '启动中', running: '执行中', completed: '已完成',
+    failed: '启动失败', cancelled: '已取消', blocked: '受阻', needs_attention: '待确认',
+  } as Record<string, string>)[status] || status;
+}
+
+function renderTaskDependencyOptions(): void {
+  const selected = taskPlanDependency.value;
+  taskPlanDependency.innerHTML = '<option value="">无</option>';
+  const pendingTasks = terminalTaskSnapshot.tasks.filter(task => !['cancelled', 'failed'].includes(task.status));
+  for (const task of pendingTasks) {
+    const option = document.createElement('option');
+    option.value = `task:${task.id}`;
+    option.textContent = `任务：${task.name}（${taskStatusLabel(task.status)}）`;
+    taskPlanDependency.appendChild(option);
+  }
+  for (const [id, title] of sessionTitles) {
+    const option = document.createElement('option');
+    option.value = `session:${id}`;
+    option.textContent = `终端：${title}`;
+    taskPlanDependency.appendChild(option);
+  }
+  if (Array.from(taskPlanDependency.options).some(option => option.value === selected)) taskPlanDependency.value = selected;
+}
+
+function renderTaskQueue(): void {
+  taskQueueList.innerHTML = '';
+  if (terminalTaskSnapshot.tasks.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'task-queue-empty';
+    empty.textContent = '还没有计划任务';
+    taskQueueList.appendChild(empty);
+    return;
+  }
+  const byId = new Map(terminalTaskSnapshot.tasks.map(task => [task.id, task]));
+  for (const task of [...terminalTaskSnapshot.tasks].reverse()) {
+    const item = document.createElement('div');
+    item.className = 'task-queue-item';
+    const title = document.createElement('div');
+    title.className = 'task-queue-title';
+    const name = document.createElement('span');
+    name.textContent = task.name;
+    const state = document.createElement('span');
+    state.className = 'task-queue-state';
+    state.textContent = taskStatusLabel(task.status);
+    title.append(name, state);
+    const meta = document.createElement('div');
+    meta.className = 'task-queue-meta';
+    const dep = task.dependency?.kind === 'task'
+      ? `前置：${byId.get(task.dependency.id)?.name || '已删除任务'}`
+      : task.dependency?.kind === 'session' ? '前置：已有终端停止' : '无前置任务';
+    const time = task.notBefore ? ` · ${new Date(task.notBefore).toLocaleString()}` : '';
+    meta.textContent = `${dep}${time} · 静止 ${Math.round(task.quietMs / 1000)} 秒${task.error ? ` · ${task.error}` : ''}`;
+    const actions = document.createElement('div');
+    actions.className = 'task-queue-actions';
+    const addAction = (label: string, onClick: () => void, className?: string): void => {
+      const button = document.createElement('button');
+      button.textContent = label;
+      if (className) button.className = className;
+      button.onclick = onClick;
+      actions.appendChild(button);
+    };
+    if (task.sessionId && sessionTitles.has(task.sessionId)) {
+      addAction('查看终端', () => { switchSession(task.sessionId!); taskQueueOverlay.classList.remove('active'); });
+    }
+    if (['pending', 'paused', 'blocked'].includes(task.status)) {
+      addAction('立即执行', () => { void window.duocli.runTerminalTaskNow(task.id).catch(error => alert(String(error))); });
+    }
+    if (['pending', 'blocked'].includes(task.status)) {
+      addAction('暂停', () => { void window.duocli.pauseTerminalTask(task.id).catch(error => alert(String(error))); });
+    }
+    if (task.status === 'paused') {
+      addAction('继续', () => { void window.duocli.resumeTerminalTask(task.id).catch(error => alert(String(error))); });
+    }
+    if (['starting', 'running'].includes(task.status)) {
+      addAction('取消', () => { void window.duocli.cancelTerminalTask(task.id).catch(error => alert(String(error))); });
+    }
+    if (['pending', 'paused', 'blocked'].includes(task.status)) {
+      addAction('修改', async () => {
+        const name = prompt('任务名称', task.name);
+        if (name === null) return;
+        const instruction = prompt('首条任务指令', task.instruction);
+        if (instruction === null) return;
+        const quiet = prompt('静止完成秒数', String(Math.round(task.quietMs / 1000)));
+        if (quiet === null) return;
+        try {
+          await window.duocli.updateTerminalTask(task.id, { expectedRevision: task.revision, name, instruction, quietMs: Number(quiet) * 1000 });
+        } catch (error) { alert('修改失败：' + String(error)); }
+      });
+    }
+    if (['running', 'needs_attention'].includes(task.status)) {
+      addAction('确认完成', () => { void window.duocli.confirmTerminalTaskComplete(task.id).catch(error => alert(String(error))); });
+    }
+    addAction('删除', () => {
+      if (!confirm(`确定删除任务「${task.name}」？`)) return;
+      void window.duocli.removeTerminalTask(task.id).catch(error => alert(String(error)));
+    }, 'danger');
+    item.append(title, meta, actions);
+    taskQueueList.appendChild(item);
+  }
+}
+
 function openNewSessionDialog(cwd?: string): void {
   const targetCwd = (cwd || currentCwd || '').trim();
   // 程序设值不触发 change 事件，需手动同步 currentCwd，
@@ -4267,16 +4503,73 @@ function openNewSessionDialog(cwd?: string): void {
   presetSelect.value = lastPreset || presetSelect.value || '';
   setPresetValue(presetSelect.value);
   setThemeValue(currentThemeId);
+  renderTaskDependencyOptions();
+  taskPlanDelay.value = '';
+  if (!taskPlanInstruction.value.trim()) {
+    taskPlanName.value = '';
+    setTaskPlanNamePreview('填写指令后自动生成', false);
+  }
   newSessionOverlay.classList.add('active');
   setTimeout(() => cwdInput.focus(), 0);
   void pullRecentCwdsFromRemote();
   void refreshPresetUsage().then(() => renderPresetSelect());
 }
 
+taskPlanEnabled.addEventListener('change', () => {
+  taskPlanFields.hidden = !taskPlanEnabled.checked;
+  newSessionCreateBtn.textContent = taskPlanEnabled.checked ? '加入任务队列' : '创建终端';
+  if (taskPlanEnabled.checked && taskPlanInstruction.value.trim()) scheduleTaskPlanNameSuggest();
+});
+taskQueueBtn.addEventListener('click', () => { renderTaskQueue(); taskQueueOverlay.classList.add('active'); });
+taskQueueClose.addEventListener('click', () => taskQueueOverlay.classList.remove('active'));
+taskQueueOverlay.addEventListener('click', event => { if (event.target === taskQueueOverlay) taskQueueOverlay.classList.remove('active'); });
+
+let taskPlanNameTimer: ReturnType<typeof setTimeout> | null = null;
+let taskPlanNameRequest = 0;
+
+function setTaskPlanNamePreview(text: string, hasValue: boolean): void {
+  taskPlanNamePreview.textContent = text;
+  taskPlanNamePreview.classList.toggle('has-value', hasValue);
+}
+
+function scheduleTaskPlanNameSuggest(): void {
+  if (taskPlanNameTimer) clearTimeout(taskPlanNameTimer);
+  const instruction = taskPlanInstruction.value.trim();
+  if (!instruction) {
+    taskPlanName.value = '';
+    setTaskPlanNamePreview('填写指令后自动生成', false);
+    return;
+  }
+  setTaskPlanNamePreview('正在生成名称…', false);
+  const requestId = ++taskPlanNameRequest;
+  taskPlanNameTimer = setTimeout(async () => {
+    try {
+      const title = await window.duocli.suggestTitleFromText(instruction);
+      if (requestId !== taskPlanNameRequest) return;
+      const name = title || instruction.replace(/\s+/g, ' ').trim().slice(0, 40) || '计划任务';
+      taskPlanName.value = name;
+      setTaskPlanNamePreview(name, true);
+    } catch {
+      if (requestId !== taskPlanNameRequest) return;
+      const fallback = instruction.replace(/\s+/g, ' ').trim().slice(0, 40) || '计划任务';
+      taskPlanName.value = fallback;
+      setTaskPlanNamePreview(fallback, true);
+    }
+  }, 500);
+}
+
+taskPlanInstruction.addEventListener('input', () => {
+  if (!taskPlanEnabled.checked) return;
+  scheduleTaskPlanNameSuggest();
+});
+taskPlanDelayClear.addEventListener('click', () => {
+  taskPlanDelay.value = '';
+  taskPlanDelay.focus();
+});
+
 function closeNewSessionDialog(): void {
   newSessionOverlay.classList.remove('active');
   cwdRecentDropdown.classList.remove('open');
-  themeSelect.classList.remove('open');
   presetSelectWrap.classList.remove('open');
 }
 
@@ -4359,7 +4652,8 @@ window.duocli.onPtyData((id, data) => {
       if (statusBusySuppressUntil.has(id)) statusBusySuppressUntil.delete(id);
     }
     if ((!prevBusy && sessionBusy.has(id)) || (prevUnread && !sessionUnread.has(id))) {
-      renderSessionList();
+      patchSessionStatusDot(id);
+      syncSessionStatusToMain();
     }
 
     // 累积最近数据用于提示符检测（保留最后 500 字符）
@@ -4388,33 +4682,8 @@ window.duocli.onPtyData((id, data) => {
       recentDataBuffer.delete(id);
     }
 
-    // 提示符检测：按行拆分，检查最后几行是否包含提示符
-    const lines = plain.split('\n').map(l => l.trimEnd()).filter(l => l.length > 0);
-    const lastLines = lines.slice(-3).join('\n');
-    // 排除 Claude Code 工作中状态：xxx… (xxx) 等 spinner 模式
-    const cliWorking = /\w+…\s*\(/.test(lastLines);
-    // Shell 提示符
-    const promptLike = /(^|[\s\n])(❯|›|▷|\$|>|%|➜)\s*$/.test(lastLines) && !/>\s*[a-zA-Z]/.test(lastLines);
-    const shellPrompt = /[\]#$%>❯›]\s*$/.test(lastLines);
-    const hasPrompt = (promptLike || shellPrompt) && !cliWorking;
-
-    if (hasPrompt) {
-      // 检测到提示符 → 从进行中转为已停止（绿→黄/灰）
-      clearTimeout(unreadTimers.get(id));
-      unreadTimers.delete(id);
-      recentDataBuffer.delete(id);
-      statusBusySuppressUntil.delete(id);
-      const wasBusy = sessionBusy.delete(id);
-      const hadUnread = sessionUnread.has(id);
-      // 桌面或手机正在看着 → 灰；没人看 → 黄（未查看）
-      if (!sessionIsBeingWatched(id) && !sessionUnread.has(id)) {
-        sessionUnread.add(id);
-      }
-      const nowUnread = sessionUnread.has(id);
-      if (wasBusy || hadUnread !== nowUnread) renderSessionList();
-    } else if (!ignoreBusy) {
-      // 未检测到提示符：静默超时兜底（无新输出 → 绿→黄/灰）
-      // 避免提示符匹配不到时永远卡在绿灯；suppress 窗口内不启超时
+    if (!ignoreBusy) {
+      // 连续 10 秒没有新内容才停止。提示符不再提前结束本轮任务。
       clearTimeout(unreadTimers.get(id));
       unreadTimers.set(id, setTimeout(() => {
         unreadTimers.delete(id);
@@ -4425,9 +4694,10 @@ window.duocli.onPtyData((id, data) => {
           if (!sessionIsBeingWatched(id)) {
             sessionUnread.add(id);
           }
-          renderSessionList();
+          patchSessionStatusDot(id);
+          syncSessionStatusToMain();
         }
-      }, 3000));
+      }, 10000));
     }
   }
 });
@@ -4450,6 +4720,22 @@ window.duocli.onSessionRemoteView((id, info) => {
   else if (info?.viewing === false) sessionRemoteViewers.delete(id);
   if (changed) renderSessionList();
   else if (info?.viewed) syncSessionStatusToMain();
+});
+
+window.duocli.onSessionActivityChanged((state) => {
+  if (!sessionTitles.has(state.sessionId)) return;
+  clearTimeout(unreadTimers.get(state.sessionId));
+  unreadTimers.delete(state.sessionId);
+  if (state.status === 'running') {
+    sessionBusy.add(state.sessionId);
+    sessionUnread.delete(state.sessionId);
+  } else {
+    sessionBusy.delete(state.sessionId);
+    if (sessionIsBeingWatched(state.sessionId)) sessionUnread.delete(state.sessionId);
+    else sessionUnread.add(state.sessionId);
+  }
+  patchSessionStatusDot(state.sessionId);
+  syncSessionStatusToMain();
 });
 
 window.duocli.onPtyExit((id) => {
@@ -4487,6 +4773,33 @@ window.duocli.onRemoteCreated((info) => {
     if (dims) window.duocli.resizePty(info.id, dims.cols, dims.rows);
   }, 100);
 });
+
+window.duocli.onTaskPtyCreated((info) => {
+  const now = Date.now();
+  sessionTitles.set(info.id, info.title);
+  sessionThemes.set(info.id, info.themeId);
+  sessionUpdateTimes.set(info.id, now);
+  sessionCreateTimes.set(info.id, now);
+  sessionCwds.set(info.id, info.cwd);
+  sessionDisplayNames.set(info.id, info.displayName);
+  if (info.cwd) addRecentCwd(info.cwd);
+  termManager.create(info.id, info.themeId, info.cwd, data => { writePtyWithAutoReset(info.id, data); });
+  updateEmptyState();
+  renderSessionList();
+  syncPaneLiveSessions();
+});
+
+window.duocli.onTerminalTasksChanged((snapshot) => {
+  if (snapshot.revision < terminalTaskSnapshot.revision) return;
+  terminalTaskSnapshot = snapshot;
+  renderTaskDependencyOptions();
+  if (taskQueueOverlay.classList.contains('active')) renderTaskQueue();
+});
+
+void window.duocli.listTerminalTasks().then(snapshot => {
+  terminalTaskSnapshot = snapshot;
+  renderTaskDependencyOptions();
+}).catch(error => console.error('加载计划任务失败:', error));
 
 // 远程服务器信息处理：合并推送/拉取预设
 async function handleRemoteServerInfo(info: typeof remoteServerInfo) {
@@ -4710,6 +5023,7 @@ window.duocli.onSetAutoContinueConfig((sessionId, config) => {
     autoAgree: true,
     autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
     sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
+    loopEnabled: AUTO_CONTINUE_DEFAULT_LOOP_ENABLED,
     maxLoops: AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
     initialDelayMs: AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
     loopCount: 0,
@@ -4721,6 +5035,7 @@ window.duocli.onSetAutoContinueConfig((sessionId, config) => {
   cancelAutoContinueRun(existing);
   Object.assign(existing, config);
   existing.maxLoops ??= AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
+  existing.loopEnabled = inferLoopEnabled(existing);
   existing.initialDelayMs ??= AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
   existing.loopCount = 0;
   existing.sending = false;

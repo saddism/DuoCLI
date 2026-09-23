@@ -1,6 +1,6 @@
 // DuoCLI Mobile - Service Worker
 
-const CACHE_NAME = 'duocli-v81';
+const CACHE_NAME = 'duocli-v89';
 const ASSETS = [
   '/',
   '/index.html',
@@ -92,23 +92,25 @@ self.addEventListener('fetch', e => {
   );
 });
 
-// 推送通知
+// 推送通知：应用正在前台看时不弹系统横幅，避免和页面抢视线。
 self.addEventListener('push', e => {
   if (!e.data) return;
 
-  try {
-    const data = e.data.json();
-    e.waitUntil(
-      self.registration.showNotification(data.title || 'DuoCLI', {
+  e.waitUntil((async () => {
+    try {
+      const data = e.data.json();
+      const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      if (windows.some(client => client.visibilityState === 'visible')) return;
+      await self.registration.showNotification(data.title || 'DuoCLI', {
         body: data.body || '',
         icon: '/icon-192.png',
         badge: '/icon-192.png',
         tag: data.sessionId || 'default',
         data: { sessionId: data.sessionId },
         requireInteraction: false,
-      })
-    );
-  } catch {}
+      });
+    } catch {}
+  })());
 });
 
 // 点击通知 → 打开应用

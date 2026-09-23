@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 
 const {
   LIVE_TERMINAL_SCROLLBACK,
+  TYPICAL_DESKTOP_ROWS,
+  LIVE_HISTORY_SCREENS,
   isAtBottom,
   isAtHistoryEdge,
   shouldFollowOutput,
@@ -26,7 +28,9 @@ test('terminal does not follow output when a user gesture starts after the write
 });
 
 test('history is requested only by an explicit history gesture at the live top', () => {
-  assert.ok(LIVE_TERMINAL_SCROLLBACK >= 24 && LIVE_TERMINAL_SCROLLBACK <= 200);
+  assert.equal(LIVE_TERMINAL_SCROLLBACK, TYPICAL_DESKTOP_ROWS * LIVE_HISTORY_SCREENS);
+  assert.equal(LIVE_HISTORY_SCREENS, 3);
+  assert.ok(LIVE_TERMINAL_SCROLLBACK >= 100 && LIVE_TERMINAL_SCROLLBACK <= 200);
   assert.equal(isHistoryDirection(-1), true);
   assert.equal(isAtHistoryEdge({ viewportY: 8, noLocalHistory: false }), false);
   assert.equal(isAtHistoryEdge({ viewportY: 0, noLocalHistory: false }), true);

@@ -73,7 +73,7 @@ function collectResumeFileMtimes(root: string, wanted: Set<string>): Map<string,
   if (!wanted.size) return found;
   const walk = (dir: string, depth: number) => {
     if (depth > 8) return;
-    let names: string[] = [];
+    let names: string[];
     try { names = fs.readdirSync(dir); } catch { return; }
     for (const name of names) {
       const full = path.join(dir, name);

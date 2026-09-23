@@ -496,7 +496,10 @@ body.landscape-workspace #main-drawer-close,
 
 .status-dot.running {
   background: var(--green);
-  box-shadow: 0 0 10px rgba(16, 185, 129, 0.55);
+  border-radius: 0;
+  clip-path: polygon(18% 8%, 92% 50%, 18% 92%);
+  box-shadow: none;
+  filter: drop-shadow(0 0 5px rgba(16, 185, 129, 0.55));
   animation: pulse-dot 2s infinite ease-in-out;
 }
 
@@ -1235,6 +1238,7 @@ body.native-chat-mode .user-prompt-jump {
   position: relative;
   overflow: auto;
   overflow-anchor: none;
+  outline: none;
   -webkit-overflow-scrolling: touch;
   touch-action: pan-y;
   overscroll-behavior: contain;
@@ -1253,6 +1257,9 @@ body.native-chat-mode .user-prompt-jump {
   white-space: pre-wrap;
   word-break: break-all;
   padding: 0 8px;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .terminal-history-live-btn {
@@ -1895,6 +1902,10 @@ body.native-chat-mode .user-prompt-jump {
   align-items: center;
   gap: 8px;
   cursor: pointer;
+}
+
+#auto-continue-modal .ac-loop-fields {
+  margin-top: 10px;
 }
 
 #ac-agree-delay-row {
@@ -2732,6 +2743,12 @@ body:not(.computer-desktop-active) #device-desktop-window-btn {
   overflow: auto;
   overflow-wrap: anywhere;
   tab-size: 2;
+}
+
+/* 文本预览时媒体槽为空仍 flex:1，会把正文挤到左下角一小块。 */
+.mobile-file-preview-media:empty,
+.mobile-file-preview-content:empty {
+  display: none;
 }
 
 @media (hover: hover) and (pointer: fine) and (min-width: 720px),
@@ -3981,6 +3998,21 @@ html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
 }
+
+.task-plan-toggle { display: flex !important; align-items: center; gap: 8px; margin-top: 12px; }
+.task-plan-toggle input { width: auto !important; }
+.task-plan-fields { margin-top: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
+.task-plan-fields p { margin: 8px 0 0; color: var(--text2); font-size: 12px; line-height: 1.5; }
+.task-queue-modal-content { max-height: 82vh; overflow-y: auto; }
+.task-queue-list { display: flex; flex-direction: column; gap: 10px; }
+.task-queue-empty { padding: 32px 12px; color: var(--text2); text-align: center; }
+.task-queue-item { padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); }
+.task-queue-title { display: flex; justify-content: space-between; gap: 8px; font-weight: 650; }
+.task-queue-state { padding: 2px 7px; border-radius: 999px; color: var(--text2); background: var(--surface-3); font-size: 11px; white-space: nowrap; }
+.task-queue-meta { margin-top: 7px; color: var(--text2); font-size: 12px; line-height: 1.5; }
+.task-queue-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+.task-queue-actions button { flex: 1 1 calc(50% - 8px); padding: 8px; border: 1px solid var(--border); border-radius: 7px; color: var(--text); background: var(--surface-1); }
+.task-queue-actions button.danger { color: #f87171; }
 @media (any-pointer: coarse) {
   html, body { touch-action: pan-x pan-y; }
   input, select, textarea, [contenteditable="true"] {
@@ -4084,3 +4116,41 @@ html {
   from { opacity: 0; transform: scale(0.95); }
   to { opacity: 1; transform: scale(1); }
 }
+
+/* Archive and the captured native edge form one continuous scroll surface. */
+.terminal-history-layer.is-continuous {
+  background: var(--terminal-history-background);
+  color: var(--terminal-history-foreground);
+}
+.terminal-history-layer.is-continuous .terminal-history-hint {
+  position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+  z-index: 3; border-radius: 6px; max-width: 90%; pointer-events: none;
+}
+.terminal-history-layer.is-continuous .terminal-history-row {
+  font-family: var(--terminal-history-font-family);
+  font-size: var(--terminal-history-font-size);
+  padding-left: var(--terminal-history-padding-left);
+  padding-right: var(--terminal-history-padding-right);
+}
+.terminal-history-live-edge {
+  position: absolute; left: 0; right: 0; overflow: hidden;
+  background: var(--terminal-history-background, inherit);
+  pointer-events: auto;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.terminal-history-preview,
+.terminal-history-preview.xterm,
+.terminal-history-preview .xterm-rows,
+.terminal-history-preview .xterm-rows span {
+  pointer-events: auto !important;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  cursor: text;
+}
+.terminal-history-preview .xterm-helpers,
+.terminal-history-preview .xterm-viewport {
+  pointer-events: none !important;
+}
+.terminal-history-layer.is-continuous .terminal-history-scroller { overscroll-behavior: contain; }
+.terminal-history-live-btn[hidden] { display: none !important; }

@@ -121,3 +121,19 @@ test('resolvePromptJumpLine prefers a fresh title-bar line over a stale marker',
   ]);
   assert.equal(banner.resolvePromptJumpLine(buffer, '请修好远程镜像交互', { line: 8, isDisposed: false }), 0);
 });
+
+test('findPromptItemIndex uses the title bar of the last matching history block', () => {
+  const items = [
+    { text: '╭─── User ───╮' },
+    { text: '│ 上一条任务 │' },
+    { text: '╰────────────╯' },
+    { text: '╭─── User ───╮' },
+    { text: '│ 请修好远程镜像交互 │' },
+    { text: '╰────────────╯' },
+  ];
+  assert.equal(banner.findPromptItemIndex(items, '请修好远程镜像交互'), 3);
+});
+
+test('findPromptItemIndex still matches a plain archived line', () => {
+  assert.equal(banner.findPromptItemIndex([{ text: 'noise' }, { text: '修好远程镜像交互' }], '修好远程镜像交互'), 1);
+});

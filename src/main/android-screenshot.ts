@@ -1,4 +1,5 @@
 import { runAdb } from './android-devices';
+import { prepareAdbScreenshot } from './android-screencap';
 
 interface CachedScreenshot {
   promise: Promise<Buffer>;
@@ -16,10 +17,12 @@ export class AndroidScreenshotManager {
     if (!id) throw new Error('请先选择 Android 设备');
     const existing = this.inFlight.get(id);
     if (existing) return existing.promise;
-    const promise = capture().finally(() => {
-      const current = this.inFlight.get(id);
-      if (current?.promise === promise) this.inFlight.delete(id);
-    });
+    const promise = capture()
+      .then((buf) => prepareAdbScreenshot(buf))
+      .finally(() => {
+        const current = this.inFlight.get(id);
+        if (current?.promise === promise) this.inFlight.delete(id);
+      });
     this.inFlight.set(id, { promise, startedAt: Date.now() });
     return promise;
   }
@@ -29,4 +32,3 @@ export class AndroidScreenshotManager {
     else this.inFlight.clear();
   }
 }
-

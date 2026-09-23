@@ -65,6 +65,8 @@ function harness({ controller = true, fallback = false, controlReady = !fallback
     clearTimeout(id) { timers.delete(id); },
     fetch(url, options) { requests.push({ url, body: JSON.parse(options.body) }); return Promise.resolve({ ok: true }); },
     setDeviceHint: message => hints.push(message), $: () => null,
+    androidControlDeviceId: () => 'phone',
+    isComputerDevice: () => false,
   });
   vm.runInContext(geometry + gestures, context);
   context.bindAndroidPointerSurface(surface, true);

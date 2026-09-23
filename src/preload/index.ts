@@ -42,6 +42,21 @@ contextBridge.exposeInMainWorld('duocli', {
   // 创建终端
   createPty: (cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) =>
     ipcRenderer.invoke('pty:create', cwd, presetCommand, themeId, providerEnv),
+  listTerminalTasks: () => ipcRenderer.invoke('tasks:list'),
+  createTerminalTask: (input: any) => ipcRenderer.invoke('tasks:create', input),
+  updateTerminalTask: (taskId: string, input: any) => ipcRenderer.invoke('tasks:update', taskId, input),
+  cancelTerminalTask: (taskId: string) => ipcRenderer.invoke('tasks:cancel', taskId),
+  pauseTerminalTask: (taskId: string) => ipcRenderer.invoke('tasks:pause', taskId),
+  resumeTerminalTask: (taskId: string) => ipcRenderer.invoke('tasks:resume', taskId),
+  runTerminalTaskNow: (taskId: string) => ipcRenderer.invoke('tasks:run-now', taskId),
+  removeTerminalTask: (taskId: string) => ipcRenderer.invoke('tasks:remove', taskId),
+  confirmTerminalTaskComplete: (taskId: string) => ipcRenderer.invoke('tasks:confirm-complete', taskId),
+  onTerminalTasksChanged: (cb: (snapshot: any) => void) =>
+    ipcRenderer.on('tasks:changed', (_e, snapshot) => cb(snapshot)),
+  onSessionActivityChanged: (cb: (state: any) => void) =>
+    ipcRenderer.on('session:activity-changed', (_e, state) => cb(state)),
+  onTaskPtyCreated: (cb: (sessionInfo: any, taskId: string) => void) =>
+    ipcRenderer.on('pty:task-created', (_e, sessionInfo, taskId) => cb(sessionInfo, taskId)),
 
   // 写入数据 (改成 invoke 等待完成)
   writePty: (id: string, data: string) =>
@@ -62,6 +77,10 @@ contextBridge.exposeInMainWorld('duocli', {
   // 重新用 AI 生成标题
   regenerateTitle: (id: string) =>
     ipcRenderer.invoke('pty:regenerate-title', id),
+
+  // 根据文本生成标题（计划任务等）
+  suggestTitleFromText: (text: string) =>
+    ipcRenderer.invoke('title:suggest-from-text', text),
 
   // 获取所有会话
   getSessions: () => ipcRenderer.invoke('pty:sessions'),

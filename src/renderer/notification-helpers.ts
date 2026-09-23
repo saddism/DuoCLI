@@ -6,7 +6,7 @@
 let audioContext: AudioContext | null = null;
 
 // 通知防抖计时器
-let notifyTimer: ReturnType<typeof setTimeout> | null = null;
+const notifyTimer: ReturnType<typeof setTimeout> | null = null;
 const NOTIFICATION_COOLDOWN = 15000; // 15 秒冷却时间
 let lastNotifyTime = 0;
 
@@ -148,10 +148,11 @@ export function setupNotificationListener(): void {
     console.warn('[Notification] 未找到 onNotification API');
     return;
   }
-  
-  window.duocli.onNotification((title: string, body: string, sessionId?: string) => {
-    notifyWithCooldown(title, body, sessionId);
+
+  window.duocli.onNotification(() => {
+    // 系统横幅由主进程弹出。窗口在前台时只留提示音，避免右上角再叠一条。
+    if (document.hasFocus()) playCompletionSound();
   });
-  
+
   console.log('[Notification] 已注册通知监听');
 }

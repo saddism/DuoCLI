@@ -1,5 +1,9 @@
 import type { Terminal, IDisposable } from '@xterm/xterm';
 
+const { HISTORY_EDGE_LINES } = require('../../mobile/client/terminal-scroll-helpers.js') as {
+  HISTORY_EDGE_LINES: number;
+};
+
 // Following is user intent, not a snapshot of the viewport during an xterm refresh.
 export class TerminalScrollController {
   private following = true;
@@ -16,17 +20,27 @@ export class TerminalScrollController {
     private terminal: Terminal,
     container: HTMLElement,
     private button: HTMLButtonElement,
-    private onHistoryIntent?: () => void,
+    private onHistoryIntent?: (deltaY?: number) => void,
   ) {
     const options = { capture: true, signal: this.events.signal };
     // The rendered screen and viewport are siblings. Listen above both, before
     // xterm processes the gesture or an asynchronous write can complete.
     container.addEventListener('wheel', (event) => {
-      if (event.target instanceof Element && event.target.closest('.terminal-history-layer')) return;
-      if (event.deltaY === 0 || terminal.buffer.active.type === 'alternate') return;
+      if (!(event.target instanceof Element) || !event.target.closest('.xterm')
+        || event.target.closest('.terminal-history-layer')) return;
+      if (event.deltaY === 0 || event.shiftKey || terminal.buffer.active.type === 'alternate') return;
       const version = this.pause();
-      if (event.deltaY < 0 && terminal.buffer.active.viewportY <= 3) this.onHistoryIntent?.();
-      this.checkAfterGesture(version, event.deltaY > 0 ? 3 : 0);
+      const rowHeight = (terminal.element?.querySelector('.xterm-screen')?.getBoundingClientRect().height || 0) / terminal.rows || 18;
+      const pixels = event.deltaY * (event.deltaMode === 1 ? rowHeight : event.deltaMode === 2 ? container.clientHeight : 1);
+      // xterm consumes the native rows before the archive boundary. Carry
+      // only the remainder across the seam, not the same wheel distance twice.
+      const olderPixels = event.deltaY < 0 ? Math.min(-0.01, pixels + terminal.buffer.active.viewportY * rowHeight) : 0;
+      const atHistoryEdge = event.deltaY < 0 && terminal.buffer.active.viewportY <= HISTORY_EDGE_LINES;
+      if (atHistoryEdge) this.onHistoryIntent?.(olderPixels);
+      // A downward notch while still reading must not snap back to the latest
+      // row. Follow again only once the viewport is actually at the bottom.
+      // If this wheel already opened history, don't deliver the same distance twice.
+      this.checkAfterGesture(version, 0, olderPixels, !atHistoryEdge);
     }, { ...options, passive: true });
 
     container.addEventListener('pointerdown', (event) => {
@@ -90,16 +104,16 @@ export class TerminalScrollController {
     return this.gesture;
   }
 
-  private checkAfterGesture(version: number, tolerance: number): void {
+  private checkAfterGesture(version: number, tolerance: number, olderPixels = 0, notifyHistory = false): void {
     // Native scroll events and xterm's DOM scroll area settle on later frames.
     const check = () => {
       if (this.disposed || version !== this.gesture) return;
       const buffer = this.terminal.buffer.active;
-      if (!this.pointerDown && !this.terminal.hasSelection()
+      if (olderPixels >= 0 && !this.pointerDown && !this.terminal.hasSelection()
         && buffer.type === 'normal' && this.distance() <= tolerance) {
         this.follow();
-      } else if (!this.pointerDown && buffer.type === 'normal' && buffer.viewportY <= 3) {
-        this.onHistoryIntent?.();
+      } else if (notifyHistory && olderPixels < 0 && !this.pointerDown && buffer.type === 'normal' && buffer.viewportY <= HISTORY_EDGE_LINES) {
+        this.onHistoryIntent?.(olderPixels);
       }
       this.updateButton();
     };
@@ -174,20 +188,10 @@ export class TerminalScrollController {
     try {
       if (this.terminal.options) this.terminal.options.smoothScrollDuration = 0;
     } catch { /* options may be read-only during dispose */ }
-    const baseY = this.terminal.buffer.active.baseY;
-    if (this.distance() <= 0) {
-      // Already on the live edge: still tell xterm the user is not scrolling,
-      // otherwise a full live buffer recycles one row on the next write.
-      try { this.terminal.scrollToLine(baseY); } catch { /* renderer may not exist yet */ }
-      return;
-    }
-    const viewport = (this.terminal as unknown as { _core?: { _viewport?: { scrollToLine?: (y: number, force?: boolean) => void } } })._core?._viewport;
-    try {
-      if (typeof viewport?.scrollToLine === 'function') viewport.scrollToLine(baseY, true);
-      else this.terminal.scrollToLine(baseY);
-    } catch {
-      try { this.terminal.scrollToBottom(); } catch { /* renderer may not exist yet */ }
-    }
+    // xterm 5.5 ignores zero-distance scrollToLine AND scrollToBottom calls.
+    // A positive scroll is clamped at baseY and clears its user-scrolling flag,
+    // even when a TUI just cleared scrollback and the viewport is already there.
+    try { this.terminal.scrollLines(Math.max(1, this.distance())); } catch { /* renderer may not exist yet */ }
   }
 
   private scheduleSync(): void {

@@ -3,10 +3,12 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   root.DuoTerminalScrollHelpers = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
-  // Live xterm only keeps a few screens above the viewport. Older rows live in
-  // the history archive and are shown by the overlay. 80 ≈ 3 screens on a
-  // 24-row terminal; cheap to pan, enough to scroll with a finger/scrollbar.
-  const LIVE_TERMINAL_SCROLLBACK = 80;
+  // Live xterm keeps ~3 typical desktop screens locally (≈40 rows each). Older
+  // rows live in the archive overlay. First paint must include this window so a
+  // slight flick does not jump into history.
+  const TYPICAL_DESKTOP_ROWS = 40;
+  const LIVE_HISTORY_SCREENS = 3;
+  const LIVE_TERMINAL_SCROLLBACK = TYPICAL_DESKTOP_ROWS * LIVE_HISTORY_SCREENS;
   const HISTORY_EDGE_LINES = 3;
 
   function isAtBottom(viewportY, baseY) {
@@ -47,6 +49,8 @@
   }
 
   return {
+    TYPICAL_DESKTOP_ROWS,
+    LIVE_HISTORY_SCREENS,
     LIVE_TERMINAL_SCROLLBACK,
     HISTORY_EDGE_LINES,
     isAtBottom,
