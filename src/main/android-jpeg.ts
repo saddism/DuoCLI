@@ -1,5 +1,6 @@
 import sharp from 'sharp';
 import { runAdb } from './android-devices';
+import { humanizeAndroidImageError } from './android-screencap';
 import { AndroidScreenshotManager } from './android-screenshot';
 import {
   DVM2_FLAG_DISCONTINUITY,
@@ -195,7 +196,7 @@ export class AndroidJpegManager {
         const delay = Math.max(0, interval - (Date.now() - started));
         await new Promise((resolve) => setTimeout(resolve, delay));
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = humanizeAndroidImageError(error);
         for (const { client } of source.clients.values()) {
           client.sendJson({ type: 'android:jpeg-status', status: 'error', deviceId: source.deviceId, transport: 'jpeg-ws', error: message });
         }

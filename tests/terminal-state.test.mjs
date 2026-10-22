@@ -77,9 +77,34 @@ test('large history and resize restore a parsed screen, never an arbitrary ANSI 
   await state.snapshot(value => { snapshot = value; });
   assert.equal(snapshot.cols, 43);
   assert.equal(snapshot.rows, 33);
+  assert.equal(snapshot.hasMoreHistory, false);
   await write(restored, snapshot.data);
   assert.deepEqual(buffer(restored), buffer(state.terminal));
   assert.equal(restored.modes.bracketedPasteMode, true);
+});
+
+test('limited scrollback snapshot is only the latest screen and reports more history', async t => {
+  const state = new TerminalState();
+  const restored = browserTerminal(40, 12);
+  t.after(() => { state.dispose(); restored.dispose(); });
+  state.resize(40, 12);
+  state.write(Array.from({ length: 80 }, (_, i) => `line-${String(i).padStart(3, '0')}\r\n`).join(''), () => {});
+  let latest;
+  await state.snapshot(value => { latest = value; }, { scrollback: 0 });
+  assert.equal(latest.scrollback, 0);
+  assert.equal(latest.hasMoreHistory, true);
+  assert.ok(latest.scrollbackTotal > 0);
+  assert.ok(latest.data.length < 20_000);
+
+  let fuller;
+  await state.snapshot(value => { fuller = value; }, { scrollback: 40 });
+  assert.equal(fuller.scrollback, 40);
+  assert.ok(fuller.data.length > latest.data.length);
+
+  await write(restored, latest.data);
+  const text = buffer(restored).lines.join('\n');
+  assert.match(text, /line-079/);
+  assert.doesNotMatch(text, /line-000/);
 });
 
 test('duplicate submission IDs emit one paste and one Enter; separate submissions retain order', async t => {
@@ -93,6 +118,71 @@ test('duplicate submission IDs emit one paste and one Enter; separate submission
   await Promise.all([manager.submit('test', 'one', '你好\n第二行'), manager.submit('test', 'one', '你好\n第二行'), manager.submit('test', 'two', 'next')]);
   assert.deepEqual(writes, ['\x1b[200~你好\n第二行\x1b[201~', '\r', '\x1b[200~next\x1b[201~', '\r']);
   await assert.rejects(manager.submit('test', 'one', 'different'), /提交编号重复/);
+});
+
+test('composer submission keeps concurrent terminal input after its Enter', async t => {
+  const manager = new PtyManager({ onData() {}, onTitleUpdate() {}, onExit() {} });
+  const state = new TerminalState();
+  t.after(() => state.dispose());
+  state.write('\x1b[?2004h', () => {});
+  const writes = [];
+  manager.sessions.set('test', {
+    terminalState: state, submissions: new Map(), submitQueue: Promise.resolve(),
+    inputTransaction: false, inputTransactionCount: 0, queuedInputs: [],
+    ptyProcess: { write: data => writes.push(data) }, sizeBySource: { desktop: null, mobile: null },
+    sizeOwner: null, lastInputAt: { desktop: 0, mobile: 0 }, currentLine: '', accumulatedInputs: [],
+    titleInputRevision: 0, titleSegmentCount: 0, titleGenerated: true, titleLocked: false,
+    autoResponseTimers: new Set(), updatedAt: 0,
+  });
+  const sending = manager.submit('test', 'atomic', 'composer text', 20);
+  manager.write('test', 'desktop text', 'desktop');
+  await sending;
+  assert.deepEqual(writes, ['\x1b[200~composer text\x1b[201~', '\r', 'desktop text']);
+});
+
+test('submission can retry the same ID after a failure before writing', async t => {
+  const manager = new PtyManager({ onData() {}, onTitleUpdate() {}, onExit() {} });
+  const state = new TerminalState();
+  t.after(() => state.dispose());
+  const originalSnapshot = state.snapshot.bind(state);
+  let first = true;
+  state.snapshot = async (...args) => {
+    if (first) { first = false; throw new Error('snapshot unavailable'); }
+    return originalSnapshot(...args);
+  };
+  const writes = [];
+  manager.sessions.set('test', {
+    terminalState: state, submissions: new Map(), submitQueue: Promise.resolve(),
+    inputTransaction: false, inputTransactionCount: 0, queuedInputs: [],
+    ptyProcess: { write: data => writes.push(data) }, sizeBySource: { desktop: null, mobile: null },
+    sizeOwner: null, lastInputAt: { desktop: 0, mobile: 0 }, currentLine: '', accumulatedInputs: [],
+    titleInputRevision: 0, titleSegmentCount: 0, titleGenerated: true, titleLocked: false,
+    autoResponseTimers: new Set(), updatedAt: 0,
+  });
+  await assert.rejects(manager.submit('test', 'retry', 'safe retry', 0), /snapshot unavailable/);
+  await new Promise(resolve => setImmediate(resolve));
+  await manager.submit('test', 'retry', 'safe retry', 0);
+  assert.deepEqual(writes, ['safe retry', '\r']);
+});
+
+test('chat submission does not claim terminal geometry', async t => {
+  const manager = new PtyManager({ onData() {}, onTitleUpdate() {}, onExit() {} });
+  const state = new TerminalState();
+  t.after(() => state.dispose());
+  const writes = [];
+  const session = {
+    terminalState: state, submissions: new Map(), submitQueue: Promise.resolve(),
+    inputTransaction: false, inputTransactionCount: 0, queuedInputs: [],
+    ptyProcess: { write: data => writes.push(data), resize() { throw new Error('chat must not resize'); } },
+    sizeBySource: { desktop: { cols: 100, rows: 40 }, mobile: { cols: 40, rows: 20 }, chat: null },
+    sizeOwner: 'desktop', lastInputAt: { desktop: 0, mobile: 0, chat: 0 }, currentLine: '', accumulatedInputs: [],
+    titleInputRevision: 0, titleSegmentCount: 0, titleGenerated: true, titleLocked: false,
+    autoResponseTimers: new Set(), updatedAt: 0, currentCols: 100, currentRows: 40,
+  };
+  manager.sessions.set('test', session);
+  await manager.submit('test', 'chat', 'follow up', 0, 'chat');
+  assert.equal(session.sizeOwner, 'desktop');
+  assert.deepEqual(writes, ['follow up', '\r']);
 });
 
 test('device discovery distinguishes usable, unauthorized and offline devices', () => {

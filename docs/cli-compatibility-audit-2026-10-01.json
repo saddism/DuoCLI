@@ -1,0 +1,181 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-01T07:42:12+08:00",
+  "platform": "macOS arm64; Node.js 20 build/test runtime",
+  "referenceSource": {
+    "url": "https://github.com/stablyai/orca/tree/3727100cc9dbcea6201f8a3e506676a3c4b53b18",
+    "commit": "3727100cc9dbcea6201f8a3e506676a3c4b53b18",
+    "scope": "Read native-chat support and provider vault parsers; verified adapters against installed local record shapes. Vault parser support alone does not prove live native chat."
+  },
+  "method": "Read audit.txt containing 42 in isolated temporary workspaces, then return the fixed answer marker. Actual node-pty launches; no user project was used for model writes. Credentials and private conversation text are not included here. Some CLI startup/update prompts caused provider-managed auto updates; versions before/after are recorded.",
+  "validation": {
+    "buildTs": "passed",
+    "unitTests": {
+      "passed": 392,
+      "failed": 0,
+      "skipped": 0
+    },
+    "fullExistingBrowserSuite": "passed",
+    "latestMobileRealHttpWsSuite": {
+      "passed": 33,
+      "failed": 0,
+      "transcriptAppendToRenderMs": 155
+    },
+    "latestActivityFoldBrowserSuite": "passed",
+    "actualModelAnswersExtracted": [
+      "codex",
+      "cursor",
+      "devin",
+      "agy"
+    ],
+    "currentInteractiveCursorAndDevin": "answer verified; Cursor combined tool heading and less-indented answer checked",
+    "codexInteractiveHarness": "Not claimed as passed: folder-trust/startup timing prevented reliable prompt submission; headless answer and transcript extraction passed.",
+    "physicalPhoneAcceptance": "not performed",
+    "runningDesktopBackendActivation": "not restarted; existing user PTYs preserved",
+    "mobileServiceWorkerCache": "duocli-v105"
+  },
+  "limits": [
+    "Fresh Kimi/OpenCode/Devin/Antigravity/ZCode PTYs can remain unbound until an exact provider session ID is available. Never select the newest session in the working directory.",
+    "SQLite adapters use the sqlite3 executable in asynchronous read-only mode. Verified on this Mac; other desktop platforms require that executable.",
+    "Alternate-screen TUIs retain their native terminal behavior instead of applying the normal-buffer folding overlay. Unknown headings remain visible.",
+    "Login, quota, and CLI installation/configuration failures are separate from transcript-parser compatibility.",
+    "OpenCode adapter covers the locally verified message/part schema; a different future schema requires a separate adapter."
+  ],
+  "clis": [
+    {
+      "cli": "codex",
+      "versionAtFirstInventory": "0.159.1",
+      "versionAtFinalInventory": "0.159.3",
+      "observedProbeResult": "answer_verified",
+      "nativeChatFormat": "paginated SQLite items and realtime items; JSONL fallback",
+      "sessionBinding": "live writer-lock ownership / explicit resume / output",
+      "modelAnswerGatePassed": true
+    },
+    {
+      "cli": "claude",
+      "versionAtFirstInventory": "2.1.165",
+      "versionAtFinalInventory": "2.1.165",
+      "observedProbeResult": "quota_or_rate_limit",
+      "nativeChatFormat": "JSONL with parentUuid branch and separated thinking",
+      "sessionBinding": "preassigned UUID / explicit resume",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "cursor",
+      "versionAtFirstInventory": "2026.09.26-dd393fe",
+      "versionAtFinalInventory": "2026.09.28-64d2043",
+      "observedProbeResult": "answer_verified",
+      "nativeChatFormat": "store.db: ordered current root SHA-256 message references",
+      "sessionBinding": "create-chat UUID / explicit resume",
+      "modelAnswerGatePassed": true
+    },
+    {
+      "cli": "qwen",
+      "versionAtFirstInventory": "0.10.5",
+      "versionAtFinalInventory": "0.24.7",
+      "observedProbeResult": "expired_access_token_401",
+      "nativeChatFormat": "JSONL message.parts and Claude-style message.content",
+      "sessionBinding": "preassigned UUID / explicit resume",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "gemini",
+      "versionAtFirstInventory": "0.58.0",
+      "versionAtFinalInventory": "0.62.0",
+      "observedProbeResult": "authentication_required",
+      "nativeChatFormat": "legacy JSON and modern JSONL with replacing $set.messages",
+      "sessionBinding": "preassigned UUID / explicit resume",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "qoder",
+      "versionAtFirstInventory": "1.1.64",
+      "versionAtFinalInventory": "1.1.64",
+      "observedProbeResult": "quota_or_rate_limit",
+      "nativeChatFormat": "Claude-style JSONL with active-leaf",
+      "sessionBinding": "preassigned UUID / explicit resume",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "qodercn",
+      "versionAtFirstInventory": "1.1.64",
+      "versionAtFinalInventory": "1.1.64",
+      "observedProbeResult": "quota_or_rate_limit",
+      "nativeChatFormat": "Claude-style JSONL with active-leaf",
+      "sessionBinding": "preassigned UUID / explicit resume",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "opencode",
+      "versionAtFirstInventory": "1.17.11",
+      "versionAtFinalInventory": "1.17.11",
+      "observedProbeResult": "quota_or_rate_limit",
+      "nativeChatFormat": "SQLite message/part schema verified locally",
+      "sessionBinding": "explicit resume / provider output; fresh PTY may remain unbound",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "kimi",
+      "versionAtFirstInventory": "0.41.0",
+      "versionAtFinalInventory": "2.1.1",
+      "observedProbeResult": "provider_credentials_missing",
+      "nativeChatFormat": "main-agent wire.jsonl streamed events and legacy context JSONL",
+      "sessionBinding": "explicit resume / provider output; fresh PTY may remain unbound",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "kiro",
+      "versionAtFirstInventory": "2.13.0",
+      "versionAtFinalInventory": "2.13.0",
+      "observedProbeResult": "sign_in_screen",
+      "nativeChatFormat": "Prompt, AssistantMessage, ToolResults JSONL",
+      "sessionBinding": "live PID lock ownership / explicit resume",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "devin",
+      "versionAtFirstInventory": "3000.6.14",
+      "versionAtFinalInventory": "3000.11.3",
+      "observedProbeResult": "answer_verified",
+      "nativeChatFormat": "sessions.db active main_chain_id graph",
+      "sessionBinding": "explicit resume / provider output; fresh PTY may remain unbound",
+      "modelAnswerGatePassed": true
+    },
+    {
+      "cli": "agy",
+      "versionAtFirstInventory": "1.2.9",
+      "versionAtFinalInventory": "1.2.14",
+      "observedProbeResult": "headless_answer_verified; later interactive probe reported out of credits",
+      "nativeChatFormat": "Antigravity CLI brain transcript_full.jsonl",
+      "sessionBinding": "explicit resume / provider output; fresh PTY may remain unbound",
+      "modelAnswerGatePassed": true
+    },
+    {
+      "cli": "dsh",
+      "versionAtFirstInventory": "0.2.0-rc.2",
+      "versionAtFinalInventory": null,
+      "observedProbeResult": "launcher_exited_without_output; no verified structured transcript source",
+      "nativeChatFormat": null,
+      "sessionBinding": "terminal only",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "zcode",
+      "versionAtFirstInventory": "0.16.9",
+      "versionAtFinalInventory": "0.16.9",
+      "observedProbeResult": "installed_wrapper_cannot_locate_builtin_provider_config",
+      "nativeChatFormat": "SQLite message/part with explicit sequence when present",
+      "sessionBinding": "explicit resume / provider output; fresh PTY may remain unbound",
+      "modelAnswerGatePassed": false
+    },
+    {
+      "cli": "pi",
+      "versionAtFirstInventory": "0.70.6",
+      "versionAtFinalInventory": "0.70.6",
+      "observedProbeResult": "provider_api_key_missing",
+      "nativeChatFormat": "Pi JSONL session header and parentId graph",
+      "sessionBinding": "explicit new JSONL path / exact header UUID / explicit resume",
+      "modelAnswerGatePassed": false
+    }
+  ]
+}

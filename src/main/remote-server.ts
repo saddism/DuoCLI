@@ -1,12 +1,19 @@
 import express from 'express';
+import { router as macDesktopRouter, handleMacDesktopWsUpgrade } from './mac-desktop-routes';
+import { macDesktopSessionManager } from './mac-desktop-session';
+import { quickCommands } from './quick-commands';
+import { sendFileDownload } from './file-download';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import os from 'os';
+import { setTimeout as waitForChat } from 'node:timers/promises';
 import { execFileSync } from 'child_process';
 import { parseAndroidDevices, runAdb } from './android-devices';
 import { AndroidMirrorClient, AndroidMirrorInput, AndroidMirrorManager, validateAndroidMirrorInput } from './android-mirror';
+import { humanizeAndroidImageError, prepareAdbScreenshot } from './android-screencap';
+import type { TerminalTaskScheduler } from './terminal-task-scheduler';
 import { AndroidScreenshotManager } from './android-screenshot';
 import { AndroidJpegClient, AndroidJpegManager } from './android-jpeg';
 import { resolveAndroidMediaHelper } from './android-media-helper';
@@ -26,7 +33,13 @@ import { CustomPreset, getCliProvider, resolveSessionDisplayName } from './cli-p
 import { resolvePresetEnv } from './preset-env';
 import { BUILTIN_PRESETS, getAvailableBuiltinPresets } from './cli-detect';
 import { buildResumeCommand } from './session-resume';
-import { ClosedSessionsManager } from './closed-sessions';
+import { ClosedSessionsManager, sortClosedSessionsByUpdatedAt } from './closed-sessions';
+import { resolveSessionUiStatus } from './session-status';
+import { HISTORY_PAGE_ROWS, TERMINAL_CAPABILITY_VERSION } from './terminal-history';
+import { isNativeChatSupportedCli, loadSessionChat } from './native-chat';
+import { trackChatSubmissions } from './native-chat/submission-tracking';
+import { NetworkHandoffStore } from './network-handoff';
+import { CloudflaredManager, isCloudflaredConfigReady } from './cloudflared-manager';
 
 // 缓存 ptyManager 和回调供远程创建使用（在 startRemoteServer 中设置）
 let cachedPtyManager: PtyManager | null = null;
@@ -36,6 +49,12 @@ let PORT = parseInt(process.env.DUOCLI_REMOTE_PORT || '9800');
 const HOST = process.env.DUOCLI_REMOTE_HOST || '0.0.0.0';
 
 const DUOCLI_APP_ROOT = path.resolve(__dirname, '../..');
+const userPromptBanner = require(path.join(DUOCLI_APP_ROOT, 'mobile/client/user-prompt-banner.js')) as {
+  lastUserPromptFrom: (segments: unknown) => string;
+};
+const { LIVE_TERMINAL_SCROLLBACK } = require(path.join(DUOCLI_APP_ROOT, 'mobile/client/terminal-scroll-helpers.js')) as {
+  LIVE_TERMINAL_SCROLLBACK: number;
+};
 
 function findLsof(): string | null {
   const candidates = process.platform === 'darwin'
@@ -220,11 +239,18 @@ const MAX_RECENT_CWDS = 20;
 const MAX_PRESET_USAGE_ENTRIES = 100;
 const MAX_PREVIEW_BYTES = 1024 * 1024;
 export const PREVIEW_EXTENSIONS = new Set([
-  '.md', '.markdown', '.txt', '.log', '.json', '.jsonl', '.yaml', '.yml', '.toml',
-  '.xml', '.csv', '.tsv', '.ini', '.conf', '.config', '.properties',
-  '.js', '.jsx', '.ts', '.tsx', '.vue', '.css', '.scss', '.less', '.html', '.htm',
-  '.py', '.pyw', '.go', '.rs', '.java', '.kt', '.swift', '.c', '.cc', '.cpp', '.h',
-  '.hpp', '.sh', '.bash', '.zsh', '.fish', '.sql', '.nvue', '.wxml', '.wxss',
+  '.md', '.mdx', '.markdown', '.txt', '.log', '.rtf',
+  '.ipynb', '.tex', '.bib', '.rst', '.adoc', '.diff', '.patch', '.srt', '.vtt', '.graphql', '.gql', '.proto',
+  '.json', '.jsonc', '.jsonl', '.yaml', '.yml', '.toml', '.xml', '.csv', '.tsv',
+  '.ini', '.conf', '.cfg', '.config', '.properties', '.env', '.lock', '.map',
+  '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts',
+  '.vue', '.svelte', '.astro', '.nvue', '.wxml', '.wxss',
+  '.css', '.scss', '.sass', '.less', '.html', '.htm', '.xhtml',
+  '.py', '.pyw', '.pyi', '.go', '.rs', '.java', '.kt', '.kts', '.swift',
+  '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh', '.hxx', '.cs',
+  '.rb', '.php', '.pl', '.pm', '.r', '.lua', '.dart', '.scala', '.clj',
+  '.ex', '.exs', '.erl', '.hs', '.mm', '.m', '.sql', '.gradle',
+  '.sh', '.bash', '.zsh', '.fish', '.bat', '.cmd', '.ps1', '.psm1',
 ]);
 
 // 媒体扩展名 → { mime, kind }；kind 供手机端分流渲染（image/video/audio/pdf），
@@ -241,11 +267,13 @@ export const MEDIA_EXT_MAP: Record<string, { mime: string; kind: string }> = {
   '.avif': { mime: 'image/avif', kind: 'image' },
   '.heic': { mime: 'image/heic', kind: 'image' },   // 原生不可显示，下面转 JPEG
   '.heif': { mime: 'image/heif', kind: 'image' },
+  '.ico': { mime: 'image/x-icon', kind: 'image' },
   // 视频
   '.mp4': { mime: 'video/mp4', kind: 'video' },
   '.m4v': { mime: 'video/mp4', kind: 'video' },
   '.mov': { mime: 'video/quicktime', kind: 'video' },
   '.webm': { mime: 'video/webm', kind: 'video' },
+  '.mkv': { mime: 'video/x-matroska', kind: 'video' },
   // 音频
   '.mp3': { mime: 'audio/mpeg', kind: 'audio' },
   '.m4a': { mime: 'audio/mp4', kind: 'audio' },
@@ -385,9 +413,10 @@ export function startRemoteServer(
   onRemoteCreate?: (sessionInfo: any) => void,
   onRemoteDestroy?: (id: string) => void,
   onServerStarted?: (info: { lanUrl: string; token: string; port: number }) => void,
-  onSessionClosed?: (session: { title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; resumeSource?: any }) => void,
+  onSessionClosed?: (session: { title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; resumeSource?: any; updatedAt?: number }) => void,
   closedSessionsManager?: ClosedSessionsManager,
   userDataPath?: string, // 新增参数：用户数据目录
+  terminalTaskScheduler?: TerminalTaskScheduler,
 ): http.Server {
   // 缓存供 Bridge 事件使用
   cachedPtyManager = ptyManager;
@@ -402,6 +431,21 @@ export function startRemoteServer(
 
   const app = express();
   const server = http.createServer(app);
+
+  // These two endpoints explicitly use bearer tokens, never ambient cookies.
+  // CORS permits an unreachable LAN page to save its state through the public origin.
+  for (const route of ['/api/network-check', '/api/network-handoff']) {
+    app.use(route, (req, res, next) => {
+      res.set('Access-Control-Allow-Origin', '*');
+      res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+      res.set('Access-Control-Allow-Private-Network', 'true');
+      res.set('Cache-Control', 'no-store');
+      if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+      next();
+    });
+  }
+  app.use('/api/network-handoff', express.json({ limit: '2mb' }));
 
   app.use(express.json({ limit: '256kb' }));
 
@@ -425,6 +469,76 @@ export function startRemoteServer(
 
   app.use('/api', authMiddleware);
 
+  const networkHandoffs = new NetworkHandoffStore();
+  app.get('/api/network-check', (_req, res) => res.json({ ok: true }));
+  app.post('/api/network-handoff', (req, res) => {
+    try { res.json({ ticket: networkHandoffs.put(config.token, req.body) }); }
+    catch { res.status(400).json({ error: '无法保存网络切换状态，请稍后重试' }); }
+  });
+  app.get('/api/network-handoff', (req, res) => {
+    const state = networkHandoffs.take(config.token, String(req.query.ticket || ''));
+    if (!state) { res.status(410).json({ error: '网络切换状态已过期，请返回原页面重试' }); return; }
+    res.json(state);
+  });
+  
+  // Mac 桌面远程控制路由
+  app.use('/api/mac-desktop', macDesktopRouter);
+
+  app.get('/api/tasks', (_req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    res.json(terminalTaskScheduler.snapshot());
+  });
+  app.post('/api/tasks', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.create({ ...req.body, cwd: req.body?.cwd || os.homedir() })); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.patch('/api/tasks/:id', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.update(String(req.params.id || ''), req.body)); }
+    catch (error) { res.status(409).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/cancel', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.cancel(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/pause', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.pause(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/resume', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.resume(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/run-now', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.runNow(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.delete('/api/tasks/:id', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.remove(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post('/api/tasks/:id/confirm-complete', (req, res) => {
+    if (!terminalTaskScheduler) { res.status(503).json({ error: '计划任务服务不可用' }); return; }
+    try { res.json(terminalTaskScheduler.confirmComplete(String(req.params.id || ''))); }
+    catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  
+  app.get('/api/quick-commands', (_req, res) => {
+    try { res.json(quickCommands.read()); }
+    catch { res.status(500).json({ error: '快捷命令读取失败' }); }
+  });
+  app.post('/api/quick-commands', (req, res) => {
+    try { res.json(quickCommands.update(req.body)); }
+    catch (error: any) { res.status(400).json({ error: error.message || '快捷命令保存失败' }); }
+  });
+
+
   // ========== WebSocket ==========
 
   const wss = new WebSocketServer({
@@ -437,16 +551,38 @@ export function startRemoteServer(
   const sseClients = new Set<import('express').Response>();
   const wsClients = new Map<string, Set<WebSocket>>();
   ptyManager.setRemoteSubscriberCheck((id) => (wsClients.get(id)?.size ?? 0) > 0);
+  function notifySessionRemoteView(id: string, info: { viewed?: boolean; viewing?: boolean }) {
+    const notify = (global as any).__notifySessionRemoteView;
+    if (typeof notify === 'function') notify(id, info);
+  }
   type RemoteWsChunk = { data: string; sequence: number };
   type RemoteWsState = {
     id: string;
+    subscriptionId: string;
+    requestId: string;
     ready: boolean;
     sequence: number;
     revision: number;
     sendQueue: Promise<void>;
     pending: RemoteWsChunk[];
+    /** Scrollback rows currently loaded on this mobile client. */
+    historyScrollback: number;
   };
+  const snapshotEnvelope = (
+    state: RemoteWsState,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    sessionId: state.id,
+    subscriptionId: state.subscriptionId,
+    requestId: state.requestId,
+    capabilityVersion: TERMINAL_CAPABILITY_VERSION,
+    ...extra,
+  });
   const remoteStates = new Map<WebSocket, RemoteWsState>();
+  // First paint includes the live local window (~3 desktop screens). Older rows
+  // still load from the archive overlay after the user scrolls that window.
+  const INITIAL_REPLAY_SCROLLBACK = LIVE_TERMINAL_SCROLLBACK;
+  const HISTORY_CHUNK_ROWS = 80;
   const enqueueWsSend = (ws: WebSocket, state: RemoteWsState, payload: string) => {
     const operation = state.sendQueue.then(() => new Promise<void>((resolve, reject) => {
       if (ws.readyState !== WebSocket.OPEN || remoteStates.get(ws) !== state) {
@@ -475,7 +611,8 @@ export function startRemoteServer(
     state.ready = false;
     state.sequence = sequence;
     state.pending = [];
-    void enqueueWsSend(ws, state, JSON.stringify({
+    const history = session.terminalState?.history;
+    void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
       type: 'replay',
       data: session.rawBuffer || '',
       cols: session.currentCols,
@@ -485,25 +622,62 @@ export function startRemoteServer(
       // otherwise the first live flush sends the replayed bytes a second time.
       sequence,
       preserveViewport,
-    })).then(() => {
+      // Fallback path dumps the raw ANSI tail; treat it as a complete paint.
+      scrollback: 0,
+      scrollbackTotal: 0,
+      hasMoreHistory: Boolean(history?.hasMore),
+      epoch: history?.epoch ?? 1,
+      geometryRevision: 0,
+      historyCursor: history?.historyCursor ?? null,
+      historyHasMore: Boolean(history?.hasMore),
+      earliestAvailable: Boolean(history && !history.truncated && !history.hasMore),
+      truncated: Boolean(history?.truncated),
+      fallback: 'raw',
+    }))).then(() => {
       if (remoteStates.get(ws) === state) {
         state.ready = true;
+        state.historyScrollback = 0;
         // Output can arrive while the replay is in flight. Flush the queued
         // tail now that this connection has a stable replay cursor.
         flushClientPending(ws, state);
       }
     }).catch(() => closeBrokenRemoteSocket(ws, state));
   };
-  const sendSnapshot = (ws: WebSocket, id: string, preserveViewport = false) => {
+  const sendSnapshot = (
+    ws: WebSocket,
+    id: string,
+    preserveViewport = false,
+    options?: { scrollback?: number; messageType?: 'replay' | 'history'; requestId?: string },
+  ) => {
     const state = remoteStates.get(ws);
     if (!state || state.id !== id) return;
     const session = ptyManager.getSession(id);
+    const messageType = options?.messageType || 'replay';
+    if (options?.requestId) state.requestId = String(options.requestId);
     if (!session || session.closing) {
       if (ws.readyState === WebSocket.OPEN) {
         state.ready = false;
         state.sequence = 0;
         state.pending = [];
-        void enqueueWsSend(ws, state, JSON.stringify({ type: 'replay', data: '', cols: 80, rows: 24, sequence: 0, preserveViewport })).then(() => {
+        state.historyScrollback = 0;
+        void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+          type: messageType,
+          missingSession: true,
+          data: '',
+          cols: 80,
+          rows: 24,
+          sequence: 0,
+          scrollback: 0,
+          scrollbackTotal: 0,
+          hasMoreHistory: false,
+          epoch: 1,
+          geometryRevision: 0,
+          historyCursor: null,
+          historyHasMore: false,
+          earliestAvailable: true,
+          truncated: false,
+          preserveViewport,
+        }))).then(() => {
           if (remoteStates.get(ws) === state) {
             state.ready = true;
             flushClientPending(ws, state);
@@ -518,16 +692,28 @@ export function startRemoteServer(
     state.ready = false;
     state.pending = [];
     const revision = ++state.revision;
+    const snapshotOptions = options?.scrollback === undefined
+      ? undefined
+      : { scrollback: options.scrollback };
     void ptyManager.snapshot(id, snapshot => {
       if (remoteStates.get(ws) !== state || state.revision !== revision || ws.readyState !== WebSocket.OPEN) return;
       state.sequence = snapshot.sequence;
-      void enqueueWsSend(ws, state, JSON.stringify({ type: 'replay', ...snapshot, preserveViewport })).then(() => {
-        if (remoteStates.get(ws) === state) {
+      state.historyScrollback = snapshot.scrollback;
+      void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+        type: messageType,
+        ...snapshot,
+        preserveViewport,
+      }))).then(() => {
+        if (remoteStates.get(ws) === state && state.revision === revision) {
           state.ready = true;
           flushClientPending(ws, state);
         }
       }).catch(() => closeBrokenRemoteSocket(ws, state));
-    }).catch(() => sendRawReplay(ws, state, session, preserveViewport));
+    }, snapshotOptions).catch(() => {
+      if (remoteStates.get(ws) === state && state.revision === revision) {
+        sendRawReplay(ws, state, session, preserveViewport);
+      }
+    });
   };
   type AliveWebSocket = WebSocket & { isAlive?: boolean };
 
@@ -571,30 +757,58 @@ export function startRemoteServer(
         const data = JSON.parse(msg.toString());
 
         if (data.type === 'subscribe' && data.sessionId) {
-          if (subscribedSession) wsClients.get(subscribedSession)?.delete(ws);
+          if (subscribedSession) {
+            wsClients.get(subscribedSession)?.delete(ws);
+            if (subscribedSession !== data.sessionId && (wsClients.get(subscribedSession)?.size ?? 0) === 0) {
+              notifySessionRemoteView(subscribedSession, { viewing: false });
+            }
+          }
           subscribedSession = data.sessionId;
           pendingSizeClaim = true;
           const state: RemoteWsState = {
             id: data.sessionId,
+            subscriptionId: crypto.randomUUID(),
+            requestId: typeof data.requestId === 'string' ? data.requestId : '',
             ready: false,
             sequence: 0,
             revision: 0,
             sendQueue: Promise.resolve(),
             pending: [],
+            historyScrollback: 0,
           };
           remoteStates.set(ws, state);
           if (!wsClients.has(data.sessionId)) wsClients.set(data.sessionId, new Set());
           wsClients.get(data.sessionId)!.add(ws);
+          notifySessionRemoteView(data.sessionId, { viewed: true, viewing: true });
 
-          // 订阅先同步回放 rawBuffer，保证手机端立刻收到 replay 并停止重连。
+          // First paint: latest screen plus the live local window. Older
+          // archive pages load when the client scrolls to the top of that window.
           const session = ptyManager.getSession(data.sessionId);
           if (session && !session.closing) {
-            // Once a mobile client owns the PTY geometry, reconnecting that
-            // client should restore the acknowledged mobile size as well.
-            // A desktop-owned session still lets the browser fit locally.
-            sendRawReplay(ws, state, session, session.sizeOwner === 'mobile');
+            sendSnapshot(
+              ws,
+              data.sessionId,
+              session.sizeOwner === 'mobile',
+              { scrollback: INITIAL_REPLAY_SCROLLBACK },
+            );
           } else if (ws.readyState === WebSocket.OPEN) {
-            void enqueueWsSend(ws, state, JSON.stringify({ type: 'replay', data: '', cols: 80, rows: 24, sequence: 0 })).then(() => {
+            void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+              type: 'replay',
+              missingSession: true,
+              data: '',
+              cols: 80,
+              rows: 24,
+              sequence: 0,
+              scrollback: 0,
+              scrollbackTotal: 0,
+              hasMoreHistory: false,
+              epoch: 1,
+              geometryRevision: 0,
+              historyCursor: null,
+              historyHasMore: false,
+              earliestAvailable: true,
+              truncated: false,
+            }))).then(() => {
               if (remoteStates.get(ws) === state) {
                 state.ready = true;
                 flushClientPending(ws, state);
@@ -603,7 +817,67 @@ export function startRemoteServer(
           }
         }
 
-        if (data.type === 'submit' && subscribedSession && typeof data.id === 'string' && data.id.length <= 128
+        if (data.type === 'historyBefore' && subscribedSession) {
+          const state = remoteStates.get(ws);
+          if (!state || state.id !== subscribedSession) return;
+          const requestId = typeof data.requestId === 'string' ? data.requestId : '';
+          const limitRows = Number.isFinite(Number(data.limitRows))
+            ? Math.max(1, Math.min(200, Math.floor(Number(data.limitRows))))
+            : HISTORY_PAGE_ROWS;
+          void ptyManager.historyBefore(subscribedSession, {
+            epoch: Number.isInteger(data.epoch) ? data.epoch : undefined,
+            requestId,
+            beforeCursor: typeof data.beforeCursor === 'string' ? data.beforeCursor : null,
+            limitRows,
+          }).then(page => {
+            if (remoteStates.get(ws) !== state || ws.readyState !== WebSocket.OPEN) return;
+            void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+              type: 'historyPage',
+              ...page,
+              requestId,
+            })));
+          }).catch(() => {
+            if (remoteStates.get(ws) !== state || ws.readyState !== WebSocket.OPEN) return;
+            void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
+              type: 'historyPage',
+              items: [],
+              nextCursor: null,
+              hasMore: false,
+              earliestAvailable: false,
+              truncated: false,
+              stale: true,
+              requestId,
+              epoch: Number.isInteger(data.epoch) ? data.epoch : 0,
+            })));
+          });
+        }
+
+        if (data.type === 'history' && subscribedSession) {
+          const state = remoteStates.get(ws);
+          if (!state || state.id !== subscribedSession) return;
+          const requested = Number(data.scrollback);
+          const nextScrollback = Number.isFinite(requested)
+            ? Math.max(state.historyScrollback, Math.min(5000, Math.floor(requested)))
+            : state.historyScrollback + HISTORY_CHUNK_ROWS;
+          if (nextScrollback <= state.historyScrollback) {
+            void enqueueWsSend(ws, state, JSON.stringify({
+              type: 'history',
+              data: '',
+              scrollback: state.historyScrollback,
+              scrollbackTotal: state.historyScrollback,
+              hasMoreHistory: false,
+              sequence: state.sequence,
+            }));
+            return;
+          }
+          sendSnapshot(ws, subscribedSession, true, {
+            scrollback: nextScrollback,
+            messageType: 'history',
+          });
+        }
+
+        if (data.type === 'submit' && subscribedSession && data.sessionId === subscribedSession
+            && typeof data.id === 'string' && data.id.length <= 128
             && typeof data.text === 'string' && data.text.length > 0 && data.text.length <= 100000) {
           const sessionId = subscribedSession;
           void ptyManager.submit(sessionId, data.id, data.text).then(() => {
@@ -611,6 +885,8 @@ export function startRemoteServer(
           }).catch((e: Error) => {
             if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'submitted', id: data.id, error: e.message }));
           });
+        } else if (data.type === 'submit' && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'submitted', id: data.id, error: '提交目标与当前会话不一致' }));
         }
 
         if (data.type === 'input' && subscribedSession) {
@@ -627,11 +903,19 @@ export function startRemoteServer(
         // 首次（订阅后）force 接管；其余走仲裁，避免和桌面端抢尺寸导致
         // TUI 反复重绘、滚动区堆残帧。
         if (data.type === 'resize' && subscribedSession && data.cols && data.rows) {
-          const initialClaim = pendingSizeClaim;
           ptyManager.resize(subscribedSession, data.cols, data.rows, 'mobile', pendingSizeClaim);
           pendingSizeClaim = false;
-          // 订阅后的首次 resize 紧跟 raw replay，跳过 snapshot，避免首屏连续多帧。
-          if (!initialClaim) sendSnapshot(ws, subscribedSession, true);
+          // Initial resize also needs an ordered acknowledgement. Otherwise a
+          // reconnect can apply the pre-resize snapshot while new output is
+          // already being parsed at the newly claimed geometry. Snapshot
+          // revisions suppress obsolete work; skipping the ACK is not safe.
+          const state = remoteStates.get(ws);
+          sendSnapshot(
+            ws,
+            subscribedSession,
+            true,
+            { scrollback: state?.historyScrollback ?? INITIAL_REPLAY_SCROLLBACK },
+          );
         }
 
         // 心跳 ping，忽略即可
@@ -648,6 +932,7 @@ export function startRemoteServer(
       if (subscribedSession) {
         wsClients.get(subscribedSession)?.delete(ws);
         if ((wsClients.get(subscribedSession)?.size ?? 0) === 0) {
+          notifySessionRemoteView(subscribedSession, { viewing: false });
           const session = ptyManager.getSession(subscribedSession);
           const desktop = session?.sizeBySource.desktop;
           if (session && desktop && session.sizeOwner === 'mobile') {
@@ -1245,6 +1530,11 @@ export function startRemoteServer(
       });
       return;
     }
+    // Mac 桌面远程控制 WS 路由
+    if (pathname === '/mac-desktop-ws') {
+      handleMacDesktopWsUpgrade(wss, request);
+      return;
+    }
     socket.destroy();
   });
 
@@ -1270,11 +1560,14 @@ export function startRemoteServer(
     // and send the same tail twice. If the socket fails, reconnect replay is
     // authoritative and will recover from rawBuffer.
     state.sequence = sequence;
-    void enqueueWsSend(ws, state, JSON.stringify({
+    const fromSequence = fresh[0].sequence;
+    void enqueueWsSend(ws, state, JSON.stringify(snapshotEnvelope(state, {
       type: 'output',
       data: fresh.map(chunk => chunk.data).join(''),
+      fromSequence,
+      toSequence: sequence,
       sequence,
-    })).catch(() => closeBrokenRemoteSocket(ws, state));
+    }))).catch(() => closeBrokenRemoteSocket(ws, state));
   };
 
   const flushClientPending = (ws: WebSocket, state: RemoteWsState): void => {
@@ -1415,18 +1708,37 @@ export function startRemoteServer(
         }
       }
     }
-    res.json({ lanIps, port: PORT, hostname: os.hostname() });
+    let publicUrl = '';
+    try {
+      const tunnelConfig = fs.readFileSync(new CloudflaredManager(DUOCLI_APP_ROOT).configPath, 'utf8');
+      const publicHost = tunnelConfig.match(/^\s*-\s*hostname:\s*([\w.-]+)\s*$/m)?.[1];
+      if (publicHost && isCloudflaredConfigReady(tunnelConfig)) publicUrl = `https://${publicHost}`;
+    } catch { /* LAN access remains available without a public tunnel configuration. */ }
+    res.json({ lanIps, port: PORT, hostname: os.hostname(), publicUrl });
   });
 
-  // 1x1 透明 PNG，给手机端 <img> 探针用（HTTPS 页面下 fetch HTTP 会被
-  // Mixed Content 拦截，但 <img> 跨协议加载不被拦，可用 onload 判通断）
-  // 注意：不挂在 /api 下，避免 token 限制——这是公开探针端点
+  // 1x1 透明 PNG，给网页端探测局域网是否可达。
+  // Chromium Local Network Access 可用 fetch(私有 IP) 豁免 Mixed Content；
+  // 其它浏览器退回 <img> 跨协议加载。不挂 /api，避免 token 限制。
   const PING_PNG = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
     'base64'
   );
-  app.get('/ping.png', (_req, res) => {
+  // Private Network Access（旧 Chromium）会对跨网段请求发 OPTIONS 预检；
+  // 缺 Allow-Private-Network 时探针永远失败，表现为「永远切不到局域网」。
+  const setPingCors = (res: import('express').Response) => {
     res.set('Cache-Control', 'no-store');
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type');
+    res.set('Access-Control-Allow-Private-Network', 'true');
+  };
+  app.options('/ping.png', (_req, res) => {
+    setPingCors(res);
+    res.status(204).end();
+  });
+  app.get('/ping.png', (_req, res) => {
+    setPingCors(res);
     res.type('png').send(PING_PNG);
   });
 
@@ -1436,6 +1748,17 @@ export function startRemoteServer(
     } else {
       res.status(401).json({ error: 'Token 错误' });
     }
+  });
+
+  app.put('/api/access-token', (req, res) => {
+    const nextToken = normalizeAccessToken(req.body?.token);
+    if (!isValidAccessToken(nextToken)) {
+      res.status(400).json({ error: 'Token 需为 8–128 位可见字符（勿含空格）' });
+      return;
+    }
+    const result = updateRemoteAccessToken(nextToken);
+    if (!result.ok) { res.status(400).json({ error: result.error }); return; }
+    res.set('Cache-Control', 'no-store').json({ ok: true });
   });
 
   app.get('/api/vapid-public-key', (_req, res) => {
@@ -1479,11 +1802,13 @@ export function startRemoteServer(
     res.json({ ok: true });
   });
 
-  // 获取会话的 UI 状态（busy/unread/idle），由 renderer 同步到 main
+  // 绿=进行中，黄=已停止未查看，灰=已查看。未同步时不能默认黄。
   function getSessionStatus(id: string, ptyProcess: any): string {
-    if (ptyProcess.exitState) return 'exited';
     const statuses = (global as any).__sessionStatuses || {};
-    return statuses[id] || 'idle';
+    return resolveSessionUiStatus(statuses[id], {
+      exited: Boolean(ptyProcess?.exitState),
+      viewing: (wsClients.get(id)?.size ?? 0) > 0,
+    });
   }
 
   function mapSessionToApi(s: any) {
@@ -1499,6 +1824,12 @@ export function startRemoteServer(
       provider: s.provider,
       status: getSessionStatus(s.id, s.ptyProcess),
       createdAt: s.createdAt || Date.now(),
+      lastSubmittedAt: s.lastSubmittedAt || 0,
+      themeId: s.themeId || '',
+      cli: s.cliKind || '',
+      resumeId: s.resumeId || null,
+      chatCapable: isNativeChatSupportedCli(s.cliKind),
+      lastUserPrompt: userPromptBanner.lastUserPromptFrom(s.accumulatedInputs),
     };
   }
 
@@ -1507,6 +1838,92 @@ export function startRemoteServer(
     const sessions = ptyManager.getAllSessions().map(s => mapSessionToApi(s));
     res.json(sessions);
   });
+
+  app.get('/api/sessions/:id/chat', async (req, res) => {
+    const session = ptyManager.getSession(String(req.params.id));
+    if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    const controller = new AbortController();
+    const onClose = () => controller.abort();
+    res.on('close', onClose);
+    try {
+      const knownRevision = typeof req.query.revision === 'string' ? req.query.revision : '';
+      const requestedWait = Number(req.query.wait);
+      const waitMs = knownRevision && req.query.before === undefined && Number.isFinite(requestedWait)
+        ? Math.max(0, Math.min(10000, requestedWait)) : 0;
+      const deadline = Date.now() + waitMs;
+      // Hold an unchanged revision until the transcript changes. Terminal output
+      // is a different source: only complete CLI transcript records become chat.
+      while (!controller.signal.aborted) {
+        if (ptyManager.getSession(session.id) !== session) {
+          res.status(404).json({ error: '会话不存在' }); return;
+        }
+        ptyManager.ensureResumeId(session.id);
+        // /new and /resume can replace the live thread while its old transcript
+        // still exists. Refresh the process-owned binding before reading it.
+        ptyManager.rebindLiveResumeId(session.id);
+        const snapshot = await loadSessionChat(session.cliKind, session.resumeId, session.cwd, session.cliStorageEnv);
+        const messages = trackChatSubmissions(snapshot.messages, session.submissions);
+        // The transcript can flush before Enter is acknowledged. Tracking changes
+        // must invalidate a revision even when the file itself has not changed.
+        const trackingRevision = crypto.createHash('sha256')
+          .update(JSON.stringify(messages.filter(message => message.submissionId)
+            .map(message => [message.id, message.submissionId])))
+          .digest('hex').slice(0, 16);
+        const revision = snapshot.revision
+          ? `${snapshot.agent}:${snapshot.sessionId}:${snapshot.revision}:${trackingRevision}` : undefined;
+        if (knownRevision && revision && knownRevision === revision) {
+          if (Date.now() < deadline) {
+            await waitForChat(Math.min(200, deadline - Date.now()), undefined, { signal: controller.signal });
+            continue;
+          }
+          res.json({ supported: true, unchanged: true, revision, waitSupported: true });
+          return;
+        }
+        const requestedBefore = Number(req.query.before);
+        const endIndex = Number.isFinite(requestedBefore)
+          ? Math.max(0, Math.min(messages.length, Math.floor(requestedBefore)))
+          : messages.length;
+        const requestedLimit = Number(req.query.limit);
+        const pageLimit = Number.isFinite(requestedLimit)
+          ? Math.max(50, Math.min(500, Math.floor(requestedLimit)))
+          : 300;
+        const startIndex = Math.max(0, endIndex - pageLimit);
+        const { filePath: _ignored, ...publicSnapshot } = snapshot;
+        void _ignored;
+        res.json({
+          ...publicSnapshot,
+          revision,
+          waitSupported: true,
+          messages: messages.slice(startIndex, endIndex),
+          paged: true,
+          submissionTracking: true,
+          totalMessages: messages.length,
+          startIndex,
+          hasMore: startIndex > 0,
+        });
+        return;
+      }
+    } catch (error: any) {
+      if (controller.signal.aborted) return;
+      res.status(500).json({ error: error?.message || '读取对话失败' });
+    } finally {
+      res.off('close', onClose);
+    }
+  });
+
+  const sendSessionFileDownload = (req: express.Request, res: express.Response) => {
+    const session = ptyManager.getSession(String(req.params.id));
+    if (!session) { res.status(404).json({ error: '会话不存在' }); return; }
+    sendFileDownload(
+      session.cwd,
+      String(req.query.path || ''),
+      res,
+      [...PREVIEW_EXTENSIONS, ...Object.keys(MEDIA_EXT_MAP)],
+    );
+  };
+  app.get('/api/sessions/:id/file-download/:filename', sendSessionFileDownload);
+  app.get('/api/sessions/:id/file-download', sendSessionFileDownload);
 
   // 手机端只读预览会话 cwd 内的文本文件
   app.get('/api/sessions/:id/file-preview', (req, res) => {
@@ -1646,7 +2063,7 @@ export function startRemoteServer(
       // 解析 bytes=start-end
       const m = /bytes=(\d*)-(\d*)/.exec(range);
       if (!m) { res.status(416).json({ error: 'Range 无效' }); return; }
-      let start = m[1] ? parseInt(m[1], 10) : 0;
+      const start = m[1] ? parseInt(m[1], 10) : 0;
       let end = m[2] ? parseInt(m[2], 10) : total - 1;
       if (isNaN(start) || isNaN(end)) { res.status(416).json({ error: 'Range 无效' }); return; }
       if (start < 0 || start >= total) { res.status(416).json({ error: 'Range 越界' }); return; }
@@ -1704,16 +2121,27 @@ export function startRemoteServer(
     }
   });
 
+  // 手机点进会话 = 已查看（黄→灰）；进行中绿点仍由桌面端同步
+  app.post('/api/sessions/:id/seen', (req, res) => {
+    const id = String(req.params.id || '');
+    if (!id || !ptyManager.getSession(id)) {
+      res.status(404).json({ error: '会话不存在' });
+      return;
+    }
+    notifySessionRemoteView(id, { viewed: true });
+    res.json({ ok: true });
+  });
+
   // 输入
   app.post('/api/sessions/:id/input', async (req, res) => {
-    const { input, submissionId } = req.body;
+    const { input, submissionId, source } = req.body;
     if (typeof input !== 'string') { res.status(400).json({ error: '缺少 input' }); return; }
     if (submissionId !== undefined) {
       if (typeof submissionId !== 'string' || submissionId.length > 128 || !input || input.length > 100000) {
         res.status(400).json({ error: '无效的提交' }); return;
       }
       try {
-        await ptyManager.submit(req.params.id, submissionId, input);
+        await ptyManager.submit(req.params.id, submissionId, input, 50, source === 'chat' ? 'chat' : 'mobile');
         res.json({ ok: true, id: submissionId });
       } catch (e: any) { res.status(409).json({ error: e.message }); }
       return;
@@ -1725,9 +2153,9 @@ export function startRemoteServer(
 
   // 原始键码
   app.post('/api/sessions/:id/key', (req, res) => {
-    const { key } = req.body;
+    const { key, source } = req.body;
     if (typeof key !== 'string') { res.status(400).json({ error: '缺少 key' }); return; }
-    ptyManager.write(req.params.id, key, 'mobile');
+    ptyManager.write(req.params.id, key, source === 'chat' ? 'chat' : 'mobile');
     res.json({ ok: true });
   });
 
@@ -1797,6 +2225,7 @@ export function startRemoteServer(
       resumeCommand: cs.resumeCommand,
       displayName: cs.displayName || getDisplayName(cs.presetCommand),
       closedAt: cs.closedAt,
+      updatedAt: cs.updatedAt || cs.closedAt,
       state: cs.state || 'closed',
     };
   }
@@ -1804,8 +2233,7 @@ export function startRemoteServer(
   // 已关闭会话 — 可恢复的历史记录
   app.get('/api/closed-sessions', (_req, res) => {
     if (!closedSessionsManager) { res.json([]); return; }
-    const items = closedSessionsManager.list()
-      .sort((a, b) => b.closedAt - a.closedAt)
+    const items = sortClosedSessionsByUpdatedAt(closedSessionsManager.list())
       .map(mapClosedSessionToApi);
     res.json(items);
   });
@@ -1948,6 +2376,12 @@ export function startRemoteServer(
         resumeId,
         resumeCommand,
         resumeSource: capture?.source || beforeClose.resumeSource || undefined,
+        updatedAt: Math.max(
+          beforeClose.updatedAt || 0,
+          beforeClose.createdAt || 0,
+          beforeClose.lastInputAt?.desktop || 0,
+          beforeClose.lastInputAt?.mobile || 0,
+        ) || Date.now(),
       });
     }
     onRemoteDestroy?.(req.params.id);
@@ -2082,7 +2516,7 @@ export function startRemoteServer(
       args.push('exec-out', 'screencap', '-p');
       const png = deviceId
         ? await androidScreenshotManager.capture(deviceId, () => runAdb(args, { timeout: 4000, maxBuffer: 8 * 1024 * 1024 }))
-        : await runAdb(args, { timeout: 4000, maxBuffer: 8 * 1024 * 1024 });
+        : await prepareAdbScreenshot(await runAdb(args, { timeout: 4000, maxBuffer: 8 * 1024 * 1024 }));
       const meta = await sharp(png).metadata();
       let pipeline = sharp(png);
       if (scale < 1) {
@@ -2103,7 +2537,7 @@ export function startRemoteServer(
       }
       res.send(jpeg);
     } catch (e: any) {
-      res.status(500).json({ error: '截图失败: ' + (e.message || e) });
+      res.status(500).json({ error: '截图失败: ' + humanizeAndroidImageError(e) });
     }
   });
 
@@ -2137,7 +2571,7 @@ export function startRemoteServer(
       }
       res.send(jpeg);
     } catch (error) {
-      res.status(500).json({ error: '截图失败: ' + (error instanceof Error ? error.message : String(error)) });
+      res.status(500).json({ error: '截图失败: ' + humanizeAndroidImageError(error) });
     }
   });
 
@@ -2190,6 +2624,22 @@ export function startRemoteServer(
     }
   });
 
+  const ANDROID_NAV_KEYCODES: Record<string, number> = { back: 4, home: 3, recents: 187 };
+
+  app.post('/api/android/key', async (req, res) => {
+    try {
+      const deviceId = typeof req.body.deviceId === 'string' ? req.body.deviceId.trim() : '';
+      const key = typeof req.body.key === 'string' ? req.body.key.trim() : '';
+      const keyCode = ANDROID_NAV_KEYCODES[key];
+      if (!deviceId || !keyCode) { res.status(400).json({ error: '参数错误' }); return; }
+      if (!legacyControlAllowed(req, res, deviceId)) return;
+      await runAdb(['-s', deviceId, 'shell', 'input', 'keyevent', String(keyCode)]);
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(500).json({ error: '按键失败: ' + (e.message || e) });
+    }
+  });
+
   app.post('/api/android/input-text', async (req, res) => {
     try {
       const deviceId = typeof req.body.deviceId === 'string' ? req.body.deviceId.trim() : '';
@@ -2203,7 +2653,7 @@ export function startRemoteServer(
       if (!previousIme || previousIme === 'null' || previousIme === 'none') {
         throw new Error('无法读取手机当前默认输入法，已停止文字注入以避免修改系统设置');
       }
-      let helperIme = 'com.android.adbkeyboard/.AdbIME';
+      const helperIme = 'com.android.adbkeyboard/.AdbIME';
       try {
         await runAdb(['-s', deviceId, 'shell', 'ime', 'set', helperIme]);
         await runAdb(['-s', deviceId, 'shell', 'am', 'broadcast', '-a', 'ADB_INPUT_TEXT', '--es', 'msg', text]);
@@ -2248,15 +2698,31 @@ export function startRemoteServer(
     // 还会把用户正在滑开的会话卡片换成新节点、打断手势。存活性由 3s 心跳保证。
     let lastSessionsPayload = '';
     let lastClosedPayload = '';
+    let lastQuickCommandsPayload = '';
+    let lastTasksPayload = '';
     const sendSessions = () => {
+      try {
+        const payload = JSON.stringify(quickCommands.read());
+        if (payload !== lastQuickCommandsPayload) {
+          lastQuickCommandsPayload = payload;
+          res.write(`event: quick-commands\ndata: ${payload}\n\n`);
+        }
+      } catch { /* Keep the stream alive if configuration cannot be read. */ }
+
       const sessions = JSON.stringify(ptyManager.getAllSessions().map(s => mapSessionToApi(s)));
       if (sessions !== lastSessionsPayload) {
         lastSessionsPayload = sessions;
         res.write(`event: sessions\ndata: ${sessions}\n\n`);
       }
+      if (terminalTaskScheduler) {
+        const tasks = JSON.stringify(terminalTaskScheduler.snapshot());
+        if (tasks !== lastTasksPayload) {
+          lastTasksPayload = tasks;
+          res.write(`event: tasks\ndata: ${tasks}\n\n`);
+        }
+      }
       if (!closedSessionsManager) return;
-      const closed = JSON.stringify(closedSessionsManager.list()
-        .sort((a, b) => b.closedAt - a.closedAt)
+      const closed = JSON.stringify(sortClosedSessionsByUpdatedAt(closedSessionsManager.list())
         .map(mapClosedSessionToApi));
       if (closed !== lastClosedPayload) {
         lastClosedPayload = closed;

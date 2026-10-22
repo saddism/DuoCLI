@@ -54,21 +54,44 @@
 
         <label>配色</label>
         <div class="new-session-row">
-          <div id="theme-select" class="custom-select">
-            <div class="custom-select-display" id="theme-display">
-              <span class="theme-dot" style="background:#0078d4"></span>VS Code Dark
-            </div>
-            <div class="custom-select-dropdown" id="theme-dropdown">
-              <div class="custom-select-option" data-value="auto"><span class="theme-dot" style="background:conic-gradient(#e06c75,#e5c07b,#98c379,#56b6c2,#61afef,#c678dd,#e06c75)"></span>自动配色</div>
-              <div class="custom-select-option" data-value="vscode-dark"><span class="theme-dot" style="background:#0078d4"></span>VS Code Dark</div>
-              <div class="custom-select-option" data-value="monokai"><span class="theme-dot" style="background:#a6e22e"></span>Monokai</div>
-              <div class="custom-select-option" data-value="dracula"><span class="theme-dot" style="background:#bd93f9"></span>Dracula</div>
-              <div class="custom-select-option" data-value="solarized-dark"><span class="theme-dot" style="background:#268bd2"></span>Solarized Dark</div>
-              <div class="custom-select-option" data-value="one-dark"><span class="theme-dot" style="background:#61afef"></span>One Dark</div>
-              <div class="custom-select-option" data-value="nord"><span class="theme-dot" style="background:#88c0d0"></span>Nord</div>
-            </div>
+          <div id="theme-select" class="theme-swatch-row" role="listbox" aria-label="终端配色">
+            <button type="button" class="theme-swatch theme-swatch-auto selected" data-value="auto" title="自动配色" aria-label="自动配色"></button>
+            <button type="button" class="theme-swatch" data-value="vscode-dark" title="VS Code Dark" aria-label="VS Code Dark" style="background:#0078d4"></button>
+            <button type="button" class="theme-swatch" data-value="monokai" title="Monokai" aria-label="Monokai" style="background:#a6e22e"></button>
+            <button type="button" class="theme-swatch" data-value="dracula" title="Dracula" aria-label="Dracula" style="background:#bd93f9"></button>
+            <button type="button" class="theme-swatch" data-value="solarized-dark" title="Solarized Dark" aria-label="Solarized Dark" style="background:#268bd2"></button>
+            <button type="button" class="theme-swatch" data-value="one-dark" title="One Dark" aria-label="One Dark" style="background:#61afef"></button>
+            <button type="button" class="theme-swatch" data-value="nord" title="Nord" aria-label="Nord" style="background:#88c0d0"></button>
           </div>
         </div>
+
+        <label class="task-plan-toggle"><input id="task-plan-enabled" type="checkbox" /> 加入计划任务队列</label>
+        <section id="task-plan-fields" class="task-plan-fields" hidden>
+          <label>首条任务指令<textarea id="task-plan-instruction" rows="3" maxlength="100000" placeholder="终端启动后自动发送的指令"></textarea></label>
+          <div class="task-plan-name-row">
+            <span>任务名称 · 自动生成</span>
+            <div id="task-plan-name-preview" class="task-plan-name-preview">填写指令后自动生成</div>
+            <input id="task-plan-name" type="hidden" maxlength="120" />
+          </div>
+          <div class="task-plan-grid">
+            <label>延迟启动（分钟）
+              <div class="task-plan-time-row">
+                <input id="task-plan-delay" type="number" min="0" step="1" placeholder="例如 5" />
+                <button type="button" id="task-plan-delay-clear" class="task-plan-time-clear" title="清空时间">×</button>
+              </div>
+              <span class="ac-field-hint">留空或填 0，立即启动</span>
+            </label>
+            <label>完成等待（秒）
+              <input id="task-plan-quiet" type="number" min="1" max="3600" value="10" />
+              <span class="ac-field-hint">连续无新输出达到此时长，即视为完成</span>
+            </label>
+            <label class="task-plan-dependency-field">前置任务（可选）
+              <select id="task-plan-dependency"><option value="">无</option></select>
+              <span class="ac-field-hint">选择后，等待前置任务完成再启动</span>
+            </label>
+          </div>
+          <p>启动需同时满足延迟时间和前置任务条件。完成后会启动后续任务。</p>
+        </section>
       </div>
 
       <div class="confirm-buttons">
@@ -78,38 +101,38 @@
     </div>
   </div>
 
-  <!-- 计划设置弹窗 -->
+  <!-- 会话设置弹窗 -->
   <div id="auto-continue-overlay" class="new-session-overlay">
-    <div class="new-session-dialog" style="width: min(400px, calc(100vw - 40px));">
+    <div class="new-session-dialog session-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="session-settings-title">
       <div class="new-session-header">
-        <h3>计划设置</h3>
+        <h3 id="session-settings-title">会话设置</h3>
         <button id="auto-continue-dialog-close" class="new-session-close" title="关闭">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
         </button>
       </div>
       <div class="new-session-body ac-config-body">
-        <label class="ac-config-command-label">命令列表（每行一条，按顺序发送）</label>
-        <textarea id="auto-continue-message" class="ac-config-command" rows="4" placeholder="每行一条命令，按顺序发送"></textarea>
+        <section class="ac-config-group session-settings-color">
+          <div>
+            <div class="ac-config-group-title">终端颜色</div>
+            <span class="session-settings-hint">为当前会话选择主题色</span>
+          </div>
+          <button type="button" id="session-settings-color-btn" class="session-settings-color-btn">
+            <span id="session-settings-color-swatch" class="session-settings-color-swatch"></span>
+            <span>更改颜色</span>
+          </button>
+        </section>
+
+        <section class="ac-config-group session-settings-commands">
+          <label class="ac-config-group-title ac-config-command-label" for="auto-continue-message">计划命令</label>
+          <textarea id="auto-continue-message" class="ac-config-command" rows="4" placeholder="每行一条命令，按顺序发送"></textarea>
+        </section>
 
         <section class="ac-config-group ac-config-group-primary">
-          <div class="ac-config-group-title">运行安排</div>
+          <div class="ac-config-group-title">发送安排</div>
           <div class="ac-config-grid">
             <label class="ac-config-field">开始时间
               <span class="ac-field-hint">延迟分钟，0 表示立即</span>
               <input id="auto-continue-initial-delay" type="number" min="0" value="0" placeholder="0" />
-            </label>
-            <label class="ac-config-field">运行次数
-              <span class="ac-field-hint">-1 表示不限制</span>
-              <input id="auto-continue-max-loops" type="number" min="-1" value="-1" placeholder="-1" />
-            </label>
-          </div>
-        </section>
-
-        <section class="ac-config-group">
-          <div class="ac-config-group-title">计划与发送</div>
-          <div class="ac-config-grid">
-            <label class="ac-config-field">计划间隔（分钟）
-              <input id="auto-continue-interval" type="number" min="1" placeholder="分钟" />
             </label>
             <label class="ac-config-field">命令间隔（秒）
               <input id="auto-continue-command-interval" type="number" min="0" value="2" placeholder="秒" />
@@ -121,7 +144,25 @@
           </div>
         </section>
 
-        <section class="ac-config-group">
+        <section class="ac-config-group session-settings-loop">
+          <label class="ac-config-toggle">
+            <input id="auto-continue-loop-enabled" type="checkbox" />
+            启用循环
+          </label>
+          <div id="auto-continue-loop-fields" class="ac-loop-fields" hidden>
+            <div class="ac-config-grid">
+              <label class="ac-config-field">计划间隔（分钟）
+                <input id="auto-continue-interval" type="number" min="1" placeholder="分钟" />
+              </label>
+              <label class="ac-config-field">循环次数
+                <span class="ac-field-hint">-1 表示不限制</span>
+                <input id="auto-continue-max-loops" type="number" min="-1" value="-1" placeholder="-1" />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="ac-config-group session-settings-agree">
           <div class="ac-config-group-title">自动同意</div>
           <label class="ac-config-toggle">
             <input id="auto-continue-auto-agree" type="checkbox" checked />
@@ -142,34 +183,239 @@
     </div>
   </div>
 
+  <!-- AI 配置弹窗 -->
+  <div id="ai-config-overlay" class="new-session-overlay" tabindex="-1">
+    <div class="new-session-dialog ai-config-dialog" role="dialog" aria-modal="true" aria-labelledby="ai-config-title">
+      <div class="new-session-header">
+        <h3 id="ai-config-title">AI 配置</h3>
+        <button id="ai-config-close" class="new-session-close" title="关闭" type="button">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <div id="ai-config-form">
+        <div class="ai-config-description">
+          <strong>AI 用途</strong>
+          <span>用于整理会话历史，并根据你发送给终端的内容自动生成对话标题；不参与终端命令执行。</span>
+        </div>
+        <div class="ai-form-group">
+          <label class="ai-form-label">API 格式</label>
+          <select id="ai-format-select" class="ai-form-input">
+            <option value="anthropic">Anthropic</option>
+            <option value="openai">OpenAI 兼容</option>
+            <option value="gemini">Gemini</option>
+            <option value="ollama">Ollama</option>
+          </select>
+        </div>
+        <div class="ai-form-group">
+          <label class="ai-form-label">Base URL</label>
+          <input id="ai-baseurl-input" class="ai-form-input" type="text" placeholder="https://api.anthropic.com" />
+        </div>
+        <div class="ai-form-group">
+          <label class="ai-form-label">API Key</label>
+          <div class="ai-key-row">
+            <input id="ai-apikey-input" class="ai-form-input" type="password" placeholder="输入 API Key..." />
+            <button id="ai-key-toggle" class="ai-key-toggle-btn" title="显示/隐藏" type="button">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+            </button>
+          </div>
+        </div>
+        <div class="ai-form-group">
+          <label class="ai-form-label">模型</label>
+          <input id="ai-model-input" class="ai-form-input" type="text" placeholder="claude-3-5-haiku-20241022" />
+        </div>
+
+        <section class="terminal-auto-response-section">
+          <div class="terminal-auto-response-heading">终端容错自动回复</div>
+          <label class="terminal-auto-response-toggle">
+            <input id="terminal-auto-response-enabled" type="checkbox" />
+            检测终端错误后自动发送回复
+          </label>
+          <label class="ai-form-label" for="terminal-auto-response-rules">规则</label>
+          <textarea id="terminal-auto-response-rules" class="ai-form-input" rows="4" placeholder="每行：错误关键词 => 自动发送内容"></textarea>
+          <div class="terminal-auto-response-number-row">
+            <label class="ai-form-group">发送延迟（秒）
+              <input id="terminal-auto-response-delay" class="ai-form-input" type="number" min="0" max="60" />
+            </label>
+            <label class="ai-form-group">同规则冷却（秒）
+              <input id="terminal-auto-response-cooldown" class="ai-form-input" type="number" min="0" max="3600" />
+            </label>
+          </div>
+          <button id="terminal-auto-response-save" class="toolbar-btn terminal-auto-response-save" type="button">保存容错规则</button>
+        </section>
+      </div>
+      <div id="ai-config-actions">
+        <button id="ai-test-btn" class="toolbar-btn ai-btn" type="button">测试</button>
+        <button id="ai-apply-btn" class="toolbar-btn ai-btn ai-apply-btn" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 远程连接指南 -->
+  <div id="remote-guide-overlay" class="new-session-overlay" tabindex="-1">
+    <div class="new-session-dialog remote-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="remote-guide-title">
+      <div class="new-session-header">
+        <h3 id="remote-guide-title">远程连接指南</h3>
+        <button id="remote-guide-close" class="new-session-close" title="关闭" type="button">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+        </button>
+      </div>
+      <div class="remote-guide-body">
+        <div id="remote-guide-status" class="remote-guide-status"></div>
+
+        <section class="remote-guide-section">
+          <h4>1. 同一 Wi-Fi，马上能用</h4>
+          <p>电脑打开 DuoCLI 后，本地服务会自动在 9800 端口就绪，不用再装别的软件。</p>
+          <ol>
+            <li>手机和电脑连同一个 Wi-Fi</li>
+            <li>手机浏览器打开下面的局域网地址</li>
+            <li>粘贴 Token，点「连接终端」</li>
+          </ol>
+          <div class="remote-guide-kv">
+            <span class="remote-guide-k">局域网</span>
+            <code id="remote-guide-lan-url">启动后自动显示</code>
+          </div>
+          <div class="remote-guide-actions">
+            <button type="button" id="remote-guide-copy-lan" class="toolbar-btn">复制地址</button>
+            <button type="button" id="remote-guide-copy-token" class="toolbar-btn">复制 Token</button>
+            <button type="button" id="remote-guide-copy-login" class="toolbar-btn">复制一键登录链接</button>
+          </div>
+          <p class="remote-guide-note">地址和 Token 也在左侧「手机远程同步」卡片里。点眼睛可查看 Token。</p>
+        </section>
+
+        <section class="remote-guide-section">
+          <h4>2. 固定公网地址，出门也能连</h4>
+          <p>局域网只能在家里用。要在外面用手机连，需要一个你自己的固定域名，通过 Cloudflare Tunnel 转到本机 9800。不用自己买云服务器，也不用开端口。</p>
+          <ul id="remote-guide-checklist" class="remote-guide-checklist"></ul>
+          <ol>
+            <li>
+              安装 cloudflared
+              <div class="remote-guide-cmd-row">
+                <code>brew install cloudflared</code>
+                <button type="button" class="remote-guide-copy-cmd" data-cmd="brew install cloudflared">复制</button>
+              </div>
+            </li>
+            <li>
+              登录 Cloudflare，并创建一条隧道
+              <div class="remote-guide-cmd-row">
+                <code>cloudflared tunnel login</code>
+                <button type="button" class="remote-guide-copy-cmd" data-cmd="cloudflared tunnel login">复制</button>
+              </div>
+              <div class="remote-guide-cmd-row">
+                <code>cloudflared tunnel create duocli</code>
+                <button type="button" class="remote-guide-copy-cmd" data-cmd="cloudflared tunnel create duocli">复制</button>
+              </div>
+              <p class="remote-guide-note">登录后会得到隧道 ID，凭证一般在 <code>~/.cloudflared/&lt;隧道ID&gt;.json</code>。域名要在 Cloudflare 里指到这条隧道。</p>
+            </li>
+            <li>
+              生成本机配置文件，把隧道名、域名、凭证路径改成你自己的
+              <div class="remote-guide-actions">
+                <button type="button" id="remote-guide-prepare-config" class="toolbar-btn">生成配置并打开</button>
+                <button type="button" id="remote-guide-reveal-config" class="toolbar-btn">在 Finder 中显示</button>
+              </div>
+              <p id="remote-guide-config-path" class="remote-guide-path">配置路径将在这里显示</p>
+            </li>
+            <li>保存文件后回到 DuoCLI 点「重试」，侧栏地址应变为 <code>https://你的域名</code></li>
+          </ol>
+        </section>
+
+        <section class="remote-guide-section">
+          <h4>连不上时</h4>
+          <ul>
+            <li>先确认电脑 DuoCLI 还在运行。关掉窗口一般还能连，完全退出应用后本地服务会停。</li>
+            <li>局域网打不开：确认同一 Wi-Fi，并让防火墙放行 9800 端口。</li>
+            <li>提示 Token 错误：从侧栏点眼睛复制，不要手打。</li>
+            <li>公网打不开：配置文件里不能还留着 <code>YOUR_TUNNEL_NAME</code>、<code>duocli.example.com</code> 这类占位符。</li>
+          </ul>
+        </section>
+      </div>
+      <div class="remote-guide-footer">
+        <button type="button" id="remote-guide-retry" class="toolbar-btn">重试检测</button>
+        <button type="button" id="remote-guide-done" class="toolbar-btn">知道了</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 主体 -->
   <div id="main">
-    <!-- 左侧目录树收起按钮 -->
-    <button id="file-tree-toggle" class="panel-toggle" type="button" title="收起目录树" aria-label="收起目录树" aria-expanded="true">
+    <!-- 左侧边栏收起按钮 -->
+    <button id="sidebar-toggle" class="panel-toggle" type="button" title="收起会话列表" aria-label="收起会话列表" aria-expanded="true">
       <svg class="ui-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"></polyline></svg>
     </button>
 
-    <div id="file-tree-panel">
-      <div id="file-tree-header">
-        <button id="file-tree-open-btn" class="toolbar-icon-btn" title="在 Finder 中显示">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+    <div id="sidebar">
+      <div class="workspace-brand"><span class="workspace-brand-mark" aria-hidden="true">›_</span><strong>DuoCLI</strong><span class="workspace-brand-label">工作区</span></div>
+      <div id="sidebar-topbar">
+        <button id="toolbar-new-btn" class="toolbar-btn primary-new-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          <span>新建终端</span>
+          <span class="btn-kbd-hint">⌘N</span>
         </button>
-        <span id="file-tree-path">目录</span>
-        <button id="file-tree-refresh-btn" class="toolbar-icon-btn" title="刷新目录">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-        </button>
+        <button id="task-queue-btn" class="toolbar-btn" title="查看计划任务">任务队列</button>
       </div>
-      <div id="file-tree-list">
-        <div class="file-tree-empty">选择会话后显示当前目录</div>
+      <label class="workspace-search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg><input id="session-search" type="search" placeholder="搜索会话或项目" aria-label="搜索会话或项目" autocomplete="off"></label>
+      <div class="workspace-section-label">项目与会话<span id="workspace-session-count"></span></div>
+      <div id="session-list"></div>
+      <div id="session-search-empty" class="workspace-search-empty" hidden>没有匹配的会话</div>
+      <details id="remote-connection-panel" class="workspace-connection">
+        <summary>手机远程同步</summary>
+      <!-- 远程服务器连接信息 -->
+      <div id="remote-server-info" class="remote-server-info" style="display: none;">
+        <div class="remote-info-header">
+          <span class="remote-status-pulse status-healthy"></span>
+          <span class="remote-info-title">手机远程同步</span>
+          <div class="remote-info-header-actions">
+            <button type="button" class="remote-info-guide">怎么连</button>
+            <button type="button" class="remote-info-retry" hidden>重试</button>
+          </div>
+        </div>
+        <div class="remote-info-status">检测中…</div>
+        <div class="remote-info-url" title="点击复制公网或局域网地址"></div>
+        <div class="remote-info-token-row">
+          <span class="remote-info-token-label">Token:</span>
+          <span class="remote-info-token-value" tabindex="0" role="button"></span>
+          <input class="remote-info-token-input" type="text" maxlength="128" spellcheck="false" autocomplete="off" hidden />
+          <button type="button" class="remote-info-token-toggle" title="显示 Token" aria-label="显示 Token">
+            <svg class="remote-info-token-eye-open" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+              <circle cx="12" cy="12" r="3"></circle>
+            </svg>
+            <svg class="remote-info-token-eye-closed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"></path>
+              <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"></path>
+              <line x1="1" y1="1" x2="23" y2="23"></line>
+            </svg>
+          </button>
+          <button type="button" class="remote-info-token-edit" title="修改 Token" aria-label="修改 Token">改</button>
+          <button type="button" class="remote-info-token-save" title="保存 Token" aria-label="保存 Token" hidden>存</button>
+          <button type="button" class="remote-info-token-cancel" title="取消" aria-label="取消修改" hidden>取消</button>
+        </div>
+        <div class="remote-info-token-hint" hidden></div>
+        <button type="button" class="remote-info-guide-hint">同一 Wi-Fi 下，手机浏览器打开上面的地址，再粘贴 Token。公网怎么配？</button>
+      </div>
+      </details>
+
+      <!-- 版权信息 -->
+      <div id="sidebar-footer">
+        <button type="button" id="sidebar-settings-btn" class="sidebar-settings-btn" title="AI 配置" aria-label="AI 配置" aria-haspopup="dialog" aria-expanded="false">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0-2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+          <span>AI 配置</span>
+        </button>
+        <details class="workspace-about"><summary>关于 DuoCLI</summary>
+        <div class="footer-line">DuoCLI — 多开 CLI 神器</div>
+        <div class="footer-line">by 大壮好大</div>
+        <div class="footer-line"><a id="footer-github" href="#">GitHub</a></div>
+        <div class="footer-tip">如果你喜欢这个软件，只需关注公众号「壮哥的壮」，然后心中默念"大壮好大"，每天祈祷 +1</div>
+        </details>
       </div>
     </div>
-
     <!-- 左侧拖拽条 -->
-    <div id="file-tree-resizer" class="resizer"></div>
+    <div id="sidebar-resizer" class="resizer"></div>
 
     <div id="terminal-area">
       <div id="pane-layout-toolbar" class="pane-layout-toolbar" hidden>
-        <span id="pane-layout-summary">工作区</span>
         <button id="pane-tile-btn" class="toolbar-icon-btn" type="button" title="自动平铺所有窗口">平铺</button>
       </div>
       <div id="pane-workspace" class="pane-workspace-root" aria-label="工作区"></div>
@@ -196,6 +442,7 @@
               <div class="empty-feat-chip"><span class="feat-dot blue"></span>Codex 全功能</div>
               <div class="empty-feat-chip"><span class="feat-dot orange"></span>手机远程实时同步</div>
             </div>
+            <button type="button" id="empty-remote-guide-btn" class="empty-remote-guide-btn">手机怎么连？</button>
           </div>
         </div>
       </div>
@@ -210,133 +457,36 @@
     </div>
 
     <!-- 右侧拖拽条 -->
-    <div id="sidebar-resizer" class="resizer"></div>
+    <div id="file-tree-resizer" class="resizer"></div>
 
-    <!-- 右侧边栏收起按钮 -->
-    <button id="sidebar-toggle" class="panel-toggle" type="button" title="收起会话列表" aria-label="收起会话列表" aria-expanded="true">
+    <!-- 右侧目录树收起按钮 -->
+    <button id="file-tree-toggle" class="panel-toggle" type="button" title="收起目录树" aria-label="收起目录树" aria-expanded="true">
       <svg class="ui-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>
     </button>
 
-    <div id="sidebar">
-      <div id="sidebar-topbar">
-        <button id="toolbar-new-btn" class="toolbar-btn primary-new-btn">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-          <span>新建终端</span>
-          <span class="btn-kbd-hint">⌘N</span>
+    <div id="file-tree-panel">
+      <div id="file-tree-header">
+        <button id="file-tree-open-btn" class="toolbar-icon-btn" title="在 Finder 中显示">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+        </button>
+        <span id="file-tree-path">目录</span>
+        <button id="file-tree-refresh-btn" class="toolbar-icon-btn" title="刷新目录">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
         </button>
       </div>
-      <!-- 远程服务器连接信息 -->
-      <div id="remote-server-info" class="remote-server-info" style="display: none;">
-        <div class="remote-info-header">
-          <span class="remote-status-pulse status-healthy"></span>
-          <span class="remote-info-title">手机远程同步</span>
-          <button type="button" class="remote-info-retry" hidden>重试</button>
-        </div>
-        <div class="remote-info-status">检测中…</div>
-        <div class="remote-info-url" title="点击复制公网或局域网地址"></div>
-        <div class="remote-info-token-row">
-          <span class="remote-info-token-label">Token:</span>
-          <span class="remote-info-token-value" tabindex="0" role="button"></span>
-          <input class="remote-info-token-input" type="text" maxlength="128" spellcheck="false" autocomplete="off" hidden />
-          <button type="button" class="remote-info-token-toggle" title="显示 Token" aria-label="显示 Token">
-            <svg class="remote-info-token-eye-open" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
-              <circle cx="12" cy="12" r="3"></circle>
-            </svg>
-            <svg class="remote-info-token-eye-closed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"></path>
-              <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"></path>
-              <line x1="1" y1="1" x2="23" y2="23"></line>
-            </svg>
-          </button>
-          <button type="button" class="remote-info-token-edit" title="修改 Token" aria-label="修改 Token">改</button>
-          <button type="button" class="remote-info-token-save" title="保存 Token" aria-label="保存 Token" hidden>存</button>
-          <button type="button" class="remote-info-token-cancel" title="取消" aria-label="取消修改" hidden>取消</button>
-        </div>
-        <div class="remote-info-token-hint" hidden></div>
+      <div id="file-tree-list">
+        <div class="file-tree-empty">选择会话后显示当前目录</div>
       </div>
-      <div id="sidebar-tabs">
-        <button class="sidebar-tab active" data-tab="sessions">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
-          <span>终端会话</span>
-        </button>
-        <button class="sidebar-tab" data-tab="ai-config">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-          <span>AI 配置</span>
-        </button>
-      </div>
+    </div>
+  </div>
 
-      <!-- 会话 Tab -->
-      <div id="tab-sessions" class="tab-content active">
-        <div id="session-list"></div>
+  <div id="task-queue-overlay" class="new-session-overlay">
+    <div class="new-session-dialog task-queue-dialog">
+      <div class="new-session-header">
+        <h3>终端任务队列</h3>
+        <button id="task-queue-close" class="new-session-close" title="关闭">×</button>
       </div>
-
-      <!-- AI 配置 Tab -->
-      <div id="tab-ai-config" class="tab-content">
-        <div id="ai-config-form">
-          <div class="ai-config-description">
-            <strong>AI 用途</strong>
-            <span>用于整理会话历史，并根据你发送给终端的内容自动生成对话标题；不参与终端命令执行。</span>
-          </div>
-          <div class="ai-form-group">
-            <label class="ai-form-label">API 格式</label>
-            <select id="ai-format-select" class="ai-form-input">
-              <option value="anthropic">Anthropic</option>
-              <option value="openai">OpenAI 兼容</option>
-              <option value="gemini">Gemini</option>
-              <option value="ollama">Ollama</option>
-            </select>
-          </div>
-          <div class="ai-form-group">
-            <label class="ai-form-label">Base URL</label>
-            <input id="ai-baseurl-input" class="ai-form-input" type="text" placeholder="https://api.anthropic.com" />
-          </div>
-          <div class="ai-form-group">
-            <label class="ai-form-label">API Key</label>
-            <div class="ai-key-row">
-              <input id="ai-apikey-input" class="ai-form-input" type="password" placeholder="输入 API Key..." />
-              <button id="ai-key-toggle" class="ai-key-toggle-btn" title="显示/隐藏">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-              </button>
-            </div>
-          </div>
-          <div class="ai-form-group">
-            <label class="ai-form-label">模型</label>
-            <input id="ai-model-input" class="ai-form-input" type="text" placeholder="claude-3-5-haiku-20241022" />
-          </div>
-
-          <section class="terminal-auto-response-section">
-            <div class="terminal-auto-response-heading">终端容错自动回复</div>
-            <label class="terminal-auto-response-toggle">
-              <input id="terminal-auto-response-enabled" type="checkbox" />
-              检测终端错误后自动发送回复
-            </label>
-            <label class="ai-form-label" for="terminal-auto-response-rules">规则</label>
-            <textarea id="terminal-auto-response-rules" class="ai-form-input" rows="4" placeholder="每行：错误关键词 => 自动发送内容"></textarea>
-            <div class="terminal-auto-response-number-row">
-              <label class="ai-form-group">发送延迟（秒）
-                <input id="terminal-auto-response-delay" class="ai-form-input" type="number" min="0" max="60" />
-              </label>
-              <label class="ai-form-group">同规则冷却（秒）
-                <input id="terminal-auto-response-cooldown" class="ai-form-input" type="number" min="0" max="3600" />
-              </label>
-            </div>
-            <button id="terminal-auto-response-save" class="toolbar-btn terminal-auto-response-save" type="button">保存容错规则</button>
-          </section>
-        </div>
-        <div id="ai-config-actions">
-          <button id="ai-test-btn" class="toolbar-btn ai-btn">测试</button>
-          <button id="ai-apply-btn" class="toolbar-btn ai-btn ai-apply-btn">保存</button>
-        </div>
-      </div>
-
-      <!-- 版权信息 -->
-      <div id="sidebar-footer">
-        <div class="footer-line">DuoCLI — 多开 CLI 神器</div>
-        <div class="footer-line">by 大壮好大</div>
-        <div class="footer-line"><a id="footer-github" href="#">GitHub</a></div>
-        <div class="footer-tip">如果你喜欢这个软件，只需关注公众号「壮哥的壮」，然后心中默念"大壮好大"，每天祈祷 +1</div>
-      </div>
+      <div id="task-queue-list" class="task-queue-list"></div>
     </div>
   </div>
 

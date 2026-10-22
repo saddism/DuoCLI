@@ -1,23 +1,35 @@
 // DuoCLI Mobile - Service Worker
 
-const CACHE_NAME = 'duocli-v18';
+const CACHE_NAME = 'duocli-v117';
 const ASSETS = [
   '/',
   '/index.html',
   '/style.css',
   '/app.js',
+  '/network-mode.js',
+  '/native-chat-view.js',
   '/xterm.css',
   '/xterm.js',
   '/addon-fit.js',
   '/addon-unicode11.js',
   '/android-mirror-client.js',
   '/android-pointer-helpers.js',
+  '/android-nav-keys.js',
   '/file-preview-helpers.js',
   '/terminal-scroll-helpers.js',
+  '/terminal-momentum.js',
+  '/terminal-history-layer.js',
+  '/terminal-activity-fold.js',
   '/spinner-interceptor.js',
   '/terminal-content-helpers.js',
   '/cli-tag-colors.js',
   '/cli-logos.js',
+  '/user-prompt-banner.js',
+  '/mac-desktop-novnc-bundle.js',
+  '/mac-desktop-client.js',
+  '/mac-desktop-keyboard.js',
+  '/mac-desktop-view.html',
+  '/mac-desktop-view.js',
   '/manifest.json',
 ];
 
@@ -82,38 +94,44 @@ self.addEventListener('fetch', e => {
   );
 });
 
-// 推送通知
+// 推送通知：应用正在前台看时不弹系统横幅，避免和页面抢视线。
 self.addEventListener('push', e => {
   if (!e.data) return;
 
-  try {
-    const data = e.data.json();
-    e.waitUntil(
-      self.registration.showNotification(data.title || 'DuoCLI', {
+  e.waitUntil((async () => {
+    try {
+      const data = e.data.json();
+      const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      if (windows.some(client => client.visibilityState === 'visible')) return;
+      await self.registration.showNotification(data.title || 'DuoCLI', {
         body: data.body || '',
         icon: '/icon-192.png',
         badge: '/icon-192.png',
         tag: data.sessionId || 'default',
         data: { sessionId: data.sessionId },
         requireInteraction: false,
-      })
-    );
-  } catch {}
+      });
+    } catch {}
+  })());
 });
 
 // 点击通知 → 打开应用
 self.addEventListener('notificationclick', e => {
   e.notification.close();
+  const sessionId = e.notification.data?.sessionId;
   e.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
       // 如果已有窗口，聚焦
       for (const client of clients) {
         if (client.url.includes(self.location.origin)) {
-          return client.focus();
+          return client.focus().then(() => {
+            if (sessionId) client.postMessage({ type: 'open-session', sessionId });
+          });
         }
       }
       // 否则打开新窗口
-      return self.clients.openWindow('/');
+      const query = sessionId ? `?session=${encodeURIComponent(sessionId)}` : '';
+      return self.clients.openWindow(`/${query}`);
     })
   );
 });

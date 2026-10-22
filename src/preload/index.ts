@@ -17,11 +17,23 @@ export interface RemoteServerInfoPayload {
   token: string;
   port: number;
   publicUrl?: string;
-  tunnel?: { installed?: boolean; running: boolean; url: string; message?: string };
+  tunnel?: {
+    installed?: boolean;
+    running: boolean;
+    url: string;
+    message?: string;
+    configPath?: string;
+    configExists?: boolean;
+    configReady?: boolean;
+  };
   health?: RemoteSyncHealthPayload;
 }
 
 contextBridge.exposeInMainWorld('duocli', {
+  getQuickCommands: () => ipcRenderer.invoke('quick-commands:get'),
+  updateQuickCommands: (operation: { action: string; command?: string; commands?: string[] }) => ipcRenderer.invoke('quick-commands:update', operation),
+  submitPty: (id: string, submissionId: string, text: string) => ipcRenderer.invoke('pty:submit', id, submissionId, text),
+
   // 设置窗口标题
   setWindowTitle: (title: string) => ipcRenderer.send('window:set-title', title),
   onCloseCurrentSession: (cb: () => void) =>
@@ -30,6 +42,21 @@ contextBridge.exposeInMainWorld('duocli', {
   // 创建终端
   createPty: (cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) =>
     ipcRenderer.invoke('pty:create', cwd, presetCommand, themeId, providerEnv),
+  listTerminalTasks: () => ipcRenderer.invoke('tasks:list'),
+  createTerminalTask: (input: any) => ipcRenderer.invoke('tasks:create', input),
+  updateTerminalTask: (taskId: string, input: any) => ipcRenderer.invoke('tasks:update', taskId, input),
+  cancelTerminalTask: (taskId: string) => ipcRenderer.invoke('tasks:cancel', taskId),
+  pauseTerminalTask: (taskId: string) => ipcRenderer.invoke('tasks:pause', taskId),
+  resumeTerminalTask: (taskId: string) => ipcRenderer.invoke('tasks:resume', taskId),
+  runTerminalTaskNow: (taskId: string) => ipcRenderer.invoke('tasks:run-now', taskId),
+  removeTerminalTask: (taskId: string) => ipcRenderer.invoke('tasks:remove', taskId),
+  confirmTerminalTaskComplete: (taskId: string) => ipcRenderer.invoke('tasks:confirm-complete', taskId),
+  onTerminalTasksChanged: (cb: (snapshot: any) => void) =>
+    ipcRenderer.on('tasks:changed', (_e, snapshot) => cb(snapshot)),
+  onSessionActivityChanged: (cb: (state: any) => void) =>
+    ipcRenderer.on('session:activity-changed', (_e, state) => cb(state)),
+  onTaskPtyCreated: (cb: (sessionInfo: any, taskId: string) => void) =>
+    ipcRenderer.on('pty:task-created', (_e, sessionInfo, taskId) => cb(sessionInfo, taskId)),
 
   // 写入数据 (改成 invoke 等待完成)
   writePty: (id: string, data: string) =>
@@ -38,6 +65,8 @@ contextBridge.exposeInMainWorld('duocli', {
   // 调整大小 (改成 invoke 等待完成)
   resizePty: (id: string, cols: number, rows: number) =>
     ipcRenderer.invoke('pty:resize', id, cols, rows),
+  onPtyGeometry: (cb: (id: string, geometry: { cols: number; rows: number }) => void) =>
+    ipcRenderer.on('pty:geometry', (_e, id, geometry) => cb(id, geometry)),
 
   // 销毁终端
   destroyPty: (id: string) =>
@@ -51,6 +80,10 @@ contextBridge.exposeInMainWorld('duocli', {
   regenerateTitle: (id: string) =>
     ipcRenderer.invoke('pty:regenerate-title', id),
 
+  // 根据文本生成标题（计划任务等）
+  suggestTitleFromText: (text: string) =>
+    ipcRenderer.invoke('title:suggest-from-text', text),
+
   // 获取所有会话
   getSessions: () => ipcRenderer.invoke('pty:sessions'),
 
@@ -63,8 +96,23 @@ contextBridge.exposeInMainWorld('duocli', {
   remoteSyncRecentCwds: (cwds: string[]) => ipcRenderer.invoke('remote:sync-recent-cwds', cwds),
 
   // 监听事件
+  snapshotPty: (id: string, options?: { scrollback?: number }) =>
+    ipcRenderer.invoke('pty:snapshot', id, options),
+  historyBeforePty: (id: string, query?: {
+    beforeCursor?: string | null;
+    limitRows?: number;
+    requestId?: string;
+    epoch?: number;
+  }) => ipcRenderer.invoke('pty:history-before', id, query),
+  historyMetaPty: (id: string) => ipcRenderer.invoke('pty:history-meta', id),
+
   onPtyData: (cb: (id: string, data: string) => void) =>
     ipcRenderer.on('pty:data', (_e, id, data) => cb(id, data)),
+
+  onPtyParsed: (cb: (id: string, data: string, sequence: number) => void) =>
+    ipcRenderer.on('pty:parsed', (_e, id, data, sequence) => cb(id, data, sequence)),
+  onPtyUserSubmitted: (cb: (id: string, submittedAt: number) => void) =>
+    ipcRenderer.on('pty:user-submitted', (_e, id, submittedAt) => cb(id, submittedAt)),
 
   onTitleUpdate: (cb: (id: string, title: string) => void) =>
     ipcRenderer.on('pty:title-update', (_e, id, title) => cb(id, title)),
@@ -88,6 +136,9 @@ contextBridge.exposeInMainWorld('duocli', {
     { ok: true; token: string } | { ok: false; error: string }
   >,
   generateRemoteToken: () => ipcRenderer.invoke('remote:generate-token') as Promise<string>,
+  prepareRemoteTunnelConfig: () => ipcRenderer.invoke('remote:prepare-tunnel-config') as Promise<
+    { ok: true; configPath: string; created: boolean; configReady: boolean } | { ok: false; error: string }
+  >,
 
   // 剪贴板图片
   clipboardSaveImage: () => ipcRenderer.invoke('clipboard:save-image'),
@@ -100,6 +151,9 @@ contextBridge.exposeInMainWorld('duocli', {
   filewatcherOpen: (filePath: string) => ipcRenderer.invoke('filewatcher:open', filePath),
   filewatcherSelectEditor: () => ipcRenderer.invoke('filewatcher:select-editor'),
   filewatcherGetEditor: () => ipcRenderer.invoke('filewatcher:get-editor'),
+  listOpenWithApps: (filePath: string) => ipcRenderer.invoke('open-with:list', filePath),
+  openWithApp: (filePath: string, appPath: string) => ipcRenderer.invoke('open-with:app', filePath, appPath),
+  openWithSystemDialog: (filePath: string) => ipcRenderer.invoke('open-with:system-dialog', filePath),
   onFileChange: (cb: (filename: string, eventType: string) => void) =>
     ipcRenderer.on('filewatcher:change', (_e, filename, eventType) => cb(filename, eventType)),
 
@@ -142,8 +196,17 @@ contextBridge.exposeInMainWorld('duocli', {
   // 会话状态同步：renderer → main（供手机端读取）
   syncSessionStatus: (statuses: Record<string, string>) =>
     ipcRenderer.send('session:sync-status', statuses),
+  onSessionRemoteView: (cb: (id: string, info: { viewed?: boolean; viewing?: boolean }) => void) =>
+    ipcRenderer.on('session:remote-view', (_e, id, info) => cb(id, info)),
 
   // 催工配置：供 main 进程从 renderer 读写
+  autoContinueManaged: true,
+  getAutoContinueConfigs: () => ipcRenderer.invoke('auto-continue:get-all') as Promise<{
+    configs: Record<string, any>;
+    persisted: boolean;
+  }>,
+  syncAutoContinueConfigs: (configs: Record<string, any>) =>
+    ipcRenderer.send('auto-continue:sync', configs),
   onGetAutoContinueConfig: (cb: (sessionId: string) => void) =>
     ipcRenderer.on('auto-continue:get', (_e, sessionId) => cb(sessionId)),
   sendAutoContinueConfig: (sessionId: string, config: any) =>
@@ -159,7 +222,7 @@ contextBridge.exposeInMainWorld('duocli', {
   closedSessionsClear: () => ipcRenderer.invoke('closed-sessions:clear'),
   closedSessionsConfirmRestore: (closedId: string, sessionId: string) =>
     ipcRenderer.invoke('closed-sessions:confirm-restore', closedId, sessionId),
-  onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; contextHistory?: Array<{ role: 'user' | 'assistant'; content: string; timestamp?: number }>; exportPath?: string }>) => void) =>
+  onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number; contextHistory?: Array<{ role: 'user' | 'assistant'; content: string; timestamp?: number }>; exportPath?: string }>) => void) =>
     ipcRenderer.on('closed-sessions:update', (_e, sessions) => cb(sessions)),
 
   // ========== 上下文导出功能 ==========
@@ -170,4 +233,6 @@ contextBridge.exposeInMainWorld('duocli', {
   // ========== 通知功能 ==========
   onNotification: (cb: (title: string, body: string, sessionId?: string) => void) =>
     ipcRenderer.on('notification', (_e, title, body, sessionId) => cb(title, body, sessionId)),
+  onNotificationOpen: (cb: (sessionId: string) => void) =>
+    ipcRenderer.on('notification:open-session', (_e, sessionId) => cb(sessionId)),
 });

@@ -1,3 +1,4 @@
+import { quickCommands } from './quick-commands';
 import { app, BrowserWindow, ipcMain, dialog, clipboard, nativeImage, shell, globalShortcut } from 'electron';
 import { spawn } from 'child_process';
 import * as path from 'path';
@@ -17,9 +18,30 @@ import {
 import { getAvailableBuiltinPresets, prewarmCliDetection } from './cli-detect';
 import { ResumeCapture } from './session-resume';
 import { ClosedSessionsManager, ContextHistoryEntry } from './closed-sessions';
+import { AutoContinueManager } from './auto-continue-manager';
 import { parseAndroidDevices, runAdb } from './android-devices';
+import { humanizeAndroidImageError, prepareAdbScreenshot } from './android-screencap';
+import { TerminalActivityTracker } from './terminal-activity-tracker';
+import {
+  appendNotifyTail,
+  canNotifyAttention,
+  classifyAttention,
+  delayUntilNotify,
+  NOTIFY_COOLDOWN_MS,
+  stripAnsiForNotify,
+  type AttentionKind,
+} from './attention-notify';
+import { TerminalTaskStore } from './terminal-task-store';
+import { TerminalTaskScheduler } from './terminal-task-scheduler';
+import type { TerminalTask } from './terminal-task-types';
+import { requestTitleFromConfiguredAI, cleanGeneratedTitle } from './title-ai';
 import { extractContextFromChunks } from './context-capture';
 import { exportSessionContext, writeExportToFile } from './context-export';
+import {
+  listAppsForFile,
+  openFileWithApp,
+  openFileWithSystemDialog,
+} from './open-with';
 
 // macOS: 设置为普通应用模式，显示在 Dock 和 Command+Tab 切换器中
 if (process.platform === 'darwin') {
@@ -39,17 +61,22 @@ const sessionLastInputAt: Map<string, number> = new Map();
 const sessionArmedForNotify: Set<string> = new Set();
 const sessionLastNotifyAt: Map<string, number> = new Map();
 const sessionUserClosed: Set<string> = new Set();
-
-const NOTIFY_COOLDOWN_MS = 15_000;
-const WAITING_INPUT_DELAY_MS = 8_000;
-const IMESSAGE_TARGET = (process.env.DUOCLI_IMESSAGE_TO || '').trim();
-const IMESSAGE_SERVICE = ((process.env.DUOCLI_IMESSAGE_SERVICE || 'iMessage').trim().toLowerCase() === 'sms')
-  ? 'SMS'
-  : 'iMessage';
+const sessionRemoteViewing: Set<string> = new Set();
+const pendingNotifyTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
 const sessionOutputTail: Map<string, string> = new Map();
 /** 用于累积上下文捕获的原始输出 */
 const sessionContextBuffer: Map<string, string> = new Map();
+const MAX_CONTEXT_BUFFER_CHARS = 2 * 1024 * 1024;
+
+function appendSessionContext(id: string, data: string): void {
+  if (!data) return;
+  const previous = sessionContextBuffer.get(id) || '';
+  const merged = previous + data;
+  sessionContextBuffer.set(id, merged.length > MAX_CONTEXT_BUFFER_CHARS
+    ? merged.slice(-MAX_CONTEXT_BUFFER_CHARS)
+    : merged);
+}
 
 const DESKTOP_PREVIEW_EXTENSIONS = new Set([
   '.md', '.markdown', '.txt', '.log', '.json', '.jsonl', '.yaml', '.yml', '.toml',
@@ -68,6 +95,16 @@ const DESKTOP_MAX_PREVIEW_BYTES = 2 * 1024 * 1024;
 // ========== 已关闭会话持久化 ==========
 let closedSessionsManager: ClosedSessionsManager;
 
+function sessionUpdatedAt(session?: { updatedAt?: number; createdAt?: number; lastInputAt?: { desktop?: number; mobile?: number } } | null): number {
+  if (!session) return Date.now();
+  return Math.max(
+    session.updatedAt || 0,
+    session.createdAt || 0,
+    session.lastInputAt?.desktop || 0,
+    session.lastInputAt?.mobile || 0,
+  ) || Date.now();
+}
+
 function addClosedSession(session: {
   title: string;
   cwd: string;
@@ -76,6 +113,7 @@ function addClosedSession(session: {
   resumeCommand: string;
   resumeSource?: ResumeCapture['source'];
   contextHistory?: ContextHistoryEntry[];
+  updatedAt?: number;
 }): void {
   const saved = closedSessionsManager.add(session);
   safeSend('closed-sessions:update', saved);
@@ -163,12 +201,79 @@ let isQuitting = false;
 let quitConfirmed = false;
 let quitDialogOpen = false;
 let ignoreActivateUntil = 0;
+
+/** LaunchAgent KeepAlive 守护：用户主动退出时写暂停标记，避免 Cmd+Q 后又被拉起。 */
+const KEEP_ALIVE_LABEL = 'com.kaifeng.duocli-app';
+const KEEP_ALIVE_DIR = path.join(os.homedir(), '.config', 'duocli-tunnel');
+const KEEP_ALIVE_PAUSE_PATH = path.join(KEEP_ALIVE_DIR, 'app-keep.paused');
+const KEEP_ALIVE_PLIST_PATH = path.join(
+  os.homedir(),
+  'Library',
+  'LaunchAgents',
+  `${KEEP_ALIVE_LABEL}.plist`,
+);
+
+function clearKeepAlivePause(): void {
+  if (process.platform !== 'darwin') return;
+  try {
+    if (fs.existsSync(KEEP_ALIVE_PAUSE_PATH)) fs.unlinkSync(KEEP_ALIVE_PAUSE_PATH);
+  } catch {
+    // ignore
+  }
+}
+
+/** Cmd+Q / 菜单退出：暂停守护，进程退出后再 bootout，防止 KeepAlive 立刻重开。 */
+function pauseKeepAliveDaemon(): void {
+  if (process.platform !== 'darwin') return;
+  try {
+    fs.mkdirSync(KEEP_ALIVE_DIR, { recursive: true });
+    fs.writeFileSync(KEEP_ALIVE_PAUSE_PATH, `${new Date().toISOString()}\n`);
+  } catch {
+    // ignore
+  }
+  try {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (uid == null) return;
+    const pid = process.pid;
+    spawn(
+      'bash',
+      [
+        '-c',
+        `while kill -0 ${pid} 2>/dev/null; do sleep 0.2; done; ` +
+          `launchctl bootout gui/${uid}/${KEEP_ALIVE_LABEL} >/dev/null 2>&1 || true`,
+      ],
+      { detached: true, stdio: 'ignore' },
+    ).unref();
+  } catch {
+    // ignore
+  }
+}
+
+/** 用户再次主动打开应用时恢复守护（若本机已安装对应 LaunchAgent）。 */
+function resumeKeepAliveDaemon(): void {
+  if (process.platform !== 'darwin') return;
+  clearKeepAlivePause();
+  if (!fs.existsSync(KEEP_ALIVE_PLIST_PATH)) return;
+  try {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (uid == null) return;
+    spawn('launchctl', ['bootstrap', `gui/${uid}`, KEEP_ALIVE_PLIST_PATH], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref();
+  } catch {
+    // already loaded / unavailable — ignore
+  }
+}
 const aiConfigManager = new AIConfigManager();
 let cloudflaredManager: CloudflaredManager | null = null;
 let cachedRemoteServerInfo: any = null;
 let remoteServer: ReturnType<typeof startRemoteServer> | null = null;
 let remoteSyncMonitor: RemoteSyncMonitor | null = null;
 let remoteServerRestarting = false;
+let autoContinueManager: AutoContinueManager | null = null;
+let terminalActivityTracker: TerminalActivityTracker | null = null;
+let terminalTaskScheduler: TerminalTaskScheduler | null = null;
 
 function publishRemoteServerInfo(
   info: { lanUrl: string; token: string; port: number },
@@ -229,7 +334,66 @@ function restartRemoteAccessServer(): void {
     (session) => addClosedSession(session),
     closedSessionsManager,
     app.getPath('userData'), // 传入 userData 路径供上下文导出使用
+    terminalTaskScheduler || undefined,
   );
+}
+
+function taskSessionInfo(session: ReturnType<PtyManager['create']>): Record<string, unknown> {
+  const provider = getCliProvider(session.presetCommand);
+  (session as any).provider = provider;
+  return {
+    id: session.id,
+    title: session.title,
+    themeId: session.themeId,
+    cwd: session.cwd,
+    displayName: getDisplayName(session.presetCommand),
+    provider,
+    cli: session.cliKind,
+    resumeId: session.resumeId,
+  };
+}
+
+async function waitForTaskTerminalReady(sessionId: string, presetCommand: string): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 60_000) {
+    const session = ptyManager.getSession(sessionId);
+    if (!session) throw new Error('计划终端在启动过程中退出');
+    if (!presetCommand) {
+      if (Date.now() - startedAt >= 500) return;
+    } else if (session.launchSentAt && Date.now() - Math.max(session.launchSentAt, session.updatedAt) >= 1500) {
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error('终端启动超时，请手动确认后重试');
+}
+
+function setupTerminalTasks(): void {
+  terminalActivityTracker = new TerminalActivityTracker(10_000);
+  terminalActivityTracker.onChange(state => {
+    const statuses = { ...((global as any).__sessionStatuses || {}) } as Record<string, string>;
+    statuses[state.sessionId] = state.status === 'running' ? 'running' : 'idle';
+    (global as any).__sessionStatuses = statuses;
+    safeSend('session:activity-changed', state);
+  });
+  const store = new TerminalTaskStore(path.join(app.getPath('userData'), 'terminal-tasks.json'));
+  terminalTaskScheduler = new TerminalTaskScheduler(store, terminalActivityTracker, {
+    create: async (task: TerminalTask) => {
+      const env = getCustomPresetEnv(task.presetCommand);
+      const session = ptyManager.create(task.cwd, task.presetCommand, task.themeId, Object.keys(env).length ? env : undefined);
+      try { recordRemotePresetUsage(task.presetCommand); } catch { /* ignore */ }
+      const info = taskSessionInfo(session);
+      safeSend('pty:task-created', info, task.id);
+      await waitForTaskTerminalReady(session.id, task.presetCommand);
+      return { sessionId: session.id };
+    },
+    submit: (sessionId, instruction, submissionId) => ptyManager.submit(sessionId, submissionId, instruction),
+    cancel: async (sessionId) => { sessionUserClosed.add(sessionId); await ptyManager.close(sessionId); },
+    hasSession: (sessionId) => Boolean(ptyManager.getSession(sessionId)),
+    hasInputAutomation: (sessionId) => Boolean((autoContinueManager?.get(sessionId) as any)?.enabled),
+  });
+  terminalTaskScheduler.onChange(snapshot => safeSend('tasks:changed', snapshot));
+  terminalTaskScheduler.start();
 }
 
 function openExternalHttpUrl(url: string): boolean {
@@ -284,6 +448,7 @@ function createWindow(appIcon?: Electron.NativeImage): void {
       preload: path.join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: false,
     },
   });
 
@@ -328,52 +493,30 @@ function safeSend(channel: string, ...args: unknown[]): void {
   }
 }
 
-function stripAnsi(text: string): string {
-  return text
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
-    .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, '');
+function isDesktopWindowFocused(): boolean {
+  return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused());
 }
 
-function appleScriptQuote(text: string): string {
-  return `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n/g, ' ')}"`;
-}
-
-function sendIMessageNotification(message: string): void {
-  if (process.platform !== 'darwin' || !IMESSAGE_TARGET) return;
-  const scriptLines = [
-    'tell application "Messages"',
-    `set targetService to 1st service whose service type = ${IMESSAGE_SERVICE}`,
-    `set targetBuddy to buddy ${appleScriptQuote(IMESSAGE_TARGET)} of targetService`,
-    `send ${appleScriptQuote(message)} to targetBuddy`,
-    'end tell',
-  ];
-  const args = scriptLines.flatMap((line) => ['-e', line]);
-  const p = spawn('osascript', args, { stdio: 'ignore', detached: true });
-  p.on('error', () => { /* ignore */ });
-  p.unref();
+function clearPendingNotify(id: string): void {
+  const timer = pendingNotifyTimers.get(id);
+  if (timer) clearTimeout(timer);
+  pendingNotifyTimers.delete(id);
 }
 
 function sendUserNotification(id: string, title: string, body: string, sound?: boolean): void {
-  // 发送远程推送
-  sendRemotePush(title, body, id);
-  
-  // 发送 iMessage（macOS）
-  sendIMessageNotification(`[DuoCLI] ${title}：${body}`);
-  
-  // 播放提示音（如果启用）
-  if (sound !== false) {
-    playNotifySound();
+  const attendingRemote = sessionRemoteViewing.has(id);
+  const desktopFocused = isDesktopWindowFocused();
+  // 正在看这个会话（手机）或 DuoCLI 窗口在前台时，不再弹系统通知。
+  if (!attendingRemote && !desktopFocused) {
+    sendRemotePush(title, body, id);
+    if (sound !== false) playNotifySound();
+    createDesktopNotification(title, body, id);
   }
-  
-  // 创建桌面端系统通知（Electron）
-  createDesktopNotification(title, body);
-  
-  // 同时发送给前端渲染进程
   safeSend('notification', title, body, id);
 }
 
 // 创建桌面端系统通知（Electron Notification API）
-function createDesktopNotification(title: string, body: string): void {
+function createDesktopNotification(title: string, body: string, sessionId?: string): void {
   if (!BrowserWindow.getAllWindows().length) return;
   
   const notification = new Notification({
@@ -390,6 +533,7 @@ function createDesktopNotification(title: string, body: string): void {
     if (window) {
       window.focus();
       window.show();
+      if (sessionId) window.webContents.send('notification:open-session', sessionId);
     }
   });
   
@@ -438,64 +582,77 @@ function playNotifySound(): void {
   }
 }
 
-function maybeNotifyAttention(id: string, data: string): void {
+function notifyTitleFor(kind: AttentionKind): string {
+  if (kind === 'decision') return '需要你决策';
+  if (kind === 'done') return '任务已完成';
+  return '会话等待输入';
+}
+
+function flushAttentionNotify(id: string, expectedKind: AttentionKind): void {
+  pendingNotifyTimers.delete(id);
+  const kind = classifyAttention(sessionOutputTail.get(id) || '');
+  if (!kind) return;
+  if (kind !== expectedKind && !(expectedKind !== 'decision' && kind === 'decision')) return;
   const now = Date.now();
-  const lastNotify = sessionLastNotifyAt.get(id) || 0;
-  if (now - lastNotify < NOTIFY_COOLDOWN_MS) return;
-
-  const plain = stripAnsi(data);
-  if (!plain) return;
-
-  const tail = ((sessionOutputTail.get(id) || '') + plain).slice(-1200);
-  sessionOutputTail.set(id, tail);
-
-  const promptLike = /(?:^|\n)\s*(?:[$#>❯›▷➜]|(?:\[[^\]]+\]))\s*$/.test(tail);
-  const cliWorking = /\w+…\s*\(/.test(tail);
-  const hasPrompt = promptLike && !cliWorking;
-  const needDecision = /(是否|请选择|请确认|需要你|输入\s*(?:y|n|yes|no)|\[(?:y\/n|yes\/no)\]|continue\?|press enter|按回车|确认继续)/i.test(tail);
-  const taskDone = /(任务已完成|已完成|完成了|done\b|completed\b|finished\b|all set\b|success(?:fully)?\b)/i.test(tail);
-  const lastInputAt = sessionLastInputAt.get(id) || 0;
-  const waitedLongEnough = now - lastInputAt >= WAITING_INPUT_DELAY_MS;
-
+  if (!canNotifyAttention({
+    kind,
+    armed: sessionArmedForNotify.has(id),
+    now,
+    lastInputAt: sessionLastInputAt.get(id) || 0,
+    lastNotifyAt: sessionLastNotifyAt.get(id) || 0,
+  })) return;
   const session = ptyManager.getSession(id);
   const title = session?.title || session?.presetCommand || '终端';
-
-  if (hasPrompt && needDecision) {
-    sendUserNotification(id, '需要你决策', title);
-    sessionLastNotifyAt.set(id, now);
-    sessionArmedForNotify.delete(id);
-    return;
-  }
-
-  if (!sessionArmedForNotify.has(id) || !hasPrompt || !waitedLongEnough) return;
-
-  if (taskDone) {
-    sendUserNotification(id, '任务已完成', title);
-  } else {
-    sendUserNotification(id, '会话等待输入', title);
-  }
+  sendUserNotification(id, notifyTitleFor(kind), title);
   sessionLastNotifyAt.set(id, now);
   sessionArmedForNotify.delete(id);
+}
+
+function maybeNotifyAttention(id: string, data: string): void {
+  const plain = stripAnsiForNotify(data);
+  if (!plain.trim()) return;
+
+  const tail = appendNotifyTail(sessionOutputTail.get(id) || '', plain);
+  sessionOutputTail.set(id, tail);
+
+  const kind = classifyAttention(tail);
+  clearPendingNotify(id);
+  if (!kind) return;
+  if (kind !== 'decision' && !sessionArmedForNotify.has(id)) return;
+
+  const now = Date.now();
+  if (now - (sessionLastNotifyAt.get(id) || 0) < NOTIFY_COOLDOWN_MS) return;
+
+  const delay = delayUntilNotify(kind, now, sessionLastInputAt.get(id) || 0);
+  const timer = setTimeout(() => flushAttentionNotify(id, kind), delay);
+  timer.unref?.();
+  pendingNotifyTimers.set(id, timer);
 }
 
 function setupPtyManager(): void {
   ptyManager = new PtyManager({
     onData: (id, data) => {
       safeSend('pty:data', id, data);
+      terminalActivityTracker?.noteData(id, data);
+      autoContinueManager?.observeOutput(id, data);
       
       // ===== 累积上下文输出用于捕获 =====
-      const existing = sessionContextBuffer.get(id) || '';
-      sessionContextBuffer.set(id, existing + data);
+      appendSessionContext(id, data);
       
       maybeNotifyAttention(id, data);
     },
     onRawData: (id, data, sequence) => {
       pushRawDataToRemote(id, data, sequence);
+      safeSend('pty:parsed', id, data, sequence);
     },
+    onResize: (id, cols, rows) => safeSend('pty:geometry', id, { cols, rows }),
     onTitleUpdate: (id, title) => {
       safeSend('pty:title-update', id, title);
     },
     onExit: (id) => {
+      terminalTaskScheduler?.sessionExited(id, sessionUserClosed.has(id));
+      terminalActivityTracker?.remove(id);
+      autoContinueManager?.remove(id);
       // 兜底：从 buffer 中提取 resume ID
       ptyManager.captureResumeFromBuffer(id);
 
@@ -509,6 +666,7 @@ function setupPtyManager(): void {
           resumeId: session.resumeId,
           resumeCommand: session.resumeCommand || '',
           resumeSource: session.resumeSource || undefined,
+          updatedAt: sessionUpdatedAt(session),
         });
       }
 
@@ -529,10 +687,18 @@ function setupPtyManager(): void {
       sessionLastInputAt.delete(id);
       sessionArmedForNotify.delete(id);
       sessionLastNotifyAt.delete(id);
+      sessionRemoteViewing.delete(id);
+      clearPendingNotify(id);
+      sessionContextBuffer.delete(id);
     },
     onPasteInput: (id, cwd) => {
       sessionLastInputAt.set(id, Date.now());
       sessionArmedForNotify.add(id);
+      clearPendingNotify(id);
+      autoContinueManager?.noteManualInput(id);
+    },
+    onUserSubmitted: (id, submittedAt) => {
+      safeSend('pty:user-submitted', id, submittedAt);
     },
   },
   () => loadAiPreferenceData().manualConfig || null,
@@ -576,6 +742,47 @@ function registerIPC(): void {
     };
   });
 
+  ipcMain.handle('tasks:list', () => terminalTaskScheduler?.snapshot() || { revision: 0, tasks: [] });
+  ipcMain.handle('tasks:create', (_e, input) => {
+    if (!terminalTaskScheduler) throw new Error('计划任务服务尚未就绪');
+    return terminalTaskScheduler.create(input);
+  });
+  ipcMain.handle('tasks:update', (_e, taskId: string, input) => {
+    if (!terminalTaskScheduler) throw new Error('计划任务服务尚未就绪');
+    return terminalTaskScheduler.update(String(taskId || ''), input);
+  });
+  ipcMain.handle('tasks:cancel', (_e, taskId: string) => {
+    if (!terminalTaskScheduler) throw new Error('计划任务服务尚未就绪');
+    return terminalTaskScheduler.cancel(String(taskId || ''));
+  });
+  ipcMain.handle('tasks:pause', (_e, taskId: string) => {
+    if (!terminalTaskScheduler) throw new Error('计划任务服务尚未就绪');
+    return terminalTaskScheduler.pause(String(taskId || ''));
+  });
+  ipcMain.handle('tasks:resume', (_e, taskId: string) => {
+    if (!terminalTaskScheduler) throw new Error('计划任务服务尚未就绪');
+    return terminalTaskScheduler.resume(String(taskId || ''));
+  });
+  ipcMain.handle('tasks:run-now', (_e, taskId: string) => {
+    if (!terminalTaskScheduler) throw new Error('计划任务服务尚未就绪');
+    return terminalTaskScheduler.runNow(String(taskId || ''));
+  });
+  ipcMain.handle('tasks:remove', (_e, taskId: string) => {
+    if (!terminalTaskScheduler) throw new Error('计划任务服务尚未就绪');
+    return terminalTaskScheduler.remove(String(taskId || ''));
+  });
+  ipcMain.handle('tasks:confirm-complete', (_e, taskId: string) => {
+    if (!terminalTaskScheduler) throw new Error('计划任务服务尚未就绪');
+    return terminalTaskScheduler.confirmComplete(String(taskId || ''));
+  });
+
+  ipcMain.handle('quick-commands:get', () => quickCommands.read());
+  ipcMain.handle('quick-commands:update', (_e, operation) => quickCommands.update(operation));
+  ipcMain.handle('pty:submit', (_e, id: string, submissionId: string, text: string) => {
+    if (typeof text !== 'string' || text.length > 100000 || typeof submissionId !== 'string') throw new Error('无效消息');
+    return ptyManager.submit(id, submissionId, text);
+  });
+
   // 写入数据
   ipcMain.handle('pty:write', (_e, id: string, data: string) => {
     console.log(`[Main] pty:write 收到, id=${id}, data="${data}"`);
@@ -586,7 +793,27 @@ function registerIPC(): void {
   // 调整大小
   ipcMain.handle('pty:resize', (_e, id: string, cols: number, rows: number) => {
     ptyManager.resize(id, cols, rows);
-    return true;
+    const session = ptyManager.getSession(id);
+    return session ? { cols: session.currentCols, rows: session.currentRows } : null;
+  });
+
+  ipcMain.handle('pty:snapshot', (_e, id: string, options?: { scrollback?: number }) => {
+    return new Promise((resolve, reject) => {
+      ptyManager.snapshot(id, snapshot => resolve(snapshot), options).catch(reject);
+    });
+  });
+
+  ipcMain.handle('pty:history-before', (_e, id: string, query?: {
+    beforeCursor?: string | null;
+    limitRows?: number;
+    requestId?: string;
+    epoch?: number;
+  }) => {
+    return ptyManager.historyBefore(id, query || {});
+  });
+
+  ipcMain.handle('pty:history-meta', (_e, id: string) => {
+    return ptyManager.historyMeta(id);
   });
 
   // 销毁终端
@@ -625,6 +852,7 @@ function registerIPC(): void {
         resumeCommand: beforeClose.resumeCommand || '',
         resumeSource: beforeClose.resumeSource || undefined,
         contextHistory,
+        updatedAt: sessionUpdatedAt(beforeClose),
       });
     } else if (capture?.sessionId) {
       // `close` normally leaves the session object available until destroy;
@@ -637,12 +865,15 @@ function registerIPC(): void {
         resumeCommand: capture.resumeCommand,
         resumeSource: capture.source,
         contextHistory,
+        updatedAt: sessionUpdatedAt(beforeClose),
       });
     }
     sessionOutputTail.delete(id);
     sessionLastInputAt.delete(id);
     sessionArmedForNotify.delete(id);
     sessionLastNotifyAt.delete(id);
+    sessionRemoteViewing.delete(id);
+    clearPendingNotify(id);
     sessionUserClosed.delete(id);
     return !!capture || !!beforeClose?.resumeId;
   });
@@ -657,6 +888,31 @@ function registerIPC(): void {
     await ptyManager.regenerateTitle(id);
   });
 
+  // 根据用户输入文本生成标题（计划任务名称等）
+  ipcMain.handle('title:suggest-from-text', async (_e, text: string) => {
+    const input = String(text || '').trim();
+    if (!input) return '';
+    const fallback = input.replace(/\s+/g, ' ').slice(0, 40);
+    const config = loadAiPreferenceData().manualConfig || null;
+    if (!config?.baseUrl || !config?.apiKey || !config?.model) return fallback;
+    try {
+      const prompt = [
+        '你是终端会话标题生成助手。下面是用户准备发送给命令行工具的内容，',
+        '请理解用户想做什么，生成一个简洁的中文标题（不超过 12 个字，不要标点、不要引号、不要解释）。',
+        '',
+        '用户输入：',
+        input,
+        '',
+        '只返回标题本身。',
+      ].join('\n');
+      const title = await requestTitleFromConfiguredAI(config, prompt);
+      return cleanGeneratedTitle(title).slice(0, 50) || fallback;
+    } catch (err) {
+      console.error('[Main] 标题建议失败:', err instanceof Error ? err.message : err);
+      return fallback;
+    }
+  });
+
   // 获取所有会话信息
   ipcMain.handle('pty:sessions', () => {
     return ptyManager.getAllSessions().map((s) => ({
@@ -667,6 +923,8 @@ function registerIPC(): void {
       displayName: getDisplayName(s.presetCommand),
       cli: s.cliKind,
       resumeId: s.resumeId,
+      createdAt: s.createdAt,
+      lastSubmittedAt: s.lastSubmittedAt,
     }));
   });
 
@@ -937,10 +1195,10 @@ function registerIPC(): void {
   ipcMain.handle('android:screenshot', async (_e, deviceId?: string) => {
     try {
       const args = deviceId ? ['-s', String(deviceId), 'exec-out', 'screencap', '-p'] : ['exec-out', 'screencap', '-p'];
-      const png = await runAdb(args, { maxBuffer: 8 * 1024 * 1024 });
+      const png = await prepareAdbScreenshot(await runAdb(args, { maxBuffer: 8 * 1024 * 1024 }));
       return { ok: true, dataUrl: `data:image/png;base64,${png.toString('base64')}` };
     } catch (error: any) {
-      return { ok: false, error: error?.message || '截图失败' };
+      return { ok: false, error: humanizeAndroidImageError(error) || '截图失败' };
     }
   });
 
@@ -1010,6 +1268,25 @@ function registerIPC(): void {
 
   ipcMain.handle('filewatcher:get-editor', () => {
     return loadEditorPreference();
+  });
+
+  ipcMain.handle('open-with:list', (_e, filePath: string) => listAppsForFile(String(filePath || '')));
+  ipcMain.handle('open-with:app', (_e, filePath: string, appPath: string) =>
+    openFileWithApp(String(filePath || ''), String(appPath || '')));
+  ipcMain.handle('open-with:system-dialog', async (_e, filePath: string) => {
+    const target = String(filePath || '');
+    if (process.platform === 'linux') {
+      if (!mainWindow) return;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: '选择应用程序',
+        defaultPath: '/usr/bin',
+        properties: ['openFile'],
+      });
+      if (result.canceled || !result.filePaths[0]) return;
+      await openFileWithApp(target, result.filePaths[0]);
+      return;
+    }
+    await openFileWithSystemDialog(target);
   });
 
   // 在 Finder 中打开目录
@@ -1194,14 +1471,42 @@ function registerIPC(): void {
     return result;
   });
   ipcMain.handle('remote:generate-token', () => generateAccessToken());
+  ipcMain.handle('remote:prepare-tunnel-config', () => {
+    const result = cloudflaredManager?.prepareUserConfig()
+      ?? { ok: false as const, error: '远程隧道未初始化' };
+    if (result.ok && cachedRemoteServerInfo && cloudflaredManager) {
+      const tunnel = cloudflaredManager.getStatus();
+      cachedRemoteServerInfo = {
+        ...cachedRemoteServerInfo,
+        publicUrl: tunnel.url || undefined,
+        tunnel,
+      };
+      safeSend('remote:server-info', cachedRemoteServerInfo);
+    }
+    return result;
+  });
 
-  // ========== 催工配置中转 IPC ==========
-  // main 进程作为中转：remote-server API → renderer 的 sessionAutoContinue
+  // ========== 催工配置 IPC ==========
+  // 配置与调度由 main 进程负责，renderer 只负责设置和展示；这样重载页面、隐藏窗口
+  // 或渲染进程暂时崩溃时，计划仍然可以继续执行。
+  ipcMain.handle('auto-continue:get-all', () => ({
+    configs: autoContinueManager?.list() || {},
+    persisted: autoContinueManager?.hasPersistedState() || false,
+  }));
+  ipcMain.on('auto-continue:sync', (_e, configs: unknown) => {
+    if (!configs || typeof configs !== 'object') return;
+    const safeConfigs = { ...(configs as Record<string, any>) };
+    for (const [sessionId, config] of Object.entries(safeConfigs)) {
+      if (config?.enabled && terminalTaskScheduler?.isManagedSessionActive(sessionId)) {
+        safeConfigs[sessionId] = { ...config, enabled: false };
+        safeSend('auto-continue:error', sessionId, '计划任务执行期间不能启用循环发送');
+      }
+    }
+    autoContinueManager?.syncAll(safeConfigs);
+  });
 
-  // 存放 pending 的 get 请求回调
+  // 兼容旧版 renderer：manager 尚未就绪时仍保留一次性的 IPC 中转。
   const autoContinuePendingGets = new Map<string, (config: any) => void>();
-
-  // renderer 回复配置
   ipcMain.on('auto-continue:config-reply', (_e, sessionId: string, config: any) => {
     const resolve = autoContinuePendingGets.get(sessionId);
     if (resolve) {
@@ -1210,32 +1515,61 @@ function registerIPC(): void {
     }
   });
 
-  // 供 remote-server 调用：读取催工配置
+  const getAutoContinueFromRenderer = (sessionId: string): Promise<any> => new Promise((resolve) => {
+    autoContinuePendingGets.set(sessionId, resolve);
+    safeSend('auto-continue:get', sessionId);
+    setTimeout(() => {
+      if (autoContinuePendingGets.has(sessionId)) {
+        autoContinuePendingGets.delete(sessionId);
+        resolve(null);
+      }
+    }, 2000);
+  });
+
   (global as any).__getAutoContinueConfig = (sessionId: string): Promise<any> => {
-    return new Promise((resolve) => {
-      autoContinuePendingGets.set(sessionId, resolve);
-      safeSend('auto-continue:get', sessionId);
-      // 超时兜底
-      setTimeout(() => {
-        if (autoContinuePendingGets.has(sessionId)) {
-          autoContinuePendingGets.delete(sessionId);
-          resolve(null);
-        }
-      }, 2000);
-    });
+    if (autoContinueManager) return Promise.resolve(autoContinueManager.get(sessionId));
+    return getAutoContinueFromRenderer(sessionId);
   };
 
-  // 供 remote-server 调用：写入催工配置
   (global as any).__setAutoContinueConfig = (sessionId: string, config: any): void => {
+    if (config?.enabled && terminalTaskScheduler?.isManagedSessionActive(sessionId)) {
+      safeSend('auto-continue:error', sessionId, '计划任务执行期间不能启用循环发送');
+      return;
+    }
+    if (autoContinueManager) {
+      const normalized = autoContinueManager.set(sessionId, config);
+      safeSend('auto-continue:set', sessionId, normalized);
+      return;
+    }
     safeSend('auto-continue:set', sessionId, config);
   };
 
-  // 供 remote-server 调用：读取会话状态（busy/unread/idle）
+  // 供 remote-server 调用：读取会话状态（running/idle/inactive）
   // renderer 通过 IPC 同步状态到这里
   (global as any).__sessionStatuses = {} as Record<string, string>;
   ipcMain.on('session:sync-status', (_e, statuses: Record<string, string>) => {
-    (global as any).__sessionStatuses = statuses;
+    const current = { ...((global as any).__sessionStatuses || {}) } as Record<string, string>;
+    for (const [id, status] of Object.entries(statuses || {})) {
+      if (!(id in current)) current[id] = status;
+      else if (status === 'inactive' && current[id] === 'idle') current[id] = 'inactive';
+    }
+    for (const id of Object.keys(current)) {
+      if (!(id in (statuses || {})) && !ptyManager.getSession(id)) delete current[id];
+    }
+    (global as any).__sessionStatuses = current;
   });
+  (global as any).__notifySessionRemoteView = (id: string, info: { viewed?: boolean; viewing?: boolean }) => {
+    if (info?.viewing === true) sessionRemoteViewing.add(id);
+    else if (info?.viewing === false) sessionRemoteViewing.delete(id);
+    if (info?.viewed) {
+      const statuses = { ...((global as any).__sessionStatuses || {}) } as Record<string, string>;
+      if (statuses[id] === 'idle') {
+        statuses[id] = 'inactive';
+        (global as any).__sessionStatuses = statuses;
+      }
+    }
+    safeSend('session:remote-view', id, info);
+  };
 
 }
 
@@ -1243,8 +1577,14 @@ app.whenReady().then(async () => {
   closedSessionsManager = new ClosedSessionsManager(app.getPath('userData'));
   closedSessionsManager.onUpdate((sessions) => safeSend('closed-sessions:update', sessions));
   closedSessionsManager.resetStaleRestores();
+  closedSessionsManager.backfillUpdatedAtFromLocalSessions();
 
   setupPtyManager();
+  setupTerminalTasks();
+  autoContinueManager = new AutoContinueManager(
+    ptyManager,
+    path.join(app.getPath('userData'), 'auto-continue.json'),
+  );
 
   // macOS Dock 图标 — 在窗口创建前设置
   const appIcon = loadAppIcon();
@@ -1256,6 +1596,8 @@ app.whenReady().then(async () => {
 
   registerIPC();
   cloudflaredManager = new CloudflaredManager(path.join(__dirname, '../..'));
+  // 用户主动打开应用：清掉 Cmd+Q 留下的暂停标记，并恢复 KeepAlive（若已安装）。
+  resumeKeepAliveDaemon();
   createWindow(appIcon);
 
   remoteSyncMonitor = new RemoteSyncMonitor(
@@ -1293,7 +1635,17 @@ app.on('activate', () => {
 });
 
 function cleanupForQuit(): void {
+  // 必须先于进程退出：否则 LaunchAgent KeepAlive 会马上再 exec Electron。
+  pauseKeepAliveDaemon();
   globalShortcut.unregisterAll();
+  autoContinueManager?.stop();
+  autoContinueManager = null;
+  for (const timer of pendingNotifyTimers.values()) clearTimeout(timer);
+  pendingNotifyTimers.clear();
+  terminalTaskScheduler?.stop();
+  terminalTaskScheduler = null;
+  terminalActivityTracker?.stop();
+  terminalActivityTracker = null;
   remoteSyncMonitor?.stop();
   remoteSyncMonitor = null;
   remoteServer?.close();
@@ -1309,7 +1661,9 @@ app.on('before-quit', (event) => {
   }
 
   const sessions = ptyManager.getAllSessions();
-  if (sessions.length === 0) {
+  const queuedTasks = (terminalTaskScheduler?.snapshot().tasks || [])
+    .filter(task => ['pending', 'paused', 'starting', 'running'].includes(task.status)).length;
+  if (sessions.length === 0 && queuedTasks === 0) {
     quitConfirmed = true;
     isQuitting = true;
     cleanupForQuit();
@@ -1323,8 +1677,8 @@ app.on('before-quit', (event) => {
   const boxOptions: Electron.MessageBoxOptions = {
     type: 'warning',
     title: '退出 DuoCLI',
-    message: `当前有 ${sessions.length} 个终端正在运行`,
-    detail: '退出后所有终端进程都会被终止，手机远程服务也会停止。确定要退出吗？',
+    message: `当前有 ${sessions.length} 个终端、${queuedTasks} 个待执行或执行中的计划任务`,
+    detail: '退出后终端进程会被终止，计划任务会暂停，重新打开时再恢复等待。确定要退出吗？',
     buttons: ['取消', '退出'],
     defaultId: 0,
     cancelId: 0,

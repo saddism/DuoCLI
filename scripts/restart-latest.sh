@@ -20,4 +20,4 @@ fi
 
 cd "$PROJECT_DIR" || exit 1
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
-exec npm start
+exec bash "$PROJECT_DIR/scripts/start-latest.sh"

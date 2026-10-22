@@ -9,7 +9,7 @@
 export type PaneDirection = 'horizontal' | 'vertical';
 
 export type PaneContent =
-  | { kind: 'terminal'; sessionId: string; label?: string; agentLabel?: string }
+  | { kind: 'terminal'; sessionId: string; label?: string; projectLabel?: string; agentLabel?: string }
   | { kind: 'file'; path: string; label?: string }
   | { kind: 'android'; deviceId?: string; label?: string }
   | { kind: 'empty' };
@@ -107,6 +107,7 @@ export function splitPane(
   content: PaneContent,
   splitId = createId('split'),
   newPaneId = createId('pane'),
+  insertBefore = false,
 ): WorkspaceLayout | null {
   const pane = findPane(layout.root, paneId);
   if (!pane || countPanes(layout.root) >= MAX_PANES) return null;
@@ -115,8 +116,8 @@ export function splitPane(
     id: splitId,
     direction,
     ratio: 0.5,
-    first: pane,
-    second: createPane(content, newPaneId),
+    first: insertBefore ? createPane(content, newPaneId) : pane,
+    second: insertBefore ? pane : createPane(content, newPaneId),
   };
   const nextLayout: WorkspaceLayout = {
     ...layout,

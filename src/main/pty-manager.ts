@@ -6,6 +6,7 @@ import * as crypto from 'crypto';
 import { execSync } from 'child_process';
 import { requestTitleFromConfiguredAI, cleanGeneratedTitle, TitleAIConfig } from './title-ai';
 import { TerminalState, TerminalSnapshot } from './terminal-state';
+import { HISTORY_PAGE_ROWS, type HistoryPage } from './terminal-history';
 import {
   findNewAutoResponseRule,
   TerminalAutoResponseConfig,
@@ -19,9 +20,11 @@ import {
   parseResumeCommandLine,
   parseResumeOutput,
   preassignSessionId,
+  preassignPiSession,
   resolveSessionId,
 } from './session-resume';
 import { buildLaunchWrite, normalizePresetEnv } from './preset-env';
+import { parseInlineEnvAssignments, stripLeadingEnvAssignments } from './dsh-host';
 
 export interface PtySession {
   id: string;
@@ -30,8 +33,11 @@ export interface PtySession {
   rawBuffer: string;          // 完整 ANSI 输出，用于远程终端回放
   lastSequence: number;       // rawBuffer 对应的终端解析序号
   terminalState: TerminalState;
-  submissions: Map<string, { text: string; result: Promise<void>; settled: boolean }>;
+  submissions: Map<string, { text: string; result: Promise<void>; settled: boolean; createdAt: number; phase: 'queued' | 'text' | 'entered' }>;
   submitQueue: Promise<void>;
+  inputTransaction: boolean;
+  inputTransactionCount: number;
+  queuedInputs: Array<{ data: string; source: PtyInputSource }>;
   userInputs: string[];
   commandCount: number;
   title: string;
@@ -48,12 +54,16 @@ export interface PtySession {
   presetCommand: string;
   launchCommand: string;           // preset plus a provider-specific preassigned id
   cliKind: CliKind;
+  cliStorageEnv?: Record<string, string>;
   themeId: string;
   provider: string | null;    // 实际使用的模型提供商 (如 MiniMax, GLM 等)
   createdAt: number;          // 创建时间戳
+  updatedAt: number;          // 最后活动时间（输出或输入）
+  lastSubmittedAt: number;    // 用户最近一次实际提交非空终端内容的时间
   resumeId: string | null;    // 捕获的 resume session ID (UUID)
   resumeCommand: string | null; // 完整 resume 命令 (如 "claude --resume xxx")
   resumeSource: ResumeCapture['source'] | null;
+  resumeLookupAt: number;
   closing: boolean;
   closePromise?: Promise<ResumeCapture | null>;
   launchSentAt: number | null;
@@ -76,13 +86,14 @@ export interface PtySession {
   lastInputAt: Record<PtyInputSource, number>;
 }
 
-export type PtyInputSource = 'desktop' | 'mobile';
+export type PtyInputSource = 'desktop' | 'mobile' | 'chat';
 
 interface PtyManagerEvents {
   onData: (id: string, data: string) => void;
   onTitleUpdate: (id: string, title: string) => void;
   onExit: (id: string) => void;
   onPasteInput?: (id: string, cwd: string) => void;
+  onUserSubmitted?: (id: string, submittedAt: number) => void;
   onRawData?: (id: string, data: string, sequence: number) => void;
   onResize?: (id: string, cols: number, rows: number) => void;
 }
@@ -133,6 +144,8 @@ const PRESET_DISPLAY_NAMES: Record<string, string> = {
   'kiro-cli chat --trust-all-tools': 'Kiro全自动',
   'agent --force --approve-mcps': 'Cursor全自动',
   'agy --dangerously-skip-permissions': 'Antigravity全自动',
+  'dsh-tui': 'DSH',
+  'zcode': 'ZCode',
 };
 
 const CLI_BASE_DISPLAY_NAMES: Record<CliKind, string> = {
@@ -141,12 +154,16 @@ const CLI_BASE_DISPLAY_NAMES: Record<CliKind, string> = {
   devin: 'Devin',
   kimi: 'Kimi',
   gemini: 'Gemini',
+  qwen: 'Qwen',
+  pi: 'Pi',
   qoder: 'Qoder',
   qodercn: 'QoderCN',
   opencode: 'OpenCode',
   kiro: 'Kiro',
   cursor: 'Cursor',
   agy: 'Antigravity',
+  dsh: 'DSH',
+  zcode: 'ZCode',
   unknown: '',
 };
 
@@ -163,6 +180,7 @@ function isAutoPresetCommand(presetCommand: string, cli: CliKind): boolean {
     case 'kimi':
       return /--auto\b/.test(presetCommand);
     case 'gemini':
+    case 'qwen':
       return /--yolo/.test(presetCommand);
     case 'qoder':
     case 'qodercn':
@@ -291,7 +309,7 @@ export function getDisplayName(presetCommand: string): string {
 
 export class PtyManager {
   private sessions: Map<string, PtySession> = new Map();
-  private nextId = 1;
+  private lastUserSubmissionAt = 0;
   private events: PtyManagerEvents;
   private getTitleAIConfig?: TitleAIConfigProvider;
   private getTerminalAutoResponseConfig?: TerminalAutoResponseConfigProvider;
@@ -313,8 +331,13 @@ export class PtyManager {
   }
 
   create(cwd: string, presetCommand: string, themeId: string, envOverrides?: Record<string, string>): PtySession {
-    const id = `term-${this.nextId++}`;
+    // Stable unique ids: recycled term-1/term-2 keys reused localStorage prompt banners across restarts.
+    const id = `term-${crypto.randomUUID()}`;
     const cliKind = identifyCli(presetCommand);
+    const env = buildPtyEnvironment(cliKind, envOverrides ? normalizePresetEnv(envOverrides) : undefined);
+    const storageEnv = { ...env, ...parseInlineEnvAssignments(presetCommand).env };
+    const cliStorageEnv = Object.fromEntries(['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'PI_CODING_AGENT_DIR', 'KIMI_CODE_HOME', 'XDG_DATA_HOME']
+      .filter(key => storageEnv[key] !== undefined).map(key => [key, storageEnv[key]]));
     let launchCommand = presetCommand;
     let initialResume: ResumeCapture | null = parseResumeCommandLine(presetCommand);
 
@@ -332,16 +355,23 @@ export class PtyManager {
           source: 'preassigned',
         };
       }
-    } else if (!initialResume && (cliKind === 'claude' || cliKind === 'gemini' || cliKind === 'qoder' || cliKind === 'qodercn')) {
+    } else if (!initialResume && cliKind === 'pi') {
+      const preassigned = preassignPiSession(presetCommand, crypto.randomUUID(), cwd, cliStorageEnv.PI_CODING_AGENT_DIR);
+      launchCommand = preassigned.command;
+      initialResume = preassigned.capture;
+    } else if (!initialResume && (cliKind === 'claude' || cliKind === 'gemini' || cliKind === 'qwen' || cliKind === 'qoder' || cliKind === 'qodercn')) {
       const preassigned = preassignSessionId(presetCommand, crypto.randomUUID());
       launchCommand = preassigned.command;
       initialResume = preassigned.capture;
+    }
+    if (cliKind === 'dsh') {
+      // 新版 dsh-tui 是 DSH profile 插件，自己 boot harness，不要再塞 DSH_URL / HTTP 启动器。
+      launchCommand = stripLeadingEnvAssignments(launchCommand);
     }
     const shell = process.platform === 'win32'
       ? (process.env.COMSPEC || 'cmd.exe')
       : (process.env.SHELL || '/bin/zsh');
 
-    const env = buildPtyEnvironment(cliKind, envOverrides ? normalizePresetEnv(envOverrides) : undefined);
     if (envOverrides) {
       // 调试日志
       console.log('[PtyManager] 设置的环境变量:', JSON.stringify(envOverrides));
@@ -364,6 +394,9 @@ export class PtyManager {
       terminalState: new TerminalState(),
       submissions: new Map(),
       submitQueue: Promise.resolve(),
+      inputTransaction: false,
+      inputTransactionCount: 0,
+      queuedInputs: [],
       userInputs: [],
       commandCount: 0,
       title: '新会话',
@@ -379,12 +412,16 @@ export class PtyManager {
       presetCommand,
       launchCommand,
       cliKind,
+      cliStorageEnv,
       themeId,
       provider: null,
       createdAt: Date.now(),
+      updatedAt: Date.now(),
+      lastSubmittedAt: 0,
       resumeId: initialResume?.sessionId || null,
       resumeCommand: initialResume?.resumeCommand || null,
       resumeSource: initialResume?.source || null,
+      resumeLookupAt: 0,
       closing: false,
       launchSentAt: null,
       launchCommandEchoed: false,
@@ -398,9 +435,9 @@ export class PtyManager {
       autoResponseTimers: new Set(),
       currentCols: 80,
       currentRows: 24,
-      sizeBySource: { desktop: null, mobile: null },
+      sizeBySource: { desktop: null, mobile: null, chat: null },
       sizeOwner: 'desktop',
-      lastInputAt: { desktop: 0, mobile: 0 },
+      lastInputAt: { desktop: 0, mobile: 0, chat: 0 },
       disposables: [],
     };
 
@@ -475,6 +512,7 @@ export class PtyManager {
         }
       }
 
+      session.updatedAt = Date.now();
       this.events.onData(id, data);
       session.terminalState.write(data, sequence => {
         // Only publish raw history after the same bytes have been parsed by
@@ -508,7 +546,7 @@ export class PtyManager {
         this.clearAutoResponseTimers(session);
         this.captureResumeFromBuffer(id);
         if (!session.resumeId) {
-          const resolved = resolveSessionId(session.cliKind, session.cwd, session.createdAt, session.presetCommand, session.ptyProcess.pid);
+          const resolved = resolveSessionId(session.cliKind, session.cwd, session.createdAt, session.presetCommand, session.ptyProcess.pid, session.cliStorageEnv);
           if (resolved) {
             session.resumeId = resolved.sessionId;
             session.resumeCommand = resolved.resumeCommand;
@@ -543,9 +581,14 @@ export class PtyManager {
     return session;
   }
 
-  write(id: string, data: string, source: PtyInputSource = 'desktop'): void {
+  write(id: string, data: string, source: PtyInputSource = 'desktop', insideTransaction = false): void {
     const session = this.sessions.get(id);
     if (!session || session.closing) return;
+    if (session.inputTransaction && !insideTransaction) {
+      session.queuedInputs ??= [];
+      session.queuedInputs.push({ data, source });
+      return;
+    }
     // 终端能力/光标报告不是用户输入，不能触发尺寸接管或取消任务。
     if (/^(?:\x1b\[[?>]?[\d;:]*c|\x1b\[\d+n|\x1b\[\??\d+;\d+R|\x1b\[\?[\d;]+\$y|\x1b\](?:10|11|12);[^\x07\x1b]*(?:\x07|\x1b\\))+$/.test(data)) {
       if (session.sizeOwner === source) session.ptyProcess.write(data);
@@ -553,7 +596,8 @@ export class PtyManager {
     }
 
     session.lastInputAt[source] = Date.now();
-    if (session.sizeOwner !== source) {
+    session.updatedAt = session.lastInputAt[source];
+    if (source !== 'chat' && session.sizeOwner !== source) {
       session.sizeOwner = source;
       // 接管终端的那一端立刻拿回自己上次 fit 出的尺寸
       const own = session.sizeBySource[source];
@@ -595,43 +639,102 @@ export class PtyManager {
 
     // C1 硬约束：对所有输入照常转发给 CLI，起名逻辑是纯旁路
     session.ptyProcess.write(data);
+    if (parsed.segments.length > 0) {
+      const submittedAt = Math.max(Date.now(), this.lastUserSubmissionAt + 1);
+      this.lastUserSubmissionAt = submittedAt;
+      session.lastSubmittedAt = submittedAt;
+      this.events.onUserSubmitted?.(id, submittedAt);
+    }
   }
 
-  submit(id: string, submissionId: string, text: string): Promise<void> {
+  submit(id: string, submissionId: string, text: string, enterDelayMs = 50, source: PtyInputSource = 'mobile'): Promise<void> {
     const session = this.sessions.get(id);
     if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
     const existing = session.submissions.get(submissionId);
     if (existing) return existing.text === text ? existing.result : Promise.reject(new Error('提交编号重复'));
+    const entry = { text, result: Promise.resolve(), settled: false, createdAt: Date.now(), phase: 'queued' as const } as {
+      text: string; result: Promise<void>; settled: boolean; createdAt: number; phase: 'queued' | 'text' | 'entered';
+    };
+    session.inputTransactionCount = (session.inputTransactionCount || 0) + 1;
+    session.inputTransaction = true;
     const result = session.submitQueue.then(async () => {
       if (this.sessions.get(id) !== session) throw new Error('会话已结束');
-      let bracketed = false;
-      await session.terminalState.snapshot(() => { bracketed = session.terminalState.terminal.modes.bracketedPasteMode; });
-      const normalized = text.replace(/\r\n?/g, '\n');
-      this.write(id, bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized, 'mobile');
-      // TUI 输入状态需要完成一次更新；回车不能与粘贴被识别成同一次 paste。
-      await new Promise(resolve => setTimeout(resolve, 50));
-      if (this.sessions.get(id) !== session) throw new Error('会话已结束');
-      this.write(id, '\r', 'mobile');
+      try {
+        let bracketed = false;
+        await session.terminalState.snapshot(() => { bracketed = session.terminalState.terminal.modes.bracketedPasteMode; });
+        const normalized = text.replace(/\r\n?/g, '\n');
+        entry.phase = 'text';
+        this.write(id, bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized, source, true);
+        // TUI 输入状态需要 complete one update before Enter.
+        await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(120_000, enterDelayMs))));
+        if (this.sessions.get(id) !== session) throw new Error('会话已结束');
+        this.write(id, '\r', source, true);
+        entry.phase = 'entered';
+      } finally {
+        session.inputTransactionCount = Math.max(0, (session.inputTransactionCount || 1) - 1);
+        session.inputTransaction = session.inputTransactionCount > 0;
+        if (!session.inputTransaction) {
+          const queued = session.queuedInputs?.splice(0) || [];
+          for (const pending of queued) this.write(id, pending.data, pending.source);
+        }
+      }
     });
     session.submitQueue = result.catch(() => {});
-    const entry = { text, result, settled: false };
+    entry.result = result;
     session.submissions.set(submissionId, entry);
     const prune = () => {
       entry.settled = true;
       for (const [key, value] of session.submissions) {
-        if (session.submissions.size <= 256) break;
+        if (session.submissions.size <= 4096) break;
         // Never evict an in-flight ID: an HTTP retry may still be on its way.
-        if (value.settled) session.submissions.delete(key);
+        if (value.settled && Date.now() - (value.createdAt || 0) > 24 * 60 * 60 * 1000) session.submissions.delete(key);
       }
     };
-    void result.then(prune, prune);
+    void result.then(prune, () => {
+      prune();
+      // A failure before any bytes were written is safe to retry with the same ID.
+      if (entry.phase === 'queued' && session.submissions.get(submissionId) === entry) {
+        session.submissions.delete(submissionId);
+      }
+    });
     return result;
   }
 
-  snapshot(id: string, consume: (snapshot: TerminalSnapshot) => void): Promise<void> {
+  snapshot(
+    id: string,
+    consume: (snapshot: TerminalSnapshot) => void,
+    options?: { scrollback?: number },
+  ): Promise<void> {
     const session = this.sessions.get(id);
     if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
-    return session.terminalState.snapshot(consume);
+    return session.terminalState.snapshot(snapshot => {
+      consume({ ...snapshot, sessionId: id });
+    }, options);
+  }
+
+  historyBefore(id: string, query: {
+    beforeCursor?: string | null;
+    limitRows?: number;
+    requestId?: string;
+    epoch?: number;
+  } = {}): Promise<HistoryPage> {
+    const session = this.sessions.get(id);
+    if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
+    return session.terminalState.historyBefore({
+      ...query,
+      limitRows: query.limitRows ?? HISTORY_PAGE_ROWS,
+    });
+  }
+
+  historyMeta(id: string): Promise<{
+    epoch: number;
+    historyCursor: string | null;
+    historyHasMore: boolean;
+    truncated: boolean;
+  }> {
+    const session = this.sessions.get(id);
+    if (!session || session.closing) return Promise.reject(new Error('会话已结束'));
+    return session.terminalState.historyMeta();
   }
 
   resize(id: string, cols: number, rows: number, source: PtyInputSource = 'desktop', force = false): void {
@@ -680,7 +783,7 @@ export class PtyManager {
     session.closePromise = (async () => {
       this.captureResumeFromBuffer(id);
       if (!session.resumeId) {
-        const resolved = resolveSessionId(session.cliKind, session.cwd, session.createdAt, session.presetCommand, session.ptyProcess.pid);
+        const resolved = resolveSessionId(session.cliKind, session.cwd, session.createdAt, session.presetCommand, session.ptyProcess.pid, session.cliStorageEnv);
         if (resolved) {
           session.resumeId = resolved.sessionId;
           session.resumeCommand = resolved.resumeCommand;
@@ -723,6 +826,46 @@ export class PtyManager {
 
   getSession(id: string): PtySession | undefined {
     return this.sessions.get(id);
+  }
+
+  /** Fill resumeId from PTY output or a process-owned CLI registration. Chat UI
+   *  needs this while a continued/restored session is still running. */
+  ensureResumeId(id: string, now = Date.now()): string | null {
+    const session = this.sessions.get(id);
+    if (!session || session.closing) return session?.resumeId ?? null;
+    if (session.resumeId) return session.resumeId;
+    this.captureResumeFromBuffer(id);
+    if (session.resumeId) return session.resumeId;
+    if (session.resumeLookupAt && now - session.resumeLookupAt < 3000) return null;
+    session.resumeLookupAt = now;
+    return this.applyResolvedResumeId(session);
+  }
+
+  /** Replace a stale resume id after the CLI changes its live conversation. */
+  rebindLiveResumeId(id: string, now = Date.now()): boolean {
+    const session = this.sessions.get(id);
+    if (!session || session.closing || !['codex', 'claude'].includes(session.cliKind) || !session.ptyProcess?.pid) return false;
+    if (session.resumeLookupAt && now - session.resumeLookupAt < 8000) return false;
+    session.resumeLookupAt = now;
+    const previous = session.resumeId;
+    const next = this.applyResolvedResumeId(session);
+    return Boolean(next && next !== previous);
+  }
+
+  private applyResolvedResumeId(session: PtySession): string | null {
+    const resolved = resolveSessionId(
+      session.cliKind,
+      session.cwd,
+      session.createdAt,
+      session.presetCommand,
+      session.ptyProcess.pid,
+      session.cliStorageEnv,
+    );
+    if (!resolved || resolved.sessionId === session.resumeId) return session.resumeId;
+    session.resumeId = resolved.sessionId;
+    session.resumeCommand = resolved.resumeCommand;
+    session.resumeSource = resolved.source;
+    return session.resumeId;
   }
 
   getLaunchStatus(id: string): { sentAt: number | null; commandEchoed: boolean; output: string; returnedToShell: boolean } | null {

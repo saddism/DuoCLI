@@ -30,6 +30,7 @@ test('getDisplayName infers CLI name when preset flags vary slightly', () => {
   assert.equal(getDisplayName('claude --dangerously-skip-permissions'), 'Claude全自动');
   assert.equal(getDisplayName('qodercli --dangerously-skip-permissions'), 'Qoder全自动');
   assert.equal(getDisplayName('qodercli --permission-mode bypass_permissions'), 'Qoder全自动');
+  assert.equal(getDisplayName('dsh-tui'), 'DSH');
 });
 
 // 内置预设下拉与显示名映射是两份手写列表，漏一个就会在会话列表里显示成“终端”

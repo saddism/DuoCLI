@@ -6,7 +6,7 @@
 let audioContext: AudioContext | null = null;
 
 // 通知防抖计时器
-let notifyTimer: ReturnType<typeof setTimeout> | null = null;
+const notifyTimer: ReturnType<typeof setTimeout> | null = null;
 const NOTIFICATION_COOLDOWN = 15000; // 15 秒冷却时间
 let lastNotifyTime = 0;
 
@@ -68,7 +68,7 @@ export function playCompletionSound(): void {
 /**
  * 显示系统通知（如果支持的话）
  */
-export function showSystemNotification(title: string, body: string): void {
+export function showSystemNotification(title: string, body: string, sessionId?: string): void {
   // 检查浏览器是否支持 Notification API
   if (!('Notification' in window)) {
     console.warn('[Notification] 当前浏览器不支持系统通知');
@@ -77,11 +77,11 @@ export function showSystemNotification(title: string, body: string): void {
   
   // 请求权限
   if (Notification.permission === 'granted') {
-    createNotification(title, body);
+    createNotification(title, body, sessionId);
   } else if (Notification.permission !== 'denied') {
     Notification.requestPermission().then(permission => {
       if (permission === 'granted') {
-        createNotification(title, body);
+        createNotification(title, body, sessionId);
       }
     });
   }
@@ -90,7 +90,7 @@ export function showSystemNotification(title: string, body: string): void {
 /**
  * 创建并显示通知
  */
-function createNotification(title: string, body: string): void {
+function createNotification(title: string, body: string, sessionId?: string): void {
   const notification = new Notification(title, {
     body: body,
     icon: '/icon.png', // 使用应用图标（如果需要）
@@ -101,6 +101,7 @@ function createNotification(title: string, body: string): void {
   
   notification.onclick = () => {
     window.focus();
+    if (sessionId) window.dispatchEvent(new CustomEvent('duocli:open-session', { detail: { sessionId } }));
     notification.close();
   };
   
@@ -129,7 +130,7 @@ export function notifyWithCooldown(
   playCompletionSound();
   
   // 显示系统通知
-  showSystemNotification(title, body);
+  showSystemNotification(title, body, sessionId);
   
   // 记录会话 ID（如果有）
   if (sessionId) {
@@ -147,10 +148,11 @@ export function setupNotificationListener(): void {
     console.warn('[Notification] 未找到 onNotification API');
     return;
   }
-  
-  window.duocli.onNotification((title: string, body: string, sessionId?: string) => {
-    notifyWithCooldown(title, body, sessionId);
+
+  window.duocli.onNotification(() => {
+    // 系统横幅由主进程弹出。窗口在前台时只留提示音，避免右上角再叠一条。
+    if (document.hasFocus()) playCompletionSound();
   });
-  
+
   console.log('[Notification] 已注册通知监听');
 }

@@ -1,0 +1,115 @@
+{
+  "date": "2026-10-04",
+  "scope": ["桌面终端", "网页及手机终端", "结构化对话页"],
+  "workspace": "保留审查开始时的全部未提交改动；本文件只记录本轮新增发现和修复。",
+  "method": "先在隔离夹具中复现，再修复并回归。覆盖 A-B-A 切换、延迟剪贴板、连续快照、输出缺口、断线期间清屏、分页等待期间继续滚动、发送中的草稿恢复和复制失败。没有向用户 CLI 注入测试命令。",
+  "findings": [
+    {
+      "id": "CHAT-01",
+      "severity": "P2",
+      "problem": "复制全文从渲染后的 DOM 取文本，丢失 Markdown、换行和代码围栏，并混入 Shell/复制代码等界面文字。",
+      "fix": "按消息节点保存原始文本块，全文复制取原文；代码和工具复制仍取对应正文。",
+      "source": "mobile/client/native-chat-view.js",
+      "regression": "tests/e2e/mobile-remote.e2e.mjs",
+      "reproducedBeforeRepair": true,
+      "status": "fixed"
+    },
+    {
+      "id": "CHAT-02",
+      "severity": "P2",
+      "problem": "局域网页面没有 Clipboard API 时对话复制无效，全文复制却提示成功；拒绝剪贴板权限也没有兜底。",
+      "fix": "通过页面统一复制入口使用既有 textarea 兜底，只根据实际结果提示成功或失败。",
+      "source": ["mobile/client/native-chat-view.js", "mobile/client/app.js"],
+      "regression": "tests/e2e/mobile-remote.e2e.mjs",
+      "reproducedBeforeRepair": true,
+      "status": "fixed"
+    },
+    {
+      "id": "CHAT-03",
+      "severity": "P2",
+      "problem": "更早消息请求使用发送请求时的滚动位置和高度，忽略等待期间的继续滚动及实时消息增长，分页完成后阅读位置跳动。",
+      "fix": "响应通过校验后、渲染之前采集当前消息锚点；无锚点时按当时高度和位置补偿。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-chat-state.test.mjs",
+      "reproducedBeforeRepair": true,
+      "status": "fixed"
+    },
+    {
+      "id": "CHAT-04",
+      "severity": "P1",
+      "problem": "消息仍在发送时切回会话，会将已发送文本从 pending 记录恢复到草稿；确认成功后文本仍留在输入框，容易再次发送。",
+      "fix": "存在当前发送任务时只恢复独立草稿；发送状态未确认且不存在当前任务时继续保留原文恢复能力。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-composer-state.test.mjs",
+      "reproducedBeforeRepair": true,
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-01",
+      "severity": "P1",
+      "problem": "连续快照在同一连接内到达时，前一个快照的动画帧会在后一个快照仍解析时开放输入并撤掉遮罩。",
+      "fix": "增加快照 generation，解析完成和延迟显示回调都必须属于当前快照。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-terminal-output.test.mjs",
+      "reproducedBeforeRepair": true,
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-02",
+      "severity": "P2",
+      "problem": "快照解析后的延迟显示回调可能在新的输出缺口恢复期间撤掉恢复显示状态。原有 resync 标志仍能阻止实际输入，但页面状态会被旧回调修改。",
+      "fix": "快照完成回调及动画帧在 resync 期间停止修改显示和输入就绪状态。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-terminal-output.test.mjs",
+      "reproducedBeforeRepair": true,
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-03",
+      "severity": "P1",
+      "problem": "桌面异步粘贴开始后切离再返回同一终端，上一轮的文件、图片或文本结果仍会写入新一轮页面。",
+      "fix": "粘贴操作绑定实例和当次 reveal generation；成功和失败兜底路径都拒绝过期结果。",
+      "source": "src/renderer/terminal-manager.ts",
+      "regression": "tests/e2e/desktop-copy.e2e.mjs",
+      "reproducedBeforeRepair": true,
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-04",
+      "severity": "P1",
+      "problem": "CLI 在手机断线期间重置为全空屏时，重连的空快照只调整尺寸和输入状态，断线前的文字及光标仍留在手机上。",
+      "fix": "空快照也作为完整权威状态进入终端解析队列，执行 reset 后才完成显示和开放输入。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/e2e/mobile-remote.e2e.mjs",
+      "reproducedBeforeRepair": true,
+      "status": "fixed"
+    }
+  ],
+  "validation": {
+    "environment": "macOS, Node 20.19.6, headless Chrome, real xterm and isolated HTTP/WebSocket backend",
+    "baselineUnit": {"passed": 402, "failed": 0},
+    "reproduction": "修复前 4 个新单元场景、2 个对话复制浏览器场景、3 个迟到粘贴浏览器场景和 1 个空快照浏览器场景均失败。",
+    "build": {"command": "npm run build:ts", "status": "pass"},
+    "unit": {"command": "npm run test:unit", "passed": 408, "failed": 0, "status": "pass"},
+    "e2e": {
+      "command": "DUOCLI_INPUT_AUDIT=1 npm run test:e2e",
+      "suites": 10,
+      "mobile": "151/151",
+      "desktopCopy": "16/16",
+      "mobileRemote": "39/39",
+      "status": "pass"
+    },
+    "syntaxAndWhitespace": {"command": "node --check mobile/client/app.js; node --check mobile/client/native-chat-view.js; git diff --check", "status": "pass"},
+    "screenshots": [
+      "docs/screenshots/terminal-chat-audit-2026-10-04/chat-320x568.png",
+      "docs/screenshots/terminal-chat-audit-2026-10-04/chat-390x430.png",
+      "docs/screenshots/terminal-chat-audit-2026-10-04/desktop-terminal.png"
+    ],
+    "visualChecks": "已查看对话页 320x568 与键盘压缩的 390x430 截图，以及桌面终端工作区截图。未发现输入控件、更新提示或底部操作互相遮挡。"
+  },
+  "limits": [
+    "实际桌面窗口运行的是 release/mac-arm64 下的既有打包版本，不能作为本轮源码修复生效的证据。",
+    "没有重新打包或替换用户现用程序，没有实体 iPhone/Safari、Android 输入法或 Windows/Linux 验收。",
+    "本轮未提交、推送、清理或还原工作区。"
+  ]
+}

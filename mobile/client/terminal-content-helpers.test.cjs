@@ -116,3 +116,170 @@ test('a soft-wrapped token selects across buffer rows', async t => {
   assert.equal(range.start.line, 0);
   assert.ok(range.end.line > range.start.line);
 });
+
+test('hard-wrapped markdown paths rejoin across short phone rows', async t => {
+  const term = terminal(28, 8);
+  t.after(() => term.dispose());
+  await write(term, 'Open docs/guides/getting-star\r\nted.md for details');
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  assert.match(logical.text, /docs\/guides\/getting-started\.md/);
+  const match = helpers.findLinks(logical.text).find(item => item.kind === 'file');
+  assert.equal(match.filePath, 'docs/guides/getting-started.md');
+  const hit = helpers.findLinkAtCell(logical, { row: 1, col: 2 }, {
+    cols: 28,
+    predicate: (item) => item.kind === 'file',
+  });
+  assert.equal(hit.filePath, 'docs/guides/getting-started.md');
+});
+
+test('hard-wrapped path after hyphen keeps the separator', async t => {
+  const term = terminal(32, 8);
+  t.after(() => term.dispose());
+  await write(term, 'see docs/reliability-usability-\r\naudit-2026-09-11.md please');
+  const logical = helpers.readLogicalLine(term.buffer.active, 1);
+  const match = helpers.findLinks(logical.text).find(item => item.kind === 'file');
+  assert.equal(match.filePath, 'docs/reliability-usability-audit-2026-09-11.md');
+});
+
+test('hard-wrapped typescript / vue / python / json paths rejoin', async t => {
+  const cases = [
+    { cols: 28, text: 'Open src/components/VeryLongCompo\r\nnent.tsx please', path: 'src/components/VeryLongComponent.tsx' },
+    { cols: 26, text: 'edit pages/home/index-page\r\n.vue now', path: 'pages/home/index-page.vue' },
+    { cols: 30, text: 'run scripts/data_pipeline_hel\r\npers.py ok', path: 'scripts/data_pipeline_helpers.py' },
+    { cols: 28, text: 'load config/app-settings.pro\r\nd.json', path: 'config/app-settings.prod.json' },
+  ];
+  for (const item of cases) {
+    const term = terminal(item.cols, 8);
+    t.after(() => term.dispose());
+    await write(term, item.text);
+    const logical = helpers.readLogicalLine(term.buffer.active, 0);
+    assert.match(logical.text, new RegExp(item.path.replace(/\./g, '\\.')));
+    const match = helpers.findLinks(logical.text).find(entry => entry.kind === 'file');
+    assert.equal(match.filePath, item.path, item.path);
+  }
+});
+
+test('hard wrap that splits a known extension rejoins', async t => {
+  const term = terminal(24, 8);
+  t.after(() => term.dispose());
+  await write(term, 'touch src/ui/ButtonComponen\r\nt.tsx');
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  const match = helpers.findLinks(logical.text).find(item => item.kind === 'file');
+  assert.equal(match.filePath, 'src/ui/ButtonComponent.tsx');
+});
+
+test('hard wrap that splits only the extension suffix rejoins', async t => {
+  const term = terminal(22, 8);
+  t.after(() => term.dispose());
+  await write(term, 'open src/App.t\r\nsx');
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  const match = helpers.findLinks(logical.text).find(item => item.kind === 'file');
+  assert.equal(match.filePath, 'src/App.tsx');
+});
+
+test('hard-wrapped image path is linkable', async t => {
+  const term = terminal(28, 8);
+  t.after(() => term.dispose());
+  await write(term, 'see assets/brand/hero-banner-\r\nlarge.png');
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  const match = helpers.findLinks(logical.text).find(item => item.kind === 'file');
+  assert.equal(match.filePath, 'assets/brand/hero-banner-large.png');
+});
+
+test('ordinary word before a filename is not glued into a fake path', async t => {
+  const term = terminal(40, 6);
+  t.after(() => term.dispose());
+  await write(term, 'please src/helpers.ts today');
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  assert.deepEqual(helpers.findLinks(logical.text).map(item => item.filePath), ['src/helpers.ts']);
+  assert.equal(logical.text.includes('pleasesrc/helpers.ts'), false);
+});
+
+test('artifact ZIP and image links both survive Chinese text and terminal wraps', async t => {
+  const zip = 'data-store/Artifacts/20260912-app-store-parent-v7/家长糖宣传图-V7.zip';
+  const png = 'data-store/Artifacts/20260912-app-store-parent-v7/images/04.png';
+  const text = `下载整组图片 (${zip}) · 查看新版 04 (${png})`;
+  for (const cols of [36, 80, 240]) {
+    const term = terminal(cols, 12);
+    t.after(() => term.dispose());
+    await write(term, text);
+    const logical = helpers.readLogicalLine(term.buffer.active, 0);
+    const matches = helpers.findLinks(logical.text);
+    assert.deepEqual(matches.map(item => item.filePath), [zip, png]);
+    for (const match of matches) {
+      const range = helpers.matchRange(logical, match);
+      assert.equal(helpers.findLinkAtCell(logical, { row: range.start.line, col: range.start.cell }, { cols }).filePath, match.filePath);
+    }
+  }
+});
+
+test('hard wrapped archive extension rejoins', async t => {
+  const term = terminal(80, 6);
+  t.after(() => term.dispose());
+  await write(term, '下载 data-store/家长糖.z\r\nip');
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  assert.deepEqual(helpers.findLinks(logical.text).map(item => item.filePath), ['data-store/家长糖.zip']);
+});
+
+test('parenthesized Chinese artifact citations are file links', () => {
+  const mp4 = 'Artifacts/20260913-原生验证/enhanced-review.mp4';
+  const md = 'docs/制作总稿原生验证-20260913.md';
+  const text = `增强检查片（23.9 秒） (${mp4}) · 验证记录 (${md})`;
+  assert.deepEqual(helpers.findLinks(text).map(item => item.filePath), [mp4, md]);
+});
+
+test('glued Chinese labels still expose parenthesized paths', () => {
+  const mp4 = 'Artifacts/20260913-原生验证/enhanced-review.mp4';
+  const md = 'docs/制作总稿原生验证-20260913.md';
+  const text = `增强检查片（23.9 秒）(${mp4})·验证记录(${md})`;
+  assert.deepEqual(helpers.findLinks(text).map(item => item.filePath), [mp4, md]);
+});
+
+test('hard-wrapped parenthesized citations keep both paths clickable', async t => {
+  const mp4 = 'Artifacts/20260913-原生验证/enhanced-review.mp4';
+  const md = 'docs/制作总稿原生验证-20260913.md';
+  const term = terminal(100, 8);
+  t.after(() => term.dispose());
+  await write(term, `  增强检查片（23.9 秒） (${mp4}) · 验证记录\r\n  (${md})`);
+  const found = [];
+  const seen = new Set();
+  for (let y = 0; y < 4; y++) {
+    const logical = helpers.readLogicalLine(term.buffer.active, y);
+    for (const item of helpers.findLinks(logical.text)) {
+      if (item.kind !== 'file' || seen.has(item.filePath)) continue;
+      seen.add(item.filePath);
+      found.push(item.filePath);
+    }
+  }
+  assert.deepEqual(found, [mp4, md]);
+});
+
+test('hard wrap that splits docs/ inside parentheses rejoins', async t => {
+  const md = 'docs/制作总稿原生验证-20260913.md';
+  const term = terminal(88, 8);
+  t.after(() => term.dispose());
+  await write(term, `  验证记录 (${md.slice(0, 2)}\r\n${md.slice(2)})`);
+  const logical = helpers.readLogicalLine(term.buffer.active, 0);
+  assert.deepEqual(helpers.findLinks(logical.text).map(item => item.filePath), [md]);
+});
+
+test('phone-width hard wrap through a Chinese HTML path stays clickable', async t => {
+  const html = 'Artifacts/20260913-全片总稿验证/project/views/r000134-b8055f7f9fea-4e4df0ce/index.html';
+  const rows = [
+    '• 完整内容提案已整理好：全片制作总稿 HTML',
+    '  (Artifacts/20260913-全片总稿验',
+    '证/project/views/r000134-b8055f7',
+    'f9fea-4e4df0ce/index.html)。它包',
+    '含全文、18 个观点段、顶部',
+  ];
+  const term = terminal(32, 12);
+  t.after(() => term.dispose());
+  await write(term, rows.join('\r\n'));
+  const logical = helpers.readLogicalLine(term.buffer.active, 2);
+  assert.equal(helpers.findLinks(logical.text).find(item => item.kind === 'file')?.filePath, html);
+  const hit = helpers.findLinkAtCell(logical, { row: 2, col: 8 }, {
+    cols: 32,
+    predicate: (item) => item.kind === 'file',
+  });
+  assert.equal(hit.filePath, html);
+});

@@ -50,7 +50,7 @@ export class AndroidWebRtcClient {
       this.video.playsInline = true;
       this.video.srcObject = event.streams[0] || new MediaStream([event.track]);
       const markFrame = () => this.options.onFrame?.();
-      if ('requestVideoFrameCallback' in this.video) (this.video as HTMLVideoElement & { requestVideoFrameCallback: (cb: () => void) => number }).requestVideoFrameCallback(markFrame);
+      if (typeof this.video.requestVideoFrameCallback === 'function') this.video.requestVideoFrameCallback(markFrame);
       else this.video.addEventListener('loadeddata', markFrame, { once: true });
       void this.video.play().catch((error) => this.fail(Object.assign(new Error('浏览器阻止自动播放，请点击开始画面'), { code: 'PLAYBACK_BLOCKED', cause: error })));
     };

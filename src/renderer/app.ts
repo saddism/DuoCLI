@@ -1,6 +1,12 @@
-import { TerminalManager } from './terminal-manager';
+import { TerminalManager, USER_THEMES_CONFIG } from './terminal-manager';
+import { buildContrastingTerminalTheme, pickContrastingForeground } from './theme-contrast';
 import { PaneWorkspace } from './pane-workspace';
 import { countPanes, listPanes, type PaneContent } from './pane-layout';
+import {
+  compactLayoutPhase,
+  nextSidebarWidth,
+  shouldFileTreeCollapse,
+} from './compact-layout';
 import { AndroidMirrorClient } from './android-mirror-client';
 import {
   cancelAutoContinueRun,
@@ -9,21 +15,16 @@ import {
   shouldResetAfterManualInput,
 } from './auto-continue-runtime';
 import { formatPresetEnv, parsePresetEnv, resolvePresetEnv } from '../main/preset-env';
-
-// 与手机端共用同一份 CLI 标签配色，见 mobile/client/cli-tag-colors.js
-const { getCliTagColors } = require('../../mobile/client/cli-tag-colors.js') as {
-  getCliTagColors: (displayName: string) => [string, string];
-};
+import { isTransientTerminalOutput } from '../main/session-status';
 
 // 与手机端共用同一份 CLI Logo，见 mobile/client/cli-logos.js
-const { getLogoUrl, getDefaultLogoUrl, hasLogo } = require('../../mobile/client/cli-logos.js') as {
+const { getLogoUrl, getDefaultLogoUrl, getLetterLogoUrl, hasLogo, logoNeedsInvert } = require('../../mobile/client/cli-logos.js') as {
   getLogoUrl: (cliName: string) => string;
   getDefaultLogoUrl: () => string;
+  getLetterLogoUrl: (cliName: string) => string;
   hasLogo: (cliName: string) => boolean;
+  logoNeedsInvert: (cliName: string) => boolean;
 };
-
-// 导入用户主题配置
-import { USER_THEMES_CONFIG } from './terminal-manager';
 
 // 导入通知助手
 import { setupNotificationListener } from './notification-helpers';
@@ -33,7 +34,15 @@ let remoteServerInfo: {
   token: string;
   port: number;
   publicUrl?: string;
-  tunnel?: { installed?: boolean; running: boolean; url: string; message?: string };
+  tunnel?: {
+    installed?: boolean;
+    running: boolean;
+    url: string;
+    message?: string;
+    configPath?: string;
+    configExists?: boolean;
+    configReady?: boolean;
+  };
   health?: RemoteSyncHealth;
 } | null = null;
 
@@ -54,22 +63,72 @@ let remoteTokenValue = '';
 let remoteTokenEditing = false;
 let remoteTokenSaving = false;
 
+interface TerminalTaskView {
+  id: string;
+  revision: number;
+  name: string;
+  cwd: string;
+  presetCommand: string;
+  instruction: string;
+  status: string;
+  notBefore?: number;
+  dependency?: { kind: 'task' | 'session'; id: string; generation?: number };
+  quietMs: number;
+  sessionId?: string;
+  error?: string;
+  completedAt?: number;
+}
+
+interface TerminalTaskSnapshotView {
+  revision: number;
+  tasks: TerminalTaskView[];
+}
+
 declare global {
   interface Window {
     duocli: {
       setWindowTitle: (title: string) => void;
       createPty: (cwd: string, presetCommand: string, themeId: string, providerEnv?: Record<string, string>) => Promise<{ id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }>;
+      listTerminalTasks: () => Promise<TerminalTaskSnapshotView>;
+      createTerminalTask: (input: Record<string, unknown>) => Promise<TerminalTaskView>;
+      updateTerminalTask: (taskId: string, input: Record<string, unknown>) => Promise<TerminalTaskView>;
+      cancelTerminalTask: (taskId: string) => Promise<TerminalTaskView>;
+      pauseTerminalTask: (taskId: string) => Promise<TerminalTaskView>;
+      resumeTerminalTask: (taskId: string) => Promise<TerminalTaskView>;
+      runTerminalTaskNow: (taskId: string) => Promise<TerminalTaskView>;
+      removeTerminalTask: (taskId: string) => Promise<TerminalTaskSnapshotView>;
+      confirmTerminalTaskComplete: (taskId: string) => Promise<TerminalTaskView>;
+      onTerminalTasksChanged: (cb: (snapshot: TerminalTaskSnapshotView) => void) => void;
+      onSessionActivityChanged: (cb: (state: { sessionId: string; status: 'running' | 'stopped'; generation: number }) => void) => void;
+      onTaskPtyCreated: (cb: (sessionInfo: { id: string; title: string; themeId: string; cwd: string; displayName: string }, taskId: string) => void) => void;
       writePty: (id: string, data: string) => void;
-      resizePty: (id: string, cols: number, rows: number) => void;
+      resizePty: (id: string, cols: number, rows: number) => Promise<{ cols: number; rows: number } | boolean | null>;
+      onPtyGeometry?: (cb: (id: string, geometry: { cols: number; rows: number }) => void) => void;
       destroyPty: (id: string) => Promise<boolean>;
       renamePty: (id: string, title: string) => void;
       regenerateTitle: (id: string) => Promise<void>;
-      getSessions: () => Promise<Array<{ id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }>>;
+      suggestTitleFromText: (text: string) => Promise<string>;
+      getSessions: () => Promise<Array<{ id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null; createdAt?: number; lastSubmittedAt?: number }>>;
       selectFolder: (currentPath?: string) => Promise<string | null>;
       fileTreeListDir: (dirPath: string) => Promise<Array<{ name: string; path: string; isDir: boolean }>>;
       remoteAddRecentCwd: (cwd: string) => Promise<boolean>;
       remoteSyncRecentCwds: (cwds: string[]) => Promise<boolean>;
+      snapshotPty: (id: string, options?: { scrollback?: number }) => Promise<any>;
+      historyBeforePty: (id: string, query?: {
+        beforeCursor?: string | null;
+        limitRows?: number;
+        requestId?: string;
+        epoch?: number;
+      }) => Promise<any>;
+      historyMetaPty: (id: string) => Promise<{
+        epoch: number;
+        historyCursor: string | null;
+        historyHasMore: boolean;
+        truncated: boolean;
+      }>;
       onPtyData: (cb: (id: string, data: string) => void) => void;
+      onPtyParsed: (cb: (id: string, data: string, sequence: number) => void) => void;
+      onPtyUserSubmitted: (cb: (id: string, submittedAt: number) => void) => void;
       onTitleUpdate: (cb: (id: string, title: string) => void) => void;
       onPtyExit: (cb: (id: string) => void) => void;
       onRemoteCreated: (cb: (sessionInfo: { id: string; title: string; themeId: string; cwd: string; displayName: string; cli?: string; resumeId?: string | null }) => void) => void;
@@ -80,6 +139,9 @@ declare global {
       retryRemoteSync: () => Promise<RemoteSyncHealth | null>;
       setRemoteToken: (token: string) => Promise<{ ok: true; token: string } | { ok: false; error: string }>;
       generateRemoteToken: () => Promise<string>;
+      prepareRemoteTunnelConfig: () => Promise<
+        { ok: true; configPath: string; created: boolean; configReady: boolean } | { ok: false; error: string }
+      >;
       clipboardSaveImage: () => Promise<string | null>;
       clipboardGetFilePath: () => Promise<string | null>;
       // 文件监听 API
@@ -88,6 +150,9 @@ declare global {
       filewatcherOpen: (filePath: string) => Promise<void>;
       filewatcherSelectEditor: () => Promise<string | null>;
       filewatcherGetEditor: () => Promise<string | null>;
+      listOpenWithApps: (filePath: string) => Promise<Array<{ name: string; path: string }>>;
+      openWithApp: (filePath: string, appPath: string) => Promise<void>;
+      openWithSystemDialog: (filePath: string) => Promise<void>;
       openFolder: (folderPath: string) => Promise<void>;
       openUrl: (url: string) => Promise<void>;
       onFileChange: (cb: (filename: string, eventType: string) => void) => void;
@@ -103,6 +168,9 @@ declare global {
       claudeProvidersList: () => Promise<Array<{ id: string; name: string; baseUrl: string; apiKey: string; model?: string }>>;
       claudeProvidersSave: (providers: Array<{ id: string; name: string; baseUrl: string; apiKey: string; model?: string }>) => Promise<boolean>;
       // 文件操作
+      exportContextToExportDirectory: (sessionId: string, targetAgent?: string) => Promise<{ ok: boolean; filePath: string; error?: string }>;
+      onNotification: (cb: (title: string, body: string, sessionId?: string) => void) => void;
+      onNotificationOpen: (cb: (sessionId: string) => void) => void;
       openFile: (filePath: string) => Promise<void>;
       readFilePreview: (cwd: string, filePath: string) => Promise<any>;
       readDirectory: (dirPath: string) => Promise<Array<{ name: string; isDirectory: boolean; isFile: boolean }>>;
@@ -113,18 +181,22 @@ declare global {
       androidInputText: (deviceId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
       // 会话状态同步
       syncSessionStatus: (statuses: Record<string, string>) => void;
+      onSessionRemoteView: (cb: (id: string, info: { viewed?: boolean; viewing?: boolean }) => void) => void;
       // 催工配置中转
+      autoContinueManaged: boolean;
+      getAutoContinueConfigs: () => Promise<{ configs: Record<string, any>; persisted: boolean }>;
+      syncAutoContinueConfigs: (configs: Record<string, any>) => void;
       onGetAutoContinueConfig: (cb: (sessionId: string) => void) => void;
       sendAutoContinueConfig: (sessionId: string, config: any) => void;
       onSetAutoContinueConfig: (cb: (sessionId: string, config: any) => void) => void;
       // 已关闭会话
-      closedSessionsList: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>>;
+      closedSessionsList: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number }>>;
       closedSessionsBeginRestore: (id: string) => Promise<boolean>;
       closedSessionsCancelRestore: (id: string) => Promise<boolean>;
-      closedSessionsRemove: (id: string) => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>>;
-      closedSessionsClear: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>>;
+      closedSessionsRemove: (id: string) => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number }>>;
+      closedSessionsClear: () => Promise<Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number }>>;
       closedSessionsConfirmRestore: (closedId: string, sessionId: string) => Promise<boolean>;
-      onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number }>) => void) => void;
+      onClosedSessionsUpdate: (cb: (sessions: Array<{ id: string; title: string; cwd: string; presetCommand: string; resumeId: string; resumeCommand: string; displayName: string; closedAt: number; updatedAt?: number }>) => void) => void;
       onCloseCurrentSession: (cb: () => void) => void;
     };
   }
@@ -163,6 +235,7 @@ const sessionTitles: Map<string, string> = new Map();
 const sessionThemes: Map<string, string> = new Map();
 const sessionUpdateTimes: Map<string, number> = new Map();
 const sessionCreateTimes: Map<string, number> = new Map();
+const sessionLastSubmittedTimes: Map<string, number> = new Map();
 // 会话工作目录
 const sessionCwds: Map<string, string> = new Map();
 // 会话显示名称（如 Claude全自动、Codex 等）
@@ -182,11 +255,31 @@ interface ClosedSessionInfo {
   resumeCommand: string;
   displayName: string;
   closedAt: number;
+  updatedAt?: number;
   state?: 'closed' | 'restoring';
+  contextHistory?: Array<{ role: 'user' | 'assistant'; content: string; timestamp?: number }>;
 }
 let closedSessions: ClosedSessionInfo[] = [];
-let closedSessionsCollapsed = false;
+let closedSessionsCollapsed = true;
 const restoringClosedSessionIds = new Set<string>();
+type ClosedSessionThemeChoice = { bgColor: string; fgColor: string; themeName: string };
+const CLOSED_SESSION_THEME_CHOICES_KEY = 'duocli_closed_session_theme_choices';
+const closedSessionThemeChoices = new Map<string, ClosedSessionThemeChoice>();
+try {
+  const saved = JSON.parse(localStorage.getItem(CLOSED_SESSION_THEME_CHOICES_KEY) || '[]');
+  if (Array.isArray(saved)) {
+    for (const entry of saved) {
+      if (Array.isArray(entry) && typeof entry[0] === 'string' &&
+        typeof entry[1]?.bgColor === 'string' && typeof entry[1]?.fgColor === 'string') {
+        closedSessionThemeChoices.set(entry[0], entry[1]);
+      }
+    }
+  }
+} catch { /* ignore invalid saved choices */ }
+
+function saveClosedSessionThemeChoices(): void {
+  localStorage.setItem(CLOSED_SESSION_THEME_CHOICES_KEY, JSON.stringify([...closedSessionThemeChoices]));
+}
 
 // 自动继续配置
 interface AutoContinueConfig {
@@ -197,6 +290,7 @@ interface AutoContinueConfig {
   autoAgree: boolean;
   autoAgreeDelaySec: number;
   sendDelaySec: number;
+  loopEnabled: boolean;
   maxLoops: number;
   initialDelayMs: number;
   loopCount: number;
@@ -207,14 +301,22 @@ interface AutoContinueConfig {
 }
 
 const sessionAutoContinue: Map<string, AutoContinueConfig> = new Map();
+let sessionRegistryReady = false;
 const AUTO_CONTINUE_DEFAULT_MESSAGES = ['继续'];
 const AUTO_CONTINUE_DEFAULT_INTERVAL = 10 * 60 * 1000; // 10 分钟
 const AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL = 2000; // 命令间隔 2 秒
 const AUTO_AGREE_DEFAULT_DELAY_SEC = 5; // 自动同意默认延后 5 秒
 const AUTO_CONTINUE_SEND_DELAY_SEC = 2; // 发送回车前默认延迟 2 秒
-const AUTO_CONTINUE_DEFAULT_MAX_LOOPS = -1; // -1 表示不限制
+const AUTO_CONTINUE_DEFAULT_MAX_LOOPS = -1; // 启用循环时默认不限制
+const AUTO_CONTINUE_DEFAULT_LOOP_ENABLED = false;
 const AUTO_CONTINUE_DEFAULT_INITIAL_DELAY = 0; // 首次循环立即执行
 const AUTO_CONTINUE_STORAGE_KEY = 'duocli_auto_continue';
+
+function inferLoopEnabled(config: { loopEnabled?: boolean; maxLoops?: number } | null | undefined): boolean {
+  if (typeof config?.loopEnabled === 'boolean') return config.loopEnabled;
+  if (config?.maxLoops == null) return false;
+  return config.maxLoops === -1 || config.maxLoops > 1;
+}
 
 function hasSessionInUI(sessionId: string): boolean {
   return sessionTitles.has(sessionId);
@@ -228,6 +330,10 @@ function getSessionCreateTime(id: string): number {
   return fallback;
 }
 
+function getSessionSortTime(id: string): number {
+  return Math.max(getSessionCreateTime(id), sessionLastSubmittedTimes.get(id) || 0);
+}
+
 function serializeAutoContinueConfig(config: AutoContinueConfig): Record<string, unknown> {
   return {
     enabled: config.enabled,
@@ -237,20 +343,59 @@ function serializeAutoContinueConfig(config: AutoContinueConfig): Record<string,
     autoAgree: config.autoAgree,
     autoAgreeDelaySec: config.autoAgreeDelaySec,
     sendDelaySec: config.sendDelaySec,
+    loopEnabled: config.loopEnabled,
     maxLoops: config.maxLoops,
     initialDelayMs: config.initialDelayMs,
     loopCount: config.loopCount,
-    nextRunAt: config.nextRunAt,
+    // Note: nextRunAt is excluded and will be computed by main process from initialDelayMs
   };
 }
 
 // 持久化催工配置到 localStorage
+let autoContinueStateReady = false;
+
 function saveAutoContinueToStorage(): void {
   const data: Record<string, any> = {};
   sessionAutoContinue.forEach((config, sessionId) => {
     data[sessionId] = serializeAutoContinueConfig(config);
   });
   localStorage.setItem(AUTO_CONTINUE_STORAGE_KEY, JSON.stringify(data));
+  if (autoContinueStateReady && window.duocli.autoContinueManaged) {
+    window.duocli.syncAutoContinueConfigs(data);
+  }
+}
+
+function hydrateAutoContinueConfig(sessionId: string, config: any): void {
+  const msgs = Array.isArray(config?.messages)
+    ? config.messages
+    : (config?.message ? [config.message] : [...AUTO_CONTINUE_DEFAULT_MESSAGES]);
+  const intervalMs = config?.intervalMs ?? AUTO_CONTINUE_DEFAULT_INTERVAL;
+  const initialDelayMs = config?.initialDelayMs ?? AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
+  sessionAutoContinue.set(sessionId, {
+    enabled: config?.enabled ?? false,
+    messages: msgs,
+    intervalMs,
+    commandIntervalMs: config?.commandIntervalMs ?? AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL,
+    autoAgree: config?.autoAgree ?? true,
+    autoAgreeDelaySec: config?.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC,
+    sendDelaySec: config?.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC,
+    loopEnabled: inferLoopEnabled(config),
+    maxLoops: config?.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
+    initialDelayMs,
+    loopCount: config?.loopCount ?? 0,
+    nextRunAt: resolveNextRunAt(config?.nextRunAt, Date.now(), initialDelayMs),
+    sending: false,
+    runVersion: 0,
+    timeoutIds: new Set(),
+  });
+}
+
+function replaceAutoContinueConfigs(data: Record<string, any>): void {
+  sessionAutoContinue.forEach(config => cancelAutoContinueRun(config));
+  sessionAutoContinue.clear();
+  for (const [sessionId, config] of Object.entries(data)) {
+    hydrateAutoContinueConfig(sessionId, config);
+  }
 }
 
 // 从 localStorage 恢复催工配置
@@ -261,27 +406,7 @@ function loadAutoContinueFromStorage(): void {
     const data = JSON.parse(raw) as Record<string, any>;
     for (const [sessionId, config] of Object.entries(data)) {
       // 兼容旧版 message → messages 迁移
-      const msgs = Array.isArray(config.messages)
-        ? config.messages
-        : (config.message ? [config.message] : [...AUTO_CONTINUE_DEFAULT_MESSAGES]);
-      const intervalMs = config.intervalMs ?? AUTO_CONTINUE_DEFAULT_INTERVAL;
-      const initialDelayMs = config.initialDelayMs ?? AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
-      sessionAutoContinue.set(sessionId, {
-        enabled: config.enabled ?? false,
-        messages: msgs,
-        intervalMs,
-        commandIntervalMs: config.commandIntervalMs ?? AUTO_CONTINUE_DEFAULT_COMMAND_INTERVAL,
-        autoAgree: config.autoAgree ?? true,
-        autoAgreeDelaySec: config.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC,
-        sendDelaySec: config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC,
-        maxLoops: config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
-        initialDelayMs,
-        loopCount: config.loopCount ?? 0,
-        nextRunAt: resolveNextRunAt(config.nextRunAt, Date.now(), initialDelayMs),
-        sending: false,
-        runVersion: 0,
-        timeoutIds: new Set(),
-      });
+      hydrateAutoContinueConfig(sessionId, config);
     }
   } catch {}
 }
@@ -291,13 +416,33 @@ let autoContinueTimer: ReturnType<typeof setInterval> | null = null;
 
 // 启动时恢复催工配置并启动定时器
 loadAutoContinueFromStorage();
+const autoContinueManagedByMain = window.duocli.autoContinueManaged === true;
+autoContinueStateReady = !autoContinueManagedByMain;
 // 旧逻辑会无条件清空磁盘配置，导致用户的催工设置永远丢失。
 // 现状：冷启动时 sessionTitles 为空 → loadAutoContinueFromStorage 写入的旧 session-id 配置
 // 不会命中任何当前会话，定时器自然 no-op；当 onRemoteCreated/createPty 创建新会话时
 // 会通过 onSetAutoContinueConfig 同步推送新配置覆盖旧条目。
 // 检查是否有启用的配置，如果有则启动定时器
 const hasEnabledConfig = Array.from(sessionAutoContinue.values()).some(c => c.enabled);
-if (hasEnabledConfig) initAutoContinueTimer();
+if (hasEnabledConfig && !autoContinueManagedByMain) initAutoContinueTimer();
+if (autoContinueManagedByMain) {
+  void window.duocli.getAutoContinueConfigs().then((state) => {
+    if (state.persisted) {
+      replaceAutoContinueConfigs(state.configs || {});
+      localStorage.setItem(AUTO_CONTINUE_STORAGE_KEY, JSON.stringify(state.configs || {}));
+    } else {
+      // 首次升级时把旧版 renderer 配置迁移到 main；之后以 main 的文件为准。
+      autoContinueStateReady = true;
+      saveAutoContinueToStorage();
+      return;
+    }
+    autoContinueStateReady = true;
+    if (sessionRegistryReady) renderSessionList();
+  }).catch(() => {
+    // main manager 正常启动时不会进入这里；保留配置但不在 renderer 重复调度。
+    autoContinueStateReady = true;
+  });
+}
 
 // 首次循环有独立的启动时间；首次完成后，手动输入才重置下一轮计时。
 function writePtyWithAutoReset(id: string, data: string): void {
@@ -312,10 +457,16 @@ function writePtyWithAutoReset(id: string, data: string): void {
 
 // 初始化自动继续定时器
 function initAutoContinueTimer(): void {
+  if (window.duocli.autoContinueManaged) {
+    if (autoContinueTimer) clearInterval(autoContinueTimer);
+    autoContinueTimer = null;
+    return;
+  }
   if (autoContinueTimer) {
     clearInterval(autoContinueTimer);
   }
   autoContinueTimer = setInterval(() => {
+    if (!sessionRegistryReady) return;
     const now = Date.now();
     const staleSessionIds: string[] = [];
     sessionAutoContinue.forEach((config, sessionId) => {
@@ -325,8 +476,10 @@ function initAutoContinueTimer(): void {
         return;
       }
       if (config.sending) return;
+      const looping = config.loopEnabled === true;
       const maxLoops = config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
-      if (maxLoops > 0 && config.loopCount >= maxLoops) {
+      const reachedLoopLimit = looping && maxLoops > 0 && config.loopCount >= maxLoops;
+      if ((!looping && config.loopCount >= 1) || reachedLoopLimit) {
         config.enabled = false;
         cancelAutoContinueRun(config);
         saveAutoContinueToStorage();
@@ -343,7 +496,7 @@ function initAutoContinueTimer(): void {
         config.sending = true;
         // 若本轮中途退出，重启后至少等待一个循环间隔再继续。
         config.nextRunAt = now + config.intervalMs;
-        const stopAfterCycle = maxLoops > 0 && config.loopCount >= maxLoops;
+        const stopAfterCycle = !looping || (maxLoops > 0 && config.loopCount >= maxLoops);
         saveAutoContinueToStorage();
         console.log(`[循环] 准备发送 ${messages.length} 条命令到会话 ${sessionId}`);
 
@@ -413,6 +566,7 @@ function toggleAutoContinue(sessionId: string, enabled: boolean): void {
       autoAgree: true,
       autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
       sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
+      loopEnabled: AUTO_CONTINUE_DEFAULT_LOOP_ENABLED,
       maxLoops: AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
       initialDelayMs: AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
       loopCount: 0,
@@ -436,7 +590,7 @@ function toggleAutoContinue(sessionId: string, enabled: boolean): void {
   renderSessionList();
 }
 
-// 显示自动继续配置对话框
+// 显示会话设置对话框（颜色与计划任务）
 function showAutoContinueConfigDialog(sessionId: string): void {
   const config = sessionAutoContinue.get(sessionId) || {
     enabled: false,
@@ -446,6 +600,7 @@ function showAutoContinueConfigDialog(sessionId: string): void {
     autoAgree: true,
     autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
     sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
+    loopEnabled: AUTO_CONTINUE_DEFAULT_LOOP_ENABLED,
     maxLoops: AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
     initialDelayMs: AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
     loopCount: 0,
@@ -462,7 +617,10 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   const currentAutoAgree = config.autoAgree ?? true;
   const currentAutoAgreeDelay = config.autoAgreeDelaySec ?? AUTO_AGREE_DEFAULT_DELAY_SEC;
   const currentSendDelay = config.sendDelaySec ?? AUTO_CONTINUE_SEND_DELAY_SEC;
-  const currentMaxLoops = config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
+  const currentLoopEnabled = inferLoopEnabled(config);
+  const currentMaxLoops = currentLoopEnabled
+    ? (config.maxLoops ?? AUTO_CONTINUE_DEFAULT_MAX_LOOPS)
+    : AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
   const currentInitialDelay = config.initialDelayMs ?? AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
 
   const overlay = document.getElementById('auto-continue-overlay')!;
@@ -473,12 +631,23 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   const autoAgreeDelayInput = document.getElementById('auto-continue-agree-delay') as HTMLInputElement;
   const autoAgreeDelayRow = document.getElementById('auto-agree-delay-row')!;
   const sendDelayInput = document.getElementById('auto-continue-send-delay') as HTMLInputElement;
+  const loopEnabledCheckbox = document.getElementById('auto-continue-loop-enabled') as HTMLInputElement;
+  const loopFields = document.getElementById('auto-continue-loop-fields')!;
   const maxLoopsInput = document.getElementById('auto-continue-max-loops') as HTMLInputElement;
   const initialDelayInput = document.getElementById('auto-continue-initial-delay') as HTMLInputElement;
   const saveBtn = document.getElementById('auto-continue-save')!;
   const stopBtn = document.getElementById('auto-continue-stop')!;
   const cancelBtn = document.getElementById('auto-continue-cancel')!;
   const closeBtn = document.getElementById('auto-continue-dialog-close')!;
+  const colorBtn = document.getElementById('session-settings-color-btn')!;
+  const colorSwatch = document.getElementById('session-settings-color-swatch')!;
+
+  function syncLoopFields(): void {
+    loopFields.hidden = !loopEnabledCheckbox.checked;
+    if (loopEnabledCheckbox.checked && (!maxLoopsInput.value || maxLoopsInput.value === '1')) {
+      maxLoopsInput.value = String(AUTO_CONTINUE_DEFAULT_MAX_LOOPS);
+    }
+  }
 
   messageInput.value = currentMessages.join('\n');
   messageInput.placeholder = '每行一条命令，按顺序发送';
@@ -488,8 +657,12 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   autoAgreeDelayInput.value = String(currentAutoAgreeDelay);
   autoAgreeDelayRow.style.display = currentAutoAgree ? '' : 'none';
   sendDelayInput.value = String(currentSendDelay);
+  loopEnabledCheckbox.checked = currentLoopEnabled;
   maxLoopsInput.value = String(currentMaxLoops);
   initialDelayInput.value = String(Math.round(currentInitialDelay / 60000));
+  syncLoopFields();
+  const themeId = sessionThemes.get(sessionId);
+  colorSwatch.style.backgroundColor = themeId ? TerminalManager.getThemeDotColor(themeId) : '#666';
 
   // 根据当前状态设置按钮文字和显示
   if (config.enabled) {
@@ -503,33 +676,55 @@ function showAutoContinueConfigDialog(sessionId: string): void {
   autoAgreeCheckbox.onchange = () => {
     autoAgreeDelayRow.style.display = autoAgreeCheckbox.checked ? '' : 'none';
   };
+  loopEnabledCheckbox.onchange = () => { syncLoopFields(); };
+  const onColorPick = () => showColorPickerDialog(sessionId, colorSwatch);
+  colorBtn.addEventListener('click', onColorPick);
 
   overlay.classList.add('active');
-  messageInput.focus();
+  colorBtn.focus();
+
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key === 'Escape') close();
+  };
+  const onBackdropClick = (event: MouseEvent) => {
+    if (event.target === overlay) close();
+  };
+  overlay.addEventListener('keydown', onKeyDown);
+  overlay.addEventListener('click', onBackdropClick);
 
   function close(): void {
     overlay.classList.remove('active');
+    overlay.removeEventListener('keydown', onKeyDown);
+    overlay.removeEventListener('click', onBackdropClick);
     saveBtn.removeEventListener('click', onSave);
     stopBtn.removeEventListener('click', onStop);
     cancelBtn.removeEventListener('click', close);
     closeBtn.removeEventListener('click', close);
+    colorBtn.removeEventListener('click', onColorPick);
     autoAgreeCheckbox.onchange = null;
+    loopEnabledCheckbox.onchange = null;
   }
 
   function onSave(): void {
     const messages = messageInput.value.split('\n').map(m => m.trim()).filter(Boolean);
     if (!messages.length) { messageInput.focus(); return; }
-    const intervalMinutes = parseInt(intervalInput.value, 10);
-    if (isNaN(intervalMinutes) || intervalMinutes < 1) { intervalInput.focus(); return; }
+
+    const loopEnabled = loopEnabledCheckbox.checked;
+    let intervalMinutes = parseInt(intervalInput.value, 10);
+    let maxLoops = parseInt(maxLoopsInput.value, 10);
+    if (loopEnabled) {
+      if (isNaN(intervalMinutes) || intervalMinutes < 1) { intervalInput.focus(); return; }
+      if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { maxLoopsInput.focus(); return; }
+    } else {
+      if (isNaN(intervalMinutes) || intervalMinutes < 1) intervalMinutes = Math.round(AUTO_CONTINUE_DEFAULT_INTERVAL / 60000);
+      maxLoops = AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
+    }
 
     const agreeDelay = parseInt(autoAgreeDelayInput.value, 10);
     if (autoAgreeCheckbox.checked && (isNaN(agreeDelay) || agreeDelay < 0)) { autoAgreeDelayInput.focus(); return; }
 
     const sendDelay = parseInt(sendDelayInput.value, 10);
     if (isNaN(sendDelay) || sendDelay < 0) { sendDelayInput.focus(); return; }
-
-    const maxLoops = parseInt(maxLoopsInput.value, 10);
-    if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { maxLoopsInput.focus(); return; }
 
     const initialDelayMinutes = parseInt(initialDelayInput.value, 10);
     if (isNaN(initialDelayMinutes) || initialDelayMinutes < 0) { initialDelayInput.focus(); return; }
@@ -545,9 +740,9 @@ function showAutoContinueConfigDialog(sessionId: string): void {
     config.autoAgree = autoAgreeCheckbox.checked;
     config.autoAgreeDelaySec = isNaN(agreeDelay) ? AUTO_AGREE_DEFAULT_DELAY_SEC : agreeDelay;
     config.sendDelaySec = sendDelay;
+    config.loopEnabled = loopEnabled;
     config.maxLoops = maxLoops;
     config.initialDelayMs = initialDelayMinutes * 60000;
-    config.nextRunAt = Date.now() + config.initialDelayMs;
     config.enabled = true;
     sessionAutoContinue.set(sessionId, config);
 
@@ -784,11 +979,12 @@ function renderRemoteServerInfo(): void {
   statusEl.textContent = health?.message
     ?? (syncStatus === 'healthy' ? '公网与局域网均正常' : '正在检测连接状态…');
 
-  const tunnelReady = syncStatus === 'healthy' && Boolean(remoteServerInfo.publicUrl);
-  urlEl.textContent = tunnelReady
+  const hasPublicUrl = Boolean(remoteServerInfo.publicUrl);
+  const tunnelReady = syncStatus === 'healthy' && hasPublicUrl;
+  urlEl.textContent = hasPublicUrl
     ? remoteServerInfo.publicUrl!
     : remoteServerInfo.lanUrl;
-  urlEl.title = tunnelReady
+  urlEl.title = hasPublicUrl
     ? `公网地址（局域网：${remoteServerInfo.lanUrl}）`
     : '点击复制局域网地址';
 
@@ -828,6 +1024,21 @@ function renderRemoteServerInfo(): void {
   retryBtn.hidden = !showRetry;
   retryBtn.disabled = syncStatus === 'retrying';
   retryBtn.textContent = syncStatus === 'retrying' ? '恢复中…' : '重试';
+
+  const guideHintEl = remoteServerInfoEl.querySelector('.remote-info-guide-hint') as HTMLButtonElement | null;
+  if (guideHintEl) {
+    if (tunnelReady) {
+      guideHintEl.textContent = '手机浏览器打开上面的公网地址，再粘贴 Token。查看完整步骤';
+    } else if (syncStatus === 'error') {
+      guideHintEl.textContent = '本地远程服务异常，点「怎么连」查看排查步骤';
+    } else if (hasPublicUrl) {
+      guideHintEl.textContent = '公网已配置。连不上就点「重试」，或先用局域网。查看完整步骤';
+    } else {
+      guideHintEl.textContent = '同一 Wi-Fi 下，手机浏览器打开上面的地址，再粘贴 Token。公网怎么配？';
+    }
+  }
+
+  renderRemoteGuide();
 }
 
 async function handleRemoteRetryClick(): Promise<void> {
@@ -849,6 +1060,120 @@ async function handleRemoteRetryClick(): Promise<void> {
     console.warn('[RemoteSync] Manual retry failed:', err);
   } finally {
     renderRemoteServerInfo();
+  }
+}
+
+function getPreferredRemoteBaseUrl(): string | null {
+  if (!remoteServerInfo) return null;
+  return remoteServerInfo.publicUrl || remoteServerInfo.lanUrl || null;
+}
+
+function getRemoteLoginUrl(): string | null {
+  const base = getPreferredRemoteBaseUrl();
+  if (!base || !remoteServerInfo) return null;
+  return `${base.replace(/\/+$/, '')}/?token=${encodeURIComponent(remoteServerInfo.token)}`;
+}
+
+async function copyRemoteGuideText(text: string, button: HTMLButtonElement, doneLabel = '已复制'): Promise<void> {
+  const original = button.textContent || '';
+  try {
+    await navigator.clipboard.writeText(text);
+    button.textContent = doneLabel;
+  } catch {
+    button.textContent = '复制失败';
+  }
+  window.setTimeout(() => { button.textContent = original; }, 1600);
+}
+
+function renderRemoteGuide(): void {
+  const statusEl = document.getElementById('remote-guide-status');
+  const lanEl = document.getElementById('remote-guide-lan-url');
+  const checklistEl = document.getElementById('remote-guide-checklist');
+  const configPathEl = document.getElementById('remote-guide-config-path');
+  if (!statusEl || !lanEl || !checklistEl || !configPathEl) return;
+
+  const health = remoteServerInfo?.health;
+  const tunnel = remoteServerInfo?.tunnel;
+  const publicReady = health?.status === 'healthy' && Boolean(remoteServerInfo?.publicUrl);
+  lanEl.textContent = remoteServerInfo?.lanUrl || '启动后自动显示';
+
+  statusEl.classList.remove('is-ok', 'is-warn', 'is-error');
+  const title = document.createElement('strong');
+  const detail = document.createElement('span');
+  if (!remoteServerInfo) {
+    statusEl.classList.add('is-warn');
+    title.textContent = '正在启动本地远程服务';
+    detail.textContent = '打开 DuoCLI 后会自动出现局域网地址和 Token。';
+  } else if (publicReady) {
+    statusEl.classList.add('is-ok');
+    title.textContent = '公网和局域网都可以用';
+    detail.textContent = `手机打开 ${remoteServerInfo.publicUrl}，再粘贴 Token。`;
+  } else if (health?.status === 'error') {
+    statusEl.classList.add('is-error');
+    title.textContent = '本地远程服务未就绪';
+    detail.textContent = health.message || '手机现在连不上，先看下面的排查步骤。';
+  } else {
+    statusEl.classList.add('is-warn');
+    title.textContent = '现在只能走局域网';
+    detail.textContent = health?.message || tunnel?.message || '同一 Wi-Fi 下已经能连。要出门用，按第 2 步配置固定域名。';
+  }
+  statusEl.replaceChildren(title, detail);
+
+  const checks = [
+    { done: Boolean(tunnel?.installed), label: '已安装 cloudflared' },
+    { done: Boolean(tunnel?.configExists), label: '已有本机配置文件' },
+    { done: Boolean(tunnel?.configReady), label: '配置已改成你自己的域名和隧道' },
+    { done: Boolean(tunnel?.running), label: '隧道正在运行' },
+    { done: publicReady, label: '公网地址可以访问' },
+  ];
+  checklistEl.replaceChildren(...checks.map((item) => {
+    const li = document.createElement('li');
+    const mark = document.createElement('span');
+    mark.className = item.done ? 'remote-guide-check is-done' : 'remote-guide-check';
+    mark.setAttribute('aria-hidden', 'true');
+    const text = document.createElement('span');
+    text.textContent = item.label;
+    li.append(mark, text);
+    return li;
+  }));
+
+  configPathEl.textContent = tunnel?.configPath || '还没有本机配置文件，点「生成配置并打开」即可创建';
+}
+
+function openRemoteGuide(): void {
+  const overlay = document.getElementById('remote-guide-overlay');
+  if (!overlay) return;
+  renderRemoteGuide();
+  overlay.classList.add('active');
+  overlay.focus();
+}
+
+function closeRemoteGuide(): void {
+  document.getElementById('remote-guide-overlay')?.classList.remove('active');
+}
+
+async function handlePrepareRemoteTunnelConfig(openInEditor: boolean): Promise<void> {
+  const pathEl = document.getElementById('remote-guide-config-path');
+  try {
+    const result = await window.duocli.prepareRemoteTunnelConfig();
+    if (!result.ok) {
+      if (pathEl) pathEl.textContent = result.error;
+      return;
+    }
+    if (pathEl) {
+      pathEl.textContent = result.created
+        ? `已生成模板：${result.configPath}。请改成你自己的隧道名、域名和凭证路径。`
+        : result.configPath;
+    }
+    if (openInEditor) await window.duocli.openFile(result.configPath);
+    else await window.duocli.openFolder(result.configPath);
+    const info = await window.duocli.getRemoteServerInfo();
+    if (info) {
+      remoteServerInfo = info;
+      renderRemoteServerInfo();
+    }
+  } catch (err) {
+    if (pathEl) pathEl.textContent = err instanceof Error ? err.message : String(err);
   }
 }
 
@@ -911,9 +1236,11 @@ async function saveRemoteTokenEdit(): Promise<void> {
 }
 
 function appendCliLogo(parent: HTMLElement, cliName: string): HTMLImageElement {
-  const fallback = getDefaultLogoUrl();
+  const fallback = getLetterLogoUrl(cliName) || getDefaultLogoUrl();
   const img = document.createElement('img');
-  img.className = 'cli-logo' + (hasLogo(cliName) ? '' : ' cli-logo-default');
+  img.className = 'cli-logo'
+    + (hasLogo(cliName) ? '' : ' cli-logo-default')
+    + (logoNeedsInvert(cliName) ? ' cli-logo-invert' : '');
   img.src = getLogoUrl(cliName);
   img.alt = '';
   img.loading = 'lazy';
@@ -922,6 +1249,7 @@ function appendCliLogo(parent: HTMLElement, cliName: string): HTMLImageElement {
     if (img.src !== fallback) {
       img.src = fallback;
       img.classList.add('cli-logo-default');
+      img.classList.remove('cli-logo-invert');
       return;
     }
     img.style.display = 'none';
@@ -1211,14 +1539,25 @@ const presetDropdown = document.getElementById('preset-dropdown')!;
 const presetAddBtn = document.getElementById('preset-add-btn')!;
 const presetManageBtn = document.getElementById('preset-manage-btn')!;
 const themeSelect = document.getElementById('theme-select')!;
-const themeDisplay = document.getElementById('theme-display')!;
-const themeDropdown = document.getElementById('theme-dropdown')!;
 const toolbarNewBtn = document.getElementById('toolbar-new-btn')!;
 const remoteServerInfoEl = document.getElementById('remote-server-info')!;
 const newSessionOverlay = document.getElementById('new-session-overlay')!;
 const newSessionCloseBtn = document.getElementById('new-session-close')!;
 const newSessionCancelBtn = document.getElementById('new-session-cancel')!;
 const newSessionCreateBtn = document.getElementById('new-session-create')!;
+const taskPlanEnabled = document.getElementById('task-plan-enabled') as HTMLInputElement;
+const taskPlanFields = document.getElementById('task-plan-fields')!;
+const taskPlanName = document.getElementById('task-plan-name') as HTMLInputElement;
+const taskPlanNamePreview = document.getElementById('task-plan-name-preview')!;
+const taskPlanInstruction = document.getElementById('task-plan-instruction') as HTMLTextAreaElement;
+const taskPlanDelay = document.getElementById('task-plan-delay') as HTMLInputElement;
+const taskPlanDelayClear = document.getElementById('task-plan-delay-clear')!;
+const taskPlanDependency = document.getElementById('task-plan-dependency') as HTMLSelectElement;
+const taskPlanQuiet = document.getElementById('task-plan-quiet') as HTMLInputElement;
+const taskQueueBtn = document.getElementById('task-queue-btn')!;
+const taskQueueOverlay = document.getElementById('task-queue-overlay')!;
+const taskQueueClose = document.getElementById('task-queue-close')!;
+const taskQueueList = document.getElementById('task-queue-list')!;
 const fileTreeList = document.getElementById('file-tree-list')!;
 const fileTreeRefreshBtn = document.getElementById('file-tree-refresh-btn')!;
 const fileTreeOpenBtn = document.getElementById('file-tree-open-btn')!;
@@ -1228,7 +1567,6 @@ const fileTreeToggle = document.getElementById('file-tree-toggle')!;
 const fileTreeResizer = document.getElementById('file-tree-resizer')!;
 const terminalArea = document.getElementById('terminal-area')!;
 const paneLayoutToolbar = document.getElementById('pane-layout-toolbar')!;
-const paneLayoutSummary = document.getElementById('pane-layout-summary')!;
 const paneTileBtn = document.getElementById('pane-tile-btn') as HTMLButtonElement;
 const paneWorkspaceRoot = document.getElementById('pane-workspace')!;
 const terminalContent = document.getElementById('terminal-content')!;
@@ -1237,16 +1575,21 @@ const sessionList = document.getElementById('session-list')!;
 const sidebar = document.getElementById('sidebar')!;
 const sidebarToggle = document.getElementById('sidebar-toggle')!;
 const sidebarResizer = document.getElementById('sidebar-resizer')!;
+const sessionSearch = document.getElementById('session-search') as HTMLInputElement;
+sessionSearch.addEventListener('input', () => renderSessionList());
+sessionSearch.addEventListener('keydown', event => {
+  if (event.key === 'Escape') { sessionSearch.value = ''; renderSessionList(); }
+});
+
+let terminalTaskSnapshot: TerminalTaskSnapshotView = { revision: 0, tasks: [] };
 
 // 文件状态栏 DOM
 const fileStatusbar = document.getElementById('file-statusbar')!;
 const fileStatusbarFiles = document.getElementById('file-statusbar-files')!;
 
-const sidebarTabs = document.querySelectorAll('.sidebar-tab');
-const tabSessions = document.getElementById('tab-sessions')!;
-
-// AI 配置相关 DOM
-const tabAiConfig = document.getElementById('tab-ai-config')!;
+const sidebarSettingsBtn = document.getElementById('sidebar-settings-btn')!;
+const aiConfigOverlay = document.getElementById('ai-config-overlay')!;
+const aiConfigClose = document.getElementById('ai-config-close')!;
 
 const aiApplyBtn = document.getElementById('ai-apply-btn')!;
 const aiTestBtn = document.getElementById('ai-test-btn')!;
@@ -1270,10 +1613,19 @@ let fileTreeRootCwd: string | null = null;
 const fileTreeExpandedDirs: Set<string> = new Set();
 const fileTreeChildrenCache: Map<string, FileTreeItem[]> = new Map();
 
-// 未读消息状态（绿点：AI 完成工作，等待输入）
+// 未查看状态（黄点：已停止且尚未点进去看）
 const sessionUnread: Set<string> = new Set();
-// 工作中状态（黄点：AI 正在输出）
+// 手机端正在看着的会话（停下来应直接变灰，不要标黄）
+const sessionRemoteViewers: Set<string> = new Set();
+// 进行中状态（绿点：AI 正在输出）
 const sessionBusy: Set<string> = new Set();
+// 切换会话后短暂忽略 resize 重绘，避免误标为进行中
+const statusBusySuppressUntil: Map<string, number> = new Map();
+const STATUS_BUSY_SUPPRESS_MS = 1500;
+
+function suppressSessionBusyFromResize(id: string): void {
+  statusBusySuppressUntil.set(id, Date.now() + STATUS_BUSY_SUPPRESS_MS);
+}
 // 未读延迟计时器（静默超时检测）
 const unreadTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 // 最近收到的数据缓冲（用于提示符检测）
@@ -1283,14 +1635,56 @@ const sessionTitleLocked: Set<string> = new Set();
 // 置顶会话
 const pinnedSessions: Set<string> = new Set();
 
+function sessionIsBeingWatched(id: string): boolean {
+  return id === getActiveSessionId() || sessionRemoteViewers.has(id);
+}
+
+function sessionStatusClass(id: string): 'running' | 'idle' | 'inactive' {
+  if (sessionBusy.has(id)) return 'running';
+  if (sessionUnread.has(id) && !sessionIsBeingWatched(id)) return 'idle';
+  return 'inactive';
+}
+
+function createSessionStatusDot(id: string, status?: 'running' | 'idle' | 'inactive' | 'exited'): HTMLSpanElement {
+  const kind = status || sessionStatusClass(id);
+  const dot = document.createElement('span');
+  dot.className = `session-status-dot ${kind}`;
+  dot.dataset.sessionStatus = id;
+  dot.title = kind === 'running'
+    ? '进行中'
+    : kind === 'idle'
+      ? '已停止（未查看）'
+      : kind === 'exited'
+        ? '已关闭'
+        : '已查看';
+  return dot;
+}
+
+/** 只更新状态点，避免整表重建导致 hover 闪动、点击丢失 */
+function patchSessionStatusDot(id: string): void {
+  const dot = sessionList.querySelector(`.session-status-dot[data-session-status="${id}"]`) as HTMLElement | null;
+  if (!dot) {
+    renderSessionList();
+    return;
+  }
+  const kind = sessionStatusClass(id);
+  dot.className = `session-status-dot ${kind}`;
+  dot.dataset.sessionStatus = id;
+  dot.title = kind === 'running'
+    ? '进行中'
+    : kind === 'idle'
+      ? '已停止（未查看）'
+      : '已查看';
+}
+
 // 同步会话状态到 main 进程（供手机端 remote-server 读取）
 function syncSessionStatusToMain(): void {
   const statuses: Record<string, string> = {};
   for (const id of sessionTitles.keys()) {
     if (sessionBusy.has(id)) {
-      statuses[id] = 'running';   // 黄灯：AI 正在工作
-    } else if (sessionUnread.has(id)) {
-      statuses[id] = 'idle';      // 绿灯：等待输入
+      statuses[id] = 'running';   // 绿三角：进行中
+    } else if (sessionUnread.has(id) && !sessionIsBeingWatched(id)) {
+      statuses[id] = 'idle';      // 黄灯：已停止未查看
     } else {
       statuses[id] = 'inactive';  // 灰灯：已查看
     }
@@ -1300,7 +1694,11 @@ function syncSessionStatusToMain(): void {
 
 // 终端管理器
 const termManager = new TerminalManager(paneWorkspaceRoot, (id, cols, rows) => {
-  window.duocli.resizePty(id, cols, rows);
+  suppressSessionBusyFromResize(id);
+  void window.duocli.resizePty(id, cols, rows).then(geometry => {
+    // Older main processes returned true; resnapshot their accepted geometry.
+    if (geometry) termManager.applyPtyGeometry(id, typeof geometry === 'object' ? geometry : undefined);
+  }).catch(() => undefined);
 });
 
 let paneWorkspace: PaneWorkspace;
@@ -1310,7 +1708,7 @@ function mountPaneContent(paneId: string, content: PaneContent, body: HTMLElemen
   body.innerHTML = '';
   if (content.kind === 'terminal') {
     if (!termManager.mountTo(content.sessionId, body)) {
-      renderPaneMessage(body, '终端会话已结束', '请从右侧会话列表恢复或创建新终端。');
+      renderPaneMessage(body, '终端会话已结束', '请从左侧会话列表恢复或创建新终端。');
     }
     return;
   }
@@ -1335,6 +1733,7 @@ function unmountPaneContent(paneId: string, content: PaneContent): void {
 }
 
 function handlePaneFocus(paneId: string, content: PaneContent): void {
+  updateSessionListSelection();
   for (const [id, pane] of androidPanes) pane.setActive(id === paneId && content.kind === 'android');
   if (content.kind === 'terminal') {
     termManager.switchTo(content.sessionId);
@@ -1368,7 +1767,7 @@ function renderEmptyPane(body: HTMLElement, paneId: string): void {
   body.innerHTML = '';
   const empty = document.createElement('div');
   empty.className = 'pane-empty-content';
-  empty.innerHTML = '<strong>空 Pane</strong><span>从右侧选择会话，或使用拆分按钮创建内容。</span>';
+  empty.innerHTML = '<strong>空 Pane</strong><span>从左侧选择会话，或使用拆分按钮创建内容。</span>';
   const actions = document.createElement('div');
   actions.className = 'pane-empty-actions';
   const button = document.createElement('button');
@@ -1376,7 +1775,7 @@ function renderEmptyPane(body: HTMLElement, paneId: string): void {
   button.textContent = '创建终端';
   button.addEventListener('click', () => {
     paneWorkspace.focusPane(paneId);
-    openNewSessionDialog(paneWorkspace.getWorkspaceKey() || currentCwd);
+    openNewSessionDialog(currentCwd);
   });
   const androidButton = document.createElement('button');
   androidButton.type = 'button';
@@ -1394,7 +1793,7 @@ function renderFilePane(body: HTMLElement, filePath: string): void {
   const requestToken = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   body.dataset.previewToken = requestToken;
   body.innerHTML = '<div class="pane-empty-content">正在读取文件…</div>';
-  const workspace = body.dataset.workspaceKey || currentCwd;
+  const workspace = currentCwd;
   void window.duocli.readFilePreview(workspace, filePath).then((result) => {
     if (body.dataset.previewToken !== requestToken) return;
     if (!result?.ok) {
@@ -1465,8 +1864,9 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
   let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
   let fallbackInFlight = false;
   let fallbackGeneration = 0;
-  let androidSession: { deviceId: string; sessionId: string; subscriptionId: string; expiresAt: number } | null = null;
-  let androidSessionPromise: Promise<typeof androidSession> | null = null;
+  type AndroidSession = { deviceId: string; sessionId: string; subscriptionId: string; expiresAt: number };
+  let androidSession: AndroidSession | null = null;
+  let androidSessionPromise: Promise<AndroidSession> | null = null;
 
   const setHint = (value: string) => { hint.textContent = value; };
   const setPreviewVisible = (live: boolean) => {
@@ -1578,7 +1978,8 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
         if (message.status === 'starting') setHint('正在建立实时镜像…');
         else if (message.status === 'ready') {
           setHint('');
-          if (!mirror?.isController) mirror?.claimControl(true);
+          // Do NOT auto-claim on ready: both desktop and phone receive it and
+          // keep stealing the lease from each other. Claim on interaction.
         } else if (message.status === 'error') {
           setHint(mirrorLastError || '实时镜像不可用，已切换截图回退');
           startFallback();
@@ -1587,6 +1988,8 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
           startFallback();
         } else if (message.status === 'control-owner' && message.controller === false) {
           setHint('设备正在由其他客户端控制');
+        } else if (message.type === 'android:control-challenge') {
+          setHint('其他端点正在请求控制权；继续操作即可保持控制');
         }
       },
       onMeta: (meta) => {
@@ -1720,6 +2123,7 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
     return true;
   };
   const bindSurface = (surface: HTMLCanvasElement | HTMLImageElement) => {
+    const target: HTMLElement = surface;
     surface.style.touchAction = 'none';
     const activePointers = new Map<number, {
       deviceId: string;
@@ -1740,16 +2144,16 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
         }
       }
     };
-    surface.addEventListener('pointerdown', (event) => {
+    target.addEventListener('pointerdown', (event) => {
       if ((event.pointerType === 'mouse' && event.button !== 0) || !currentDevice) return;
       const point = surfacePoint(surface, event);
       if (!point) return;
       event.preventDefault();
       const deviceId = currentDevice;
-      const mirrorReady = mirror?.isReady() && mirror.hasFrame && surface === preview;
-      if (mirrorReady && !mirror.isController) mirror.claimControl(true);
-      const sentDown = mirrorReady && mirror.isController
-        ? mirror.sendInput({ type: 'touch', action: 'down', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 1 }) != null
+      const mirrorReady = mirror?.isReady() && mirror.hasFrame && surface === preview ? mirror : null;
+      if (mirrorReady && !mirrorReady.isController) mirrorReady.claimControl(true);
+      const sentDown = mirrorReady && mirrorReady.isController
+        ? mirrorReady.sendInput({ type: 'touch', action: 'down', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 1 }) != null
         : false;
       activePointers.set(event.pointerId, {
         deviceId,
@@ -1763,7 +2167,7 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
       });
       surface.setPointerCapture?.(event.pointerId);
     });
-    surface.addEventListener('pointermove', (event) => {
+    target.addEventListener('pointermove', (event) => {
       const state = activePointers.get(event.pointerId);
       if (!state) return;
       const point = surfacePoint(surface, event);
@@ -1773,7 +2177,7 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
       pendingMoves.set(event.pointerId, point);
       if (!moveFrame) moveFrame = requestAnimationFrame(flushMoves);
     });
-    surface.addEventListener('pointerup', (event) => {
+    target.addEventListener('pointerup', (event) => {
       const state = activePointers.get(event.pointerId);
       if (!state) return;
       const point = surfacePoint(surface, event) || state.last;
@@ -1804,17 +2208,19 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
         for (let attempt = 0; attempt < 6; attempt++) {
           if (currentDevice !== state.deviceId) return;
           if (sendLiveGesture(state.start, point, event.pointerId)) return;
-          if (!mirror?.isReady()) {
+          if (!mirror?.isReady() && attempt >= 2) {
             sendLegacyGesture(state.deviceId, state.start, point);
             return;
           }
-          if (attempt === 0 || !mirror.isController) mirror.claimControl(true);
+          if (attempt === 0 || !mirror?.isController) mirror?.claimControl(true);
           await new Promise(resolve => setTimeout(resolve, 50));
         }
-        setHint('Android 控制权尚未就绪，请稍后再试');
+        // Claim kept failing on the live channel: deliver via ADB instead of
+        // silently dropping the user's gesture.
+        sendLegacyGesture(state.deviceId, state.start, point);
       })();
     });
-    surface.addEventListener('pointercancel', (event) => {
+    target.addEventListener('pointercancel', (event) => {
       const state = activePointers.get(event.pointerId);
       activePointers.delete(event.pointerId);
       pendingMoves.delete(event.pointerId);
@@ -1824,7 +2230,7 @@ function renderAndroidPane(paneId: string, body: HTMLElement, selectedDeviceId: 
         mirror.sendEmergencyInput({ type: 'touch', action: 'cancel', pointerId: event.pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
       }
     });
-    surface.addEventListener('lostpointercapture', (event) => {
+    target.addEventListener('lostpointercapture', (event) => {
       const state = activePointers.get(event.pointerId);
       if (!state) return;
       activePointers.delete(event.pointerId);
@@ -1910,12 +2316,11 @@ paneWorkspace = new PaneWorkspace(paneWorkspaceRoot, currentCwd, {
   onContentMount: mountPaneContent,
   onContentUnmount: unmountPaneContent,
   onFocus: handlePaneFocus,
-  getAgentTagColors: getCliTagColors,
+  onExpandActivities: (sessionId, expanded) => termManager.setActivitiesExpanded(sessionId, expanded),
   onLayoutChange: (layout) => {
     const count = countPanes(layout.root);
     const isEmptyLayout = layout.root.type === 'pane' && layout.root.content.kind === 'empty';
     paneLayoutToolbar.hidden = count < 2;
-    paneLayoutSummary.textContent = `${count} 个可见分屏`;
     // Keep the existing welcome card as the single-pane insertion state. Once
     // real content exists, the pane workspace owns the entire terminal area.
     paneWorkspaceRoot.style.display = isEmptyLayout ? 'none' : '';
@@ -1941,7 +2346,7 @@ function applyCurrentCwd(cwd: string): void {
   cwdInput.value = next;
   localStorage.setItem('duocli_cwd', next);
   addRecentCwd(next);
-  paneWorkspace.setWorkspace(next);
+  // Do not swap pane layout: splits are global and may already show other projects.
   startFileWatcher(next);
   updateSessionTitleBar();
   void renderFileTree();
@@ -1959,46 +2364,26 @@ void (async () => {
   if (lastPreset) setPresetValue(lastPreset);
 })();
 
-// 自定义配色下拉组件
-const themeColorMap: Record<string, string> = {
-  'auto': '',
-  'vscode-dark': '#0078d4',
-  'monokai': '#a6e22e',
-  'dracula': '#bd93f9',
-  'solarized-dark': '#268bd2',
-  'one-dark': '#61afef',
-  'nord': '#88c0d0',
-};
+// 自定义配色：小方块选择
 let currentThemeId = 'auto';
 
 function setThemeValue(value: string): void {
   currentThemeId = value;
-  const opt = themeDropdown.querySelector(`[data-value="${value}"]`);
-  if (opt) {
-    themeDisplay.innerHTML = opt.innerHTML;
-  }
-  themeDropdown.querySelectorAll('.custom-select-option').forEach((el) => {
+  themeSelect.querySelectorAll('.theme-swatch').forEach((el) => {
     el.classList.toggle('selected', el.getAttribute('data-value') === value);
   });
 }
 
-themeDisplay.addEventListener('click', (e) => {
-  e.stopPropagation();
-  presetSelectWrap.classList.remove('open');
-  themeSelect.classList.toggle('open');
-});
-
-themeDropdown.addEventListener('click', (e) => {
-  const target = (e.target as HTMLElement).closest('.custom-select-option') as HTMLElement | null;
+themeSelect.addEventListener('click', (e) => {
+  const target = (e.target as HTMLElement).closest('.theme-swatch') as HTMLElement | null;
   if (!target) return;
+  e.stopPropagation();
   const value = target.getAttribute('data-value');
   if (value) setThemeValue(value);
-  themeSelect.classList.remove('open');
 });
 
 presetDisplay.addEventListener('click', (e) => {
   e.stopPropagation();
-  themeSelect.classList.remove('open');
   presetSelectWrap.classList.toggle('open');
 });
 
@@ -2011,7 +2396,6 @@ presetDropdown.addEventListener('click', (e) => {
 });
 
 document.addEventListener('click', () => {
-  themeSelect.classList.remove('open');
   presetSelectWrap.classList.remove('open');
 });
 
@@ -2023,6 +2407,7 @@ function buildTerminalPaneContent(sessionId: string): Extract<PaneContent, { kin
     kind: 'terminal',
     sessionId,
     label: sessionTitles.get(sessionId) || '终端',
+    projectLabel: sessionProjectLabel(sessionCwds.get(sessionId) || ''),
     agentLabel: sessionDisplayNames.get(sessionId) || '',
   };
 }
@@ -2045,6 +2430,7 @@ function syncTerminalPaneHeaders(): void {
     const meta = buildTerminalPaneContent(pane.content.sessionId);
     paneWorkspace.updateTerminalPaneMeta(pane.content.sessionId, {
       label: meta.label,
+      projectLabel: meta.projectLabel,
       agentLabel: meta.agentLabel,
     });
   }
@@ -2081,8 +2467,12 @@ function normalizeCwd(cwd: string): string {
 // 取路径最后一段作为项目名
 function cwdShortName(cwd: string): string {
   if (!cwd) return '未知项目';
-  const parts = cwd.replace(/\/+$/, '').split('/');
+  const parts = cwd.replace(/\/+$/, '').split(/[\\/]/);
   return parts[parts.length - 1] || cwd;
+}
+
+function sessionProjectLabel(cwd: string): string {
+  return cwd ? cwdShortName(cwd) : '';
 }
 
 // 自动配色：多窗口分割时优先给每个终端分配不同主题，便于辨认
@@ -2127,12 +2517,11 @@ function updatePaneAccents(): void {
       const sessionId = (pane.content as any).sessionId;
       const themeDotColor = TerminalManager.getThemeDotColor(sessionThemes.get(sessionId) || 'vscode-dark');
       
-      // 在标题前添加一个小圆圈指示器
+      // 方块色标跟在会话标题后面，和侧边栏改名位置一致
       let dotIndicator = titleElement.querySelector('.pane-color-indicator');
       if (!dotIndicator) {
         dotIndicator = document.createElement('span');
         dotIndicator.className = 'pane-color-indicator';
-        titleElement.insertBefore(dotIndicator, titleElement.firstChild);
         const paneId = pane.id;
         const sid = sessionId;
         dotIndicator.addEventListener('click', (e) => {
@@ -2140,6 +2529,9 @@ function updatePaneAccents(): void {
           showColorPickerDialogForPane(paneId, sid, dotIndicator as HTMLElement);
         });
       }
+      const sessionLabel = titleElement.querySelector('.pane-session-label');
+      if (sessionLabel) sessionLabel.after(dotIndicator);
+      else titleElement.appendChild(dotIndicator);
       (dotIndicator as HTMLElement).style.backgroundColor = themeDotColor;
       (dotIndicator as HTMLElement).style.cursor = 'pointer';
       (dotIndicator as HTMLElement).title = '点击更改颜色';
@@ -2187,6 +2579,7 @@ type UiIconName =
   | 'plus'
   | 'refresh'
   | 'restore'
+  | 'share'
   | 'trash'
   | 'video'
   | 'x';
@@ -2205,6 +2598,7 @@ const UI_ICON_PATHS: Record<UiIconName, string> = {
   plus: '<line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line>',
   refresh: '<path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.5 9A9 9 0 0 1 18.8 5.2L23 10M1 14l4.2 4.8A9 9 0 0 0 20.5 15"></path>',
   restore: '<polyline points="1 4 1 10 7 10"></polyline><path d="M3.5 15A9 9 0 1 0 2 10"></path>',
+  share: '<path d="M12 16V3"></path><polyline points="7 8 12 3 17 8"></polyline><path d="M4 13v8h16v-8"></path>',
   trash: '<polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14H5V6m3 0V3h8v3"></path><line x1="10" y1="10" x2="10" y2="17"></line><line x1="14" y1="10" x2="14" y2="17"></line>',
   video: '<rect x="3" y="5" width="13" height="14" rx="2"></rect><polygon points="16 10 21 7 21 17 16 14"></polygon>',
   x: '<line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>',
@@ -2247,7 +2641,7 @@ function updateSessionTitleBar(): void {
   const activeId = focused?.kind === 'terminal' ? focused.sessionId : null;
   if (activeId) {
     const cwd = sessionCwds.get(activeId) || '';
-    // 左侧目录树顶部：显示最右侧目录名
+    // 右侧目录树顶部：显示最右侧目录名
     const cwdDisplay = cwd ? cwd.split('/').filter(Boolean).pop() : '';
     fileTreePath.textContent = cwdDisplay || '目录';
     fileTreePath.title = cwd || '';
@@ -2255,8 +2649,9 @@ function updateSessionTitleBar(): void {
     const title = sessionTitles.get(activeId) || '';
     const displayName = sessionDisplayNames.get(activeId) || '';
     const parts = ['DuoCLI'];
-    if (displayName) parts.push(displayName);
     if (title && title !== '新会话' && title !== '新对话') parts.push(title);
+    if (cwdDisplay) parts.push(cwdDisplay);
+    if (displayName) parts.push(displayName);
     window.duocli.setWindowTitle(parts.join('-'));
   } else if (focused?.kind === 'file') {
     fileTreePath.textContent = focused.path.split(/[/\\]/).pop() || '文件';
@@ -2281,7 +2676,7 @@ function getActiveSessionId(): string | null {
 function getActiveSessionCwd(): string {
   const activeId = getActiveSessionId();
   if (activeId) return sessionCwds.get(activeId) || currentCwd;
-  return paneWorkspace.getWorkspaceKey() || currentCwd;
+  return currentCwd;
 }
 
 function quotePathForShell(filePath: string): string {
@@ -2297,8 +2692,6 @@ function insertPathToActiveTerminal(filePath: string): void {
 }
 
 function openFileInPane(filePath: string): void {
-  const workspace = getActiveSessionCwd() || currentCwd || paneWorkspace.getWorkspaceKey();
-  if (workspace && workspace !== paneWorkspace.getWorkspaceKey()) paneWorkspace.setWorkspace(workspace);
   const label = filePath.split(/[/\\]/).pop() || filePath;
   paneWorkspace.openContent({ kind: 'file', path: filePath, label });
 }
@@ -2326,6 +2719,7 @@ function showTreeContextMenu(e: MouseEvent, itemPath: string, isDir: boolean): v
       { label: '插入路径到终端', action: () => insertPathToActiveTerminal(itemPath) },
       { label: '用默认应用打开', action: () => window.duocli.openFile(itemPath) },
       { label: '用编辑器打开', action: () => window.duocli.filewatcherOpen(itemPath) },
+      { label: '其他应用程序...', action: () => { void window.duocli.openWithSystemDialog(itemPath); } },
     );
   }
 
@@ -2354,7 +2748,10 @@ async function loadDirItems(dirPath: string): Promise<FileTreeItem[]> {
   return items;
 }
 
+let fileTreeRenderGeneration = 0;
+
 async function renderFileTree(): Promise<void> {
+  const generation = ++fileTreeRenderGeneration;
   const rootCwd = getActiveSessionCwd();
   if (!rootCwd) {
     fileTreeList.innerHTML = '<div class="file-tree-empty">选择会话后显示当前目录</div>';
@@ -2405,9 +2802,11 @@ async function renderFileTree(): Promise<void> {
   fileTreeList.appendChild(rootRow);
 
   const rootItems = await loadDirItems(rootCwd);
+  if (generation !== fileTreeRenderGeneration) return;
 
   const appendRows = async (items: FileTreeItem[], level: number): Promise<void> => {
     for (const item of items) {
+      if (generation !== fileTreeRenderGeneration) return;
       const row = document.createElement('div');
       row.className = `file-tree-row ${item.isDir ? 'dir' : 'file'}`;
       row.style.paddingLeft = `${6 + level * 14}px`;
@@ -2467,12 +2866,14 @@ async function renderFileTree(): Promise<void> {
 
       if (item.isDir && fileTreeExpandedDirs.has(item.path)) {
         const children = await loadDirItems(item.path);
+        if (generation !== fileTreeRenderGeneration) return;
         await appendRows(children, level + 1);
       }
     }
   };
 
   await appendRows(rootItems, 0);
+  if (generation !== fileTreeRenderGeneration) return;
   if (!fileTreeList.children.length) {
     fileTreeList.innerHTML = '<div class="file-tree-empty">目录为空</div>';
   }
@@ -2516,7 +2917,7 @@ function showConfirmDialog(title: string, kind = '终端'): Promise<'close' | 'c
   });
 }
 
-// 颜色选择器 - 用于会话列表
+// 颜色选择器 - 用于会话设置
 function showColorPickerDialog(sessionId: string, currentDot: HTMLElement): void {
   document.querySelectorAll('.color-picker-overlay').forEach(el => el.remove());
   
@@ -2542,6 +2943,7 @@ function showColorPickerDialog(sessionId: string, currentDot: HTMLElement): void
       e.stopPropagation();
       const themeName = (e.currentTarget as HTMLElement).dataset.themeName || 'Custom';
       await applyNewThemeToSession(sessionId, theme.bg, theme.text, themeName);
+      currentDot.style.backgroundColor = theme.bg;
       overlay.remove();
       renderSessionList();
       updatePaneAccents();
@@ -2557,7 +2959,7 @@ function showColorPickerDialog(sessionId: string, currentDot: HTMLElement): void
   for (let i = 0; i < 10; i++) {
     const seed = `random-${sessionId}-${i}-${Date.now()}`;
     const bgColor = generateRandomThemeColor(seed);
-    const textColor = Math.random() > 0.7 ? '#0a0a0a' : '#ffffff';
+    const textColor = pickContrastingForeground(bgColor);
     
     const randomBtn = document.createElement('button');
     randomBtn.className = 'color-picker-btn';
@@ -2566,6 +2968,7 @@ function showColorPickerDialog(sessionId: string, currentDot: HTMLElement): void
     randomBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       await applyNewThemeToSession(sessionId, bgColor, textColor, `随机配色 ${i + 1}`);
+      currentDot.style.backgroundColor = bgColor;
       overlay.remove();
       renderSessionList();
       updatePaneAccents();
@@ -2617,6 +3020,7 @@ function showColorPickerDialogForClosedSession(closedSessionId: string, currentD
       e.stopPropagation();
       const themeName = (e.currentTarget as HTMLElement).dataset.themeName || 'Custom';
       await applyNewThemeToClosedSession(closedSessionId, theme.bg, theme.text, themeName);
+      currentDot.style.backgroundColor = theme.bg;
       overlay.remove();
       renderSessionList();
     });
@@ -2631,7 +3035,7 @@ function showColorPickerDialogForClosedSession(closedSessionId: string, currentD
   for (let i = 0; i < 10; i++) {
     const seed = `random-cs-${closedSessionId}-${i}-${Date.now()}`;
     const bgColor = generateRandomThemeColor(seed);
-    const textColor = Math.random() > 0.7 ? '#0a0a0a' : '#ffffff';
+    const textColor = pickContrastingForeground(bgColor);
     
     const randomBtn = document.createElement('button');
     randomBtn.className = 'color-picker-btn';
@@ -2640,6 +3044,7 @@ function showColorPickerDialogForClosedSession(closedSessionId: string, currentD
     randomBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       await applyNewThemeToClosedSession(closedSessionId, bgColor, textColor, `随机配色 ${i + 1}`);
+      currentDot.style.backgroundColor = bgColor;
       overlay.remove();
       renderSessionList();
     });
@@ -2702,7 +3107,7 @@ function showColorPickerDialogForPane(paneId: string, sessionId: string, current
   for (let i = 0; i < 10; i++) {
     const seed = `random-pane-${paneId}-${i}-${Date.now()}`;
     const bgColor = generateRandomThemeColor(seed);
-    const textColor = Math.random() > 0.7 ? '#0a0a0a' : '#ffffff';
+    const textColor = pickContrastingForeground(bgColor);
     
     const randomBtn = document.createElement('button');
     randomBtn.className = 'color-picker-btn';
@@ -2760,30 +3165,8 @@ async function applyNewThemeToSession(sessionId: string, bgColor: string, fgColo
     // 保存到 sessionThemes
     sessionThemes.set(sessionId, newThemeId);
     
-    // 创建动态主题配置
-    const tempTheme = {
-      background: bgColor,
-      foreground: fgColor,
-      cursor: '#ffffff',
-      cursorAccent: '#000000',
-      selectionBackground: 'rgba(255, 255, 255, 0.3)',
-      black: '#1a1a1a',
-      red: '#ff6b6b',
-      green: '#51cf66',
-      yellow: '#ffd43b',
-      blue: '#339af0',
-      magenta: '#cc5de8',
-      cyan: '#20c997',
-      white: '#f8f9fa',
-      brightBlack: '#495057',
-      brightRed: '#fa5252',
-      brightGreen: '#69db7c',
-      brightYellow: '#ffe066',
-      brightBlue: '#54a9ff',
-      brightMagenta: '#bb81e6',
-      brightCyan: '#48c9b0',
-      brightWhite: '#ffffff',
-    };
+    // 按背景亮度校正前景/光标/选区，避免浅色底白字或深色底黑字
+    const tempTheme = buildContrastingTerminalTheme(bgColor, fgColor);
     
     // 注册动态主题
     TerminalManager.registerDynamicTheme(newThemeId, tempTheme);
@@ -2802,13 +3185,8 @@ async function applyNewThemeToSession(sessionId: string, bgColor: string, fgColo
 
 // 为已关闭会话存储颜色选择
 async function applyNewThemeToClosedSession(closedSessionId: string, bgColor: string, fgColor: string, themeName: string): Promise<void> {
-  try {
-    // 这里我们只是临时记录，恢复时会话会重新创建
-    console.log(`[ColorPicker] 已选择主题 ${themeName} 用于已关闭会话 ${closedSessionId}`);
-    // 注意：真正的恢复会在下次打开时应用
-  } catch (error) {
-    console.error('保存主题选择失败:', error);
-  }
+  closedSessionThemeChoices.set(closedSessionId, { bgColor, fgColor, themeName });
+  saveClosedSessionThemeChoices();
 }
 
 // 为分格窗口中的会话应用新主题
@@ -2886,14 +3264,14 @@ function showSessionContextMenu(e: MouseEvent, targetId: string): void {
     {
       label: '关闭本项目下方所有对话',
       action: () => {
-        // 与侧栏一致：置顶优先，其余按创建时间从新到旧。
-        const byCreated = (a: string, b: string) => getSessionCreateTime(b) - getSessionCreateTime(a);
+        // 与侧栏一致：置顶优先，其余按最近提交时间排序。
+        const byRecent = (a: string, b: string) => getSessionSortTime(b) - getSessionSortTime(a);
         const projectIds = Array.from(sessionTitles.keys()).filter(id =>
           normalizeCwd(sessionCwds.get(id) || '') === targetCwdKey
         );
         const displayOrder = [
-          ...projectIds.filter(id => pinnedSessions.has(id)).sort(byCreated),
-          ...projectIds.filter(id => !pinnedSessions.has(id)).sort(byCreated),
+          ...projectIds.filter(id => pinnedSessions.has(id)).sort(byRecent),
+          ...projectIds.filter(id => !pinnedSessions.has(id)).sort(byRecent),
         ];
         const targetIndex = displayOrder.indexOf(targetId);
         if (targetIndex >= 0) destroySessions(displayOrder.slice(targetIndex + 1));
@@ -2925,7 +3303,18 @@ function showSessionContextMenu(e: MouseEvent, targetId: string): void {
   setTimeout(() => document.addEventListener('mousedown', dismiss), 0);
 }
 
+function updateSessionListSelection(): void {
+  const activeId = getActiveSessionId();
+  for (const item of sessionList.querySelectorAll<HTMLElement>('.session-item')) {
+    const active = item.dataset.sessionType === 'pty' && item.dataset.sessionId === activeId;
+    item.classList.toggle('active', active);
+    if (active) item.setAttribute('aria-current', 'true');
+    else item.removeAttribute('aria-current');
+  }
+}
+
 function renderSessionList(): void {
+  updateSessionListSelection();
   const activeId = getActiveSessionId();
 
   // 同步会话状态到 main 进程（供手机端读取）
@@ -2943,26 +3332,30 @@ function renderSessionList(): void {
   }
   sessionList.innerHTML = '';
 
-  // 置顶会话单独放在列表顶部，其余会话按创建时间降序（新创建的排最上面）
-  const allIds = Array.from(sessionTitles.keys());
-  const byCreated = (a: string, b: string) =>
-    getSessionCreateTime(b) - getSessionCreateTime(a);
-  const pinnedIds = allIds.filter(id => pinnedSessions.has(id)).sort(byCreated);
-  const unpinnedIds = allIds.filter(id => !pinnedSessions.has(id)).sort(byCreated);
+  // 置顶会话保留优先级；实际提交过内容的会话按最近提交时间上移。
+  const query = sessionSearch.value.trim().toLocaleLowerCase();
+  const matches = (...values: (string | undefined)[]) => values.join(' ').toLocaleLowerCase().includes(query);
+  const allIds = Array.from(sessionTitles.keys()).filter(id => matches(sessionTitles.get(id), sessionCwds.get(id), sessionDisplayNames.get(id)));
+  const matchingClosed = closedSessions.filter(session => matches(session.title, session.cwd, session.displayName));
+  document.getElementById('workspace-session-count')!.textContent = String(allIds.length);
+  document.getElementById('session-search-empty')!.hidden = !query || allIds.length > 0 || matchingClosed.length > 0;
+  const byRecent = (a: string, b: string) =>
+    getSessionSortTime(b) - getSessionSortTime(a) || getSessionCreateTime(b) - getSessionCreateTime(a);
+  const pinnedIds = allIds.filter(id => pinnedSessions.has(id)).sort(byRecent);
+  const unpinnedIds = allIds.filter(id => !pinnedSessions.has(id)).sort(byRecent);
 
-  // 按 cwd 分组（组间顺序固定：按该组最早会话的创建时间排序，新建不改变组顺序）
+  // 按 cwd 分组，最近提交内容的会话所在项目也升到最前面。
   // 同一目录可能因末尾斜杠 / macOS /private 前缀差异被拆成多组，先归一化再分组
   const groups: Map<string, string[]> = new Map();
   const groupDisplayCwd: Map<string, string> = new Map();
-  const groupFirstCreatedAt: Map<string, number> = new Map(); // 组排序键：该组最早会话的创建时间
+  const groupRecentAt: Map<string, number> = new Map();
   for (const id of unpinnedIds) {
     const rawCwd = sessionCwds.get(id) || '';
     const key = normalizeCwd(rawCwd);
     if (!groups.has(key)) {
       groups.set(key, []);
       groupDisplayCwd.set(key, rawCwd);
-      // 记录该组第一个出现的会话创建时间（unpinnedIds 已按时间排好，第一个就是最早的）
-      groupFirstCreatedAt.set(key, getSessionCreateTime(id));
+      groupRecentAt.set(key, getSessionSortTime(id));
     }
     groups.get(key)!.push(id);
   }
@@ -2972,14 +3365,14 @@ function renderSessionList(): void {
   if (pinnedIds.length > 0) {
     groups.set(pinnedGroupKey, pinnedIds);
     groupDisplayCwd.set(pinnedGroupKey, '');
-    groupFirstCreatedAt.set(pinnedGroupKey, -Infinity);
+    groupRecentAt.set(pinnedGroupKey, Infinity);
   }
 
-  // 组间排序：置顶区域固定在最上方，其余按首个会话创建时间升序（先创建的组在上面）
+  // 组间排序：置顶区域固定在最上方，其余按组内最新提交时间排序。
   const sortedGroupKeys = Array.from(groups.keys()).sort((a, b) => {
     if (a === pinnedGroupKey) return -1;
     if (b === pinnedGroupKey) return 1;
-    return (groupFirstCreatedAt.get(a) || 0) - (groupFirstCreatedAt.get(b) || 0);
+    return (groupRecentAt.get(b) || 0) - (groupRecentAt.get(a) || 0);
   });
 
   for (const groupKey of sortedGroupKeys) {
@@ -3024,31 +3417,9 @@ function renderSessionList(): void {
       item.className = 'session-item' + (id === activeId ? ' active' : '') + (isPinned ? ' pinned' : '');
       item.dataset.sessionId = id;
       item.dataset.sessionType = 'pty';
+      if (id === activeId) item.setAttribute('aria-current', 'true');
 
-      const dot = document.createElement('span');
-      dot.className = 'session-color-dot';
-      if (sessionBusy.has(id)) {
-        dot.style.backgroundColor = '#e5a100';
-      } else if (sessionUnread.has(id)) {
-        dot.style.backgroundColor = '#73c991';
-      } else {
-        // 使用会话主题色
-        const themeId = sessionThemes.get(id);
-        if (themeId) {
-          const themeDotColor = TerminalManager.getThemeDotColor(themeId);
-          dot.style.backgroundColor = themeDotColor;
-        } else {
-          dot.style.backgroundColor = '#666';
-        }
-      }
-      
-      // 点击 dot 打开颜色选择器
-      dot.style.cursor = 'pointer';
-      dot.title = '点击更改颜色';
-      dot.addEventListener('click', (e) => {
-        e.stopPropagation();
-        showColorPickerDialog(id, dot);
-      });
+      const statusDot = createSessionStatusDot(id);
 
       const pinBtn = document.createElement('button');
       pinBtn.className = 'session-pin' + (isPinned ? ' pinned' : '');
@@ -3064,6 +3435,7 @@ function renderSessionList(): void {
       const titleSpan = document.createElement('span');
       titleSpan.className = 'session-title';
       titleSpan.textContent = title;
+      titleSpan.title = title;
 
       // 铅笔图标按钮，点击修改名称
       const editBtn = document.createElement('button');
@@ -3077,20 +3449,24 @@ function renderSessionList(): void {
 
       const metaRow = document.createElement('div');
       metaRow.className = 'session-meta-row';
-      const timeSpan = document.createElement('span');
-      timeSpan.className = 'session-time';
-      timeSpan.textContent = friendlyTime(sessionUpdateTimes.get(id) || Date.now());
-      metaRow.appendChild(timeSpan);
+      const itemCwd = sessionCwds.get(id) || '';
+      // 项目分组头已经显示目录名；只有置顶区不在原项目组里，才补一行项目名。
+      if (isPinnedGroup) {
+        const projectName = sessionProjectLabel(itemCwd);
+        if (projectName) {
+          const projectSpan = document.createElement('span');
+          projectSpan.className = 'session-cwd';
+          projectSpan.textContent = projectName;
+          projectSpan.title = itemCwd;
+          metaRow.appendChild(projectSpan);
+        }
+      }
       const displayName = sessionDisplayNames.get(id);
       if (displayName) {
         const nameSpan = document.createElement('span');
         nameSpan.className = 'session-display-name';
         nameSpan.title = displayName;
         fillCliCaption(nameSpan, displayName);
-        
-        const [tagColor, tagBg] = getCliTagColors(displayName);
-        nameSpan.style.setProperty('--cli-tag-color', tagColor);
-        nameSpan.style.setProperty('--cli-tag-bg', tagBg);
         metaRow.appendChild(nameSpan);
       }
 
@@ -3103,33 +3479,42 @@ function renderSessionList(): void {
         providerSpan.title = '实际使用的模型提供商';
         metaRow.appendChild(providerSpan);
       }
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'session-time';
+      timeSpan.textContent = friendlyTime(sessionUpdateTimes.get(id) || Date.now());
+      metaRow.appendChild(timeSpan);
 
-      // 第一行：dot + 置顶 + 标题 + 编辑 + 关闭按钮
+      // 第一行：缩短后的标题和会话操作。第二行：终端名与设置。
       const topRow = document.createElement('div');
       topRow.className = 'session-item-top';
 
       const closeBtn = document.createElement('button');
       closeBtn.className = 'session-close';
       setIcon(closeBtn, 'x', 12);
+      closeBtn.title = '关闭会话';
       closeBtn.addEventListener('click', (e) => { e.stopPropagation(); handleCloseClick(id); });
 
       const titleRow = document.createElement('div');
       titleRow.className = 'session-title-row';
       titleRow.appendChild(titleSpan);
-      titleRow.appendChild(editBtn);
-      topRow.appendChild(dot);
-      topRow.appendChild(pinBtn);
+      topRow.appendChild(statusDot);
       topRow.appendChild(titleRow);
-      topRow.appendChild(closeBtn);
+      const iconActions = document.createElement('div');
+      iconActions.className = 'session-action-row';
+      iconActions.appendChild(pinBtn);
+      iconActions.appendChild(editBtn);
+      iconActions.appendChild(closeBtn);
+      topRow.appendChild(iconActions);
 
-      // 第二行：时间/标签 + 计划设置按钮（点击弹配置弹窗）
+      // 第二行：缩短后的终端名、时间和设置。
       const autoContinueConfig = sessionAutoContinue.get(id);
       const autoContinueEnabled = autoContinueConfig?.enabled ?? false;
 
-      const autoContinueLabel = document.createElement('span');
+      const autoContinueLabel = document.createElement('button');
+      autoContinueLabel.type = 'button';
       autoContinueLabel.className = 'session-auto-continue-label' + (autoContinueEnabled ? ' enabled' : '');
-      autoContinueLabel.textContent = '设';
-      autoContinueLabel.title = autoContinueEnabled ? '计划已开启，点击设置' : '计划设置';
+      autoContinueLabel.textContent = '设置';
+      autoContinueLabel.title = autoContinueEnabled ? '计划已开启，打开会话设置' : '会话设置';
       autoContinueLabel.addEventListener('click', (e) => {
         e.stopPropagation();
         showAutoContinueConfigDialog(id);
@@ -3138,7 +3523,10 @@ function renderSessionList(): void {
       const bottomRow = document.createElement('div');
       bottomRow.className = 'session-item-bottom';
       bottomRow.appendChild(metaRow);
-      bottomRow.appendChild(autoContinueLabel);
+      const settingsRow = document.createElement('div');
+      settingsRow.className = 'session-action-row session-settings-row';
+      settingsRow.appendChild(autoContinueLabel);
+      bottomRow.appendChild(settingsRow);
 
       // 右键菜单
       item.addEventListener('contextmenu', (e) => {
@@ -3156,7 +3544,7 @@ function renderSessionList(): void {
   }
 
   // ========== 已关闭会话（可恢复） ==========
-  if (closedSessions.length > 0) {
+  if (matchingClosed.length > 0) {
     const header = document.createElement('div');
     header.className = 'session-group-header closed-sessions-header';
     header.style.borderLeftColor = '#888';
@@ -3165,7 +3553,7 @@ function renderSessionList(): void {
     name.className = 'session-group-name';
     appendIcon(name, 'archive', 12);
     const closedLabel = document.createElement('span');
-    closedLabel.textContent = `已关闭 (${closedSessions.length})`;
+    closedLabel.textContent = `已关闭 (${matchingClosed.length})`;
     name.appendChild(closedLabel);
 
     const toggleBtn = document.createElement('button');
@@ -3185,6 +3573,8 @@ function renderSessionList(): void {
     clearBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       closedSessions = await window.duocli.closedSessionsClear();
+      closedSessionThemeChoices.clear();
+      saveClosedSessionThemeChoices();
       renderSessionList();
     });
 
@@ -3193,9 +3583,9 @@ function renderSessionList(): void {
     header.appendChild(clearBtn);
     sessionList.appendChild(header);
 
-    if (!closedSessionsCollapsed) {
-      // 按关闭时间降序（最近关闭排最前）
-      const sorted = [...closedSessions].sort((a, b) => b.closedAt - a.closedAt);
+    if (!closedSessionsCollapsed || query) {
+      // 按最后更新时间降序（最近活动排最前）；旧记录没有 updatedAt 时退回关闭时间
+      const sorted = [...matchingClosed].sort((a, b) => (b.updatedAt || b.closedAt) - (a.updatedAt || a.closedAt));
       for (const cs of sorted) {
         const item = document.createElement('div');
         item.className = 'session-item session-item-closed';
@@ -3204,27 +3594,33 @@ function renderSessionList(): void {
         const titleSpan = document.createElement('span');
         titleSpan.className = 'session-title';
         titleSpan.textContent = cs.title || '新对话';
+        titleSpan.title = cs.title || '新对话';
         titleSpan.style.opacity = cs.title ? '1' : '0.5';
 
         const metaRow = document.createElement('div');
         metaRow.className = 'session-meta-row';
-        const timeSpan = document.createElement('span');
-        timeSpan.className = 'session-time';
-        timeSpan.textContent = friendlyTime(cs.closedAt);
-        metaRow.appendChild(timeSpan);
+        const closedProject = sessionProjectLabel(cs.cwd || '');
+        if (closedProject) {
+          const projectSpan = document.createElement('span');
+          projectSpan.className = 'session-cwd';
+          projectSpan.textContent = closedProject;
+          projectSpan.title = cs.cwd || '';
+          metaRow.appendChild(projectSpan);
+        }
         if (cs.displayName) {
           const nameSpan = document.createElement('span');
           nameSpan.className = 'session-display-name';
           nameSpan.title = cs.displayName;
           fillCliCaption(nameSpan, cs.displayName);
-          
-          const [tagColor, tagBg] = getCliTagColors(cs.displayName);
-          nameSpan.style.setProperty('--cli-tag-color', tagColor);
-          nameSpan.style.setProperty('--cli-tag-bg', tagBg);
           metaRow.appendChild(nameSpan);
         }
+        const timeSpan = document.createElement('span');
+        timeSpan.className = 'session-time';
+        timeSpan.textContent = friendlyTime(cs.updatedAt || cs.closedAt);
+        metaRow.appendChild(timeSpan);
         
         // 如果该会话有对话历史，显示"导出上下文"按钮
+        const restoring = restoringClosedSessionIds.has(cs.id) || cs.state === 'restoring';
         if (cs.contextHistory && cs.contextHistory.length > 0) {
           const exportBtn = document.createElement('button');
           exportBtn.className = 'session-edit-btn';
@@ -3240,7 +3636,6 @@ function renderSessionList(): void {
 
         const restoreBtn = document.createElement('button');
         restoreBtn.className = 'session-edit-btn';
-        const restoring = restoringClosedSessionIds.has(cs.id) || cs.state === 'restoring';
         if (restoring) restoreBtn.textContent = '…';
         else setIcon(restoreBtn, 'restore', 12);
         restoreBtn.title = '恢复会话';
@@ -3258,33 +3653,44 @@ function renderSessionList(): void {
         delBtn.addEventListener('click', async (e) => {
           e.stopPropagation();
           closedSessions = await window.duocli.closedSessionsRemove(cs.id);
+          closedSessionThemeChoices.delete(cs.id);
+          saveClosedSessionThemeChoices();
           renderSessionList();
         });
 
         const titleRow = document.createElement('div');
         titleRow.className = 'session-title-row';
         titleRow.appendChild(titleSpan);
-        titleRow.appendChild(restoreBtn);
 
         const topRow = document.createElement('div');
         topRow.className = 'session-item-top';
-        const dot = document.createElement('span');
-        dot.className = 'session-color-dot';
-        dot.style.backgroundColor = '#555';
-        
-        // 点击 dot 打开颜色选择器（已关闭会话）
-        dot.style.cursor = 'pointer';
-        dot.title = '点击更改颜色';
-        dot.addEventListener('click', (e) => {
-          e.stopPropagation();
-          showColorPickerDialogForClosedSession(cs.id, dot);
-        });
-        topRow.appendChild(dot);
+        topRow.appendChild(createSessionStatusDot(cs.id, 'exited'));
         topRow.appendChild(titleRow);
-        topRow.appendChild(delBtn);
+        const iconActions = document.createElement('div');
+        iconActions.className = 'session-action-row';
+        iconActions.appendChild(restoreBtn);
+        iconActions.appendChild(delBtn);
+        topRow.appendChild(iconActions);
+
+        const colorBtn = document.createElement('button');
+        colorBtn.type = 'button';
+        colorBtn.className = 'session-closed-color-btn';
+        colorBtn.textContent = '设置';
+        colorBtn.title = '设置恢复后的终端颜色';
+        colorBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          showColorPickerDialogForClosedSession(cs.id, colorBtn);
+        });
+        const settingsRow = document.createElement('div');
+        settingsRow.className = 'session-action-row session-settings-row';
+        settingsRow.appendChild(colorBtn);
+        const bottomRow = document.createElement('div');
+        bottomRow.className = 'session-item-bottom';
+        bottomRow.appendChild(metaRow);
+        bottomRow.appendChild(settingsRow);
 
         item.appendChild(topRow);
-        item.appendChild(metaRow);
+        item.appendChild(bottomRow);
         sessionList.appendChild(item);
       }
     }
@@ -3323,7 +3729,7 @@ async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
     claimed = await window.duocli.closedSessionsBeginRestore(cs.id);
     if (!claimed) return;
 
-    const cwd = cs.cwd || sessionCwds.get(getActiveSessionId() || '') || paneWorkspace.getWorkspaceKey() || '';
+    const cwd = cs.cwd || sessionCwds.get(getActiveSessionId() || '') || currentCwd || '';
     const themeId = resolveThemeId(currentThemeId, cwd);
     const result = await window.duocli.createPty(cwd, resumeCmd, themeId, resolvePresetEnv(getCustomPresets(), resumeCmd));
     resultId = result.id;
@@ -3336,7 +3742,10 @@ async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
     sessionDisplayNames.set(result.id, cs.displayName || result.displayName);
     syncPaneLiveSessions();
     termManager.create(result.id, result.themeId, cwd, (data) => { writePtyWithAutoReset(result.id, data); });
-    paneWorkspace.setWorkspace(result.cwd || cwd);
+    const closedTheme = closedSessionThemeChoices.get(cs.id);
+    if (closedTheme) {
+      await applyNewThemeToSession(result.id, closedTheme.bgColor, closedTheme.fgColor, closedTheme.themeName);
+    }
     showTerminalSession(result.id);
     termManager.followSession(result.id);
     updatePaneAccents();
@@ -3347,6 +3756,8 @@ async function restoreClosedSession(cs: ClosedSessionInfo): Promise<void> {
     if (!restored) return;
 
     closedSessions = await window.duocli.closedSessionsRemove(cs.id);
+    closedSessionThemeChoices.delete(cs.id);
+    saveClosedSessionThemeChoices();
     updateEmptyState();
     renderSessionList();
     updateSessionTitleBar();
@@ -3380,7 +3791,7 @@ async function exportSessionContext(cs: ClosedSessionInfo): Promise<void> {
     );
     
     if (result && result.ok) {
-      shell.openExternal(`file://${result.filePath}`);
+      await window.duocli.openFile(result.filePath);
       alert('✅ 上下文已导出！\n\n文件位置：' + result.filePath + '\n\n您可以将此文件拖拽到其他 AI Agent（如 Cursor、Codex、Claude）中继续使用。');
     } else {
       alert('❌ 导出失败：' + (result?.error || '未知错误'));
@@ -3399,6 +3810,49 @@ async function createSession(): Promise<boolean> {
   const themeId = resolveThemeId(currentThemeId, currentCwd);
   lastPreset = preset;
   localStorage.setItem('duocli_preset', preset);
+  if (taskPlanEnabled.checked) {
+    const instruction = taskPlanInstruction.value.trim();
+    if (!instruction) { alert('请输入首条任务指令'); return false; }
+    let name = taskPlanName.value.trim();
+    if (!name) {
+      setTaskPlanNamePreview('正在生成名称…', false);
+      try {
+        name = await window.duocli.suggestTitleFromText(instruction);
+      } catch (error) {
+        console.warn('任务名称生成失败，使用指令截断:', error);
+      }
+      if (!name) {
+        name = instruction.replace(/\s+/g, ' ').trim().slice(0, 40) || '计划任务';
+      }
+      setTaskPlanNamePreview(name, true);
+      taskPlanName.value = name;
+    }
+    const dependency = taskPlanDependency.value;
+    const delayRaw = taskPlanDelay.value.trim();
+    let notBefore: number | undefined;
+    if (delayRaw !== '') {
+      const delayMin = Number(delayRaw);
+      if (!Number.isFinite(delayMin) || delayMin < 0) { alert('开始时间无效'); return false; }
+      if (delayMin > 0) notBefore = Date.now() + Math.round(delayMin * 60_000);
+    }
+    await window.duocli.createTerminalTask({
+      requestId: crypto.randomUUID(),
+      name,
+      cwd: currentCwd,
+      presetCommand: preset,
+      themeId,
+      instruction,
+      notBefore,
+      dependsOnTaskId: dependency.startsWith('task:') ? dependency.slice(5) : undefined,
+      dependsOnSessionId: dependency.startsWith('session:') ? dependency.slice(8) : undefined,
+      quietMs: Math.round(Number(taskPlanQuiet.value || '10') * 1000),
+    });
+    taskPlanInstruction.value = '';
+    taskPlanName.value = '';
+    taskPlanDelay.value = '';
+    setTaskPlanNamePreview('填写指令后自动生成', false);
+    return true;
+  }
   const result = await window.duocli.createPty(currentCwd, preset, themeId, resolvePresetEnv(getCustomPresets(), preset));
   const now = Date.now();
   sessionTitles.set(result.id, result.title);
@@ -3418,7 +3872,6 @@ async function createSession(): Promise<boolean> {
   }
   // 初始化终端
   termManager.create(result.id, result.themeId, currentCwd, (data) => { writePtyWithAutoReset(result.id, data); });
-  paneWorkspace.setWorkspace(currentCwd);
   showTerminalSession(result.id);
   updatePaneAccents();
   updateEmptyState();
@@ -3434,21 +3887,18 @@ async function createSession(): Promise<boolean> {
 }
 
 function switchSession(id: string): void {
-  const cwd = sessionCwds.get(id) || currentCwd;
-  if (cwd) paneWorkspace.setWorkspace(cwd);
   const prev = getActiveSessionId();
+  // 必须先压住 resize 重绘，再挂终端；否则黄/灰会先被刷成绿
+  suppressSessionBusyFromResize(id);
   showTerminalSession(id);
 
-  // 用户切换到该会话 → 清除所有状态指示灯（黄/绿→灰）
+  // 点进会话 = 已查看：只清未查看黄点；进行中绿点保留（仍在跑应继续绿）
   const hadUnread = sessionUnread.delete(id);
-  const hadBusy = sessionBusy.delete(id);
   // 切换到不同会话才重渲染列表，避免重建 DOM 导致 dblclick 无法触发
-  if (prev !== id || hadUnread || hadBusy) renderSessionList();
+  if (prev !== id || hadUnread) renderSessionList();
   updateSessionTitleBar();
   void renderFileTree();
   renderFileStatusbar();
-  const dims = termManager.getActiveDimensions();
-  if (dims) window.duocli.resizePty(id, dims.cols, dims.rows);
   termManager.followSession(id);
 }
 
@@ -3473,8 +3923,11 @@ function clearSessionState(id: string): void {
   sessionThemes.delete(id);
   sessionUpdateTimes.delete(id);
   sessionCreateTimes.delete(id);
+  sessionLastSubmittedTimes.delete(id);
   sessionUnread.delete(id);
+  sessionRemoteViewers.delete(id);
   sessionBusy.delete(id);
+  statusBusySuppressUntil.delete(id);
   clearTimeout(unreadTimers.get(id));
   unreadTimers.delete(id);
   recentDataBuffer.delete(id);
@@ -3648,13 +4101,18 @@ async function handleAiTest(): Promise<void> {
   }
 }
 
-function switchTab(tabName: string): void {
-  sidebarTabs.forEach((tab) => {
-    tab.classList.toggle('active', tab.getAttribute('data-tab') === tabName);
-  });
-  tabSessions.classList.toggle('active', tabName === 'sessions');
-  tabAiConfig.classList.toggle('active', tabName === 'ai-config');
-  if (tabName === 'ai-config') refreshAiConfig();
+function openAiConfig(): void {
+  aiConfigOverlay.classList.add('active');
+  sidebarSettingsBtn.classList.add('active');
+  sidebarSettingsBtn.setAttribute('aria-expanded', 'true');
+  void refreshAiConfig();
+  aiConfigOverlay.focus();
+}
+
+function closeAiConfig(): void {
+  aiConfigOverlay.classList.remove('active');
+  sidebarSettingsBtn.classList.remove('active');
+  sidebarSettingsBtn.setAttribute('aria-expanded', 'false');
 }
 
 // ========== 事件绑定 ==========
@@ -3710,28 +4168,30 @@ cwdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') cwdInput.bl
 
 // ========== 面板收起/展开与拖拽功能 ==========
 
-// 左侧目录树收起/展开
+// 右侧目录树收起/展开
 let fileTreeCollapsed = false;
 let fileTreeLastWidth = 220;
+let fileTreeUserCollapsed = false;
+let fileTreePinnedOpen = false;
+let layoutCompact = false;
 
 function syncPanelTogglePositions(): void {
   const toggleInset = 8;
   const toggleSize = 26;
 
   if (fileTreeCollapsed) {
-    fileTreeToggle.style.left = '10px';
+    fileTreeToggle.style.right = '10px';
   } else {
-    const left = Math.max(8, fileTreePanel.offsetWidth - toggleSize - toggleInset);
-    fileTreeToggle.style.left = `${left}px`;
+    fileTreeToggle.style.right = '8px';
   }
 
-  sidebarToggle.style.top = '';
-  sidebarToggle.style.bottom = '8px';
+  sidebarToggle.style.top = '10px';
+  sidebarToggle.style.bottom = '';
   if (sidebarCollapsed) {
-    sidebarToggle.style.right = '10px';
+    sidebarToggle.style.left = '10px';
   } else {
-    const right = Math.max(8, sidebar.offsetWidth - toggleSize - toggleInset);
-    sidebarToggle.style.right = `${right}px`;
+    const left = Math.max(8, sidebar.offsetWidth - toggleSize - toggleInset);
+    sidebarToggle.style.left = `${left}px`;
   }
 }
 
@@ -3742,40 +4202,67 @@ function updatePanelToggleA11y(toggle: HTMLElement, collapsed: boolean, panelNam
   toggle.setAttribute('title', `${expanded ? '收起' : '展开'}${panelName}`);
 }
 
-fileTreeToggle.addEventListener('click', () => {
-  fileTreeCollapsed = !fileTreeCollapsed;
-  if (fileTreeCollapsed) {
-    fileTreeLastWidth = fileTreePanel.offsetWidth;
+function applyFileTreeCollapsed(collapsed: boolean): void {
+  // A collapsed tree must not leave a one-pixel resize target between the
+  // toggle and terminal. Hide the handle itself so it cannot be hovered or
+  // dragged while the tree is closed.
+  fileTreeResizer.hidden = collapsed;
+  fileTreeResizer.classList.remove('active');
+  if (collapsed && dragState.panel === fileTreePanel) {
+    dragState.isDragging = false;
+    dragState.panel = null;
+  }
+  if (collapsed === fileTreeCollapsed && fileTreePanel.classList.contains('collapsed') === collapsed) {
+    updatePanelToggleA11y(fileTreeToggle, collapsed, '目录树');
+    syncPanelTogglePositions();
+    return;
+  }
+  fileTreeCollapsed = collapsed;
+  if (collapsed) {
+    if (fileTreePanel.offsetWidth > 0) fileTreeLastWidth = fileTreePanel.offsetWidth;
     fileTreePanel.classList.add('collapsed');
     fileTreeToggle.classList.add('collapsed');
-    setIcon(fileTreeToggle, 'chevron-right', 12);
+    setIcon(fileTreeToggle, 'chevron-left', 12);
   } else {
     fileTreePanel.style.width = fileTreeLastWidth + 'px';
     fileTreePanel.classList.remove('collapsed');
     fileTreeToggle.classList.remove('collapsed');
-    setIcon(fileTreeToggle, 'chevron-left', 12);
+    setIcon(fileTreeToggle, 'chevron-right', 12);
   }
   updatePanelToggleA11y(fileTreeToggle, fileTreeCollapsed, '目录树');
   syncPanelTogglePositions();
-  localStorage.setItem('duocli_filetree_collapsed', String(fileTreeCollapsed));
+}
+
+fileTreeToggle.addEventListener('click', () => {
+  const next = !fileTreeCollapsed;
+  fileTreeUserCollapsed = next;
+  fileTreePinnedOpen = !next;
+  applyFileTreeCollapsed(next);
+  localStorage.setItem('duocli_filetree_collapsed', String(fileTreeUserCollapsed));
 });
 
-// 右侧边栏收起/展开
+// 左侧会话栏收起/展开
 let sidebarCollapsed = false;
 let sidebarLastWidth = 260;
+let sidebarPreferredWidth = 260;
+let sidebarPinnedWidth = false;
 
 sidebarToggle.addEventListener('click', () => {
   sidebarCollapsed = !sidebarCollapsed;
   if (sidebarCollapsed) {
-    sidebarLastWidth = sidebar.offsetWidth;
+    if (sidebar.offsetWidth > 0) {
+      sidebarLastWidth = sidebar.offsetWidth;
+      sidebarPreferredWidth = sidebar.offsetWidth;
+    }
     sidebar.classList.add('collapsed');
     sidebarToggle.classList.add('collapsed');
-    setIcon(sidebarToggle, 'chevron-left', 12);
+    setIcon(sidebarToggle, 'chevron-right', 12);
   } else {
-    sidebar.style.width = sidebarLastWidth + 'px';
+    sidebarPinnedWidth = layoutCompact;
+    sidebar.style.width = sidebarPreferredWidth + 'px';
     sidebar.classList.remove('collapsed');
     sidebarToggle.classList.remove('collapsed');
-    setIcon(sidebarToggle, 'chevron-right', 12);
+    setIcon(sidebarToggle, 'chevron-left', 12);
   }
   updatePanelToggleA11y(sidebarToggle, sidebarCollapsed, '会话列表');
   syncPanelTogglePositions();
@@ -3801,7 +4288,49 @@ const dragState: DragState = {
   maxWidth: 0
 };
 
-// 左侧目录树拖拽
+function applySidebarWidth(width: number): void {
+  if (sidebarCollapsed) return;
+  if (Math.abs((sidebar.offsetWidth || 0) - width) < 2) {
+    syncPanelTogglePositions();
+    return;
+  }
+  sidebar.style.width = width + 'px';
+  syncPanelTogglePositions();
+}
+
+function syncCompactLayout(): void {
+  if (dragState.isDragging) return;
+  const phase = compactLayoutPhase(window.innerWidth, layoutCompact);
+  if (phase === 'hold') return;
+  layoutCompact = phase === 'compact';
+  document.body.classList.toggle('layout-compact', layoutCompact);
+  if (phase === 'roomy') {
+    fileTreePinnedOpen = false;
+    sidebarPinnedWidth = false;
+  }
+
+  applyFileTreeCollapsed(shouldFileTreeCollapse({
+    phase,
+    userCollapsed: fileTreeUserCollapsed,
+    userPinnedOpen: fileTreePinnedOpen,
+    collapsed: fileTreeCollapsed,
+  }));
+
+  const currentSidebarWidth = sidebar.offsetWidth || sidebarPreferredWidth;
+  if (phase === 'compact' && !sidebarCollapsed && !sidebarPinnedWidth && currentSidebarWidth > sidebarPreferredWidth) {
+    sidebarPreferredWidth = currentSidebarWidth;
+  }
+  const sidebarWidth = nextSidebarWidth({
+    phase,
+    userCollapsed: sidebarCollapsed,
+    userPinnedWidth: sidebarPinnedWidth,
+    currentWidth: currentSidebarWidth,
+    preferredWidth: sidebarPreferredWidth,
+  });
+  if (sidebarWidth != null) applySidebarWidth(sidebarWidth);
+}
+
+// 右侧目录树拖拽
 fileTreeResizer.addEventListener('mousedown', (e) => {
   if (fileTreeCollapsed) return;
   e.preventDefault();
@@ -3814,7 +4343,7 @@ fileTreeResizer.addEventListener('mousedown', (e) => {
   fileTreeResizer.classList.add('active');
 });
 
-// 右侧边栏拖拽
+// 左侧会话栏拖拽
 sidebarResizer.addEventListener('mousedown', (e) => {
   if (sidebarCollapsed) return;
   e.preventDefault();
@@ -3832,9 +4361,9 @@ document.addEventListener('mousemove', (e) => {
   const deltaX = e.clientX - dragState.startX;
   let newWidth;
   if (dragState.panel === fileTreePanel) {
-    newWidth = dragState.startWidth + deltaX;
-  } else {
     newWidth = dragState.startWidth - deltaX;
+  } else {
+    newWidth = dragState.startWidth + deltaX;
   }
   newWidth = Math.max(dragState.minWidth, Math.min(dragState.maxWidth, newWidth));
   dragState.panel.style.width = newWidth + 'px';
@@ -3847,8 +4376,12 @@ document.addEventListener('mouseup', () => {
     fileTreeResizer.classList.remove('active');
     sidebarResizer.classList.remove('active');
     if (dragState.panel === fileTreePanel) {
+      fileTreeLastWidth = fileTreePanel.offsetWidth;
       localStorage.setItem('duocli_filetree_width', String(fileTreePanel.offsetWidth));
     } else if (dragState.panel === sidebar) {
+      sidebarLastWidth = sidebar.offsetWidth;
+      sidebarPreferredWidth = sidebar.offsetWidth;
+      sidebarPinnedWidth = layoutCompact;
       localStorage.setItem('duocli_sidebar_width', String(sidebar.offsetWidth));
     }
     syncPanelTogglePositions();
@@ -3856,7 +4389,10 @@ document.addEventListener('mouseup', () => {
   }
 });
 
-window.addEventListener('resize', syncPanelTogglePositions);
+window.addEventListener('resize', () => {
+  syncCompactLayout();
+  syncPanelTogglePositions();
+});
 
 // 恢复保存的面板状态
 (function restorePanelStates() {
@@ -3868,24 +4404,23 @@ window.addEventListener('resize', syncPanelTogglePositions);
   const savedSidebarWidth = localStorage.getItem('duocli_sidebar_width');
   if (savedSidebarWidth) {
     sidebar.style.width = savedSidebarWidth + 'px';
-    sidebarLastWidth = parseInt(savedSidebarWidth);
+    sidebarLastWidth = parseInt(savedSidebarWidth, 10);
+    sidebarPreferredWidth = sidebarLastWidth;
   }
   const savedFileTreeCollapsed = localStorage.getItem('duocli_filetree_collapsed');
   if (savedFileTreeCollapsed === 'true') {
-    fileTreeCollapsed = true;
-    fileTreePanel.classList.add('collapsed');
-    fileTreeToggle.classList.add('collapsed');
-    setIcon(fileTreeToggle, 'chevron-right', 12);
-    updatePanelToggleA11y(fileTreeToggle, true, '目录树');
+    fileTreeUserCollapsed = true;
+    applyFileTreeCollapsed(true);
   }
   const savedSidebarCollapsed = localStorage.getItem('duocli_sidebar_collapsed');
   if (savedSidebarCollapsed === 'true') {
     sidebarCollapsed = true;
     sidebar.classList.add('collapsed');
     sidebarToggle.classList.add('collapsed');
-    setIcon(sidebarToggle, 'chevron-left', 12);
+    setIcon(sidebarToggle, 'chevron-right', 12);
     updatePanelToggleA11y(sidebarToggle, true, '会话列表');
   }
+  syncCompactLayout();
   syncPanelTogglePositions();
 })();
 
@@ -3941,11 +4476,13 @@ document.addEventListener('dragleave', (e) => {
 });
 
 document.addEventListener('drop', (e) => {
-  e.preventDefault();
   terminalArea.classList.remove('drag-over');
-  // 只有当数据来自外部文件时才处理
+  // Only claim file drops. Pane-header swaps use text/plain and must reach
+  // their own handlers; calling preventDefault here for every drop broke
+  // vertical swaps when the release landed on the terminal body.
   const files = Array.from(e.dataTransfer?.files || []);
   if (!files.length) return;
+  e.preventDefault();
   const activeId = getActiveSessionId();
   if (!activeId) {
     alert('请先选择一个终端会话');
@@ -3954,6 +4491,109 @@ document.addEventListener('drop', (e) => {
   const payload = files.map((f) => quotePathForShell(f.path)).join(' ') + ' ';
   writePtyWithAutoReset(activeId, payload);
 });
+
+function taskStatusLabel(status: string): string {
+  return ({
+    pending: '等待中', paused: '已暂停', starting: '启动中', running: '执行中', completed: '已完成',
+    failed: '启动失败', cancelled: '已取消', blocked: '受阻', needs_attention: '待确认',
+  } as Record<string, string>)[status] || status;
+}
+
+function renderTaskDependencyOptions(): void {
+  const selected = taskPlanDependency.value;
+  taskPlanDependency.innerHTML = '<option value="">无</option>';
+  const pendingTasks = terminalTaskSnapshot.tasks.filter(task => !['cancelled', 'failed'].includes(task.status));
+  for (const task of pendingTasks) {
+    const option = document.createElement('option');
+    option.value = `task:${task.id}`;
+    option.textContent = `任务：${task.name}（${taskStatusLabel(task.status)}）`;
+    taskPlanDependency.appendChild(option);
+  }
+  for (const [id, title] of sessionTitles) {
+    const option = document.createElement('option');
+    option.value = `session:${id}`;
+    option.textContent = `终端：${title}`;
+    taskPlanDependency.appendChild(option);
+  }
+  if (Array.from(taskPlanDependency.options).some(option => option.value === selected)) taskPlanDependency.value = selected;
+}
+
+function renderTaskQueue(): void {
+  taskQueueList.innerHTML = '';
+  if (terminalTaskSnapshot.tasks.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'task-queue-empty';
+    empty.textContent = '还没有计划任务';
+    taskQueueList.appendChild(empty);
+    return;
+  }
+  const byId = new Map(terminalTaskSnapshot.tasks.map(task => [task.id, task]));
+  for (const task of [...terminalTaskSnapshot.tasks].reverse()) {
+    const item = document.createElement('div');
+    item.className = 'task-queue-item';
+    const title = document.createElement('div');
+    title.className = 'task-queue-title';
+    const name = document.createElement('span');
+    name.textContent = task.name;
+    const state = document.createElement('span');
+    state.className = 'task-queue-state';
+    state.textContent = taskStatusLabel(task.status);
+    title.append(name, state);
+    const meta = document.createElement('div');
+    meta.className = 'task-queue-meta';
+    const dep = task.dependency?.kind === 'task'
+      ? `前置：${byId.get(task.dependency.id)?.name || '已删除任务'}`
+      : task.dependency?.kind === 'session' ? '前置：已有终端停止' : '无前置任务';
+    const time = task.notBefore ? ` · ${new Date(task.notBefore).toLocaleString()}` : '';
+    meta.textContent = `${dep}${time} · 静止 ${Math.round(task.quietMs / 1000)} 秒${task.error ? ` · ${task.error}` : ''}`;
+    const actions = document.createElement('div');
+    actions.className = 'task-queue-actions';
+    const addAction = (label: string, onClick: () => void, className?: string): void => {
+      const button = document.createElement('button');
+      button.textContent = label;
+      if (className) button.className = className;
+      button.onclick = onClick;
+      actions.appendChild(button);
+    };
+    if (task.sessionId && sessionTitles.has(task.sessionId)) {
+      addAction('查看终端', () => { switchSession(task.sessionId!); taskQueueOverlay.classList.remove('active'); });
+    }
+    if (['pending', 'paused', 'blocked'].includes(task.status)) {
+      addAction('立即执行', () => { void window.duocli.runTerminalTaskNow(task.id).catch(error => alert(String(error))); });
+    }
+    if (['pending', 'blocked'].includes(task.status)) {
+      addAction('暂停', () => { void window.duocli.pauseTerminalTask(task.id).catch(error => alert(String(error))); });
+    }
+    if (task.status === 'paused') {
+      addAction('继续', () => { void window.duocli.resumeTerminalTask(task.id).catch(error => alert(String(error))); });
+    }
+    if (['starting', 'running'].includes(task.status)) {
+      addAction('取消', () => { void window.duocli.cancelTerminalTask(task.id).catch(error => alert(String(error))); });
+    }
+    if (['pending', 'paused', 'blocked'].includes(task.status)) {
+      addAction('修改', async () => {
+        const name = prompt('任务名称', task.name);
+        if (name === null) return;
+        const instruction = prompt('首条任务指令', task.instruction);
+        if (instruction === null) return;
+        const quiet = prompt('静止完成秒数', String(Math.round(task.quietMs / 1000)));
+        if (quiet === null) return;
+        try {
+          await window.duocli.updateTerminalTask(task.id, { expectedRevision: task.revision, name, instruction, quietMs: Number(quiet) * 1000 });
+        } catch (error) { alert('修改失败：' + String(error)); }
+      });
+    }
+    if (['running', 'needs_attention'].includes(task.status)) {
+      addAction('确认完成', () => { void window.duocli.confirmTerminalTaskComplete(task.id).catch(error => alert(String(error))); });
+    }
+    addAction('删除', () => {
+      if (!confirm(`确定删除任务「${task.name}」？`)) return;
+      void window.duocli.removeTerminalTask(task.id).catch(error => alert(String(error)));
+    }, 'danger');
+    item.append(title, meta, actions);
+    taskQueueList.appendChild(item);
+  }
+}
 
 function openNewSessionDialog(cwd?: string): void {
   const targetCwd = (cwd || currentCwd || '').trim();
@@ -3967,16 +4607,74 @@ function openNewSessionDialog(cwd?: string): void {
   presetSelect.value = lastPreset || presetSelect.value || '';
   setPresetValue(presetSelect.value);
   setThemeValue(currentThemeId);
+  renderTaskDependencyOptions();
+  taskPlanDelay.value = '';
+  if (!taskPlanInstruction.value.trim()) {
+    taskPlanName.value = '';
+    setTaskPlanNamePreview('填写指令后自动生成', false);
+  }
   newSessionOverlay.classList.add('active');
   setTimeout(() => cwdInput.focus(), 0);
   void pullRecentCwdsFromRemote();
   void refreshPresetUsage().then(() => renderPresetSelect());
 }
 
+taskPlanEnabled.addEventListener('change', () => {
+  taskPlanFields.hidden = !taskPlanEnabled.checked;
+  newSessionCreateBtn.textContent = taskPlanEnabled.checked ? '加入任务队列' : '创建终端';
+  if (taskPlanEnabled.checked && taskPlanInstruction.value.trim()) scheduleTaskPlanNameSuggest();
+});
+taskQueueBtn.addEventListener('click', () => { renderTaskQueue(); taskQueueOverlay.classList.add('active'); });
+taskQueueClose.addEventListener('click', () => taskQueueOverlay.classList.remove('active'));
+taskQueueOverlay.addEventListener('click', event => { if (event.target === taskQueueOverlay) taskQueueOverlay.classList.remove('active'); });
+
+let taskPlanNameTimer: ReturnType<typeof setTimeout> | null = null;
+let taskPlanNameRequest = 0;
+
+function setTaskPlanNamePreview(text: string, hasValue: boolean): void {
+  taskPlanNamePreview.textContent = text;
+  taskPlanNamePreview.title = text;
+  taskPlanNamePreview.classList.toggle('has-value', hasValue);
+}
+
+function scheduleTaskPlanNameSuggest(): void {
+  if (taskPlanNameTimer) clearTimeout(taskPlanNameTimer);
+  const instruction = taskPlanInstruction.value.trim();
+  if (!instruction) {
+    taskPlanName.value = '';
+    setTaskPlanNamePreview('填写指令后自动生成', false);
+    return;
+  }
+  setTaskPlanNamePreview('正在生成名称…', false);
+  const requestId = ++taskPlanNameRequest;
+  taskPlanNameTimer = setTimeout(async () => {
+    try {
+      const title = await window.duocli.suggestTitleFromText(instruction);
+      if (requestId !== taskPlanNameRequest) return;
+      const name = title || instruction.replace(/\s+/g, ' ').trim().slice(0, 40) || '计划任务';
+      taskPlanName.value = name;
+      setTaskPlanNamePreview(name, true);
+    } catch {
+      if (requestId !== taskPlanNameRequest) return;
+      const fallback = instruction.replace(/\s+/g, ' ').trim().slice(0, 40) || '计划任务';
+      taskPlanName.value = fallback;
+      setTaskPlanNamePreview(fallback, true);
+    }
+  }, 500);
+}
+
+taskPlanInstruction.addEventListener('input', () => {
+  if (!taskPlanEnabled.checked) return;
+  scheduleTaskPlanNameSuggest();
+});
+taskPlanDelayClear.addEventListener('click', () => {
+  taskPlanDelay.value = '';
+  taskPlanDelay.focus();
+});
+
 function closeNewSessionDialog(): void {
   newSessionOverlay.classList.remove('active');
   cwdRecentDropdown.classList.remove('open');
-  themeSelect.classList.remove('open');
   presetSelectWrap.classList.remove('open');
 }
 
@@ -4013,15 +4711,18 @@ presetManageBtn.addEventListener('click', () => {
   showPresetManageDialog();
 });
 
-// Tab 切换
-sidebarTabs.forEach((tab) => {
-  tab.addEventListener('click', () => {
-    const tabName = tab.getAttribute('data-tab');
-    if (tabName) switchTab(tabName);
-  });
+sidebarSettingsBtn.addEventListener('click', () => openAiConfig());
+aiConfigClose.addEventListener('click', () => closeAiConfig());
+aiConfigOverlay.addEventListener('click', (e) => {
+  if (e.target === aiConfigOverlay) closeAiConfig();
+});
+aiConfigOverlay.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeAiConfig();
+  }
 });
 
-// AI 配置按钮
 aiTestBtn.addEventListener('click', () => handleAiTest());
 aiApplyBtn.addEventListener('click', () => handleAiApply());
 terminalAutoResponseSave.addEventListener('click', () => { void saveTerminalAutoResponseConfig(); });
@@ -4031,20 +4732,40 @@ aiKeyToggle.addEventListener('click', () => {
 
 // ========== IPC 监听 ==========
 
+window.duocli.onPtyParsed((id, _data, sequence) => {
+  termManager.applyParsed(id, _data, sequence);
+});
+
+window.duocli.onPtyUserSubmitted((id, submittedAt) => {
+  if (!Number.isFinite(submittedAt)) return;
+  sessionLastSubmittedTimes.set(id, submittedAt);
+  if (sessionTitles.has(id)) renderSessionList();
+});
+
 window.duocli.onPtyData((id, data) => {
-  termManager.write(id, data);
+  // Rendering uses the ordered parsed stream below, the same sequence domain
+  // as snapshots. Raw output still drives activity/status without double paint.
   if (sessionTitles.has(id)) {
     sessionUpdateTimes.set(id, Date.now());
   }
-  // 所有会话都追踪状态（工作中/等待输入），确保切换查看后状态不丢失
-  const activeId = getActiveSessionId();
+  // 所有会话都追踪状态（进行中/已停未查看），确保切换查看后状态不丢失
   if (sessionTitles.has(id)) {
-    // 有新输出就优先显示"工作中"（黄点），并清掉旧的"待处理"（绿点）
+    // 有新输出 → 标为进行中（绿点），并清掉「未查看」
+    // 切换后短窗口内的 resize 重绘忽略，避免灰→误绿
+    const suppressBusy = Date.now() < (statusBusySuppressUntil.get(id) || 0);
     const prevBusy = sessionBusy.has(id);
     const prevUnread = sessionUnread.has(id);
-    sessionBusy.add(id);
-    sessionUnread.delete(id);
-    if (!prevBusy || prevUnread) renderSessionList();
+    // 切换/fit 带来的 CSI 重绘不能把黄、灰点刷成绿
+    const ignoreBusy = suppressBusy || (isTransientTerminalOutput(data) && !sessionBusy.has(id));
+    if (!ignoreBusy) {
+      sessionBusy.add(id);
+      sessionUnread.delete(id);
+      if (statusBusySuppressUntil.has(id)) statusBusySuppressUntil.delete(id);
+    }
+    if ((!prevBusy && sessionBusy.has(id)) || (prevUnread && !sessionUnread.has(id))) {
+      patchSessionStatusDot(id);
+      syncSessionStatusToMain();
+    }
 
     // 累积最近数据用于提示符检测（保留最后 500 字符）
     const prev = recentDataBuffer.get(id) || '';
@@ -4055,7 +4776,8 @@ window.duocli.onPtyData((id, data) => {
     const plain = recentDataBuffer.get(id)!.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
     // 催工开启时，自动确认 CLI 各类确认提示（proceed / make this edit / 等）
     const acConfig = sessionAutoContinue.get(id);
-    if (acConfig?.enabled && (acConfig.autoAgree ?? true) && /Do you want to .*\?/.test(plain)) {
+    if (!window.duocli.autoContinueManaged
+      && acConfig?.enabled && (acConfig.autoAgree ?? true) && /Do you want to .*\?/.test(plain)) {
       // 数选项行数（格式: "  1. xxx"、"  2. xxx"...）
       const optionCount = (plain.match(/^\s+\d+\.\s/gm) || []).length;
       // 3个选项: 1=Yes, 2=Yes永久, 3=No → 选2
@@ -4071,46 +4793,22 @@ window.duocli.onPtyData((id, data) => {
       recentDataBuffer.delete(id);
     }
 
-    // 提示符检测：按行拆分，检查最后几行是否包含提示符
-    const lines = plain.split('\n').map(l => l.trimEnd()).filter(l => l.length > 0);
-    const lastLines = lines.slice(-3).join('\n');
-    // 排除 Claude Code 工作中状态：xxx… (xxx) 等 spinner 模式
-    const cliWorking = /\w+…\s*\(/.test(lastLines);
-    // Shell 提示符
-    const promptLike = /(^|[\s\n])(❯|›|▷|\$|>|%|➜)\s*$/.test(lastLines) && !/>\s*[a-zA-Z]/.test(lastLines);
-    const shellPrompt = /[\]#$%>❯›]\s*$/.test(lastLines);
-    const hasPrompt = (promptLike || shellPrompt) && !cliWorking;
-
-    if (hasPrompt) {
-      // 检测到提示符 → 从工作中转为等待输入（黄→绿/灰）
-      clearTimeout(unreadTimers.get(id));
-      unreadTimers.delete(id);
-      recentDataBuffer.delete(id);
-      const wasBusy = sessionBusy.delete(id);
-      const hadUnread = sessionUnread.has(id);
-      // 当前活跃会话直接变灰（用户正在看着）；非活跃会话标记为待处理（绿点）
-      if (id !== activeId && !sessionUnread.has(id)) {
-        sessionUnread.add(id);
-      }
-      const nowUnread = sessionUnread.has(id);
-      if (wasBusy || hadUnread !== nowUnread) renderSessionList();
-    } else {
-      // 未检测到提示符：用静默超时兜底（15秒无新输出 → 黄→绿/灰）
-      // 避免提示符匹配不到时永远卡在黄灯
+    if (!ignoreBusy) {
+      // 连续 10 秒没有新内容才停止。提示符不再提前结束本轮任务。
       clearTimeout(unreadTimers.get(id));
       unreadTimers.set(id, setTimeout(() => {
         unreadTimers.delete(id);
         recentDataBuffer.delete(id);
-        // 超时兜底：如果仍然是黄灯状态，转为绿灯或灰灯
+        // 超时兜底：如果仍然是进行中，转为黄（未查看）或灰（当前会话）
         if (sessionBusy.has(id)) {
           sessionBusy.delete(id);
-          const currentActiveId = getActiveSessionId();
-          if (id !== currentActiveId) {
+          if (!sessionIsBeingWatched(id)) {
             sessionUnread.add(id);
           }
-          renderSessionList();
+          patchSessionStatusDot(id);
+          syncSessionStatusToMain();
         }
-      }, 3000));
+      }, 10000));
     }
   }
 });
@@ -4125,6 +4823,33 @@ window.duocli.onTitleUpdate((id, title) => {
     updateSessionTitleBar();
   }
 });
+
+window.duocli.onSessionRemoteView((id, info) => {
+  let changed = false;
+  if (info?.viewed && sessionUnread.delete(id)) changed = true;
+  if (info?.viewing === true) sessionRemoteViewers.add(id);
+  else if (info?.viewing === false) sessionRemoteViewers.delete(id);
+  if (changed) renderSessionList();
+  else if (info?.viewed) syncSessionStatusToMain();
+});
+
+window.duocli.onSessionActivityChanged((state) => {
+  if (!sessionTitles.has(state.sessionId)) return;
+  clearTimeout(unreadTimers.get(state.sessionId));
+  unreadTimers.delete(state.sessionId);
+  if (state.status === 'running') {
+    sessionBusy.add(state.sessionId);
+    sessionUnread.delete(state.sessionId);
+  } else {
+    sessionBusy.delete(state.sessionId);
+    if (sessionIsBeingWatched(state.sessionId)) sessionUnread.delete(state.sessionId);
+    else sessionUnread.add(state.sessionId);
+  }
+  patchSessionStatusDot(state.sessionId);
+  syncSessionStatusToMain();
+});
+
+window.duocli.onPtyGeometry?.((id, geometry) => termManager.applyPtyGeometry(id, geometry));
 
 window.duocli.onPtyExit((id) => {
   paneWorkspace.removeContent('terminal', id);
@@ -4150,9 +4875,7 @@ window.duocli.onRemoteCreated((info) => {
   if (info.cwd) addRecentCwd(info.cwd);
   // 创建 xterm 实例（桌面端也能看到和操作）
   termManager.create(info.id, info.themeId, info.cwd, (data) => { writePtyWithAutoReset(info.id, data); });
-  if (normalizeCwd(paneWorkspace.getWorkspaceKey()) === normalizeCwd(info.cwd || currentCwd)) {
-    showTerminalSession(info.id);
-  }
+  showTerminalSession(info.id);
   updateEmptyState();
   renderSessionList();
   updateSessionTitleBar();
@@ -4163,6 +4886,33 @@ window.duocli.onRemoteCreated((info) => {
     if (dims) window.duocli.resizePty(info.id, dims.cols, dims.rows);
   }, 100);
 });
+
+window.duocli.onTaskPtyCreated((info) => {
+  const now = Date.now();
+  sessionTitles.set(info.id, info.title);
+  sessionThemes.set(info.id, info.themeId);
+  sessionUpdateTimes.set(info.id, now);
+  sessionCreateTimes.set(info.id, now);
+  sessionCwds.set(info.id, info.cwd);
+  sessionDisplayNames.set(info.id, info.displayName);
+  if (info.cwd) addRecentCwd(info.cwd);
+  termManager.create(info.id, info.themeId, info.cwd, data => { writePtyWithAutoReset(info.id, data); });
+  updateEmptyState();
+  renderSessionList();
+  syncPaneLiveSessions();
+});
+
+window.duocli.onTerminalTasksChanged((snapshot) => {
+  if (snapshot.revision < terminalTaskSnapshot.revision) return;
+  terminalTaskSnapshot = snapshot;
+  renderTaskDependencyOptions();
+  if (taskQueueOverlay.classList.contains('active')) renderTaskQueue();
+});
+
+void window.duocli.listTerminalTasks().then(snapshot => {
+  terminalTaskSnapshot = snapshot;
+  renderTaskDependencyOptions();
+}).catch(error => console.error('加载计划任务失败:', error));
 
 // 远程服务器信息处理：合并推送/拉取预设
 async function handleRemoteServerInfo(info: typeof remoteServerInfo) {
@@ -4206,11 +4956,73 @@ remoteServerInfoEl.querySelector('.remote-info-retry')?.addEventListener('click'
   void handleRemoteRetryClick();
 });
 
+remoteServerInfoEl.querySelector('.remote-info-guide')?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  openRemoteGuide();
+});
+
+remoteServerInfoEl.querySelector('.remote-info-guide-hint')?.addEventListener('click', (event) => {
+  event.stopPropagation();
+  openRemoteGuide();
+});
+
+document.getElementById('empty-remote-guide-btn')?.addEventListener('click', () => {
+  openRemoteGuide();
+});
+
+const remoteGuideOverlay = document.getElementById('remote-guide-overlay');
+document.getElementById('remote-guide-close')?.addEventListener('click', () => closeRemoteGuide());
+document.getElementById('remote-guide-done')?.addEventListener('click', () => closeRemoteGuide());
+remoteGuideOverlay?.addEventListener('click', (event) => {
+  if (event.target === remoteGuideOverlay) closeRemoteGuide();
+});
+remoteGuideOverlay?.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeRemoteGuide();
+});
+
+document.getElementById('remote-guide-copy-lan')?.addEventListener('click', (event) => {
+  const url = remoteServerInfo?.lanUrl;
+  if (!url) return;
+  void copyRemoteGuideText(url, event.currentTarget as HTMLButtonElement);
+});
+
+document.getElementById('remote-guide-copy-token')?.addEventListener('click', (event) => {
+  const token = remoteServerInfo?.token;
+  if (!token) return;
+  remoteTokenVisible = true;
+  renderRemoteServerInfo();
+  void copyRemoteGuideText(token, event.currentTarget as HTMLButtonElement);
+});
+
+document.getElementById('remote-guide-copy-login')?.addEventListener('click', (event) => {
+  const loginUrl = getRemoteLoginUrl();
+  if (!loginUrl) return;
+  void copyRemoteGuideText(loginUrl, event.currentTarget as HTMLButtonElement);
+});
+
+document.getElementById('remote-guide-prepare-config')?.addEventListener('click', () => {
+  void handlePrepareRemoteTunnelConfig(true);
+});
+
+document.getElementById('remote-guide-reveal-config')?.addEventListener('click', () => {
+  void handlePrepareRemoteTunnelConfig(false);
+});
+
+document.getElementById('remote-guide-retry')?.addEventListener('click', () => {
+  void handleRemoteRetryClick();
+});
+
+document.querySelectorAll<HTMLButtonElement>('.remote-guide-copy-cmd').forEach((button) => {
+  button.addEventListener('click', () => {
+    const cmd = button.dataset.cmd;
+    if (!cmd) return;
+    void copyRemoteGuideText(cmd, button);
+  });
+});
+
 remoteServerInfoEl.querySelector('.remote-info-url')?.addEventListener('click', () => {
-  if (!remoteServerInfo) return;
-  const text = remoteServerInfo.publicUrl && remoteServerInfo.health?.status === 'healthy'
-    ? remoteServerInfo.publicUrl
-    : remoteServerInfo.lanUrl;
+  const text = getPreferredRemoteBaseUrl();
+  if (!text) return;
   void navigator.clipboard.writeText(text).catch(() => { /* ignore */ });
 });
 
@@ -4290,7 +5102,9 @@ window.duocli.getSessions().then((sessions) => {
     sessionTitles.set(info.id, info.title);
     sessionThemes.set(info.id, info.themeId);
     sessionUpdateTimes.set(info.id, now);
-    sessionCreateTimes.set(info.id, now);
+    sessionCreateTimes.set(info.id, info.createdAt || now);
+    if (info.lastSubmittedAt) sessionLastSubmittedTimes.set(info.id,
+      Math.max(info.lastSubmittedAt, sessionLastSubmittedTimes.get(info.id) || 0));
     sessionCwds.set(info.id, info.cwd);
     sessionDisplayNames.set(info.id, info.displayName);
     termManager.create(info.id, info.themeId, info.cwd, (data) => { writePtyWithAutoReset(info.id, data); });
@@ -4298,10 +5112,12 @@ window.duocli.getSessions().then((sessions) => {
   syncPaneLiveSessions();
   rebalanceDistinctAutoThemes();
   paneWorkspace.remountAll();
+  sessionRegistryReady = true;
   updatePaneAccents();
   updateEmptyState();
   renderSessionList();
 }).catch(() => {
+  sessionRegistryReady = true;
   syncPaneLiveSessions();
 });
 
@@ -4322,6 +5138,7 @@ window.duocli.onSetAutoContinueConfig((sessionId, config) => {
     autoAgree: true,
     autoAgreeDelaySec: AUTO_AGREE_DEFAULT_DELAY_SEC,
     sendDelaySec: AUTO_CONTINUE_SEND_DELAY_SEC,
+    loopEnabled: AUTO_CONTINUE_DEFAULT_LOOP_ENABLED,
     maxLoops: AUTO_CONTINUE_DEFAULT_MAX_LOOPS,
     initialDelayMs: AUTO_CONTINUE_DEFAULT_INITIAL_DELAY,
     loopCount: 0,
@@ -4333,6 +5150,7 @@ window.duocli.onSetAutoContinueConfig((sessionId, config) => {
   cancelAutoContinueRun(existing);
   Object.assign(existing, config);
   existing.maxLoops ??= AUTO_CONTINUE_DEFAULT_MAX_LOOPS;
+  existing.loopEnabled = inferLoopEnabled(existing);
   existing.initialDelayMs ??= AUTO_CONTINUE_DEFAULT_INITIAL_DELAY;
   existing.loopCount = 0;
   existing.sending = false;
@@ -4512,6 +5330,13 @@ document.querySelector('.footer-tip')!.addEventListener('click', () => {
 async function initApp(): Promise<void> {
   // 注册通知监听（桌面端和网页端通用）
   setupNotificationListener();
+  window.addEventListener('duocli:open-session', (event) => {
+    const sessionId = (event as CustomEvent<{ sessionId?: string }>).detail?.sessionId;
+    if (sessionId) switchSession(sessionId);
+  });
+  window.duocli.onNotificationOpen((sessionId: string) => {
+    if (sessionId) switchSession(sessionId);
+  });
   
   // 其他初始化...
 }

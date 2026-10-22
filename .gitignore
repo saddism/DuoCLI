@@ -46,3 +46,16 @@ frp/cloudflared-config.private.yml
 .env
 .env.*
 .duocli/
+
+# Local MCP connector state
+.local/
+
+# Test artifacts (generated)
+tests/.artifacts/
+
+# Local diagnostic screenshots can contain private conversations or access tokens.
+/IMG_0052.png
+/IMG_1777.png
+/IMG_1778.png
+/docs/images/screenshots-2026-09/
+/docs/screenshots/native-chat-binding-2026-10-03/

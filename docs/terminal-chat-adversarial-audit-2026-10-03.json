@@ -1,0 +1,155 @@
+{
+  "date": "2026-10-03",
+  "scope": [
+    "Electron 桌面终端",
+    "网页/手机 PWA 终端",
+    "对话历史、分页、输入和会话切换"
+  ],
+  "method": "延迟/过期响应、A-B-A 切换、历史分支重写、缺失输出包、恢复快照丢失、重连期间解析、原生剪贴板延迟、重绘后的链接重新悬停。仅在隔离夹具中注入测试输入。",
+  "findings": [
+    {
+      "id": "CHAT-01",
+      "severity": "P1",
+      "problem": "更早消息读取失败时，错误快照覆盖当前状态，并错误提示加载成功。",
+      "fix": "验证分页结果，失败保留当前快照并显示错误。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-chat-state.test.mjs",
+      "status": "fixed"
+    },
+    {
+      "id": "CHAT-02",
+      "severity": "P1",
+      "problem": "迟到的更早分页覆盖最新 revision 和消息总数。",
+      "fix": "拒绝不同 revision 的分页，仅合并旧页正文和分页边界。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-chat-state.test.mjs",
+      "status": "fixed"
+    },
+    {
+      "id": "CHAT-03",
+      "severity": "P2",
+      "problem": "A-B-A 切换后，上一轮分页响应仍可修改新页面状态。",
+      "fix": "分页回调绑定视图 generation，过期成功或失败均不更新页面。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-chat-state.test.mjs",
+      "status": "fixed"
+    },
+    {
+      "id": "CHAT-04",
+      "severity": "P1",
+      "problem": "同一会话重写历史后，已加载的旧分支前缀可能混入新分支。",
+      "fix": "保留旧前缀前验证重叠消息的 ID 和角色。",
+      "source": "mobile/client/app.js",
+      "regression": [
+        "tests/mobile-chat-state.test.mjs",
+        "tests/e2e/mobile-remote.e2e.mjs"
+      ],
+      "status": "fixed"
+    },
+    {
+      "id": "CHAT-05",
+      "severity": "P1",
+      "problem": "同一会话记录暂时不可读时，已显示的对话被空结果替换。",
+      "fix": "保留已读正文、显示重试状态；不同会话不会沿用此规则。",
+      "source": "mobile/client/app.js",
+      "regression": [
+        "tests/mobile-chat-state.test.mjs",
+        "tests/e2e/mobile-remote.e2e.mjs"
+      ],
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-01",
+      "severity": "P1",
+      "problem": "重连发生在快照解析期间，过期回调未释放写入计数，后续滚动持续被分类为输出。",
+      "fix": "同一终端的旧连接回调也释放计数，再拒绝其页面更新。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-terminal-output.test.mjs",
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-02",
+      "severity": "P1",
+      "problem": "发现输出序号缺口后仍可输入，迟到输出也可能重新打开输入门。",
+      "fix": "恢复期间关闭输入，忽略实时帧，完整 replay 后才恢复。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-terminal-sync.test.mjs",
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-03",
+      "severity": "P1",
+      "problem": "缺口恢复的 replay 丢失后没有专用超时，可能一直停在不完整状态。",
+      "fix": "恢复超时关闭对应连接，交由既有重连逻辑重试；成功 replay 取消超时。",
+      "source": "mobile/client/app.js",
+      "regression": "tests/mobile-terminal-sync.test.mjs",
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-04",
+      "severity": "P1",
+      "problem": "桌面恢复快照期间，键盘与快捷命令仍能写入 CLI。",
+      "fix": "统一输入入口检查同步状态及终端可见性，只有实际发送的输入才更新最近发言。",
+      "source": "src/renderer/terminal-manager.ts",
+      "regression": "tests/e2e/terminal-history-regression.e2e.mjs",
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-05",
+      "severity": "P1",
+      "problem": "文件名包含单引号时切换到双引号包裹，shell 特殊字符会改变路径含义。",
+      "fix": "POSIX 路径保持单引号引用并正确转义内嵌单引号；图片路径同步引用。",
+      "source": "src/renderer/terminal-manager.ts",
+      "regression": "tests/e2e/desktop-copy.e2e.mjs",
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-06",
+      "severity": "P2",
+      "problem": "终端关闭后，迟到的原生剪贴板结果仍可调用旧输入回调。",
+      "fix": "统一输入入口拒绝已关闭、隐藏或正在恢复的终端。",
+      "source": "src/renderer/terminal-manager.ts",
+      "regression": "tests/e2e/desktop-copy.e2e.mjs",
+      "status": "fixed"
+    },
+    {
+      "id": "TERM-07",
+      "severity": "P2",
+      "problem": "xterm 5.5 在鼠标离开后保留旧格坐标及链接缓存，重新进入同一位置时文件链接无法点击。",
+      "fix": "mouseleave 清除旧格及缓存行，下一次悬停重新读取链接。",
+      "source": "src/renderer/terminal-manager.ts",
+      "regression": "tests/e2e/desktop-copy.e2e.mjs",
+      "status": "fixed"
+    }
+  ],
+  "validation": {
+    "environment": "macOS, Node 20.19.6, headless Chrome",
+    "reproducedBeforeRepair": "8 个新单元回归先失败；桌面恢复期间输入和连续重绘链接点击也在浏览器中复现。",
+    "build": {
+      "command": "npm run build:ts",
+      "status": "pass"
+    },
+    "unit": {
+      "command": "npm run test:unit",
+      "passed": 402,
+      "failed": 0
+    },
+    "e2e": {
+      "command": "DUOCLI_INPUT_AUDIT=1 npm run test:e2e",
+      "suites": 10,
+      "status": "pass",
+      "mobile": "151/151",
+      "desktopCopy": "13/13",
+      "mobileRemote": "36/36"
+    },
+    "whitespace": {
+      "command": "git diff --check",
+      "status": "pass"
+    }
+  },
+  "limits": [
+    "未重启当前 DuoCLI 或中断现有 CLI 任务。",
+    "未进行实体 iPhone/Safari、Android 输入法、Windows/Linux 和打包版本验收。",
+    "xterm 链接兼容处理针对当前 5.5.0 内部结构；升级后需重新验证。"
+  ]
+}

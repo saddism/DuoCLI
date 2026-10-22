@@ -108,3 +108,33 @@ test('replacing a focused pane keeps normal sessions independent of the four-pan
     ['one', 'two', 'three', 'five']);
   assert.ok(layout.validateLayout(switched));
 });
+
+test('swapPaneContents exchanges terminals in a vertical split', () => {
+  let workspace = layout.createEmptyLayout();
+  const firstId = workspace.root.id;
+  workspace = layout.setPaneContent(workspace, firstId, { kind: 'terminal', sessionId: 'top' });
+  workspace = layout.splitPane(workspace, firstId, 'vertical', { kind: 'terminal', sessionId: 'bottom' }, 'split-v', 'pane-bottom');
+
+  const swapped = layout.swapPaneContents(workspace, firstId, 'pane-bottom');
+  assert.equal(swapped.root.type, 'split');
+  assert.equal(swapped.root.direction, 'vertical');
+  assert.deepEqual(
+    layout.listPanes(swapped.root).map((pane) => (pane.content.kind === 'terminal' ? pane.content.sessionId : '')),
+    ['bottom', 'top'],
+  );
+});
+
+test('splitting before a pane creates space above or to its left and focuses the new pane', () => {
+  for (const direction of ['vertical', 'horizontal']) {
+    let workspace = layout.createEmptyLayout();
+    const originalId = workspace.root.id;
+    workspace = layout.setPaneContent(workspace, originalId, { kind: 'terminal', sessionId: 'original' });
+    const split = layout.splitPane(workspace, originalId, direction, { kind: 'empty' }, 'split-before', 'new-pane', true);
+    assert.equal(split.root.direction, direction);
+    assert.equal(split.root.first.id, 'new-pane');
+    assert.equal(split.root.second.id, originalId);
+    assert.deepEqual(split.root.second.content, { kind: 'terminal', sessionId: 'original' });
+    assert.equal(split.focusedPaneId, 'new-pane');
+    assert.ok(layout.validateLayout(split));
+  }
+});

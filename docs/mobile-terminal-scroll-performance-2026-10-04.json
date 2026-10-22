@@ -1,0 +1,59 @@
+{
+  "date": "2026-10-04",
+  "scope": "手机终端滚动卡顿；保留工作区内其他审查改动。",
+  "diagnosis": [
+    {
+      "problem": "每次刷新链接高亮扫描最后 3000 行，解析逻辑换行并创建数千个标记及装饰。该工作在滚动期间也执行。",
+      "fix": "只扫描当前视口及上下邻近行，滑动和惯性期间推迟高亮；滚动后重新高亮当前视口。"
+    },
+    {
+      "problem": "清除链接装饰时没有清除其对应的 xterm marker，重复刷新会累积未释放标记。",
+      "fix": "释放装饰及对应 marker；注册装饰失败时也释放 marker。"
+    },
+    {
+      "problem": "手机拖动及折叠记录原生触摸滚动时，工具折叠仍会遍历整段历史并重建正文。",
+      "fix": "拖动、惯性和折叠层自己的滚动期间暂停扫描，手势结束后合并为一次更新；显式切换视图仍立即响应。"
+    }
+  ],
+  "benchmark": {
+    "environment": "macOS, Node 20.19.6, headless Chrome, 390x760 mobile viewport, CPU throttling 4x",
+    "fixture": "5000 行、包含文件路径和工具活动的 xterm 历史；27 行视口。没有向用户 CLI 发送测试命令。",
+    "before": {
+      "linkHighlightMs": 1401.9,
+      "logicalLinesScanned": 3000,
+      "decorations": 2822,
+      "linkLinesScannedDuringTouch": 3000,
+      "foldBufferRowsScannedDuringTouch": 5001,
+      "foldMsDuringTouch": 77.6
+    },
+    "after": {
+      "linkHighlightMs": 30.1,
+      "logicalLinesScanned": 54,
+      "decorations": 49,
+      "linkLinesScannedDuringTouch": 0,
+      "foldBufferRowsScannedDuringTouch": 0,
+      "foldMsDuringTouch": 0,
+      "markersBeforeRepeat": 49,
+      "markersAfterRepeat": 49,
+      "foldRowsScannedDuringNativeTouch": 0,
+      "updatesResumeAfterTouch": true,
+      "highlightsFollowOlderViewport": true
+    },
+    "interpretation": "这是同一隔离场景的主线程扫描开销，不是手机实测帧率或端到端网络延迟。"
+  },
+  "validation": {
+    "performanceRegression": "tests/e2e/mobile-scroll-performance.e2e.mjs；已加入 npm run test:e2e。按工作量、标记释放和手势优先级断言，不使用依赖机器速度的耗时阈值。",
+    "performance": "pass",
+    "activityFoldBrowser": "pass",
+    "unit": {"passed": 408, "failed": 0, "status": "pass"},
+    "e2e": {"suites": 11, "status": "pass", "exitCode": 0, "log": "/tmp/duocli-mobile-scroll-e2e-final.log"},
+    "retryEvidence": "首次完整回归中 mobile-remote 的 Cursor 工具折叠可见性用例超时；添加失败现场诊断后，该套单独重跑 39/39 通过，最终 11 套完整回归通过。未复现首次超时，未据此声称真机稳定性已经验证。",
+    "syntaxAndWhitespace": "pass",
+    "liveStaticAssets": "本机正在监听 9800 的源代码 Electron 服务提供的 app.js、terminal-activity-fold.js 和 sw.js 与工作区逐字节一致，sw.js 为 duocli-v109。手机刷新页面即可加载新版前端，无须重启 CLI。"
+  },
+  "limits": [
+    "未拿到具体手机、浏览器和 CLI 的反馈；尚未验证用户手机上的实际帧率。",
+    "Codex 等 alternate-screen 终端仍将手势换成远程翻页键，它的网络与 CLI 重绘延迟需要和本地滚动开销分开。",
+    "本轮仅修改源码和回归测试，没有重新打包、替换现用应用或重启用户会话。"
+  ]
+}

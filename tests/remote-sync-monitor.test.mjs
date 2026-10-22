@@ -56,6 +56,23 @@ test('probePublicRemoteServer fails when server returns 502', async () => {
   }
 });
 
+test('probePublicRemoteServer retries a transient failure', async () => {
+  let hits = 0;
+  const server = http.createServer((_req, res) => {
+    hits += 1;
+    res.statusCode = hits === 1 ? 502 : 200;
+    res.end(hits === 1 ? 'bad gateway' : 'ok');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    assert.equal(await probePublicRemoteServer(`http://127.0.0.1:${port}`), true);
+    assert.equal(hits, 2);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test('isDuocliTunnelCommand recognizes project and legacy config paths', () => {
   assert.equal(
     CloudflaredManager.isDuocliTunnelCommand('/opt/homebrew/bin/cloudflared --protocol http2 --config /Users/me/DuoCLI/frp/cloudflared-config.local.yml tunnel run'),

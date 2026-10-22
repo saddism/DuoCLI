@@ -5,10 +5,28 @@ const API = location.origin;
 // 从 URL 参数读取 token（支持带 token 直接访问）
 const urlParams = new URLSearchParams(location.search);
 const urlToken = urlParams.get('token');
+const urlCloudOrigin = urlParams.get('cloud');
+const urlFromLan = urlParams.get('from') === 'lan';
+const networkHandoffTicket = urlParams.get('handoff');
+const urlNetworkPreference = urlParams.get('network');
+if (['auto', 'lan', 'cf'].includes(urlNetworkPreference)) localStorage.setItem('duocli_network_preference', urlNetworkPreference);
+let pendingSessionToOpen = urlParams.get('session');
 if (urlToken) {
   localStorage.setItem('duocli_token', urlToken);
-  // 清除 URL 参数，避免暴露 token
-  history.replaceState({}, '', location.pathname);
+}
+if (urlCloudOrigin) {
+  try {
+    const parsedCloudOrigin = new URL(urlCloudOrigin);
+    if (parsedCloudOrigin.protocol === 'http:' || parsedCloudOrigin.protocol === 'https:') {
+      localStorage.setItem('duocli_cloud_url', parsedCloudOrigin.origin);
+    }
+  } catch { /* ignore an invalid handoff origin */ }
+}
+if (urlToken || urlCloudOrigin || pendingSessionToOpen || urlFromLan || networkHandoffTicket || urlNetworkPreference) {
+  // 清除 URL 参数，避免暴露 token 或连接交接信息
+  history.replaceState({ duocliRoot: true }, '', location.pathname);
+} else if (!history.state?.duocliRoot && !history.state?.duocliSession) {
+  history.replaceState({ duocliRoot: true }, '', location.pathname);
 }
 let token = localStorage.getItem('duocli_token') || '';
 let currentSessionId = null;
@@ -30,13 +48,31 @@ const mobileFileTree = createFileTreeState();
 const fileBrowseTree = createFileTreeState();
 let fileBrowseFilter = 'all';
 let filePreviewReturnPage = 'detail-page';
+let filePreviewCurrentPath = '';
 let mobileFilePreviewRequest = 0;
 let currentDevicePanel = 'device';
 let devicePanelReturnPage = 'main-page';
 let activeSessionsCache = [];
+let terminalTaskSnapshot = { revision: 0, tasks: [] };
 let closedSessions = [];
-let closedSessionsCollapsed = false;
+let closedSessionsCollapsed = true;
 const restoringClosedSessionIds = new Set();
+let macDesktopClient = null;
+const macDesktopEnabled = false;
+const COMPUTER_DEVICE_ID = 'duocli-computer';
+
+function isComputerDevice(id) {
+  return id === COMPUTER_DEVICE_ID;
+}
+
+function isComputerSelected() {
+  return isComputerDevice($('device-select')?.value);
+}
+
+function androidControlDeviceId() {
+  const id = androidMirrorDevice || $('device-select')?.value || '';
+  return id && !isComputerDevice(id) ? id : '';
+}
 
 // xterm.js 相关
 let term = null;
@@ -49,31 +85,158 @@ let wsConnectTimeoutTimer = null;
 let wsLastPongAt = 0;
 let wsReplayRetryTimer = null;
 let wsReplayRetryCount = 0;
+let wsConnectionGeneration = 0;
+let wsSessionId = null;
 let terminalInputReady = false;
+let sessionViewMode = 'terminal';
+let shortcutMode = 'commands';
+let sessionViewGeneration = 0;
+let currentSessionChatCapable = false;
+let chatPollTimer = null;
+let chatPollGeneration = 0;
+let chatRefreshRequest = 0;
+let chatRefreshController = null;
+let chatPollFailures = 0;
+const chatSnapshots = new Map();
+const chatLocalMessages = new Map();
+const chatOlderLoads = new Set();
+const nativeChatView = globalThis.DuoNativeChatView;
+const CHAT_VIEW_PREF_KEY = 'duocli_mobile_chat_view';
 let composerSubmission = null;
+const composerSubmissions = new Map();
+let pendingTerminalSendIntent = null;
 let copyToastTimer = null;
 let isUserScrolling = false;
 let terminalTouchActive = false;
 let terminalScrollInteractionRevision = 0;
 let terminalOutputWriteCount = 0;
 let terminalWriteQueue = Promise.resolve();
+let terminalPendingWrite = null;
 let terminalSequence = -1;
 let pendingRecreateViewport = null;
-// 不同 xterm 版本的滚动回调可能在同步代码之后触发，
-// 用布尔标志会被竞态误判。改用时间戳窗口标记程序化滚动。
+let terminalHistoryScrollback = 0;
+let terminalHasMoreHistory = false;
+let terminalArchiveHasMore = false;
+let terminalHistoryLoading = false;
+let terminalHistoryLayer = null;
+let terminalFoldView = null;
+let terminalCapabilityVersion = 1;
+let terminalEpoch = 1;
+let terminalHistoryCursor = null;
+let terminalFirstLatestPaint = false;
+let terminalConnectingHintTimer = null;
+let terminalHistoryGestureAccum = 0;
+let terminalHistoryIntent = false;
+let terminalResyncing = false;
+let terminalOpenGeneration = 0;
+let terminalSnapshotGeneration = 0;
+// 仅用于跟尾（jumpTerminalToLatest）。回看/跳到历史位置绝不能开这个窗口，
+// 否则 onScroll 会把 isUserScrolling 清掉，新输出再把视口拽回底部。
 let programmaticScrollUntil = 0;
 let sseReconnectTimer = null;
 let sseReconnectAttempt = 0;
 const WEAK_NETWORK_STORAGE_KEY = 'duocli_weak_network_mode';
 const MOBILE_LAST_CWD_KEY = 'duocli_mobile_last_cwd';
 const MOBILE_LAST_PRESET_KEY = 'duocli_mobile_last_preset';
+const MOBILE_DRAFTS_KEY = 'duocli_mobile_drafts_v1';
+const MOBILE_PENDING_SUBMISSIONS_KEY = 'duocli_mobile_pending_submissions_v1';
+const MAX_SUBMISSION_LENGTH = 100_000;
 let weakNetworkMode = localStorage.getItem(WEAK_NETWORK_STORAGE_KEY) === '1';
+const mobileDrafts = new Map();
+const mobilePendingSubmissions = new Map();
+
+function loadMobileDrafts() {
+  try {
+    const value = JSON.parse(localStorage.getItem(MOBILE_DRAFTS_KEY) || '{}');
+    if (!value || typeof value !== 'object') return;
+    for (const [sessionId, text] of Object.entries(value)) {
+      if (typeof text === 'string' && text.length <= 200_000) mobileDrafts.set(sessionId, text);
+    }
+  } catch { /* ignore malformed local state */ }
+}
+
+function saveMobileDrafts() {
+  try {
+    const value = Object.fromEntries([...mobileDrafts].filter(([, text]) => text));
+    localStorage.setItem(MOBILE_DRAFTS_KEY, JSON.stringify(value));
+  } catch { /* storage can be unavailable in private browsing */ }
+}
+
+function saveMobileDraft(sessionId, text) {
+  if (!sessionId) return;
+  const normalized = String(text || '');
+  if (normalized) mobileDrafts.set(sessionId, normalized);
+  else mobileDrafts.delete(sessionId);
+  saveMobileDrafts();
+}
+
+function removeMobileDraft(sessionId) {
+  if (!sessionId) return;
+  mobileDrafts.delete(sessionId);
+  saveMobileDrafts();
+}
+
+function saveCurrentMobileDraft() {
+  if (currentSessionId && $('msg-input')) saveMobileDraft(currentSessionId, $('msg-input').value);
+}
+
+function restoreMobileDraft(sessionId) {
+  const input = $('msg-input');
+  if (!input) return;
+  const pending = mobilePendingSubmissions.get(sessionId);
+  input.value = mobileDrafts.get(sessionId)
+    || (!composerSubmissions.has(sessionId) ? pending?.text : '') || '';
+  resizeComposer();
+}
+
+function loadMobilePendingSubmissions() {
+  try {
+    const value = JSON.parse(localStorage.getItem(MOBILE_PENDING_SUBMISSIONS_KEY) || '{}');
+    if (!value || typeof value !== 'object') return;
+    for (const [id, item] of Object.entries(value)) {
+      if (!item || typeof item !== 'object' || typeof item.sessionId !== 'string'
+          || typeof item.text !== 'string' || item.text.length > MAX_SUBMISSION_LENGTH) continue;
+      mobilePendingSubmissions.set(item.sessionId, {
+        id: typeof item.id === 'string' ? item.id : id,
+        sessionId: item.sessionId,
+        text: item.text,
+        retryCount: Number.isInteger(item.retryCount) ? item.retryCount : 0,
+      });
+    }
+  } catch { /* ignore malformed local state */ }
+}
+
+function saveMobilePendingSubmissions() {
+  try {
+    localStorage.setItem(MOBILE_PENDING_SUBMISSIONS_KEY, JSON.stringify(Object.fromEntries(mobilePendingSubmissions)));
+  } catch { /* ignore */ }
+}
+
+loadMobileDrafts();
+loadMobilePendingSubmissions();
 const terminalScrollHelpers = globalThis.DuoTerminalScrollHelpers || {
+  LIVE_TERMINAL_SCROLLBACK: 5000,
   isAtBottom(viewportY, baseY) { return viewportY >= baseY; },
+  isAtHistoryEdge(input) { return Boolean(input?.noLocalHistory || (input?.viewportY ?? 0) <= 3); },
   shouldFollowOutput(wasAtBottom, touchActive, startInteraction, currentInteraction) {
     return wasAtBottom && !touchActive && startInteraction === currentInteraction;
   },
+  isHistoryDirection(deltaY) { return deltaY < 0; },
+  shouldRequestHistory() { return false; },
+  shouldFollowAfterLayout(input) {
+    return !input?.userScrolling && !input?.touchActive && !input?.historyVisible
+      && !input?.alreadyAtBottom && !input?.firstLatestPaint;
+  },
+  alternateScreenPageKeys() { return { data: '', remainder: 0 }; },
+  createAlternateScreenScroller() {
+    return { scroll() { return false; }, wheel() { return false; }, reset() {} };
+  },
+  ALT_SCREEN_PAGE_UP: '\u001b[5~',
+  ALT_SCREEN_PAGE_DOWN: '\u001b[6~',
 };
+const terminalHistoryLayerApi = globalThis.DuoTerminalHistoryLayer;
+const terminalFoldViewApi = globalThis.DuoTerminalActivityFold;
+const terminalMomentum = globalThis.DuoTerminalMomentum;
 const spinnerInterceptor = globalThis.DuoSpinnerInterceptor || {
   intercept(data) { return typeof data === 'string' && data.length ? data : null; },
 };
@@ -169,7 +332,7 @@ function ensureWeakNetworkPrompt() {
     if (!weakNetworkMode) {
       setWeakNetworkMode(true);
       showCopyToast('已切到弱网模式，正在重连');
-      if (currentSessionId && $('detail-page').classList.contains('active')) {
+      if (currentSessionId && $('detail-page').classList.contains('active') && sessionViewMode !== 'chat') {
         connectWebSocket(currentSessionId);
       }
       if ($('main-page').classList.contains('active') && token) {
@@ -220,54 +383,118 @@ function shortenPath(p, maxLen = 30) {
   return '…/' + result;
 }
 
-// CLI 标签配色来自 cli-tag-colors.js，桌面端用的是同一份
-const { getCliTagColors } = globalThis.DuoCliTagColors || {
-  getCliTagColors: () => ['#94a3b8', '#1e293b'],
-};
-
 // CLI Logo 来自 cli-logos.js，桌面端用的也是同一份
-const { getLogoUrl, getDefaultLogoUrl, hasLogo } = globalThis.DuoCliLogos || {
+const { getLogoUrl, getDefaultLogoUrl, getLetterLogoUrl, hasLogo, logoNeedsInvert } = globalThis.DuoCliLogos || {
   getLogoUrl: () => '',
   getDefaultLogoUrl: () => '',
+  getLetterLogoUrl: () => '',
   hasLogo: () => false,
+  logoNeedsInvert: () => false,
 };
 
+function setDetailCliLogo(displayName) {
+  const img = $('detail-cli-logo');
+  if (!img) return;
+  const name = String(displayName || '').trim();
+  if (!name) {
+    img.hidden = true;
+    img.removeAttribute('src');
+    img.removeAttribute('title');
+    img.classList.remove('cli-logo-invert');
+    return;
+  }
+  const fallback = (typeof getLetterLogoUrl === 'function' ? getLetterLogoUrl(name) : '')
+    || (typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : getLogoUrl(name));
+  img.onerror = () => {
+    if (img.src !== fallback) {
+      img.src = fallback;
+      img.classList.remove('cli-logo-invert');
+    }
+  };
+  img.src = getLogoUrl(name);
+  img.classList.toggle('cli-logo-invert', Boolean(logoNeedsInvert?.(name)));
+  img.title = name;
+  img.hidden = false;
+}
+
 function hideTerminalLoading() {
+  if (terminalConnectingHintTimer) {
+    clearTimeout(terminalConnectingHintTimer);
+    terminalConnectingHintTimer = null;
+  }
   const el = $('terminal-loading');
   if (el && !el.classList.contains('hidden')) {
     el.classList.add('hidden');
   }
 }
 
-function showTerminalLoading() {
+function showTerminalLoading(labelText = '正在连接…') {
   const el = $('terminal-loading');
-  if (el) el.classList.remove('hidden');
+  if (!el) return;
+  el.classList.remove('hidden');
+  const label = el.querySelector('span');
+  if (label) label.textContent = labelText;
+  const spinner = el.querySelector('.loading-spinner');
+  if (spinner) spinner.style.display = '';
+}
+
+function armConnectingPlaceholder() {
+  hideTerminalLoading();
+  setTerminalRevealPending(true);
+  terminalFirstLatestPaint = false;
+  terminalConnectingHintTimer = setTimeout(() => {
+    terminalConnectingHintTimer = null;
+    if (!terminalFirstLatestPaint) showTerminalLoading('正在连接…');
+  }, 150);
 }
 
 function isTerminalInputReady() {
+  if (globalThis.duocliNetworkSwitching) return false;
+  if (sessionViewMode === 'chat') {
+    return navigator.onLine !== false && !!currentSessionId;
+  }
   return terminalInputReady
+    && !terminalResyncing
     && navigator.onLine !== false
     && !!ws
-    && ws.readyState === WebSocket.OPEN;
+    && ws.readyState === WebSocket.OPEN
+    && wsSessionId === currentSessionId;
 }
 
 function updateComposerAvailability() {
   const sendButton = $('send-btn');
   const input = $('msg-input');
   const ready = isTerminalInputReady();
-  const disabled = !ready || !!composerSubmission;
+  composerSubmission = currentSessionId ? composerSubmissions.get(currentSessionId) || null : null;
+  const waitingForReplay = pendingTerminalSendIntent?.sessionId === currentSessionId;
+  const canQueueForReplay = !globalThis.duocliNetworkSwitching && !ready && sessionViewMode === 'terminal' && !!term
+    && navigator.onLine !== false && ws?.readyState === WebSocket.OPEN
+    && wsSessionId === currentSessionId && !!input?.value.trim();
+  const disabled = (!ready && !canQueueForReplay) || !!composerSubmission || waitingForReplay;
 
   if (sendButton) {
     sendButton.disabled = disabled;
     sendButton.setAttribute('aria-disabled', String(disabled));
-    sendButton.title = ready ? '发送' : '终端连接中，请稍候';
+    sendButton.title = ready ? '发送' : canQueueForReplay ? '连接恢复后发送' : '终端连接中，请稍候';
     sendButton.dataset.terminalReady = String(ready);
+    const label = sendButton.querySelector('span');
+    if (label) label.textContent = composerSubmission ? '发送中…' : waitingForReplay ? '等待连接…' : '发送';
   }
-  // 保留输入框可编辑，让用户可以先写好消息；只拦截发送动作。
   if (input) {
-    input.placeholder = ready ? '输入终端消息或命令...' : '终端连接中，请稍候...';
+    input.placeholder = ready
+      ? (sessionViewMode === 'chat' ? '输入跟进…' : '输入终端消息或命令...')
+      : '终端连接中，请稍候...';
     input.dataset.terminalReady = String(ready);
+    resizeComposer();
   }
+}
+
+function resizeComposer() {
+  const input = $('msg-input');
+  if (!input) return;
+  input.style.height = '42px';
+  input.style.height = `${Math.min(160, Math.max(42, input.scrollHeight + 2))}px`;
+  input.style.overflowY = input.scrollHeight > 160 ? 'auto' : 'hidden';
 }
 
 function setTerminalInputReady(ready) {
@@ -283,24 +510,30 @@ function api(path, opts = {}) {
   const timeoutMs = opts.timeout != null
     ? opts.timeout
     : (weakNetworkMode ? 25000 : 12000);
-  let signal = opts.signal;
+  const controller = new AbortController();
+  const externalSignal = opts.signal;
   let timer = null;
-  if (timeoutMs > 0 && !signal) {
-    const ctrl = new AbortController();
-    signal = ctrl.signal;
-    timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let timedOut = false;
+  let onAbort = null;
+  if (externalSignal) {
+    onAbort = () => controller.abort();
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener('abort', onAbort, { once: true });
   }
-  const cleanup = () => { if (timer) { clearTimeout(timer); timer = null; } };
-  return fetch(`${API}${path}`, { ...opts, headers, signal })
+  if (timeoutMs > 0) timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  const cleanup = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (externalSignal && onAbort) externalSignal.removeEventListener('abort', onAbort);
+  };
+  const request = { ...opts, headers, signal: controller.signal };
+  delete request.timeout;
+  return fetch(`${API}${path}`, request)
     .then(async r => {
-      cleanup();
-      if (r.status === 401) { logout(); throw new Error('未授权'); }
+      if (r.status === 401 && path !== '/api/auth') { logout(); throw new Error('未授权'); }
       let data = {};
       try {
         data = await r.json();
-      } catch {
-        data = {};
-      }
+      } catch {}
       if (!r.ok) {
         const message = data && typeof data.error === 'string' && data.error.trim()
           ? data.error.trim()
@@ -310,14 +543,14 @@ function api(path, opts = {}) {
       return data;
     })
     .catch((err) => {
-      cleanup();
-      if (err && err.name === 'AbortError') {
+      if (err && err.name === 'AbortError' && timedOut) {
         const e = new Error('请求超时，请检查网络');
         e.code = 'TIMEOUT';
         throw e;
       }
       throw err;
-    });
+    })
+    .finally(cleanup);
 }
 
 function isComputerPointer() {
@@ -328,6 +561,14 @@ function supportsLandscapePanels() {
   return isComputerPointer() || window.matchMedia('(orientation: landscape)').matches;
 }
 
+function supportsLandscapeWorkspace() {
+  return supportsLandscapePanels()
+    && window.matchMedia('(min-width: 720px)').matches
+    && window.matchMedia('(orientation: landscape)').matches;
+}
+
+let landscapeSessionsCollapsed = false;
+
 function syncLandscapePanelButtons() {
   const sessionsOpen = $('main-page').classList.contains('landscape-drawer-open');
   const deviceOpen = $('device-page').classList.contains('landscape-drawer-open');
@@ -337,7 +578,7 @@ function syncLandscapePanelButtons() {
   });
   document.querySelectorAll('.landscape-device-toggle').forEach(button => {
     button.setAttribute('aria-expanded', String(deviceOpen));
-    button.title = deviceOpen ? '收起手机侧栏' : '展开手机侧栏';
+    button.title = deviceOpen ? '收起手机侧栏' : '拉入手机界面';
   });
 }
 
@@ -345,6 +586,68 @@ function scheduleLandscapeWorkspaceResize() {
   if (!$('detail-page').classList.contains('active')) return;
   requestAnimationFrame(scheduleTerminalResize);
   setTimeout(scheduleTerminalResize, 180);
+}
+
+function applyLandscapeWorkspaceChrome() {
+  const workspace = supportsLandscapeWorkspace() && $('detail-page').classList.contains('active');
+  document.body.classList.toggle('landscape-workspace', workspace);
+  placeNetModeButton();
+  if (!workspace) {
+    // A tablet can keep a fine pointer after rotation (mouse/trackpad).
+    // Portrait navigation must not retain the landscape drawer state.
+    if (!window.matchMedia('(orientation: landscape)').matches) closeLandscapePanels();
+    else syncLandscapePanelButtons();
+    return;
+  }
+  const sessionsOpen = !landscapeSessionsCollapsed;
+  $('main-page').classList.toggle('landscape-drawer-open', sessionsOpen);
+  document.body.classList.toggle('landscape-sessions-open', sessionsOpen);
+  if (sessionsOpen) closeSwipedSessionCard();
+  syncLandscapePanelButtons();
+  if (sessionsOpen && !sseSource) startSSE();
+  scheduleLandscapeWorkspaceResize();
+}
+
+function syncCurrentSessionCard() {
+  document.querySelectorAll('.session-card[data-id]').forEach((card) => {
+    card.classList.toggle('is-current', card.dataset.id === currentSessionId);
+  });
+}
+
+function showLandscapeEmptyTerminal() {
+  stopNativeChatPolling();
+  currentSessionChatCapable = false;
+  applySessionViewMode('terminal');
+  currentSessionId = null;
+  closeTerminal();
+  setTerminalInputReady(false);
+  if ($('detail-name')) $('detail-name').textContent = '未选择会话';
+  setDetailCliLogo('');
+  if ($('detail-status')) $('detail-status').className = 'status-dot inactive';
+  mobilePromptExpanded = false;
+  mobilePromptMarker = null;
+  renderMobilePromptBanner();
+  const loading = $('terminal-loading');
+  if (!loading) return;
+  loading.classList.remove('hidden');
+  const label = loading.querySelector('span');
+  if (label) label.textContent = '左侧选择会话，或点击 + 新建';
+  const spinner = loading.querySelector('.loading-spinner');
+  if (spinner) spinner.style.display = 'none';
+}
+
+function leaveToSessionList(excludeId) {
+  if (supportsLandscapeWorkspace()) {
+    landscapeSessionsCollapsed = false;
+    showPage('detail-page');
+    const next = activeSessionsCache.find(session => session?.id && session.id !== excludeId)?.id || null;
+    if (next) void openSession(next);
+    else showLandscapeEmptyTerminal();
+    void refreshSessions();
+    return;
+  }
+  showPage('main-page');
+  void refreshSessions();
 }
 
 function closeLandscapePanels() {
@@ -357,6 +660,12 @@ function closeLandscapePanels() {
 
 async function toggleLandscapeSessionsPanel() {
   if (!supportsLandscapePanels()) return;
+  if (supportsLandscapeWorkspace() && $('detail-page').classList.contains('active')) {
+    landscapeSessionsCollapsed = !landscapeSessionsCollapsed;
+    applyLandscapeWorkspaceChrome();
+    if (!landscapeSessionsCollapsed) await refreshSessions();
+    return;
+  }
   const opening = !$('main-page').classList.contains('landscape-drawer-open');
   $('main-page').classList.toggle('landscape-drawer-open', opening);
   document.body.classList.toggle('landscape-sessions-open', opening);
@@ -377,6 +686,7 @@ async function toggleLandscapeDevicePanel() {
     $('device-page').classList.remove('landscape-drawer-open');
     document.body.classList.remove('landscape-device-open');
     stopAndroidMirror();
+    hideComputerDesktop();
     syncLandscapePanelButtons();
     scheduleLandscapeWorkspaceResize();
     return;
@@ -386,7 +696,9 @@ async function toggleLandscapeDevicePanel() {
 
 function setDevicePanel(panel) {
   const allowed = ['device', 'files', 'preview'];
-  currentDevicePanel = allowed.includes(panel) ? panel : 'device';
+  const next = allowed.includes(panel) ? panel : 'device';
+  if (currentDevicePanel === 'preview' && next !== 'preview') stopFilePreviewPlayback();
+  currentDevicePanel = next;
   document.querySelectorAll('.device-panel-tab').forEach((button) => {
     const selected = button.dataset.devicePanel === currentDevicePanel;
     button.classList.toggle('active', selected);
@@ -413,14 +725,34 @@ function openDevicePanel(panel = 'device') {
   }
 }
 
+function placeNetModeButton() {
+  const btn = $('net-mode-btn');
+  if (!btn) return;
+  // 竖屏对话内不占顶栏；只在会话列表、或横屏工作区左上角显示。
+  const useDetail = document.body.classList.contains('landscape-workspace')
+    && $('detail-page')?.classList.contains('active');
+  const host = $(useDetail ? 'detail-net-mode-host' : 'main-net-mode-host');
+  if (host && btn.parentElement !== host) host.appendChild(btn);
+}
+
 function showPage(id) {
+  if (id === 'main-page' && supportsLandscapeWorkspace() && token) {
+    id = 'detail-page';
+    landscapeSessionsCollapsed = false;
+  }
+  stopFilePreviewPlayback();
   if (id === 'main-page' || id === 'login-page') stopAndroidMirror();
   if (id !== 'detail-page') closeLandscapePanels();
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   $(id).classList.add('active');
+  if (id !== 'main-page') closeSwipedSessionCard();
   if (id !== 'detail-page') {
     hideWeakNetworkPrompt();
+    document.body.classList.remove('landscape-workspace');
+  } else {
+    applyLandscapeWorkspaceChrome();
   }
+  placeNetModeButton();
 }
 
 function formatTime(ts) {
@@ -463,8 +795,10 @@ async function copyTextToClipboard(text) {
   ta.setSelectionRange(0, ta.value.length);
   let ok = false;
   try {
+    suppressTerminalCopyHijack = true;
     ok = document.execCommand('copy');
   } catch {}
+  suppressTerminalCopyHijack = false;
   document.body.removeChild(ta);
   return ok;
 }
@@ -523,7 +857,14 @@ async function showAutoContinueConfigModal(sessionId) {
   $('ac-initial-delay').value = String(Math.round((config.initialDelayMs || 0) / 60000));
   $('ac-cmd-interval').value = String(Math.round((config.commandIntervalMs || 2000) / 1000));
   $('ac-send-delay').value = String(config.sendDelaySec ?? 2);
-  $('ac-max-loops').value = String(config.maxLoops ?? -1);
+  const loopEnabled = typeof config.loopEnabled === 'boolean'
+    ? config.loopEnabled
+    : (config.maxLoops === -1 || (typeof config.maxLoops === 'number' && config.maxLoops > 1));
+  $('ac-loop-enabled').checked = loopEnabled;
+  $('ac-max-loops').value = String(loopEnabled
+    ? ((config.maxLoops === 1 ? -1 : (config.maxLoops ?? -1)))
+    : -1);
+  $('ac-loop-fields').hidden = !loopEnabled;
   $('ac-auto-agree').checked = config.autoAgree !== false;
   $('ac-agree-delay').value = String(config.autoAgreeDelaySec ?? 5);
   $('ac-agree-delay-row').style.display = $('ac-auto-agree').checked ? '' : 'none';
@@ -542,11 +883,12 @@ async function showAutoContinueConfigModal(sessionId) {
 
 function updateDetailAutoContinueUI(config) {
   const label = $('detail-ac-label');
-  if (label) {
-    const enabled = config && config.enabled;
-    label.textContent = '设';
-    label.className = 'ac-label' + (enabled ? ' enabled' : '');
-    label.title = enabled ? '计划已开启，点击设置' : '计划设置';
+  if (label) label.hidden = true;
+  const menu = $('detail-menu-plan-btn');
+  if (menu) {
+    const enabled = Boolean(config && config.enabled);
+    menu.textContent = enabled ? '计划设置 · 已开' : '计划设置';
+    menu.classList.toggle('is-enabled', enabled);
   }
 }
 
@@ -561,7 +903,52 @@ function insertPathToTerminal(filePath) {
     showCopyToast('终端连接中，请稍候再发送');
     return;
   }
+  if (sessionViewMode === 'chat') {
+    const input = $('msg-input');
+    const value = String(filePath || '');
+    input.setRangeText(value, input.selectionStart, input.selectionEnd, 'end');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.focus({ preventScroll: true });
+    return;
+  }
   sendInputWithHexEnter(`${quotePathForShell(filePath)} `);
+}
+
+function confirmMobileAction(message, options = {}) {
+  return new Promise((resolve) => {
+    document.getElementById('mobile-confirm-dialog')?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'mobile-confirm-dialog';
+    overlay.className = 'modal active';
+    overlay.style.zIndex = '13000';
+    const confirmLabel = options.confirmLabel || '关闭';
+    const cancelLabel = options.cancelLabel || '取消';
+    overlay.innerHTML = `
+      <div class="modal-content" role="dialog" aria-modal="true">
+        <h3>${options.title || '确认'}</h3>
+        <p class="confirm-mobile-message"></p>
+        <div class="modal-actions">
+          <button type="button" class="btn-secondary" data-confirm="no">${cancelLabel}</button>
+          <button type="button" class="btn-danger" data-confirm="yes">${confirmLabel}</button>
+        </div>
+      </div>`;
+    overlay.querySelector('.confirm-mobile-message').textContent = String(message || '');
+    const finish = (ok) => {
+      overlay.remove();
+      resolve(ok);
+    };
+    overlay.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-confirm]');
+      if (button) {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(button.getAttribute('data-confirm') === 'yes');
+        return;
+      }
+      if (event.target === overlay) finish(false);
+    });
+    document.body.appendChild(overlay);
+  });
 }
 
 function showMobileContextMenu(clientX, clientY, items) {
@@ -626,7 +1013,226 @@ function markUserScrolling() {
   if (!term) return;
   terminalScrollInteractionRevision++;
   isUserScrolling = !isAtBottom();
-  if (!isUserScrolling) setTerminalUnreadOutput(false);
+  if (!isUserScrolling) {
+    setTerminalUnreadOutput(false);
+    exitTerminalHistory();
+  }
+}
+
+const TERMINAL_HISTORY_CHUNK = 80;
+const LIVE_TERMINAL_SCROLLBACK = terminalScrollHelpers.LIVE_TERMINAL_SCROLLBACK || 5000;
+
+function noteTerminalHistoryMeta(msg) {
+  if (Number.isInteger(msg?.scrollback)) terminalHistoryScrollback = Math.max(0, msg.scrollback);
+  // hasMoreHistory means this replay omitted older rows. historyHasMore only
+  // means the archive has lines, which are already in the live scrollback.
+  if (typeof msg?.hasMoreHistory === 'boolean') terminalHasMoreHistory = msg.hasMoreHistory;
+  if (typeof msg?.historyHasMore === 'boolean') terminalArchiveHasMore = msg.historyHasMore;
+  if (Number.isInteger(msg?.epoch)) terminalEpoch = msg.epoch;
+  if (typeof msg?.historyCursor === 'string' || msg?.historyCursor === null) {
+    terminalHistoryCursor = msg.historyCursor;
+  }
+  if (Number.isInteger(msg?.capabilityVersion)) terminalCapabilityVersion = msg.capabilityVersion;
+}
+
+function usesPagedHistory() {
+  return terminalCapabilityVersion >= 2 && terminalHistoryLayerApi;
+}
+
+let terminalHistoryPendingRequest = null;
+let terminalHistoryRequestTimer = null;
+
+function cancelTerminalHistoryRequest() {
+  clearTimeout(terminalHistoryRequestTimer);
+  terminalHistoryRequestTimer = null;
+  terminalHistoryPendingRequest = null;
+  terminalHistoryLoading = false;
+  terminalHistoryLayer?.setLoading(false);
+}
+
+function requestHistoryPage(query = {}) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    terminalHistoryLayer?.setLoading(false);
+    terminalHistoryLayer?.abandonSeek?.();
+    return;
+  }
+  if (terminalHistoryLoading) return;
+  if (!terminalHasMoreHistory && !query.force) {
+    terminalHistoryLayer?.setLoading(false);
+    terminalHistoryLayer?.abandonSeek?.();
+    return;
+  }
+  terminalHistoryLoading = true;
+  terminalHistoryLayer?.setLoading(true);
+  const requestId = query.requestId || `m${Date.now()}`;
+  const pending = { requestId, sessionId: currentSessionId, generation: terminalOpenGeneration };
+  terminalHistoryPendingRequest = pending;
+  clearTimeout(terminalHistoryRequestTimer);
+  terminalHistoryRequestTimer = setTimeout(() => {
+    if (terminalHistoryPendingRequest !== pending) return;
+    const seeking = terminalHistoryLayer?.isSeeking?.();
+    cancelTerminalHistoryRequest();
+    if (seeking) terminalHistoryLayer.requestMore();
+    else terminalHistoryLayer?.setError?.('加载超时，继续向上滚动重试');
+  }, 10000);
+  if (usesPagedHistory()) {
+    wsSend({
+      type: 'historyBefore',
+      sessionId: currentSessionId,
+      epoch: terminalEpoch,
+      requestId,
+      beforeCursor: query.beforeCursor !== undefined ? query.beforeCursor : terminalHistoryCursor,
+      // The first page overlaps the 120-row live window. Include enough rows
+      // to reach older content in one network round trip when available.
+      limitRows: query.beforeCursor == null ? 200 : TERMINAL_HISTORY_CHUNK,
+    });
+    return;
+  }
+  wsSend({
+    type: 'history',
+    scrollback: terminalHistoryScrollback + TERMINAL_HISTORY_CHUNK,
+  });
+}
+
+function maybeRequestTerminalHistory(explicitIntent = false, deltaY = 0) {
+  if (!term || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!terminalFirstLatestPaint) return;
+  const buffer = term.buffer.active;
+  const should = terminalScrollHelpers.shouldRequestHistory({
+    explicitIntent,
+    hasMore: terminalHasMoreHistory,
+    loading: terminalHistoryLoading,
+    touchActive: terminalTouchActive,
+    bufferType: buffer.type,
+    noLocalHistory: buffer.baseY <= 0,
+    viewportY: buffer.viewportY,
+  });
+  if (!should) return;
+  if (usesPagedHistory()) {
+    enterTerminalHistory(deltaY);
+    return;
+  }
+  requestHistoryPage({ force: true });
+}
+
+function enterTerminalHistory(deltaY = 0) {
+  if (!terminalHistoryLayer) return;
+  isUserScrolling = true;
+  const revision = `${terminalSequence}:${term?.cols || 0}:${term?.rows || 0}`;
+  if (!terminalHistoryLayer.isVisible()) {
+    // Reuse loaded pages only while the live output has not advanced. When it
+    // has, the server must choose the current archive boundary on a new page.
+    if (!terminalHistoryLayer.state.items.length
+        || terminalHistoryLayer.state.liveRevision !== revision) {
+      cancelTerminalHistoryRequest();
+      terminalHistoryLayer.reset();
+      terminalHistoryCursor = null;
+    }
+  }
+  terminalHistoryLayer.show({
+    deltaY,
+    hasMore: terminalHasMoreHistory,
+    nextCursor: terminalHistoryCursor,
+    revision,
+  });
+  if (term?.cols) terminalHistoryLayer.setCols(term.cols);
+}
+
+function handlePagedHistoryPan(deltaY, event) {
+  if (!usesPagedHistory() || !terminalHistoryLayer || !terminalFirstLatestPaint) return false;
+  if (terminalHistoryLayer.isVisible()) {
+    if (event?.cancelable) event.preventDefault();
+    terminalHistoryLayer.scrollByPixels(deltaY);
+    return true;
+  }
+  const towardHistory = terminalScrollHelpers.isHistoryDirection(deltaY);
+  if (!towardHistory) return false;
+  const buffer = term?.buffer?.active;
+  if (!buffer || buffer.type === 'alternate') return false;
+  const atEdge = terminalScrollHelpers.isAtHistoryEdge({
+    noLocalHistory: buffer.baseY <= 0,
+    viewportY: buffer.viewportY,
+  });
+  if (!atEdge || !terminalHasMoreHistory) return false;
+  terminalHistoryIntent = true;
+  terminalHistoryGestureAccum += deltaY;
+  enterTerminalHistory(deltaY);
+  if (event?.cancelable) event.preventDefault();
+  return true;
+}
+
+function exitTerminalHistory() {
+  if (!terminalHistoryLayer) return;
+  stopTerminalMomentum();
+  const wasVisible = terminalHistoryLayer.isVisible();
+  terminalHistoryLayer.hide();
+  if (wasVisible) jumpTerminalToLatest();
+  terminalFoldView?.returnFromOlder?.();
+}
+
+function applyTerminalHistoryPage(msg, generation) {
+  if (generation !== terminalOpenGeneration || currentSessionId && msg.sessionId && msg.sessionId !== currentSessionId) return;
+  const pending = terminalHistoryPendingRequest;
+  if (msg.requestId && (!pending || msg.requestId !== pending.requestId
+      || pending.sessionId !== currentSessionId || pending.generation !== generation)) return;
+  if (!terminalHistoryLayer) return;
+  const result = terminalHistoryLayer.prepend(msg);
+  if (result?.ignored) return;
+  cancelTerminalHistoryRequest();
+  if (msg.stale) {
+    noteTerminalHistoryMeta(msg);
+    terminalHistoryCursor = msg.nextCursor ?? null;
+    if (typeof msg.hasMore === 'boolean') terminalHasMoreHistory = msg.hasMore;
+  }
+  // The overlay alone owns nextCursor/hasMore for older pages. Exhausting
+  // that direction must not overwrite the live session's history boundary.
+}
+
+function applyTerminalHistorySnapshot(msg) {
+  terminalPendingWrite = null;
+  cancelTerminalHistoryRequest();
+  if (usesPagedHistory()) {
+    applyTerminalHistoryPage({
+      items: [],
+      stale: false,
+      hasMore: msg.hasMoreHistory,
+      nextCursor: terminalHistoryCursor,
+    }, terminalOpenGeneration);
+    return;
+  }
+  const activeTerm = term;
+  const generation = terminalOpenGeneration;
+  if (!activeTerm || !msg?.data) {
+    terminalHistoryLoading = false;
+    noteTerminalHistoryMeta(msg);
+    return;
+  }
+  const fromBottom = activeTerm.buffer.active.baseY - activeTerm.buffer.active.viewportY;
+  setTerminalRevealPending(true);
+  terminalWriteQueue = terminalWriteQueue.then(() => new Promise(resolve => {
+    if (term !== activeTerm || generation !== terminalOpenGeneration) {
+      terminalHistoryLoading = false;
+      setTerminalRevealPending(false);
+      resolve();
+      return;
+    }
+    activeTerm.reset();
+    activeTerm.write(msg.data || '', () => {
+      if (term === activeTerm && generation === terminalOpenGeneration) {
+        noteTerminalHistoryMeta(msg);
+        const target = Math.max(0, activeTerm.buffer.active.baseY - fromBottom);
+        try {
+          if (activeTerm.options) activeTerm.options.smoothScrollDuration = 0;
+        } catch {}
+        activeTerm.scrollToLine(target);
+        isUserScrolling = !isAtBottom();
+        setTerminalUnreadOutput(!isAtBottom());
+      }
+      terminalHistoryLoading = false;
+      setTerminalRevealPending(false);
+      resolve();
+    });
+  }));
 }
 
 function ensureTerminalScrollButton() {
@@ -643,34 +1249,140 @@ function ensureTerminalScrollButton() {
   container.appendChild(button);
 }
 
+function syncAlternateScreenControls() {
+  $('terminal-alt-controls')?.remove();
+}
+
 function setTerminalUnreadOutput(hasUnread) {
   const button = $('terminal-scroll-bottom-btn');
   if (button) button.hidden = !hasUnread;
 }
 
 let scrollToBottomRaf = 0;
+
+function setTerminalRevealPending(pending) {
+  const container = $('terminal-container');
+  if (!container) return;
+  container.classList.toggle('terminal-reveal-pending', Boolean(pending));
+}
+
+function followAfterTerminalLayout() {
+  return terminalScrollHelpers.shouldFollowAfterLayout({
+    userScrolling: isUserScrolling,
+    touchActive: terminalTouchActive,
+    historyVisible: terminalHistoryLayer?.isVisible(),
+    alreadyAtBottom: isAtBottom(),
+    firstLatestPaint: terminalFirstLatestPaint,
+  });
+}
+
+function terminalCellHeight() {
+  const height = term?._core?._renderService?.dimensions?.css?.cell?.height;
+  return Number.isFinite(height) && height > 0 ? height : 0;
+}
+
+/** Buffer-level scroll. Pixel scrollTop is unreliable with the virtual scrollbar. */
+function scrollTerminalBufferToLine(line, immediate = false) {
+  if (!term) return;
+  const target = Math.max(0, Math.min(line | 0, term.buffer.active.baseY));
+  const current = term.buffer.active.viewportY;
+  const delta = target - current;
+  if (delta === 0) return;
+  try {
+    if (term.options) term.options.smoothScrollDuration = 0;
+  } catch {}
+  const core = term._core;
+  if (core && typeof core.scrollLines === 'function') {
+    try {
+      // Source 1 = viewport request: update ydisp immediately, skip pixel animation.
+      core.scrollLines(delta, immediate, 1);
+    } catch {
+      try { core.scrollLines(delta, immediate); } catch { term.scrollLines(delta); }
+    }
+  } else {
+    term.scrollToLine(target);
+  }
+  const viewport = core && core._viewport;
+  // cellHeight 为 0 时按像素跳底会把 ydisp 写回 0，反而离开最新行。
+  if (immediate && terminalCellHeight() > 0 && viewport && typeof viewport.scrollToLine === 'function') {
+    viewport.scrollToLine(target, true);
+  }
+  if (viewport && typeof viewport.syncScrollArea === 'function') {
+    viewport.syncScrollArea(true);
+  }
+}
+
 /** 即时跳到底部（无平滑动画），用于 replay 回话与高频输出跟尾。 */
 function jumpTerminalToLatest() {
   if (!term) return;
+  stopTerminalMomentum();
   isUserScrolling = false;
   resetScrollAccum();
-  setTerminalUnreadOutput(false);
-  programmaticScrollUntil = Date.now() + 50;
-  // xterm 的公开 Terminal.scrollToBottom() 不接收参数，传入 false 也会被
-  // 丢掉；启用平滑滚动时它会沿着整个 scrollback 播放动画。内核方法的
-  // 第二个参数才是“立即滚动”，同时把选项固定为 0 兼容不同 xterm 版本。
+  terminalFoldView?.returnFromOlder?.();
   try {
-    if (term.options && term.options.smoothScrollDuration !== 0) {
-      term.options.smoothScrollDuration = 0;
-    }
+    if (term.options) term.options.smoothScrollDuration = 0;
   } catch {}
-  const core = term._core;
-  if (core && typeof core.scrollToBottom === 'function') core.scrollToBottom(true);
-  else term.scrollToBottom();
+  if (isAtBottom()) {
+    setTerminalUnreadOutput(false);
+    return;
+  }
+  programmaticScrollUntil = Date.now() + 250;
+  // xterm 公开 scrollToBottom() 不支持“立即”；scrollLines 在平滑滚动开启时
+  // 会沿整段 scrollback 播动画。先改 ydisp，再同步虚拟滚动条。
+  scrollTerminalBufferToLine(term.buffer.active.baseY, true);
+  setTerminalUnreadOutput(!isAtBottom());
+}
+
+/**
+ * 回放/切换会话：在遮罩下完成 fit + 跳底，确认贴底后再露出。
+ * 否则横幅显隐或 fit 重排会把视口打回顶部，露出来就像“从顶上慢慢滚到最新”。
+ */
+function revealTerminalAtLatest(activeTerm, hasReplayBody, preserveGeometry = false,
+  snapshotGeneration = terminalSnapshotGeneration) {
+  const generation = terminalOpenGeneration;
+  const connection = wsConnectionGeneration;
+  const interaction = terminalScrollInteractionRevision;
+  const isCurrent = () => activeTerm && term === activeTerm
+    && generation === terminalOpenGeneration && connection === wsConnectionGeneration
+    && snapshotGeneration === terminalSnapshotGeneration && !terminalResyncing;
+  const mayFollow = () => isCurrent() && interaction === terminalScrollInteractionRevision
+    && !terminalTouchActive && !isUserScrolling && !terminalHistoryLayer?.isVisible();
+  const finish = () => {
+    // Old animation frames cannot dismiss a new session's loading indicator.
+    if (!isCurrent()) return;
+    terminalFirstLatestPaint = true;
+    setTerminalRevealPending(false);
+    hideTerminalLoading();
+    setTerminalInputReady(true);
+    if (mayFollow()) jumpTerminalToLatest();
+  };
+  if (!isCurrent()) return;
+  if (terminalResizeFrame !== null) {
+    cancelAnimationFrame(terminalResizeFrame);
+    terminalResizeFrame = null;
+  }
+  if (mayFollow()) jumpTerminalToLatest();
+  requestAnimationFrame(() => {
+    if (!isCurrent()) return;
+    // A preserveViewport replay is also an acknowledged PTY geometry. Fitting
+    // it again silently changes wrapping/cursor coordinates on this side only.
+    if (!preserveGeometry && fitAddon) {
+      fitTerminalToVisibleBox(term, fitAddon);
+      const container = $('terminal-container');
+      if (container) lastTerminalSize = `${container.clientWidth}x${container.clientHeight}`;
+      handleResize();
+    }
+    if (mayFollow()) jumpTerminalToLatest();
+    requestAnimationFrame(finish);
+  });
 }
 
 function scrollTerminalToBottom() {
   if (!term) return;
+  if (terminalHistoryLayer?.isVisible()) {
+    exitTerminalHistory();
+    return;
+  }
   isUserScrolling = false;
   resetScrollAccum();
   setTerminalUnreadOutput(false);
@@ -688,14 +1400,32 @@ function scrollTerminalToBottom() {
 }
 
 function resetTerminalScrollState() {
+  cancelTerminalHistoryRequest();
+  stopTerminalMomentum();
   isUserScrolling = false;
   terminalTouchActive = false;
   terminalScrollInteractionRevision = 0;
   terminalOutputWriteCount = 0;
   terminalWriteQueue = Promise.resolve();
+  terminalPendingWrite = null;
   terminalSequence = -1;
   pendingRecreateViewport = null;
   programmaticScrollUntil = 0;
+  terminalHistoryScrollback = 0;
+  terminalHasMoreHistory = false;
+  terminalArchiveHasMore = false;
+  terminalHistoryLoading = false;
+  terminalCapabilityVersion = 1;
+  terminalEpoch = 1;
+  terminalHistoryCursor = null;
+  terminalHistoryGestureAccum = 0;
+  terminalHistoryIntent = false;
+  terminalResyncing = false;
+  terminalFirstLatestPaint = false;
+  terminalHistoryLayer?.reset();
+  terminalFoldView?.dispose?.();
+  terminalFoldView = null;
+  setTerminalRevealPending(false);
   if (scrollToBottomRaf) {
     cancelAnimationFrame(scrollToBottomRaf);
     scrollToBottomRaf = 0;
@@ -705,16 +1435,30 @@ function resetTerminalScrollState() {
 }
 
 function writeTerminalOutput(data, wasAtBottom = !isUserScrolling) {
-  if (!term) return;
+  if (!term || !data) return;
+  if (terminalPendingWrite?.term === term) {
+    terminalPendingWrite.chunks.push(data);
+    terminalPendingWrite.follow &&= wasAtBottom;
+    return;
+  }
   const activeTerm = term;
   const startInteraction = terminalScrollInteractionRevision;
+  const batch = { term: activeTerm, chunks: [data], follow: wasAtBottom };
+  terminalPendingWrite = batch;
   terminalWriteQueue = terminalWriteQueue.then(() => new Promise(resolve => {
+    if (terminalPendingWrite === batch) terminalPendingWrite = null;
     if (term !== activeTerm) { resolve(); return; }
+    const selectedViewport = activeTerm.hasSelection() ? activeTerm.buffer.active.viewportY : null;
+    const writeInteraction = terminalScrollInteractionRevision;
     terminalOutputWriteCount++;
-    activeTerm.write(data, () => {
+    activeTerm.write(batch.chunks.join(''), () => {
       if (term === activeTerm) {
         terminalOutputWriteCount--;
-        if (terminalScrollHelpers.shouldFollowOutput(wasAtBottom, terminalTouchActive,
+        if (selectedViewport !== null && activeTerm.hasSelection()
+            && writeInteraction === terminalScrollInteractionRevision) {
+          scrollTerminalBufferToLine(selectedViewport, true);
+        }
+        if (!activeTerm.hasSelection() && terminalScrollHelpers.shouldFollowOutput(batch.follow, terminalTouchActive,
             startInteraction, terminalScrollInteractionRevision)) {
           scrollTerminalToBottom();
         } else if (!isAtBottom()) setTerminalUnreadOutput(true);
@@ -726,49 +1470,84 @@ function writeTerminalOutput(data, wasAtBottom = !isUserScrolling) {
 }
 
 function restoreTerminalSnapshot(msg) {
+  terminalPendingWrite = null;
+  const snapshotGeneration = ++terminalSnapshotGeneration;
   const activeTerm = term;
+  const generation = terminalOpenGeneration;
+  const connection = wsConnectionGeneration;
   const hasReplayBody = Boolean((msg.data || '').length);
-  if (hasReplayBody) showTerminalLoading();
+  // 回放长历史时 xterm 会边写边往下刷，看起来像“滚很久才到末尾”。
+  // 遮罩 + 隐藏画布，写完并瞬时跳底后再露出。
+  setTerminalInputReady(false);
+  setTerminalRevealPending(true);
   terminalWriteQueue = terminalWriteQueue.then(() => new Promise(resolve => {
-    if (term !== activeTerm) { resolve(); return; }
+    if (term !== activeTerm || generation !== terminalOpenGeneration || connection !== wsConnectionGeneration) {
+      resolve();
+      return;
+    }
     const recreateViewport = pendingRecreateViewport;
-    const follow = recreateViewport == null && !isUserScrolling;
-    const viewport = recreateViewport ?? activeTerm.buffer.active.viewportY;
+    // 切换会话/首次回放必须跟尾。断线重连、iOS 重建终端及尺寸确认快照
+    // 都要恢复用户明确停留的历史位置。
+    const preservedViewport = recreateViewport
+      ?? (msg.preserveViewport && isUserScrolling ? activeTerm.buffer.active.viewportY : null);
+    const follow = preservedViewport == null;
+    const viewport = preservedViewport ?? activeTerm.buffer.active.viewportY;
     const revision = terminalScrollInteractionRevision;
     terminalOutputWriteCount++;
     activeTerm.reset();
-    // A resize-triggered snapshot is the acknowledgement of this browser's
-    // requested PTY geometry. Initial/reconnect replays may contain the
-    // desktop pane size, so only apply dimensions when the server marks the
-    // snapshot as preserving the remote viewport.
-    if (msg.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
+    // Restore at the source geometry first, then apply the local viewport
+    // strategy after parse. SerializeAddon snapshots assume the original size.
+    if (Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
         && msg.cols >= 2 && msg.rows > 0) {
       activeTerm.resize(msg.cols, msg.rows);
     }
     activeTerm.write(msg.data || '', () => {
-      if (term === activeTerm) {
-        terminalOutputWriteCount--;
-        if (revision === terminalScrollInteractionRevision && !terminalTouchActive) {
-          if (follow) jumpTerminalToLatest();
-          else {
-            activeTerm.scrollToLine(Math.min(viewport, activeTerm.buffer.active.baseY));
-            isUserScrolling = true;
-            setTerminalUnreadOutput(!isAtBottom());
-          }
-          if (recreateViewport != null) pendingRecreateViewport = null;
-        }
-        scheduleMobileLinkHighlights();
-        if (msg.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
-            && msg.cols >= 2 && msg.rows > 0) {
-          // The replay confirms the remote viewport we just requested. Keep
-          // that geometry while the terminal parses the snapshot; fitting
-          // here would immediately undo the acknowledgement on narrow views.
-          lastSentCols = msg.cols;
-          lastSentRows = msg.rows;
+      // Reconnects reuse this terminal. Even an obsolete connection's parser
+      // callback must release its write count before ignoring the stale frame.
+      if (term === activeTerm && generation === terminalOpenGeneration) terminalOutputWriteCount--;
+      if (term !== activeTerm || generation !== terminalOpenGeneration || connection !== wsConnectionGeneration) {
+        resolve();
+        return;
+      }
+      if (snapshotGeneration !== terminalSnapshotGeneration || terminalResyncing) {
+        resolve();
+        return;
+      }
+      scheduleMobileLinkHighlights();
+      if (msg.preserveViewport && Number.isInteger(msg.cols) && Number.isInteger(msg.rows)
+          && msg.cols >= 2 && msg.rows > 0) {
+        lastSentCols = msg.cols;
+        lastSentRows = msg.rows;
+      } else {
+        syncTerminalToViewport();
+      }
+      rebindMobilePromptMarker();
+      renderMobilePromptBanner();
+      noteTerminalHistoryMeta(msg);
+      terminalHistoryLayer?.refreshLivePreview?.();
+      const finishReveal = () => {
+        if (term !== activeTerm || generation !== terminalOpenGeneration || connection !== wsConnectionGeneration
+            || snapshotGeneration !== terminalSnapshotGeneration || terminalResyncing) return;
+        terminalFirstLatestPaint = true;
+        hideTerminalLoading();
+        setTerminalRevealPending(false);
+        setTerminalInputReady(true);
+      };
+      if (revision === terminalScrollInteractionRevision && !terminalTouchActive) {
+        if (follow) {
+          // A new-session replay explicitly starts at latest. Only gestures
+          // newer than this snapshot may cancel the delayed follow frames.
+          if (!terminalHistoryLayer?.isVisible()) isUserScrolling = false;
+          revealTerminalAtLatest(activeTerm, hasReplayBody, Boolean(msg.preserveViewport), snapshotGeneration);
         } else {
-          syncTerminalToViewport();
+          activeTerm.scrollToLine(Math.min(viewport, activeTerm.buffer.active.baseY));
+          isUserScrolling = true;
+          setTerminalUnreadOutput(!isAtBottom());
+          finishReveal();
         }
-        if (hasReplayBody) hideTerminalLoading();
+        if (recreateViewport != null) pendingRecreateViewport = null;
+      } else {
+        finishReveal();
       }
       resolve();
     });
@@ -777,14 +1556,46 @@ function restoreTerminalSnapshot(msg) {
 
 // replay 里的 cols/rows 来自桌面 pane，不能用来驱动浏览器 xterm。
 // 浏览器始终按自身 viewport fit，再通过 resize 消息声明 PTY 尺寸。
+
+// 终端在宽度为 0 时会把 "W" 量成 0，于是每一列都多出一整格字距，
+// 右边的字被行盒裁掉。可见后再量一次，并保证屏幕不要宽过容器。
+function remeasureTerminalGlyphs(activeTerm) {
+  const renderer = activeTerm?._core?._renderService?._renderer?.value;
+  if (!renderer?._widthCache || typeof renderer._setDefaultSpacing !== 'function') return;
+  if (!activeTerm.element || activeTerm.element.offsetWidth < 2) return;
+  renderer._widthCache.clear();
+  renderer._setDefaultSpacing();
+  try { activeTerm.refresh(0, activeTerm.rows - 1); } catch { /* unmounted */ }
+}
+
+function clampTerminalScreen(activeTerm) {
+  const screen = activeTerm?.element?.querySelector('.xterm-screen');
+  const surface = activeTerm?.element?.parentElement;
+  if (!screen || !surface || activeTerm.cols <= 2) return;
+  if (screen.getBoundingClientRect().right > surface.getBoundingClientRect().right + 0.5) {
+    activeTerm.resize(activeTerm.cols - 1, activeTerm.rows);
+  }
+}
+
+function fitTerminalToVisibleBox(activeTerm, activeFit) {
+  if (!activeTerm || !activeFit) return;
+  try { activeFit.fit(); } catch { /* renderer not ready */ }
+  remeasureTerminalGlyphs(activeTerm);
+  clampTerminalScreen(activeTerm);
+}
+
 function syncTerminalToViewport() {
   if (!fitAddon || !term) return;
   const container = $('terminal-container');
   if (!container || container.clientWidth < 1 || container.clientHeight < 1) return;
-  try { fitAddon.fit(); } catch {}
+  fitTerminalToVisibleBox(term, fitAddon);
   lastTerminalSize = `${container.clientWidth}x${container.clientHeight}`;
   handleResize();
+  rebindMobilePromptMarker();
   scheduleTerminalSelectHandlesUpdate();
+  // 桌面尺寸快照 fit 到手机后 ydisp 会停在顶部；跟尾时必须立刻贴底，
+  // 否则最新行还在本地 buffer 里，用户却滚不下去。
+  if (followAfterTerminalLayout()) jumpTerminalToLatest();
 }
 
 function applyTerminalSnapshotGeometry(msg) {
@@ -809,14 +1620,21 @@ function applyTerminalSnapshotGeometry(msg) {
 // 直接写 viewport.scrollTop 无效，必须走官方 term.scrollLines()。
 // 用像素累积把手指位移换算成整行滚动，保证顺滑。
 let _scrollAccum = 0;
-function resetScrollAccum() { _scrollAccum = 0; }
+let alternateScreenScroller = null;
+function resetScrollAccum() { _scrollAccum = 0; alternateScreenScroller?.reset(); panVelocityTracker?.reset(); }
 function terminalRowHeight() {
   const vp = document.querySelector('#terminal-container .xterm-viewport');
   if (vp && term && term.rows > 0) return vp.clientHeight / term.rows;
   return 18;
 }
+function consumeAlternateScreenScroll(deltaY, flush = false) {
+  if (!term || term.buffer.active.type !== 'alternate') return false;
+  return alternateScreenScroller?.scroll(deltaY, flush) || false;
+}
+
 function scrollTerminalByPixels(deltaY) {
   if (!term) return false;
+  if (term.buffer.active.type === 'alternate') return consumeAlternateScreenScroll(deltaY);
   _scrollAccum += deltaY;
   const rh = terminalRowHeight();
   const lines = Math.trunc(_scrollAccum / rh);
@@ -827,6 +1645,80 @@ function scrollTerminalByPixels(deltaY) {
   const moved = term.buffer.active.viewportY !== before;
   if (moved) markUserScrolling();
   return moved;
+}
+
+// —— 松手惯性：xterm 逐行滚动没有浏览器原生的滑动衰减，快速拖动松手后
+// 按最近 100ms 的手指速度继续滑行并按指数衰减，贴到边界即停。
+// 惯性期间沿用 terminalTouchActive 的手势保护，避免新输出把视口拽走。
+let panVelocityTracker = null;
+let panMomentumRunner = null;
+function getPanVelocityTracker() {
+  if (!terminalMomentum) return null;
+  if (!panVelocityTracker) panVelocityTracker = terminalMomentum.createPanVelocityTracker();
+  return panVelocityTracker;
+}
+function getPanMomentumRunner() {
+  if (!terminalMomentum) return null;
+  if (!panMomentumRunner) {
+    panMomentumRunner = terminalMomentum.createMomentumRunner({
+      apply: applyMomentumScrollDelta,
+      shouldContinue: momentumShouldContinue,
+      onEnd: finishMomentumPan,
+    });
+  }
+  return panMomentumRunner;
+}
+function applyMomentumScrollDelta(deltaY) {
+  // 与拖动路径同序：先给历史层（含实时区→档案边界的无缝衔接），再给实时区。
+  if (handlePagedHistoryPan(deltaY, null)) return;
+  scrollTerminalByPixels(deltaY);
+}
+function momentumShouldContinue(velocity) {
+  if (!term) return false;
+  if (terminalHistoryLayer?.isVisible()) return true;
+  const buffer = term.buffer.active;
+  if (buffer.type !== 'normal') return false;
+  if (velocity < 0) return buffer.viewportY > 0;
+  if (velocity > 0) return buffer.viewportY < buffer.baseY;
+  return false;
+}
+function beginTerminalMomentum(velocity) {
+  if (term?.buffer?.active?.type !== 'normal') return false;
+  const runner = getPanMomentumRunner();
+  if (!runner) return false;
+  const started = runner.start(velocity);
+  if (started) terminalTouchActive = true;
+  return started;
+}
+function stopTerminalMomentum() {
+  const runner = panMomentumRunner;
+  if (runner?.active()) {
+    runner.stop();
+    terminalTouchActive = false;
+  }
+}
+/** 惯性滑行结束：重演拖动松手的收尾评估（跟尾 / 回看标记 / 历史请求）。 */
+function finishMomentumPan() {
+  terminalTouchActive = false;
+  if (terminalHistoryLayer?.isVisible()) {
+    // 停在档案层里：意图已在滑行中兑现，实时区状态等回到最新时再收。
+    terminalHistoryIntent = false;
+    terminalHistoryGestureAccum = 0;
+    return;
+  }
+  finishTerminalPanGesture();
+}
+function finishTerminalPanGesture() {
+  const historyIntent = terminalHistoryIntent || terminalHistoryGestureAccum < -8;
+  terminalHistoryIntent = false;
+  terminalHistoryGestureAccum = 0;
+  if (term && isAtBottom() && !historyIntent && !term.hasSelection()) {
+    isUserScrolling = false;
+    setTerminalUnreadOutput(false);
+  } else if (term) {
+    isUserScrolling = true;
+  }
+  if (historyIntent) maybeRequestTerminalHistory(true);
 }
 
 let terminalResizeObserver = null;
@@ -843,6 +1735,8 @@ function scheduleTerminalResize() {
     terminalResizeFrame = null;
     const container = $('terminal-container');
     if (!term || !fitAddon || !container || container.clientWidth < 1 || container.clientHeight < 1) return;
+    // 回放遮罩期间由 revealTerminalAtLatest 自己 fit+跳底，这里再 fit 会露馅。
+    if (container.classList.contains('terminal-reveal-pending')) return;
     const size = `${container.clientWidth}x${container.clientHeight}`;
     if (size === lastTerminalSize) return;
     syncTerminalToViewport();
@@ -1000,38 +1894,109 @@ function scheduleTerminalSelectHandlesUpdate() {
   selectHandlesRaf = requestAnimationFrame(() => {
     selectHandlesRaf = 0;
     updateTerminalSelectHandles();
+    // 滚动/输出后同步操作条位置：选区端点出屏时贴边，复制始终可达。
+    updateTerminalCopyButton();
   });
 }
 
-function ensureTerminalCopyButton() {
+/** 终端选区操作条：长按选中后出现「复制／复制当前屏」。
+ * xterm 画布选区不会唤起系统复制菜单，之前选中后真机无入口可复制；
+ * 端点滚出视口后操作条贴上/下边，往上滚动阅读时复制仍然可达。 */
+function ensureTerminalSelectionBar() {
   const container = $('terminal-container');
-  if (!container || container.querySelector('#terminal-copy-selection-btn')) return;
-  const button = document.createElement('button');
-  button.id = 'terminal-copy-selection-btn';
-  button.type = 'button';
-  button.hidden = true;
-  button.textContent = '复制';
-  button.title = '复制选中内容';
-  button.setAttribute('aria-label', '复制选中内容');
-  button.addEventListener('click', async () => {
+  if (!container || container.querySelector('#terminal-selection-bar')) return;
+  const bar = document.createElement('div');
+  bar.id = 'terminal-selection-bar';
+  bar.hidden = true;
+  const copyButton = document.createElement('button');
+  copyButton.id = 'terminal-copy-selection-btn';
+  copyButton.type = 'button';
+  copyButton.textContent = '复制';
+  copyButton.addEventListener('click', () => {
     const text = getUnwrappedSelection();
-    if (!text) {
-      updateTerminalCopyButton();
-      return;
-    }
-    const ok = await copyTextToClipboard(text);
-    showCopyToast(ok ? '已复制到剪贴板' : '复制失败');
-    term?.clearSelection();
-    updateTerminalCopyButton();
+    if (!text) return;
+    void copyTextToClipboard(text).then((ok) => {
+      showCopyToast(ok ? '已复制到剪贴板' : '复制失败');
+      term?.clearSelection();
+    });
   });
-  container.appendChild(button);
+  const screenButton = document.createElement('button');
+  screenButton.id = 'terminal-copy-screen-btn';
+  screenButton.type = 'button';
+  screenButton.textContent = '复制当前屏';
+  screenButton.addEventListener('click', () => {
+    const text = getVisibleScreenText();
+    if (!text) return;
+    void copyTextToClipboard(text).then((ok) => {
+      showCopyToast(ok ? `已复制当前屏 ${text.split('\n').length} 行` : '复制失败');
+    });
+  });
+  bar.append(copyButton, screenButton);
+  container.appendChild(bar);
+}
+
+function getVisibleScreenText() {
+  if (!term) return '';
+  const buffer = term.buffer.active;
+  const lines = [];
+  for (let row = buffer.viewportY; row < buffer.viewportY + term.rows; row++) {
+    lines.push(buffer.getLine(row)?.translateToString(true) ?? '');
+  }
+  while (lines.length && !lines[lines.length - 1]) lines.pop();
+  return lines.join('\n');
 }
 
 function updateTerminalCopyButton() {
-  const button = $('terminal-copy-selection-btn');
-  if (!button) return;
-  button.hidden = !(term && term.hasSelection());
+  const container = $('terminal-container');
+  const bar = container?.querySelector('#terminal-selection-bar');
+  if (!bar) return;
+  const cells = term?.hasSelection() && !terminalHistoryLayer?.isVisible() ? getSelectionCells() : null;
+  const metrics = cells ? getTerminalCellMetrics() : null;
+  if (!cells || !metrics) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const barHeight = bar.offsetHeight || 34;
+  const barWidth = bar.offsetWidth || 150;
+  const viewportY = term.buffer.active.viewportY;
+  const endVisualRow = cells.end.row - viewportY;
+  // 默认挂在选区终点下一行；终点滚出视口就贴上/下边，滚动后复制仍然可达。
+  let top = metrics.originY + (endVisualRow + 1.3) * metrics.rowHeight;
+  if (endVisualRow < 0) top = metrics.originY + 6;
+  else if (endVisualRow >= term.rows - 1) top = container.clientHeight - barHeight - 8;
+  top = Math.max(metrics.originY + 6, Math.min(top, container.clientHeight - barHeight - 6));
+  let left = metrics.originX + (cells.end.col + 1) * metrics.colWidth - barWidth;
+  left = Math.max(metrics.originX + 6, Math.min(left, metrics.originX + container.clientWidth - barWidth - 6));
+  bar.style.top = `${top}px`;
+  bar.style.left = `${left}px`;
 }
+
+// execCommand('copy') 兜底会触发 copy 事件；此时 DOM 选区是隐藏 textarea，
+// 不能让下面的终端选区监听器把剪贴板劫持成 xterm 选区文本。
+let suppressTerminalCopyHijack = false;
+
+document.addEventListener('copy', (event) => {
+  if (suppressTerminalCopyHijack) {
+    suppressTerminalCopyHijack = false;
+    return;
+  }
+  const anchor = document.getSelection()?.anchorNode;
+  const selectedEl = anchor instanceof Element ? anchor : anchor?.parentElement;
+  if (selectedEl?.closest?.(
+    'input, textarea, [contenteditable="true"], .terminal-activity-view, .terminal-history-layer, .native-chat-transcript',
+  )) return;
+  if (!term?.hasSelection()) return;
+  const text = getUnwrappedSelection();
+  if (!text) return;
+  event.preventDefault();
+  event.clipboardData?.setData('text/plain', text);
+  void copyTextToClipboard(text).then((ok) => {
+    showCopyToast(ok ? '已复制到剪贴板' : '复制失败');
+    term?.clearSelection();
+    updateTerminalSelectHandles();
+  });
+});
 
 function getUnwrappedSelection() {
   if (!term || !term.hasSelection()) return '';
@@ -1044,187 +2009,327 @@ function getUnwrappedSelection() {
 // ========== 登录 ==========
 
 function logout() {
+  saveCurrentMobileDraft();
+  $('token-input').value = localStorage.getItem('duocli_token') || token;
   token = '';
-  localStorage.removeItem('duocli_token');
   terminalOpenRequest++;
   currentSessionId = null;
+  currentSessionChatCapable = false;
+  stopNativeChatPolling();
+  applySessionViewMode('terminal');
   stopSSE();
   closeTerminal();
   LanSwitcher.stop();
+  $('login-error').textContent = 'Token 已失效，请修改后重试';
   showPage('login-page');
 }
 
-// ============================================================
-// 网络模式切换：CF Tunnel ⇄ LAN 直连
-// 背景：HTTPS 页面无法在浏览器侧探测 HTTP LAN（iOS Safari Mixed Content
-// 把所有子资源请求要么拦截要么强制升级到 HTTPS，<img>/<iframe>/fetch 全堵）。
-// 所以放弃自动探针，改成顶部常驻按钮：
-//   - CF 模式（HTTPS）：按钮显示"🟡 切局域网"，点击 → 拿 /api/lan-info →
-//     选 IP（上次成功优先；否则 192.168 > 10 > 172）→ location.replace 跳过去。
-//     跳过去打不开是用户自己的事（不在家就别点）。
-//   - LAN 模式（HTTP + 私有 IP）：按钮显示"🟢 局域网"，点击 → 跳回 CF。
-//     另外 5 秒一次 fetch /ping.png 自检，连续两次不通自动跳回 CF（HTTP→HTTP
-//     不受 Mixed Content 限制，这里用 fetch 比 <img> 更准）。
-// ============================================================
+// ========== 自动探测与手动网络选择 ==========
 const LanSwitcher = (() => {
-  const PROBE_INTERVAL_LAN_MS = 5 * 1000;
-  const PROBE_TIMEOUT_MS = 2000;
-  const STORAGE_CLOUD_URL = 'duocli_cloud_url';   // 上次的 CF 入口（origin）
-  const STORAGE_LAST_LAN_IP = 'duocli_last_lan_ip'; // 上次成功用过的 LAN IP
+  const NM = globalThis.DuoNetworkMode;
+  const PREF_KEY = 'duocli_network_preference';
+  const LAN_KEY = 'duocli_lan_info';
+  let timer = null;
+  let running = false;
+  let inFlight = false;
+  let generation = 0;
+  let switching = false;
+  let lanFailures = 0;
+  let lanSuccesses = 0;
+  let lastReachableIp = '';
+  let cooldownUntil = urlFromLan ? Date.now() + 30_000 : 0;
+  const preference = () => ['lan', 'cf'].includes(localStorage.getItem(PREF_KEY)) ? localStorage.getItem(PREF_KEY) : 'auto';
+  const isLanMode = () => NM.detectNetworkMode(location) === 'lan';
+  const isCfMode = () => NM.detectNetworkMode(location) === 'cf';
+  const cloudOrigin = () => isCfMode() ? location.origin : NM.parseTrustedOrigin(localStorage.getItem('duocli_cloud_url'));
+  const lastIp = () => localStorage.getItem('duocli_last_lan_ip');
+  const stale = (epoch) => !running || epoch !== generation || !token;
 
-  let probeTimer = null;
-
-  function isPrivateIp(host) {
-    return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host);
+  async function requestAt(origin, route, options = {}, timeout = 2000) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    try {
+      const response = await fetch(`${origin}${route}`, {
+        ...options, mode: 'cors', credentials: 'omit', cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+        ...(NM.detectNetworkMode(new URL(origin)) === 'lan' ? { targetAddressSpace: 'local' } : {}),
+      });
+      if (!response.ok) throw new Error(`线路不可用 (${response.status})`);
+      return await response.json();
+    } finally { clearTimeout(timeoutId); }
   }
 
-  function isLocalHostname(host) {
-    return host === 'localhost' || host.endsWith('.local');
+  async function verify(origin) {
+    try { return (await requestAt(origin, '/api/network-check')).ok === true; }
+    catch { return false; }
   }
 
-  function isLanMode() {
-    const host = location.hostname.toLowerCase();
-    return location.protocol === 'http:' && (isPrivateIp(host) || isLocalHostname(host));
+  async function lanInfo() {
+    try {
+      const info = await api('/api/lan-info', { timeout: 2000 });
+      localStorage.setItem(LAN_KEY, JSON.stringify(info));
+      if (!cloudOrigin() && info.publicUrl) localStorage.setItem('duocli_cloud_url', NM.parseTrustedOrigin(info.publicUrl));
+      return info;
+    } catch {
+      try { return JSON.parse(localStorage.getItem(LAN_KEY) || 'null'); } catch { return null; }
+    }
   }
 
-  function isCfMode() {
-    return location.protocol === 'https:';
-  }
-
-  // 多 IP 选优：上次成功的 > 192.168 > 10 > 172 > 其它
-  function pickBestIp(ips) {
-    if (!ips || !ips.length) return null;
-    const last = localStorage.getItem(STORAGE_LAST_LAN_IP);
-    if (last && ips.includes(last)) return last;
-    const score = ip => {
-      if (ip.startsWith('192.168.')) return 3;
-      if (ip.startsWith('10.')) return 2;
-      if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return 1;
-      return 0;
+  function snapshot() {
+    saveCurrentMobileDraft();
+    const sessionId = currentSessionId || pendingSessionToOpen;
+    return {
+      sessionId, draft: mobileDrafts.get(sessionId) || '',
+      pendingSubmission: mobilePendingSubmissions.get(sessionId) || null,
+      viewPreference: localStorage.getItem(CHAT_VIEW_PREF_KEY),
+      preference: preference(), cloudOrigin: cloudOrigin(),
+      lanInfo: localStorage.getItem(LAN_KEY), lastLanIp: lastIp(),
     };
-    return [...ips].sort((a, b) => score(b) - score(a))[0];
   }
 
-  // LAN 自检：HTTP 页面 fetch HTTP 不受 Mixed Content 限制
-  async function probeLanSelf() {
-    const url = `${location.origin}/ping.png?_=${Date.now()}`;
+  async function handoff(origin, { manual = false, fromLan = false } = {}) {
+    if (switching || !token) return false;
+    if (origin === location.origin) { updateButton(); return true; }
+    if (!manual && (composerComposing || composerSubmissions.size || pendingTerminalSendIntent || document.querySelector('.modal.active'))) return false;
+    switching = true;
+    const epoch = ++generation;
+    globalThis.duocliNetworkSwitching = true;
+    const input = $('msg-input');
+    const wasReadOnly = input.readOnly;
+    input.readOnly = true;
+    updateComposerAvailability();
     try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
-      const res = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
-      clearTimeout(t);
-      return res.ok;
-    } catch {
+      // Manual switching also lets an in-flight send settle, retaining its id on failure.
+      const deadline = Date.now() + 30_000;
+      while (composerSubmissions.size && Date.now() < deadline) await NM.delay(50);
+      if (composerSubmissions.size) throw new Error('消息仍在确认，请稍后切换');
+      const state = snapshot();
+      let transfer;
+      try {
+        transfer = await requestAt(location.origin, '/api/network-handoff', { method: 'POST', body: JSON.stringify(state) }, 2500);
+      } catch {
+        // HTTP LAN -> HTTPS public is allowed even when the LAN route has disappeared.
+        transfer = await requestAt(origin, '/api/network-handoff', { method: 'POST', body: JSON.stringify(state) }, 8000);
+      }
+      if (epoch !== generation || !token) return false;
+      if (state.sessionId !== (currentSessionId || pendingSessionToOpen)) throw new Error('会话已改变，请重新切换');
+      const url = NM.buildHandoffUrl(origin, {
+        token, cloud: state.cloudOrigin, session: state.sessionId || '',
+        network: state.preference, handoff: transfer.ticket, from: fromLan ? 'lan' : '',
+      });
+      stop();
+      showCopyToast('正在切换线路，保留当前会话…');
+      location.replace(url);
+      return true;
+    } catch (error) {
+      cooldownUntil = Date.now() + 30_000;
+      showCopyToast(`切换未完成，已保留原页面：${error.message}`);
       return false;
+    } finally {
+      switching = false;
+      globalThis.duocliNetworkSwitching = false;
+      input.readOnly = wasReadOnly;
+      updateComposerAvailability();
     }
   }
 
-  async function probeLanMode() {
-    if (await probeLanSelf()) return;
-    await new Promise(r => setTimeout(r, 1000));
-    if (await probeLanSelf()) return;
-    switchToCloud(true);
+  async function select(mode) {
+    if (switching) return;
+    generation++;
+    localStorage.setItem(PREF_KEY, mode);
+    lanFailures = 0;
+    lanSuccesses = 0;
+    updateButton();
+    if (mode === 'auto') { showCopyToast('已恢复自动选择线路'); void runProbeCycle(); return; }
+    if ((mode === 'lan' && isLanMode()) || (mode === 'cf' && isCfMode())) {
+      showCopyToast(mode === 'lan' ? '已固定使用局域网' : '已固定使用公网');
+      return;
+    }
+    const epoch = generation;
+    if (mode === 'cf') {
+      const origin = cloudOrigin();
+      if (!origin) { showCopyToast('请先用公网链接打开一次，保存公网地址'); return; }
+      await handoff(origin, { manual: true });
+    } else {
+      const info = await lanInfo();
+      const reachable = await NM.findReachableLan(info?.lanIps, info?.port, lastIp(), { verify });
+      if (epoch !== generation || !token) return;
+      // Explicit manual choice may navigate even if the browser blocks local probes.
+      const ip = reachable?.ip || NM.pickBestIp(info?.lanIps, lastIp());
+      if (!ip) { showCopyToast('暂无局域网地址，请先连接电脑获取地址'); return; }
+      localStorage.setItem('duocli_last_lan_ip', ip);
+      await handoff(NM.buildLanOrigin(ip, reachable?.port || info.port), { manual: true });
+    }
   }
 
-  // CF → LAN：用户主动点
-  async function switchToLan() {
-    if (!token) return;
-    let info;
+  async function runProbeCycle() {
+    if (!running || switching || inFlight || !token || document.hidden || navigator.onLine === false || preference() !== 'auto') return;
+    const epoch = generation;
+    inFlight = true;
     try {
-      info = await api('/api/lan-info');
-    } catch {
-      showCopyToast('拿不到局域网信息（token 失效？）');
-      return;
-    }
-    const ip = pickBestIp(info && info.lanIps);
-    if (!ip) {
-      showCopyToast('电脑暂无可用局域网 IP');
-      return;
-    }
-    const port = info.port || 9800;
-    localStorage.setItem(STORAGE_CLOUD_URL, location.origin);
-    localStorage.setItem(STORAGE_LAST_LAN_IP, ip);
-    showCopyToast(`已切到局域网 ${ip}:${port}`);
-    setTimeout(() => location.replace(`http://${ip}:${port}/?token=${encodeURIComponent(token)}`), 200);
+      let decision;
+      if (isLanMode()) {
+        if (!cloudOrigin()) await lanInfo();
+        if (stale(epoch)) return;
+        const reachable = await verify(location.origin);
+        if (stale(epoch)) return;
+        lanFailures = reachable ? 0 : lanFailures + 1;
+        const cloud = cloudOrigin();
+        const cloudReachable = !reachable && lanFailures >= 2 && cloud ? await verify(cloud) : false;
+        if (stale(epoch)) return;
+        decision = NM.decideNetworkAction({ mode: 'lan', lanReachable: reachable, lanFailCount: lanFailures, cloudReachable, cloudUrl: cloud });
+        if (decision.type === 'switch-cloud') await handoff(cloud, { fromLan: true });
+      } else if (isCfMode()) {
+        const info = await lanInfo();
+        if (stale(epoch)) return;
+        const reachable = await NM.findReachableLan(info?.lanIps, info?.port, lastIp(), { verify });
+        if (stale(epoch)) return;
+        lanSuccesses = reachable && reachable.ip === lastReachableIp ? lanSuccesses + 1 : reachable ? 1 : 0;
+        lastReachableIp = reachable?.ip || '';
+        decision = NM.decideNetworkAction({ mode: 'cf', lanReachable: !!reachable, lanSuccessCount: lanSuccesses,
+          lanTarget: reachable, now: Date.now(), cooldownUntil });
+        if (decision.type === 'switch-lan') {
+          localStorage.setItem('duocli_last_lan_ip', reachable.ip);
+          await handoff(NM.buildLanOrigin(reachable.ip, reachable.port));
+        }
+      }
+    } finally { inFlight = false; }
   }
 
-  // LAN → CF：用户点 或 自检失败（需曾通过公网入口访问过，才会写入 STORAGE_CLOUD_URL）
-  function switchToCloud(auto) {
-    const cloudUrl = localStorage.getItem(STORAGE_CLOUD_URL);
-    if (!cloudUrl) {
-      if (!auto) showCopyToast('暂无云端地址，请先用公网链接打开一次');
-      return;
-    }
-    showCopyToast(auto ? '局域网失联，回到云端…' : '切到云端…');
-    setTimeout(() => location.replace(`${cloudUrl}/?token=${encodeURIComponent(token)}`), 200);
+  function showMenu() {
+    const menu = $('network-mode-modal');
+    const mode = preference();
+    $('network-mode-status').textContent = `当前：${isLanMode() ? '局域网直连' : '公网'} · ${mode === 'auto' ? '自动选择' : mode === 'lan' ? '已选择强制局域网' : '已选择强制公网'}`;
+    menu.querySelectorAll('[data-network]').forEach(button => {
+      button.setAttribute('aria-pressed', String(button.dataset.network === mode));
+      button.onclick = () => { menu.classList.remove('active'); void select(button.dataset.network); };
+    });
+    menu.classList.add('active');
   }
 
   function updateButton() {
-    const btn = $('net-mode-btn');
-    if (!btn) return;
-    if (!token) { btn.style.display = 'none'; return; }
-    btn.style.display = 'inline-flex';
-    if (isLanMode()) {
-      setIconLabel(btn, 'wifi', '局域网', 13);
-      btn.title = '当前局域网直连，点击切回云端';
-      btn.className = 'net-mode-btn lan';
-      btn.onclick = () => switchToCloud(false);
-    } else if (isCfMode()) {
-      setIconLabel(btn, 'cloud', '切局域网', 13);
-      btn.title = '在家时点击切到局域网直连，更快';
-      btn.className = 'net-mode-btn cf';
-      btn.onclick = switchToLan;
-    } else {
-      btn.style.display = 'none';
-    }
+    const button = $('net-mode-btn');
+    if (!button) return;
+    placeNetModeButton();
+    button.style.display = token ? 'inline-flex' : 'none';
+    const lan = isLanMode();
+    setIcon(button, lan ? 'wifi' : 'cloud', 16);
+    button.className = `net-mode-btn ${lan ? 'lan' : 'cf'}`;
+    button.dataset.selection = preference();
+    button.setAttribute('aria-label', lan ? '局域网' : '云端');
+    button.title = `${lan ? '局域网' : '公网'} · ${preference() === 'auto' ? '自动选择' : '手动固定'}，点击选择线路`;
+    button.onclick = showMenu;
   }
 
   function start() {
     stop();
+    running = true;
     updateButton();
-    if (!token) return;
-    if (isLanMode()) {
-      setTimeout(probeLanMode, 1000);
-      probeTimer = setInterval(probeLanMode, PROBE_INTERVAL_LAN_MS);
-    }
+    if (isCfMode()) localStorage.setItem('duocli_cloud_url', location.origin);
+    if (isLanMode()) localStorage.setItem('duocli_last_lan_ip', location.hostname);
+    timer = setInterval(() => { void runProbeCycle(); }, 5000);
+    void runProbeCycle();
   }
-
   function stop() {
-    if (probeTimer) {
-      clearInterval(probeTimer);
-      probeTimer = null;
-    }
+    running = false;
+    generation++;
+    if (timer) clearInterval(timer);
+    timer = null;
   }
-
-  return { start, stop, switchToLan, switchToCloud, isLanMode, isCfMode };
+  const resume = () => { if (!document.hidden) void runProbeCycle(); };
+  window.addEventListener('online', resume);
+  window.addEventListener('pageshow', resume);
+  document.addEventListener('visibilitychange', resume);
+  const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  connection?.addEventListener('change', resume);
+  $('network-mode-close').onclick = () => $('network-mode-modal').classList.remove('active');
+  $('network-mode-modal').onclick = event => { if (event.target === $('network-mode-modal')) $('network-mode-modal').classList.remove('active'); };
+  return { start, stop, select, isLanMode, isCfMode, probeNow: runProbeCycle,
+    switchToLan: () => select('lan'), switchToCloud: () => select('cf') };
 })();
 
 $('login-btn').onclick = async () => {
   const t = $('token-input').value.trim();
   if (!t) return;
+  let timeout = null;
   try {
+    const controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), 8000);
     const res = await fetch(`${API}/api/auth`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: t }),
+      signal: controller.signal,
     });
-    const data = await res.json();
+    clearTimeout(timeout);
+    timeout = null;
+    const data = await res.json().catch(() => ({}));
     if (data.ok) {
       token = t;
       localStorage.setItem('duocli_token', t);
       $('login-error').textContent = '';
       enterMain();
     } else {
-      $('login-error').textContent = 'Token 错误';
+      $('login-error').textContent = 'Token 错误。请到电脑 DuoCLI 左侧「手机远程同步」里复制';
     }
   } catch (e) {
-    $('login-error').textContent = '连接失败: ' + e.message;
+    if (timeout) clearTimeout(timeout);
+    $('login-error').textContent = e.name === 'AbortError'
+      ? '连接超时。请确认和电脑在同一 Wi-Fi，或改用电脑上显示的公网地址'
+      : '连接失败: ' + e.message;
   }
 };
 
 $('token-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') $('login-btn').click();
 });
+
+function closeAccessTokenModal() {
+  $('access-token-modal').classList.remove('active');
+  $('new-access-token').value = '';
+  $('access-token-error').textContent = '';
+}
+
+function openAccessTokenModal() {
+  closeDetailMoreMenu();
+  $('access-token-error').textContent = '';
+  $('new-access-token').value = '';
+  $('access-token-modal').classList.add('active');
+  $('new-access-token').focus();
+}
+
+$('access-token-btn').onclick = openAccessTokenModal;
+$('detail-menu-access-token-btn').onclick = openAccessTokenModal;
+$('access-token-close').onclick = closeAccessTokenModal;
+$('access-token-modal').onclick = event => {
+  if (event.target === $('access-token-modal')) closeAccessTokenModal();
+};
+$('new-access-token').addEventListener('keydown', event => {
+  if (event.key === 'Enter') $('access-token-save').click();
+});
+$('access-token-save').onclick = async () => {
+  const nextToken = $('new-access-token').value.trim();
+  if (!/^[\x21-\x7e]{8,128}$/.test(nextToken)) {
+    $('access-token-error').textContent = 'Token 需为 8–128 位可见字符（勿含空格）';
+    return;
+  }
+  const button = $('access-token-save');
+  button.disabled = true;
+  try {
+    await api('/api/access-token', { method: 'PUT', body: JSON.stringify({ token: nextToken }) });
+    token = nextToken;
+    localStorage.setItem('duocli_token', nextToken);
+    closeAccessTokenModal();
+    showCopyToast('Token 已修改，其他设备需重新登录');
+    stopSSE();
+    startSSE();
+  } catch (error) {
+    $('access-token-error').textContent = error.message || '修改失败，请重试';
+  } finally {
+    button.disabled = false;
+  }
+};
 
 // ========== 设备页 ==========
 
@@ -1273,19 +2378,43 @@ function writeSurfaceGeometry(surface, source, geometry) {
   if (geometry.presented) surface.dataset[`${source}PresentedGeometry`] = String(geometry.presented);
 }
 
-function imgToDevice(surface, clientX, clientY) {
-  const { width, height } = mirrorSurfaceSize(surface);
+function imgToDevice(surface, clientX, clientY, clampToEdge = false, controlSize = null) {
+  let { width, height } = mirrorSurfaceSize(surface);
+  if ((!width || !height) && controlSize?.width && controlSize?.height) {
+    width = controlSize.width;
+    height = controlSize.height;
+  }
+  // A JPEG/image may be displayed while the scrcpy control socket is healthy
+  // (for example, browsers without WebCodecs). Map into that socket's encoded
+  // dimensions, but reject a stale picture from the other screen orientation.
+  if (controlSize && (!width || !height
+    || Math.abs((width / height) / (controlSize.width / controlSize.height) - 1) > 0.02)) return null;
   const geometry = readSurfaceGeometry(surface, geometrySourceForSurface(surface));
   const physical = readSurfaceGeometry(surface, 'fallback');
+  const objectFit = (() => {
+    try { return String(getComputedStyle(surface).objectFit || '').toLowerCase(); }
+    catch { return ''; }
+  })();
+  const fillsCssBox = surface instanceof HTMLCanvasElement
+    && objectFit !== 'contain' && objectFit !== 'cover' && objectFit !== 'scale-down';
+  let rect = { left: 0, top: 0, width: 0, height: 0 };
+  try { rect = surface.getBoundingClientRect(); } catch { /* layout not ready */ }
+  if ((!rect.width || !rect.height) && typeof surface.closest === 'function') {
+    const screen = surface.closest('.android-screen');
+    if (screen && screen !== surface) {
+      try { rect = screen.getBoundingClientRect(); } catch { /* keep empty */ }
+    }
+  }
   const options = {
     clientX,
     clientY,
-    rect: surface.getBoundingClientRect(),
+    clampToEdge,
+    rect,
     contentWidth: width,
     contentHeight: height,
-    fillsCssBox: surface instanceof HTMLCanvasElement,
-    deviceWidth: geometry.deviceWidth || width,
-    deviceHeight: geometry.deviceHeight || height,
+    fillsCssBox,
+    deviceWidth: controlSize?.width || geometry.deviceWidth || width,
+    deviceHeight: controlSize?.height || geometry.deviceHeight || height,
     latestGeometry: geometry.latest,
     presentedGeometry: geometry.presented,
     physicalWidth: physical.deviceWidth,
@@ -1293,23 +2422,33 @@ function imgToDevice(surface, clientX, clientY) {
   };
   const helpers = globalThis.DuoAndroidPointerHelpers;
   if (typeof helpers?.mapClientPointToDevice === 'function') {
-    return helpers.mapClientPointToDevice(options);
+    const mapped = helpers.mapClientPointToDevice(options);
+    if (!mapped && typeof setDeviceHint === 'function') {
+      // Distinguish a miss outside the letterbox (normal) from a geometry
+      // frame mismatch (fixable): the latter would silently eat every tap.
+      if (options.latestGeometry && options.presentedGeometry
+        && options.presentedGeometry !== options.latestGeometry) {
+        setDeviceHint('画面几何正在切换，请稍候重试', false);
+      }
+    }
+    return mapped;
   }
-  const rect = options.rect;
-  if (!rect.width || !rect.height || !width || !height) return null;
+  const box = options.rect;
+  if (!box.width || !box.height || !width || !height) return null;
   const displayed = options.fillsCssBox
-    ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+    ? { left: box.left, top: box.top, width: box.width, height: box.height }
     : (() => {
-      const scale = Math.min(rect.width / width, rect.height / height);
+      const scale = Math.min(box.width / width, box.height / height);
       return {
-        left: rect.left + (rect.width - width * scale) / 2,
-        top: rect.top + (rect.height - height * scale) / 2,
+        left: box.left + (box.width - width * scale) / 2,
+        top: box.top + (box.height - height * scale) / 2,
         width: width * scale,
         height: height * scale,
       };
     })();
-  if (clientX < displayed.left || clientX > displayed.left + displayed.width
-    || clientY < displayed.top || clientY > displayed.top + displayed.height) return null;
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return null;
+  if (!clampToEdge && (clientX < displayed.left || clientX > displayed.left + displayed.width
+    || clientY < displayed.top || clientY > displayed.top + displayed.height)) return null;
   if (options.latestGeometry && options.presentedGeometry
     && options.presentedGeometry !== options.latestGeometry) return null;
   const relativeX = (clientX - displayed.left) / displayed.width;
@@ -1327,6 +2466,14 @@ function imgToDevice(surface, clientX, clientY) {
 
 function fitAndroidSurface(surface, parent) {
   if (!surface || !parent || surface.hidden || surface.style.display === 'none') return;
+  if (parent.classList?.contains('android-screen') || surface.closest?.('.android-screen')) {
+    surface.style.width = '100%';
+    surface.style.height = '100%';
+    surface.style.maxWidth = '100%';
+    surface.style.maxHeight = '100%';
+    surface.style.objectFit = 'contain';
+    return;
+  }
   const { width, height } = mirrorSurfaceSize(surface);
   const contain = globalThis.DuoAndroidPointerHelpers?.containCssSize
     || function (availW, availH, contentW, contentH) {
@@ -1343,7 +2490,7 @@ function fitAndroidSurface(surface, parent) {
 }
 
 function fitAndroidSurfaces() {
-  const previewParent = $('device-preview-wrap');
+  const previewParent = $('device-screen') || $('device-preview-wrap');
   const fullscreenParent = $('fullscreen-screen') || $('fullscreen-overlay');
   fitAndroidSurface($('device-video'), previewParent);
   fitAndroidSurface($('device-preview'), previewParent);
@@ -1369,15 +2516,18 @@ function setAndroidVideoVisible(visible) {
 
 function startAndroidFallback() {
   if (androidFallbackTimer) return;
-  const fallbackDevice = androidMirrorDevice || $('device-select')?.value || '';
+  const fallbackDevice = androidControlDeviceId();
+  if (!fallbackDevice) return;
   if (typeof globalThis.DuoAndroidJpegClient === 'function' && fallbackDevice) {
     if (!androidJpeg) {
       androidJpeg = new globalThis.DuoAndroidJpegClient({
         getToken: () => token,
         getTicket: requestAndroidMediaTicket,
         onStatus: (message) => {
-          if (message.status === 'error') setDeviceHint(`${message.error || '兼容画面暂不可用'}，正在重试`, false);
-          else if (message.status === 'disconnected') setDeviceHint('兼容画面连接中断，正在恢复…', false);
+          if (message.status === 'error') {
+            const detail = humanizeDeviceCaptureError(message.error) || '兼容画面暂不可用';
+            setDeviceHint(`${detail}，正在重试`, false);
+          } else if (message.status === 'disconnected') setDeviceHint('兼容画面连接中断，正在恢复…', false);
         },
         onMeta: (meta) => {
           for (const id of ['device-video', 'fullscreen-video']) {
@@ -1534,10 +2684,13 @@ function ensureAndroidMirror() {
       setAndroidStreamStatus(message.status);
       if (message.error) androidMirrorLastError = String(message.error);
       if (message.status === 'ready') androidMirrorLastError = '';
-      if (message.status === 'starting') setDeviceHint('正在建立 Android 实时镜像…', false);
+      if (message.status === 'starting') setDeviceHint('', false);
       else if (message.status === 'ready') {
-        setDeviceHint('Android 实时镜像已连接', false);
-        if (!androidMirror?.isController) androidMirror?.claimControl?.(true);
+        setDeviceHint('', false);
+        // Do NOT auto-claim here: both endpoints receive 'ready'. Claiming on
+        // both sides is what arms the lease tug-of-war that silently eats
+        // taps. Ownership is claimed when the user actually interacts, or
+        // when opening the fullscreen control view.
       } else if (message.status === 'error') {
         const detail = androidMirrorLastError || '实时镜像不可用';
         setDeviceHint(`${detail}，已切换截图回退（可全屏操控）`, false);
@@ -1549,7 +2702,9 @@ function ensureAndroidMirror() {
       } else if (message.status === 'control-owner' && message.controller === false) {
         setDeviceHint('设备正在由其他客户端控制，点此全屏可抢占', false);
       } else if (message.status === 'control-owner' && message.controller === true) {
-        setDeviceHint('Android 实时镜像已连接', false);
+        setDeviceHint('', false);
+      } else if (message.type === 'android:control-challenge') {
+        setDeviceHint('其他端点正在请求控制权；继续滑动即可保持控制', false);
       }
     },
     onMeta: (meta) => {
@@ -1606,7 +2761,7 @@ function ensureAndroidMirror() {
 
 function startAndroidMirror(deviceId) {
   const id = String(deviceId || '').trim();
-  if (!id) return;
+  if (!id || isComputerDevice(id)) return;
   if (androidMirrorDevice && androidMirrorDevice !== id) {
     // Invalidate the previous device's screenshot/JPEG work before starting a
     // new subscription. A slow ADB response or a late JPEG decode must never
@@ -1646,25 +2801,19 @@ function stopAndroidMirror() {
   setAndroidStreamStatus('stopped');
 }
 
-function legacyAndroidGesture(deviceId, start, end) {
-  if (!deviceId || !start || !end) return;
+function legacyAndroidGesture(deviceId, start, end, duration = 300) {
+  if (!deviceId || isComputerDevice(deviceId) || !start || !end) return;
   // ADB injects physical device pixels, which differ from the scrcpy control
   // space whenever a live mirror owns the surface.
   const from = { x: start.deviceX ?? start.x, y: start.deviceY ?? start.y };
   const to = { x: end.deviceX ?? end.x, y: end.deviceY ?? end.y };
   const moved = Math.hypot(to.x - from.x, to.y - from.y);
-  const session = androidMediaSessions.get(String(deviceId));
-  const controlEpoch = androidMirrorDevice === String(deviceId) && Number.isSafeInteger(androidMirror?.controlEpoch)
-    ? androidMirror.controlEpoch
-    : undefined;
-  const lease = {
-    ...(session?.clientId ? { clientId: session.clientId } : {}),
-    ...(controlEpoch !== undefined ? { controlEpoch } : {}),
-  };
-  const body = moved >= 12
-    ? { deviceId, x1: from.x, y1: from.y, x2: to.x, y2: to.y, duration: 300, ...lease }
+  const lease = androidControlLease(deviceId);
+  const isSwipe = moved >= 12 || duration >= 500;
+  const body = isSwipe
+    ? { deviceId, x1: from.x, y1: from.y, x2: to.x, y2: to.y, duration, ...lease }
     : { deviceId, x: to.x, y: to.y, ...lease };
-  const endpoint = moved >= 12 ? '/api/android/swipe' : '/api/android/tap';
+  const endpoint = isSwipe ? '/api/android/swipe' : '/api/android/tap';
   fetch(`${API}${endpoint}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
@@ -1676,172 +2825,269 @@ function legacyAndroidGesture(deviceId, start, end) {
   }).catch(() => setDeviceHint('操控失败：无法连接桌面端'));
 }
 
-// Keep a gesture on the live control channel once its pointer went down there.
-// Falling back to the HTTP/ADB path after a control lease change can be rejected
-// by the server, and sending only DOWN without a matching UP leaves Android in a
-// pressed state so the next gesture appears to do nothing.
-function sendLiveAndroidGesture(start, end, pointerId) {
-  if (!androidMirror?.isReady() || !androidMirror.isController || androidMirror.geometryVersion <= 0) return false;
-  const moved = Math.hypot(end.x - start.x, end.y - start.y);
-  if (moved < 12) {
-    return androidMirror.sendInput({ type: 'tap', pointerId, x: end.x, y: end.y, pressure: 1 }) != null;
-  }
-  const down = androidMirror.sendInput({ type: 'touch', action: 'down', pointerId, x: start.x, y: start.y, pressure: 1 });
-  if (down == null) return false;
-  const move = androidMirror.sendInput({ type: 'touch', action: 'move', pointerId, x: end.x, y: end.y, pressure: 1 });
-  const up = move == null ? null : androidMirror.sendInput({ type: 'touch', action: 'up', pointerId, x: end.x, y: end.y, pressure: 0 });
-    if (up == null) {
-    // If the queue accepted DOWN but a later write failed, try to release it
-    // immediately. The server also cleans active pointers on lease/socket loss.
-    if (androidMirror.isReady()) {
-      (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId, x: end.x, y: end.y, pressure: 0 });
-    }
-    return false;
-  }
-  return true;
+function androidControlLease(deviceId) {
+  const session = androidMediaSessions.get(String(deviceId));
+  const controlEpoch = androidMirrorDevice === String(deviceId) && Number.isSafeInteger(androidMirror?.controlEpoch)
+    ? androidMirror.controlEpoch
+    : undefined;
+  return {
+    ...(session?.clientId ? { clientId: session.clientId } : {}),
+    ...(controlEpoch !== undefined ? { controlEpoch } : {}),
+  };
 }
 
-function bindAndroidPointerSurface(surface, alwaysControl) {
-  if (!surface || surface.dataset.androidPointerBound) return;
-  surface.dataset.androidPointerBound = '1';
-  surface.style.touchAction = 'none';
-  const active = new Map();
-  const pendingMoves = new Map();
-  let moveFrame = 0;
-  const flushMoves = () => {
-    moveFrame = 0;
-    for (const [pointerId, value] of pendingMoves) {
-      pendingMoves.delete(pointerId);
-      const state = active.get(pointerId);
-      // A screenshot/fallback gesture may span the moment the live socket
-      // becomes ready. Do not inject a lone MOVE into scrcpy without the
-      // matching DOWN; the gesture remains on the legacy path instead.
-      if (state?.sentDown && androidMirror?.isReady() && androidMirror.isController) androidMirror.sendInput({
-        type: 'touch', action: 'move', pointerId, x: value.x, y: value.y, pressure: 1,
-      });
-    }
-  };
-  const scheduleMoveFlush = () => {
-    if (!moveFrame) moveFrame = requestAnimationFrame(flushMoves);
-  };
-  surface.addEventListener('pointerdown', (event) => {
-    // A ready socket can still be waiting for its first decoded frame while a
-    // JPEG/ADB fallback is the surface the user is actually touching. Keep that
-    // gesture on the fallback until the live canvas has a presented frame;
-    // otherwise physical fallback coordinates are sent as encoded live ones.
-    const mirrorReady = androidMirror?.isReady() && androidMirror.hasFrame
-      && surface instanceof HTMLCanvasElement;
-    const canControl = alwaysControl || remoteTapEnabled || !mirrorReady;
-    if (!canControl || (event.pointerType === 'mouse' && event.button !== 0)) return;
-    const deviceId = androidMirrorDevice || $('device-select')?.value;
-    const point = imgToDevice(surface, event.clientX, event.clientY);
-    if (!deviceId || !point) return;
-    event.preventDefault();
-    if (mirrorReady && !androidMirror.isController) {
+async function sendAndroidNavKey(name) {
+  const inputs = globalThis.DuoAndroidNavKeys?.buildAndroidNavKeyInputs?.(name) || [];
+  if (!inputs.length) return;
+  const deviceId = androidControlDeviceId();
+  if (!deviceId) {
+    showCopyToast('请先选择设备');
+    return;
+  }
+  if (androidMirror?.isReady()) {
+    if (!androidMirror.isController) {
       androidMirror.claimControl?.(true);
       setDeviceHint('正在申请 Android 控制权…', false);
     }
-    const sentDown = mirrorReady && androidMirror.isController && androidMirror.geometryVersion > 0
-      && androidMirror.sendInput({ type: 'touch', action: 'down', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 1 }) != null;
-    active.set(event.pointerId, {
-      deviceId,
-      start: point,
-      last: point,
-      sentDown,
-      transport: mirrorReady ? 'mirror' : 'legacy',
+    const sequences = [];
+    for (const input of inputs) {
+      const sequence = androidMirror.sendInput(input);
+      if (sequence == null) break;
+      sequences.push(sequence);
+    }
+    if (sequences.length === inputs.length) {
+      try {
+        for (const sequence of sequences) {
+          const ack = await androidMirror.waitForAck(sequence);
+          if (ack?.ok === false) throw new Error(ack.error || '设备未接受按键');
+        }
+      } catch (error) {
+        setDeviceHint(error?.message || '按键回执超时，请重试', false);
+      }
+      return;
+    }
+  }
+  const response = await fetch(`${API}/api/android/key`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify({ deviceId, key: name, ...androidControlLease(deviceId) }),
+  }).catch(() => {});
+  if (!response?.ok) {
+    const payload = await response?.json?.().catch(() => ({}));
+    setDeviceHint(payload?.error || '按键发送失败，请重试', false);
+  }
+}
+
+function surfaceHasBox(surface) {
+  if (!surface || surface.hidden || surface.style?.display === 'none') return false;
+  try {
+    const rect = surface.getBoundingClientRect();
+    return rect.width > 1 && rect.height > 1;
+  } catch {
+    return true;
+  }
+}
+
+function visibleAndroidSurface(screen) {
+  if (!screen) return null;
+  const canvas = screen.querySelector('canvas');
+  const image = screen.querySelector('img');
+  if (canvas && !canvas.hidden && surfaceHasBox(canvas)) return canvas;
+  if (image && image.style.display !== 'none' && (image.currentSrc || image.src) && surfaceHasBox(image)) return image;
+  if (canvas && !canvas.hidden) return canvas;
+  if (image && image.style.display !== 'none' && (image.currentSrc || image.src)) return image;
+  return canvas || image || screen;
+}
+
+// Keep each gesture tied to the connection, geometry and lease that accepted
+// its DOWN. Buffer timestamped events while claiming control so a first drag
+// or long press retains its path and duration instead of becoming a tap.
+function bindAndroidPointerSurface(target, alwaysControl) {
+  if (!target || target.dataset.androidPointerBound) return;
+  target.dataset.androidPointerBound = '1';
+  target.style.touchAction = 'none';
+  const resolveSurface = () => (
+    target.classList?.contains('android-screen') ? (visibleAndroidSurface(target) || target) : target
+  );
+  const active = new Map();
+  let timer = 0;
+  const sameConnection = state => androidMirror === state.mirror
+    && androidMirrorDevice === state.deviceId
+    && state.mirror?.connectionGeneration === state.connectionGeneration;
+  const sameLease = state => sameConnection(state)
+    && state.mirror.controlEpoch === state.epoch;
+  const releaseCapture = (pointerId, state) => {
+    const captureEl = state?.captureEl || target;
+    try {
+      if (captureEl.hasPointerCapture?.(pointerId)) captureEl.releasePointerCapture(pointerId);
+    } catch { /* capture element may already be detached */ }
+  };
+  const cancel = (pointerId, state, message) => {
+    active.delete(pointerId);
+    if (state.sentDown && sameLease(state) && state.mirror.isReady()) {
+      state.mirror.sendEmergencyInput({
+        type: 'touch', action: 'cancel', pointerId,
+        x: state.sentPoint.x, y: state.sentPoint.y, pressure: 0,
+      });
+    }
+    releaseCapture(pointerId, state);
+    if (message) setDeviceHint(message, false);
+  };
+  const send = (pointerId, state, action, point) => {
+    const sequence = state.mirror.sendInput({
+      type: 'touch', action, pointerId, x: point.x, y: point.y,
+      pressure: action === 'up' ? 0 : 1,
     });
-    surface.setPointerCapture?.(event.pointerId);
-  });
-  surface.addEventListener('pointermove', (event) => {
+    if (sequence == null) return false;
+    state.sentPoint = point;
+    // A successful WebSocket write is not confirmation of device injection.
+    if (action === 'down' || action === 'up') {
+      state.mirror.waitForAck(sequence).then(ack => {
+        if (ack.ok !== false) return;
+        if (active.get(pointerId) === state || !active.has(pointerId)) cancel(pointerId, state);
+        if (sameConnection(state)) setDeviceHint(ack.error || 'Android 未接受触摸，请重试', false);
+      }).catch(error => {
+        if (active.get(pointerId) === state || !active.has(pointerId)) cancel(pointerId, state);
+        if (sameConnection(state)) setDeviceHint(error.message || '触摸回执超时，请重试', false);
+      });
+    }
+    return true;
+  };
+  const pump = () => {
+    if (timer) clearTimeout(timer);
+    timer = 0;
+    const now = performance.now();
+    for (const [pointerId, state] of active) {
+      if (state.transport !== 'mirror') continue;
+      if (!sameConnection(state) || !state.mirror.isReady()
+        || state.mirror.geometryVersion !== state.geometryVersion
+        || (state.sentDown && (!sameLease(state) || !state.mirror.isController))) {
+        cancel(pointerId, state, '连接或画面已变化，请重新触摸');
+        continue;
+      }
+      if (!state.sentDown) {
+        if (!state.mirror.isController) {
+          // The server allows 1500 ms for an active owner's response. Leave
+          // time for the claim and grant to cross the mobile network as well.
+          if (now - state.startedAt >= 3000) cancel(pointerId, state, '未取得 Android 控制权，请重试');
+          continue;
+        }
+        state.epoch = state.mirror.controlEpoch;
+        if (!send(pointerId, state, 'down', state.start)) {
+          cancel(pointerId, state, '触摸发送失败，请重试');
+          continue;
+        }
+        state.sentDown = true;
+        state.sentAt = now;
+      }
+      while (state.events.length && state.events[0].at <= now - state.sentAt) {
+        const event = state.events.shift();
+        if (!send(pointerId, state, event.action, event.point)) {
+          cancel(pointerId, state, '触摸发送失败，请重试');
+          break;
+        }
+        if (event.action === 'up') active.delete(pointerId);
+      }
+    }
+    if ([...active.values()].some(state => state.transport === 'mirror')) timer = setTimeout(pump, 16);
+  };
+  const queue = (state, action, point) => {
+    const at = performance.now() - state.startedAt;
+    const previous = state.events[state.events.length - 1];
+    // Limit MOVE traffic to one sample per display frame, preserving the last
+    // sample before UP and the timing of a hold before a drag.
+    if (action === 'move' && previous?.action === 'move' && at - previous.at < 16) {
+      previous.point = point;
+    } else {
+      state.events.push({ action, point, at });
+    }
+  };
+  const pointerOpts = { capture: true, passive: false };
+  target.addEventListener('contextmenu', event => event.preventDefault(), pointerOpts);
+  target.addEventListener('dragstart', event => event.preventDefault(), pointerOpts);
+  target.addEventListener('pointerdown', event => {
+    const mirrorReady = androidMirror?.isReady() && androidMirror.geometryVersion > 0
+      && androidMirror.width > 0 && androidMirror.height > 0;
+    if (!(alwaysControl || remoteTapEnabled || !mirrorReady)
+      || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    const deviceId = androidControlDeviceId();
+    const controlSize = mirrorReady ? { width: androidMirror.width, height: androidMirror.height } : null;
+    const mapSurface = resolveSurface();
+    const point = imgToDevice(mapSurface, event.clientX, event.clientY, false, controlSize)
+      || (mapSurface !== target ? imgToDevice(target, event.clientX, event.clientY, false, controlSize) : null);
+    if (!deviceId || !point) return;
+    event.preventDefault();
+    const previous = active.get(event.pointerId);
+    if (previous) cancel(event.pointerId, previous);
+    const hit = event.target;
+    let captureEl = target;
+    if (hit && hit !== target && typeof hit.setPointerCapture === 'function'
+      && (typeof target.contains !== 'function' || target.contains(hit))) {
+      captureEl = hit;
+    }
+    const state = {
+      deviceId, start: point, last: point, sentPoint: point, events: [],
+      controlSize, mapSurface, captureEl,
+      startedAt: performance.now(), sentDown: false, ended: false,
+      transport: mirrorReady ? 'mirror' : 'legacy', mirror: androidMirror,
+      connectionGeneration: androidMirror?.connectionGeneration,
+      geometryVersion: androidMirror?.geometryVersion,
+    };
+    active.set(event.pointerId, state);
+    try { captureEl.setPointerCapture?.(event.pointerId); } catch { /* ignore */ }
+    if (androidMirror?.isReady() && !androidMirror.isController) {
+      androidMirror.claimControl?.(true);
+      setDeviceHint('正在申请 Android 控制权…', false);
+    }
+    pump();
+  }, pointerOpts);
+  target.addEventListener('pointermove', event => {
     const state = active.get(event.pointerId);
-    if (!state) return;
-    const point = imgToDevice(surface, event.clientX, event.clientY);
+    if (!state || state.ended) return;
+    const point = imgToDevice(state.mapSurface || resolveSurface(), event.clientX, event.clientY, true, state.controlSize);
     if (!point) return;
     event.preventDefault();
     state.last = point;
-    pendingMoves.set(event.pointerId, point);
-    scheduleMoveFlush();
-  });
-  surface.addEventListener('pointerup', (event) => {
+    if (state.transport === 'mirror') queue(state, 'move', point);
+  }, pointerOpts);
+  target.addEventListener('pointerup', event => {
     const state = active.get(event.pointerId);
-    if (!state) return;
-    const point = imgToDevice(surface, event.clientX, event.clientY) || state.last;
-    active.delete(event.pointerId);
-    pendingMoves.delete(event.pointerId);
-    if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; flushMoves(); }
-    surface.releasePointerCapture?.(event.pointerId);
+    if (!state || state.ended) return;
     event.preventDefault();
+    state.ended = true;
+    const point = imgToDevice(state.mapSurface || resolveSurface(), event.clientX, event.clientY, true, state.controlSize) || state.last;
+    releaseCapture(event.pointerId, state);
     if (state.transport === 'legacy') {
-      legacyAndroidGesture(state.deviceId, state.start, point);
-      return;
-    }
-    if (state.sentDown) {
-      // Do not silently switch transports after DOWN. If the socket is briefly
-      // unavailable, the server's lease/socket cleanup releases the pointer.
-      if (androidMirror?.isReady() && androidMirror.isController) {
-        androidMirror.sendInput({ type: 'touch', action: 'up', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 0 });
-      } else if (androidMirror?.isReady()) {
-        // Reclaiming also asks the server to flush a pointer whose DOWN was
-        // accepted just before the lease changed.
-        (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId: event.pointerId, x: point.x, y: point.y, pressure: 0 });
-        androidMirror.claimControl?.(true);
+      active.delete(event.pointerId);
+      if (androidControlDeviceId() === state.deviceId) {
+        legacyAndroidGesture(state.deviceId, state.start, point, performance.now() - state.startedAt);
       }
       return;
     }
-
-    // Control ownership and the first geometry frame arrive asynchronously.
-    // Give the claim a short window to complete so the first tap after connect
-    // is not discarded and does not hit a lease-protected legacy endpoint.
-    void (async () => {
-      for (let attempt = 0; attempt < 6; attempt++) {
-        if (androidMirrorDevice !== state.deviceId) return;
-        if (sendLiveAndroidGesture(state.start, point, event.pointerId)) return;
-        if (!androidMirror?.isReady()) {
-          legacyAndroidGesture(state.deviceId, state.start, point);
-          return;
-        }
-        if (attempt === 0 || !androidMirror.isController) androidMirror.claimControl?.(true);
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-      setDeviceHint('Android 控制权尚未就绪，请稍后再试', false);
-    })();
-  });
-  surface.addEventListener('pointercancel', (event) => {
+    // UP can arrive before the scheduled MOVE, or contain a newer position.
+    // Deliver that final position as MOVE before releasing the contact.
+    if (point.x !== state.last.x || point.y !== state.last.y) queue(state, 'move', point);
+    queue(state, 'up', point);
+    pump();
+  }, pointerOpts);
+  target.addEventListener('pointercancel', event => {
     const state = active.get(event.pointerId);
-    active.delete(event.pointerId);
-    pendingMoves.delete(event.pointerId);
-    if (moveFrame && pendingMoves.size === 0) { cancelAnimationFrame(moveFrame); moveFrame = 0; }
-    surface.releasePointerCapture?.(event.pointerId);
-    if (state?.sentDown && androidMirror?.isReady()) {
-      (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId: event.pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
-    }
-  });
-  // A few mobile browsers report lost pointer capture without a subsequent
-  // pointerup/pointercancel when the page is backgrounded or its viewport
-  // changes. Treat it as a cancel so a stuck DOWN cannot poison later input.
-  surface.addEventListener('lostpointercapture', (event) => {
+    if (state) cancel(event.pointerId, state);
+  }, pointerOpts);
+  target.addEventListener('lostpointercapture', event => {
     const state = active.get(event.pointerId);
-    if (!state) return;
-    active.delete(event.pointerId);
-    pendingMoves.delete(event.pointerId);
-    if (state.sentDown && androidMirror?.isReady()) {
-      (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId: event.pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
-    }
+    if (!state || state.ended) return;
+    if (state.captureEl && state.captureEl !== target && event.target === target) return;
+    cancel(event.pointerId, state);
   });
-  const cancelOnBlur = () => {
-    for (const [pointerId, state] of active) {
-      if (state.sentDown && androidMirror?.isReady()) {
-        (androidMirror.sendEmergencyInput || androidMirror.sendInput).call(androidMirror, { type: 'touch', action: 'cancel', pointerId, x: state.last.x, y: state.last.y, pressure: 0 });
-      }
-      surface.releasePointerCapture?.(pointerId);
-    }
-    active.clear();
-    pendingMoves.clear();
-    if (moveFrame) { cancelAnimationFrame(moveFrame); moveFrame = 0; }
+  const cancelAll = () => {
+    for (const [pointerId, state] of active) cancel(pointerId, state);
+    if (timer) clearTimeout(timer);
+    timer = 0;
   };
-  window.addEventListener('blur', cancelOnBlur);
+  window.addEventListener('blur', cancelAll);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') cancelOnBlur();
+    if (document.visibilityState === 'hidden') cancelAll();
   });
 }
 
@@ -1872,6 +3118,7 @@ function copyAndroidCanvas(from, to) {
 }
 
 function openAndroidFullscreen() {
+  closeMacDesktopFullscreen();
   const fallbackSrc = $('device-preview')?.src || '';
   const live = Boolean(androidMirror?.hasFrame || androidJpeg?.hasFrame);
   if (fallbackSrc) $('fullscreen-preview').src = fallbackSrc;
@@ -1892,21 +3139,83 @@ function openAndroidFullscreen() {
   setAndroidVideoVisible(live);
   remoteTapEnabled = true;
   androidMirror?.claimControl?.(true);
-  requestAnimationFrame(fitAndroidSurfaces);
+  requestAnimationFrame(() => {
+    fitAndroidSurfaces();
+    requestAnimationFrame(fitAndroidSurfaces);
+  });
   if (live || fallbackSrc) showCopyToast('拖动操控 · 输入文字');
+}
+
+function isMacDesktopFullscreenOpen() {
+  return document.body.classList.contains('computer-desktop-fullscreen')
+    && $('fullscreen-overlay')?.style.display === 'flex';
+}
+
+function ensureMacDesktopFullscreenPreviewEl() {
+  const screen = $('fullscreen-screen');
+  let img = $('mac-desktop-fullscreen-preview');
+  if (!img && screen) {
+    img = document.createElement('img');
+    img.id = 'mac-desktop-fullscreen-preview';
+    img.className = 'mac-desktop-fullscreen-preview';
+    img.alt = '电脑桌面';
+    screen.appendChild(img);
+  }
+  if (img) img.hidden = false;
+  return img;
+}
+
+function openMacDesktopFullscreen() {
+  if (!isComputerSelected()) {
+    showCopyToast('请先选择电脑');
+    return;
+  }
+  document.body.classList.add('computer-desktop-fullscreen');
+  const img = ensureMacDesktopFullscreenPreviewEl();
+  const inline = $('mac-desktop-preview');
+  if (img && inline?.src) {
+    img.src = inline.src;
+    writeSurfaceGeometry(img, 'fallback', readSurfaceGeometry(inline, 'fallback'));
+  }
+  bindMacDesktopPointer($('fullscreen-screen'));
+  $('fullscreen-overlay').style.display = 'flex';
+  void refreshMacDesktopScreenshot();
+  showCopyToast('全屏操控 · 点击即可操作');
+}
+
+function closeMacDesktopFullscreen() {
+  document.body.classList.remove('computer-desktop-fullscreen');
+  const img = $('mac-desktop-fullscreen-preview');
+  if (img) img.hidden = true;
+}
+
+function openDeviceFullscreen() {
+  if (isComputerSelected()) {
+    openMacDesktopFullscreen();
+    return;
+  }
+  openAndroidFullscreen();
+}
+
+function openMacDesktopWindow() {
+  if (!isComputerSelected()) {
+    showCopyToast('请先选择电脑');
+    return;
+  }
+  const url = new URL('mac-desktop-view.html', location.href);
+  if (token) url.searchParams.set('token', token);
+  const popup = window.open(url.toString(), 'duocli-mac-desktop', 'noopener,noreferrer');
+  if (!popup) {
+    showCopyToast('浏览器拦截了弹窗，请允许后重试');
+    return;
+  }
+  showCopyToast('已在新窗口打开桌面');
 }
 
 async function showPhoneControl() {
   openDevicePanel('device');
-  const ready = await refreshAndroidDevices();
-  if (!ready) {
-    showCopyToast('请先连接 Android 设备');
-    return;
-  }
-  const deviceId = $('device-select')?.value;
-  if (deviceId) startAndroidMirror(deviceId);
-  remoteTapEnabled = true;
-  openAndroidFullscreen();
+  await refreshAndroidDevices();
+  remoteTapEnabled = !isComputerDevice($('device-select')?.value);
 }
 
 function initDevicePage() {
@@ -1938,9 +3247,11 @@ function initDevicePage() {
   $('device-console-btn').onclick = () => { void showPhoneControl(); };
 
   $('device-back-btn').onclick = () => {
+    hideComputerDesktop();
     if ($('device-page').classList.contains('landscape-drawer-open')) {
       $('device-page').classList.remove('landscape-drawer-open');
       document.body.classList.remove('landscape-device-open');
+      stopFilePreviewPlayback();
       stopAndroidMirror();
       syncLandscapePanelButtons();
       scheduleLandscapeWorkspaceResize();
@@ -1959,13 +3270,14 @@ function initDevicePage() {
     }
   };
   $('fullscreen-back-btn').onclick = () => {
+    closeMacDesktopFullscreen();
     $('fullscreen-overlay').style.display = 'none';
   };
   const sendTextToDevice = async () => {
     const text = $('fullscreen-text-input').value;
     if (!text) return;
-    const deviceId = $('device-select').value;
-    if (!deviceId) { showCopyToast('请先选择设备'); return; }
+    const deviceId = androidControlDeviceId();
+    if (!deviceId) { showCopyToast('请先选择 Android 设备'); return; }
     if (androidMirror?.isReady()) {
       const sequence = androidMirror.sendInput({ type: 'text', text });
       if (sequence != null) {
@@ -2001,33 +3313,40 @@ function initDevicePage() {
       showCopyToast('已发送（截图回退）');
     } else showCopyToast('文字发送失败，请重试');
   };
-  $('fullscreen-text-btn').onclick = () => {
+  const openDeviceTextInput = () => {
     $('fullscreen-text-input').value = '';
     $('input-text-modal').classList.add('active');
     setTimeout(() => $('fullscreen-text-input').focus(), 100);
   };
+  document.querySelectorAll('.android-text-btn').forEach((btn) => {
+    if (btn.dataset.bound) return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', openDeviceTextInput);
+  });
   $('input-text-close').onclick = () => $('input-text-modal').classList.remove('active');
   $('fullscreen-text-send').onclick = sendTextToDevice;
   $('fullscreen-text-input').addEventListener('keydown', e => { if (e.key === 'Enter') void sendTextToDevice(); });
 
-  $('device-fullscreen-btn').onclick = openAndroidFullscreen;
+  $('device-fullscreen-btn').onclick = openDeviceFullscreen;
+  $('device-desktop-window-btn').onclick = openMacDesktopWindow;
+
+  document.querySelectorAll('.android-nav-keys').forEach((nav) => {
+    if (nav.dataset.bound) return;
+    nav.dataset.bound = '1';
+    nav.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const button = event.target.closest('[data-android-key]');
+      if (button) void sendAndroidNavKey(button.getAttribute('data-android-key'));
+    });
+  });
 
   // Persistent mirror input: send down/move/up immediately over the control
   // channel. The old image-only touch handlers are intentionally not kept;
   // they made a swipe arrive only after the gesture had already ended.
   const deviceVideo = $('device-video');
   const devicePreview = $('device-preview');
-  const fullscreenVideo = $('fullscreen-video');
-  const fullscreenPreview = $('fullscreen-preview');
-  bindAndroidPointerSurface(deviceVideo, true);
-  bindAndroidPointerSurface(devicePreview, true);
-  bindAndroidPointerSurface(fullscreenVideo, true);
-  bindAndroidPointerSurface(fullscreenPreview, true);
-  [deviceVideo, devicePreview].forEach((surface) => {
-    surface?.addEventListener('click', () => {
-      if ($('fullscreen-overlay')?.style.display === 'none') openAndroidFullscreen();
-    });
-  });
+  bindAndroidPointerSurface($('device-screen'), true);
+  bindAndroidPointerSurface($('fullscreen-screen'), true);
 
   const syncRemoteTapUi = () => {
     const button = $('device-tap-toggle');
@@ -2035,7 +3354,7 @@ function initDevicePage() {
       button.textContent = remoteTapEnabled ? '远程点击 · 已开' : '远程点击 · 已关';
       button.setAttribute('aria-pressed', String(remoteTapEnabled));
     }
-    [deviceVideo, devicePreview].forEach((surface) => {
+    [deviceVideo, devicePreview, $('device-screen'), $('fullscreen-screen')].forEach((surface) => {
       if (surface) surface.style.cursor = remoteTapEnabled ? 'crosshair' : 'default';
     });
   };
@@ -2043,9 +3362,13 @@ function initDevicePage() {
   if (!$('device-preview-wrap')?.dataset.fitObserved) {
     const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => fitAndroidSurfaces()) : null;
     const previewWrap = $('device-preview-wrap');
-    const fullscreenScreen = $('fullscreen-screen') || $('fullscreen-overlay');
+    const deviceScreen = $('device-screen');
+    const fullscreenScreen = $('fullscreen-screen');
+    const overlay = $('fullscreen-overlay');
     if (previewWrap) observer?.observe(previewWrap);
+    if (deviceScreen) observer?.observe(deviceScreen);
     if (fullscreenScreen) observer?.observe(fullscreenScreen);
+    if (overlay) observer?.observe(overlay);
     if (previewWrap) previewWrap.dataset.fitObserved = '1';
   }
 
@@ -2061,12 +3384,8 @@ function initDevicePage() {
   };
   $('device-select').onchange = () => {
     const id = $('device-select').value;
-    if (id) {
-      localStorage.setItem('duocli_android_device', id);
-      startAndroidMirror(id);
-    } else {
-      stopAndroidMirror();
-    }
+    if (id) localStorage.setItem('duocli_android_device', id);
+    applySelectedDevice();
   };
 }
 
@@ -2076,14 +3395,256 @@ function setDeviceHint(msg, notify = Boolean(msg)) {
   if (notify && msg) showCopyToast(msg);
 }
 
+function humanizeDeviceCaptureError(error) {
+  const text = String(error || '').trim();
+  if (!text) return '';
+  if (/unsupported image format|Input buffer contains/i.test(text)) return '截图格式异常';
+  if (/VipsJpeg|VipsPng|libvips|\bsharp\b/i.test(text)) return '截图处理失败';
+  return text;
+}
+
+function appendComputerDeviceOption(sel) {
+  const opt = document.createElement('option');
+  opt.value = COMPUTER_DEVICE_ID;
+  opt.textContent = '电脑';
+  sel.appendChild(opt);
+}
+
+function applySelectedDevice() {
+  const id = $('device-select')?.value;
+  remoteTapEnabled = !isComputerDevice(id);
+  if (isComputerDevice(id)) {
+    stopAndroidMirror();
+    void showComputerDesktop();
+    return;
+  }
+  hideComputerDesktop();
+  if (id) startAndroidMirror(id);
+  else stopAndroidMirror();
+}
+
+async function ensureMacDesktopClient() {
+  if (macDesktopClient) return macDesktopClient;
+  if (typeof window.MacDesktopClient === 'undefined') {
+    showCopyToast('远程桌面组件未加载');
+    return null;
+  }
+  macDesktopClient = new window.MacDesktopClient({ api: location.origin });
+  if (typeof macDesktopClient.renderContainer === 'function') macDesktopClient.renderContainer();
+  if (typeof macDesktopClient.fetchCapabilities === 'function') {
+    await macDesktopClient.fetchCapabilities();
+  } else if (typeof macDesktopClient.init === 'function') {
+    await macDesktopClient.init();
+  }
+  window.macDesktopClient = macDesktopClient;
+  subscribeToMacDesktopCapabilities();
+  return macDesktopClient;
+}
+
+function setComputerDesktopMessage(message) {
+  const container = $('mac-desktop-container');
+  let status = container?.querySelector('.mac-desktop-inline-status');
+  if (container && !status) {
+    status = document.createElement('div');
+    status.className = 'mac-desktop-inline-status';
+    container.prepend(status);
+  }
+  if (status) {
+    status.textContent = message || '';
+    status.hidden = !message;
+  }
+  setDeviceHint(message, false);
+}
+
+let macDesktopPreviewTimer = null;
+let macDesktopPreviewRequest = 0;
+let macDesktopObjectUrl = '';
+let macDesktopPreviewInFlight = false;
+let macDesktopHintShown = false;
+
+function ensureMacDesktopPreviewEl() {
+  const container = $('mac-desktop-container');
+  if (!container) return null;
+  let img = $('mac-desktop-preview');
+  if (!img) {
+    img = document.createElement('img');
+    img.id = 'mac-desktop-preview';
+    img.alt = '电脑桌面';
+    container.appendChild(img);
+  }
+  return img;
+}
+
+async function refreshMacDesktopScreenshot() {
+  if (macDesktopPreviewInFlight || !isComputerSelected()) return;
+  const requestId = ++macDesktopPreviewRequest;
+  macDesktopPreviewInFlight = true;
+  const fullscreen = isMacDesktopFullscreenOpen();
+  const quality = fullscreen ? 72 : 55;
+  const scale = fullscreen ? 0.75 : 0.4;
+  try {
+    const res = await fetch(`${API}/api/mac-desktop/screenshot?quality=${quality}&scale=${scale}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    if (requestId !== macDesktopPreviewRequest || !isComputerSelected()) return;
+    const blob = await res.blob();
+    const nextUrl = URL.createObjectURL(blob);
+    const previousUrl = macDesktopObjectUrl;
+    macDesktopObjectUrl = nextUrl;
+    const img = ensureMacDesktopPreviewEl();
+    const fullscreenImg = fullscreen ? ensureMacDesktopFullscreenPreviewEl() : $('mac-desktop-fullscreen-preview');
+    if (!img) return;
+    const deviceWidth = Number(res.headers.get('X-DuoCLI-Device-Width')) || 0;
+    const deviceHeight = Number(res.headers.get('X-DuoCLI-Device-Height')) || 0;
+    const geometry = {
+      deviceWidth,
+      deviceHeight,
+      latest: 1,
+      presented: 1,
+    };
+    writeSurfaceGeometry(img, 'fallback', geometry);
+    if (fullscreenImg) writeSurfaceGeometry(fullscreenImg, 'fallback', geometry);
+    const applySrc = (target) => {
+      if (!target) return;
+      target.onload = () => {
+        if (previousUrl && target === img) URL.revokeObjectURL(previousUrl);
+        setComputerDesktopMessage('');
+      };
+      target.src = nextUrl;
+    };
+    applySrc(img);
+    if (fullscreen) applySrc(fullscreenImg);
+  } catch (error) {
+    if (requestId === macDesktopPreviewRequest) {
+      setComputerDesktopMessage(error?.message || '无法获取电脑画面');
+    }
+  } finally {
+    macDesktopPreviewInFlight = false;
+  }
+}
+
+function sendMacDesktopGesture(start, end, duration) {
+  if (!start || !end) return;
+  const moved = Math.hypot(end.x - start.x, end.y - start.y) > 8;
+  const headers = { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) };
+  const request = moved
+    ? fetch(`${API}/api/mac-desktop/swipe`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ x1: start.x, y1: start.y, x2: end.x, y2: end.y, duration }),
+    })
+    : fetch(`${API}/api/mac-desktop/tap`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ x: end.x, y: end.y }),
+    });
+  request.then(async (res) => {
+    if (res.ok) return;
+    const data = await res.json().catch(() => ({}));
+    setDeviceHint(data.error || '电脑操作失败', true);
+  }).catch((error) => {
+    setDeviceHint(error?.message || '电脑操作失败', true);
+  });
+}
+
+function bindMacDesktopPointer(target) {
+  if (!target || target.dataset.macPointerBound) return;
+  target.dataset.macPointerBound = '1';
+  target.style.touchAction = 'none';
+  let gesture = null;
+  const resolveSurface = () => {
+    if (isMacDesktopFullscreenOpen()) return $('mac-desktop-fullscreen-preview') || $('mac-desktop-preview');
+    return $('mac-desktop-preview');
+  };
+  target.addEventListener('pointerdown', (event) => {
+    if (!isComputerSelected() || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    const img = resolveSurface();
+    const point = img ? imgToDevice(img, event.clientX, event.clientY, false) : null;
+    if (!point) return;
+    event.preventDefault();
+    gesture = { start: point, last: point, at: performance.now(), pointerId: event.pointerId };
+    try { target.setPointerCapture?.(event.pointerId); } catch { /* ignore */ }
+  });
+  target.addEventListener('pointermove', (event) => {
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const img = resolveSurface();
+    const point = img ? imgToDevice(img, event.clientX, event.clientY, true) : null;
+    if (point) gesture.last = point;
+  });
+  const finish = (event) => {
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const current = gesture;
+    gesture = null;
+    try { target.releasePointerCapture?.(event.pointerId); } catch { /* ignore */ }
+    sendMacDesktopGesture(current.start, current.last, performance.now() - current.at);
+  };
+  target.addEventListener('pointerup', finish);
+  target.addEventListener('pointercancel', finish);
+}
+
+function startMacDesktopPreview() {
+  stopMacDesktopPreview();
+  const container = $('mac-desktop-container');
+  bindMacDesktopPointer(container);
+  setComputerDesktopMessage('正在获取电脑画面…');
+  const tick = async () => {
+    if (!isComputerSelected()) return;
+    await refreshMacDesktopScreenshot();
+    if (!isComputerSelected()) return;
+    macDesktopPreviewTimer = setTimeout(tick, 450);
+  };
+  macDesktopPreviewTimer = setTimeout(tick, 0);
+}
+
+function stopMacDesktopPreview() {
+  if (macDesktopPreviewTimer) clearTimeout(macDesktopPreviewTimer);
+  macDesktopPreviewTimer = null;
+  macDesktopPreviewRequest++;
+  macDesktopPreviewInFlight = false;
+  if (macDesktopObjectUrl) {
+    URL.revokeObjectURL(macDesktopObjectUrl);
+    macDesktopObjectUrl = '';
+  }
+}
+
+async function showComputerDesktop() {
+  document.body.classList.add('computer-desktop-active');
+  const container = $('mac-desktop-container');
+  if (container) container.classList.remove('mac-desktop-hidden');
+  setDeviceHint('', false);
+  startMacDesktopPreview();
+  if (!macDesktopHintShown) {
+    macDesktopHintShown = true;
+    showCopyToast('右上角 ··· → 全屏 / 新窗口');
+  }
+}
+
+function hideComputerDesktop() {
+  stopMacDesktopPreview();
+  if (isMacDesktopFullscreenOpen()) {
+    closeMacDesktopFullscreen();
+    $('fullscreen-overlay').style.display = 'none';
+  } else {
+    closeMacDesktopFullscreen();
+  }
+  document.body.classList.remove('computer-desktop-active');
+  setComputerDesktopMessage('');
+  $('mac-desktop-container')?.classList.add('mac-desktop-hidden');
+}
+
 async function refreshAndroidDevices() {
-  setDeviceHint('正在加载设备...');
+  setDeviceHint('正在加载设备...', false);
   const sel = $('device-select');
   sel.disabled = true;
   try {
     const data = await api('/api/android/devices');
     const saved = localStorage.getItem('duocli_android_device');
     sel.innerHTML = '';
+    appendComputerDeviceOption(sel);
     if (data.devices.length) {
       for (const d of data.devices) {
         // 用 DOM API 而非 innerHTML 拼接，避免 adb 输出里的 OEM 设备名注入 HTML
@@ -2093,29 +3654,33 @@ async function refreshAndroidDevices() {
         opt.disabled = d.available === false || !['device', ''].includes(state);
         const reason = state === 'unauthorized' ? '请在手机上允许 USB 调试' : state === 'offline' ? '设备离线，请重新连接' : state;
         opt.textContent = opt.disabled ? `${d.id}（${reason}）` : (d.info ? `${d.id} ${d.info}` : d.id);
-        if (d.id === saved && !opt.disabled) opt.selected = true;
         sel.appendChild(opt);
       }
-    } else {
-      const opt = document.createElement('option');
-      opt.value = '';
-      opt.textContent = '未找到设备';
-      sel.appendChild(opt);
     }
-    const usable = Array.from(sel.options).filter(option => option.value && !option.disabled);
-    if (!usable.some(option => option.selected)) sel.value = usable[0]?.value || '';
-    if (usable.length) {
-      startAndroidMirror(sel.value);
+    const androidUsable = Array.from(sel.options).filter(option => option.value && !option.disabled && !isComputerDevice(option.value));
+    if (saved && [...sel.options].some(option => option.value === saved && !option.disabled)) {
+      sel.value = saved;
+    } else if (androidUsable.length) {
+      sel.value = androidUsable[0].value;
+    } else {
+      sel.value = COMPUTER_DEVICE_ID;
+    }
+    applySelectedDevice();
+    if (isComputerDevice(sel.value)) {
       setDeviceHint('', false);
-    } else {
-      stopAndroidMirror();
-      setDeviceHint(data.devices.length ? '设备未就绪：请允许 USB 调试或重新连接离线设备' : '未找到已连接的 Android 设备');
+    } else if (androidUsable.length) {
+      setDeviceHint('', false);
+    } else if (data.devices.length) {
+      setDeviceHint('设备未就绪：请允许 USB 调试或重新连接离线设备');
     }
-    return usable.length > 0;
+    return true;
   } catch (e) {
-    sel.replaceChildren(new Option('设备检测失败，请刷新重试', ''));
-    setDeviceHint('获取设备失败: ' + (e.message || e));
-    return false;
+    sel.replaceChildren();
+    appendComputerDeviceOption(sel);
+    sel.value = COMPUTER_DEVICE_ID;
+    applySelectedDevice();
+    setDeviceHint('获取 Android 设备失败: ' + (e.message || e));
+    return true;
   } finally {
     sel.disabled = false;
   }
@@ -2125,9 +3690,45 @@ let androidFallbackInFlight = false;
 let androidScreenshotRequestId = 0;
 let androidScreenshotController = null;
 
+/**
+ * 获取 Mac 桌面能力信息
+ */
+async function fetchMacDesktopCapabilities() {
+  try {
+    const response = await fetch(`${API}/api/mac-desktop/capabilities`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    return data.success ? data : null;
+  } catch (error) {
+    console.error('[MacDesktop] Fetch capabilities failed:', error);
+    return null;
+  }
+}
+
+/**
+ * 获取并缓存能力状态
+ */
+async function fetchCapabilities() {
+  // 简化实现，返回默认能力对象
+  return {
+    enabled: macDesktopEnabled,
+    serviceReachable: true,
+    busy: false,
+    displayCount: 1,
+    status: macDesktopEnabled ? 'ready' : 'disabled',
+  };
+}
+
+
 async function refreshAndroidScreenshot(quality, scale, fallback = false) {
-  const deviceId = $('device-select').value;
-  if (!deviceId) { setDeviceHint('请先选择设备'); return; }
+  const deviceId = androidControlDeviceId();
+  if (!deviceId) { setDeviceHint('请先选择 Android 设备'); return; }
   if (fallback && androidFallbackInFlight) return;
   if (fallback) androidFallbackInFlight = true;
   const requestId = ++androidScreenshotRequestId;
@@ -2167,8 +3768,8 @@ async function refreshAndroidScreenshot(quality, scale, fallback = false) {
       surfacesLoaded++;
       if (surfacesLoaded >= 2 && previousUrl) URL.revokeObjectURL(previousUrl);
     };
-    img.onload = releasePrevious;
-    fullscreen.onload = releasePrevious;
+    img.onload = () => { releasePrevious(); fitAndroidSurfaces(); };
+    fullscreen.onload = () => { releasePrevious(); fitAndroidSurfaces(); };
     img.src = nextUrl;
     fullscreen.src = nextUrl;
     if (fallback && !androidMirror?.hasFrame) setAndroidVideoVisible(false);
@@ -2176,7 +3777,7 @@ async function refreshAndroidScreenshot(quality, scale, fallback = false) {
       setDeviceHint(androidMirrorLastError
         ? `${androidMirrorLastError}，截图模式可操控`
         : '截图模式可操控（实时镜像重连中）', false);
-    } else if (!fallback) setDeviceHint('截图更新于 ' + new Date().toLocaleTimeString());
+    }
   } catch (e) {
     if (e?.name === 'AbortError') return;
     if (!fallback) setDeviceHint('截图失败: ' + (e.message || e));
@@ -2190,7 +3791,6 @@ async function refreshAndroidScreenshot(quality, scale, fallback = false) {
 // ========== 主页面 ==========
 
 async function enterMain() {
-  showPage('main-page');
   initDevicePage();
   await refreshSessions();
   await Promise.all([
@@ -2202,36 +3802,178 @@ async function enterMain() {
   renderPresetSelect();
   startSSE();
   subscribePush();
-  // 启动局域网探测（CF 模式提示切换；LAN 模式监控失联回退）
   LanSwitcher.start();
+  const pending = pendingSessionToOpen;
+  pendingSessionToOpen = null;
+  if (supportsLandscapeWorkspace()) {
+    landscapeSessionsCollapsed = false;
+    const sessionId = pending || activeSessionsCache[0]?.id || null;
+    showPage('detail-page');
+    if (sessionId) void openSession(sessionId);
+    else showLandscapeEmptyTerminal();
+    return;
+  }
+  showPage('main-page');
+  if (pending) setTimeout(() => openSession(pending), 0);
 }
 
 async function refreshSessions() {
   try {
-    const [sessions, closed] = await Promise.all([
+    const [sessions, closed, tasks] = await Promise.all([
       api('/api/sessions'),
       api('/api/closed-sessions').catch(() => []),
+      api('/api/tasks').catch(() => ({ revision: 0, tasks: [] })),
     ]);
     activeSessionsCache = Array.isArray(sessions) ? sessions : [];
     closedSessions = Array.isArray(closed) ? closed : [];
+    if (Array.isArray(tasks?.tasks) && (tasks.revision || 0) >= terminalTaskSnapshot.revision) terminalTaskSnapshot = tasks;
     renderSessionList();
+    if ($('task-queue-modal')?.classList.contains('active')) renderTaskQueue();
   } catch (e) {
     console.error('刷新会话失败', e);
   }
 }
 
-function cliTagHtml(dn, tagColor, tagBg) {
+function taskStatusLabel(status) {
+  return ({ pending: '等待中', paused: '已暂停', starting: '启动中', running: '执行中', completed: '已完成', failed: '失败', cancelled: '已取消', blocked: '受阻', needs_attention: '待确认' })[status] || status;
+}
+
+function renderTaskDependencyOptions() {
+  const select = $('new-task-dependency');
+  if (!select) return;
+  const selected = select.value;
+  select.innerHTML = '<option value="">无</option>';
+  for (const task of (terminalTaskSnapshot.tasks || []).filter(task => !['cancelled', 'failed'].includes(task.status))) {
+    const option = document.createElement('option');
+    option.value = `task:${task.id}`;
+    option.textContent = `任务：${task.name}（${taskStatusLabel(task.status)}）`;
+    select.appendChild(option);
+  }
+  for (const session of activeSessionsCache) {
+    const option = document.createElement('option');
+    option.value = `session:${session.id}`;
+    option.textContent = `终端：${session.title || session.displayName || '终端'}`;
+    select.appendChild(option);
+  }
+  if ([...select.options].some(option => option.value === selected)) select.value = selected;
+}
+
+function renderTaskQueue() {
+  const list = $('task-queue-list');
+  if (!list) return;
+  if (!terminalTaskSnapshot.tasks?.length) {
+    list.innerHTML = '<div class="task-queue-empty">还没有计划任务</div>';
+    return;
+  }
+  const byId = new Map(terminalTaskSnapshot.tasks.map(task => [task.id, task]));
+  list.innerHTML = [...terminalTaskSnapshot.tasks].reverse().map(task => {
+    const dependency = task.dependency?.kind === 'task'
+      ? `前置：${byId.get(task.dependency.id)?.name || '任务'}`
+      : task.dependency?.kind === 'session' ? '前置：已有终端停止' : '无前置任务';
+    const time = task.notBefore ? ` · ${new Date(task.notBefore).toLocaleString()}` : '';
+    const canRunNow = ['pending', 'paused', 'blocked'].includes(task.status);
+    const canPause = ['pending', 'blocked'].includes(task.status);
+    const canResume = task.status === 'paused';
+    const canCancel = ['starting', 'running'].includes(task.status);
+    const canComplete = ['running', 'needs_attention'].includes(task.status);
+    const canEdit = ['pending', 'paused', 'blocked'].includes(task.status);
+    return `<div class="task-queue-item" data-task-id="${escHtml(task.id)}">
+      <div class="task-queue-title"><span>${escHtml(task.name)}</span><span class="task-queue-state">${escHtml(taskStatusLabel(task.status))}</span></div>
+      <div class="task-queue-meta">${escHtml(dependency + time + ` · 静止 ${Math.round(task.quietMs / 1000)} 秒` + (task.error ? ` · ${task.error}` : ''))}</div>
+      <div class="task-queue-actions">
+        ${task.sessionId ? '<button data-action="view">查看终端</button>' : ''}
+        ${canRunNow ? '<button data-action="run-now">立即执行</button>' : ''}
+        ${canPause ? '<button data-action="pause">暂停</button>' : ''}
+        ${canResume ? '<button data-action="resume">继续</button>' : ''}
+        ${canCancel ? '<button data-action="cancel">取消</button>' : ''}
+        ${canEdit ? '<button data-action="edit">修改</button>' : ''}
+        ${canComplete ? '<button data-action="complete">确认完成</button>' : ''}
+        <button data-action="remove" class="danger">删除</button>
+      </div>
+    </div>`;
+  }).join('');
+  list.querySelectorAll('.task-queue-item').forEach(item => {
+    const task = terminalTaskSnapshot.tasks.find(value => value.id === item.dataset.taskId);
+    if (!task) return;
+    item.querySelector('[data-action="view"]')?.addEventListener('click', () => {
+      $('task-queue-modal').classList.remove('active');
+      if (task.sessionId) void openSession(task.sessionId);
+    });
+    item.querySelector('[data-action="run-now"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/run-now`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="pause"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/pause`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="resume"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/resume`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="cancel"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/cancel`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="complete"]')?.addEventListener('click', async () => {
+      await api(`/api/tasks/${encodeURIComponent(task.id)}/confirm-complete`, { method: 'POST', body: '{}' });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="edit"]')?.addEventListener('click', async () => {
+      const name = prompt('任务名称', task.name);
+      if (name === null) return;
+      const instruction = prompt('首条任务指令', task.instruction);
+      if (instruction === null) return;
+      const quiet = prompt('静止完成秒数', String(Math.round(task.quietMs / 1000)));
+      if (quiet === null) return;
+      await api(`/api/tasks/${encodeURIComponent(task.id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ expectedRevision: task.revision, name, instruction, quietMs: Number(quiet) * 1000 }),
+      });
+      await refreshSessions();
+    });
+    item.querySelector('[data-action="remove"]')?.addEventListener('click', async () => {
+      if (!confirm(`确定删除任务「${task.name}」？`)) return;
+      await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: 'DELETE' });
+      await refreshSessions();
+    });
+  });
+}
+
+function cliTagHtml(dn) {
   const logoUrl = getLogoUrl(dn);
-  const fallback = typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : logoUrl;
-  return `<span class="cli-tag" style="--cli-c:${tagColor};--cli-bg:${tagBg}"><img class="cli-logo-img" src="${logoUrl}" alt="${escHtml(dn)}" data-fallback="${fallback}" onerror="this.onerror=null;this.src=this.dataset.fallback||this.src"><span>${escHtml(dn)}</span></span>`;
+  const fallback = (typeof getLetterLogoUrl === 'function' ? getLetterLogoUrl(dn) : '')
+    || (typeof getDefaultLogoUrl === 'function' ? getDefaultLogoUrl() : logoUrl);
+  const invertClass = logoNeedsInvert?.(dn) ? ' cli-logo-invert' : '';
+  return `<span class="cli-tag" title="${escHtml(dn)}"><img class="cli-logo-img${invertClass}" src="${logoUrl}" alt="" data-fallback="${fallback}" onerror="this.onerror=null;this.src=this.dataset.fallback||this.src"><span>${escHtml(dn)}</span></span>`;
+}
+
+function sessionProjectName(cwd) {
+  const value = String(cwd || '').trim();
+  if (!value) return '';
+  return value.split(/[\\/]/).filter(Boolean).pop() || value;
+}
+
+const SESSION_THEME_COLORS = {
+  'vscode-dark': '#0078d4',
+  default: '#0078d4',
+  monokai: '#a6e22e',
+  dracula: '#bd93f9',
+  'solarized-dark': '#268bd2',
+  'one-dark': '#61afef',
+  nord: '#88c0d0',
+};
+
+function sessionThemeSwatchHtml(themeId) {
+  const color = SESSION_THEME_COLORS[String(themeId || '').trim()];
+  if (!color) return '';
+  return `<span class="session-color-dot" style="background:${color}" title="会话颜色"></span>`;
 }
 
 function renderClosedSessionCard(cs) {
   const dn = cs.displayName || '';
-  const [tagColor, tagBg] = dn ? getCliTagColors(dn) : ['', ''];
-
-  let tagHtml = '';
-  if (dn) tagHtml = cliTagHtml(dn, tagColor, tagBg);
+  const tagHtml = dn ? cliTagHtml(dn) : '';
+  const projectName = sessionProjectName(cs.cwd);
   
   const restoring = restoringClosedSessionIds.has(cs.id) || cs.state === 'restoring';
   return `
@@ -2241,11 +3983,12 @@ function renderClosedSessionCard(cs) {
         <div class="session-info">
           <div class="session-title-row">
             <div class="session-title">${escHtml(cs.title || '新对话')}</div>
-            ${tagHtml}
+            ${sessionThemeSwatchHtml(cs.themeId)}
           </div>
           <div class="session-meta">
-            <span class="session-time">${formatTime(cs.closedAt)}</span>
-            <span class="session-cwd">${escHtml((cs.cwd || '').split('/').pop() || cs.cwd || '')}</span>
+            ${projectName ? `<span class="session-cwd">${escHtml(projectName)}</span>` : ''}
+            ${tagHtml}
+            <span class="session-time">${formatTime(cs.updatedAt || cs.closedAt)}</span>
           </div>
         </div>
         <div class="closed-session-actions">
@@ -2352,21 +4095,71 @@ async function refreshRecentCwdOptions() {
   }
 }
 
-// ========== 会话卡片左滑关闭 ==========
+// ========== 会话置顶（手机端本地持久化） ==========
 
-const SESSION_SWIPE_REVEAL = 84;
-// Touch jitter while a finger is settling on a card should stay a tap (or a
-// vertical list scroll). Wait for a deliberate horizontal travel before the
-// card starts exposing the action underneath it.
-const SESSION_SWIPE_TRIGGER = 28;
-const SESSION_SWIPE_DIRECTION_RATIO = 1.25;
-// 记住 id 而不是节点：SSE 随时会重渲染列表，滑动状态要跟着新节点恢复。
+const PINNED_SESSIONS_KEY = 'duocli_mobile_pinned_sessions';
+const pinnedSessionIds = new Set(loadPinnedSessionIds());
+
+function loadPinnedSessionIds() {
+  try {
+    const raw = localStorage.getItem(PINNED_SESSIONS_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list.filter((id) => typeof id === 'string' && id) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePinnedSessionIds() {
+  try {
+    localStorage.setItem(PINNED_SESSIONS_KEY, JSON.stringify([...pinnedSessionIds]));
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+function isSessionPinned(id) {
+  return pinnedSessionIds.has(id);
+}
+
+function toggleSessionPin(id) {
+  if (!id) return false;
+  if (pinnedSessionIds.has(id)) pinnedSessionIds.delete(id);
+  else pinnedSessionIds.add(id);
+  savePinnedSessionIds();
+  return pinnedSessionIds.has(id);
+}
+
+function prunePinnedSessions(liveIds) {
+  const live = new Set(liveIds);
+  let changed = false;
+  for (const id of [...pinnedSessionIds]) {
+    if (!live.has(id)) {
+      pinnedSessionIds.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) savePinnedSessionIds();
+}
+
+// ========== 会话卡片左滑：置顶 + 关闭 ==========
+
+const SESSION_SWIPE_PIN_WIDTH = 72;
+const SESSION_SWIPE_CLOSE_WIDTH = 84;
+const SESSION_SWIPE_REVEAL = SESSION_SWIPE_PIN_WIDTH + SESSION_SWIPE_CLOSE_WIDTH;
+// 列表惯性滚动、手指抖动都不该露出操作区。只有明显的水平左滑才算。
+const SESSION_SWIPE_TRIGGER = 72;
+const SESSION_SWIPE_DIRECTION_RATIO = 2.4;
+const SESSION_SWIPE_OPEN = 72;
+const SESSION_SWIPE_SCROLL_GUARD_MS = 160;
 let swipedSessionId = null;
 let sessionCloseInProgress = false;
+let sessionListScrollAt = 0;
 
 function setSessionCardSwipe(card, offset, instant = false) {
   const body = card.querySelector('.session-card-body');
   if (!body) return;
+  const revealed = offset <= -8;
   if (instant) {
     body.style.transition = 'none';
     body.style.transform = offset ? `translateX(${offset}px)` : '';
@@ -2375,8 +4168,11 @@ function setSessionCardSwipe(card, offset, instant = false) {
   } else {
     body.style.transform = offset ? `translateX(${offset}px)` : '';
   }
-  card.classList.toggle('swiped', offset !== 0);
-  card.querySelector('.session-close-action')?.toggleAttribute('aria-hidden', offset === 0);
+  // 只有真正露出操作区才挂 swiped，避免残余位移也把按钮画出来
+  card.classList.toggle('swiped', revealed);
+  card.querySelectorAll('.session-card-actions button').forEach((btn) => {
+    btn.toggleAttribute('aria-hidden', !revealed);
+  });
 }
 
 function closeSessionCardSwipe(card) {
@@ -2397,16 +4193,45 @@ function closeSwipedSessionCard() {
   else swipedSessionId = null;
 }
 
-async function closeSessionFromList(id, title) {
+async function closeSessionFromList(id, title, options = {}) {
   if (sessionCloseInProgress) return;
-  if (!confirm(`确定关闭对话「${title}」吗？`)) return;
   sessionCloseInProgress = true;
   try {
+    if (!options.skipConfirm) {
+      const ok = await confirmMobileAction(`确定关闭对话「${title}」吗？`, { title: '关闭对话' });
+      if (!ok) return;
+    }
     await api(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    pinnedSessionIds.delete(id);
+    savePinnedSessionIds();
     swipedSessionId = null;
+    removeMobileDraft(id);
+    lastLocalPromptAtBySession.delete(id);
+    userPromptBanner?.writeStoredPrompt(id, '');
+    const pending = mobilePendingSubmissions.get(id);
+    if (pending) {
+      mobilePendingSubmissions.delete(id);
+      saveMobilePendingSubmissions();
+    }
+    activeSessionsCache = activeSessionsCache.filter(session => session.id !== id);
+    if (currentSessionId === id) {
+      terminalOpenRequest++;
+      currentSessionId = null;
+      currentSessionChatCapable = false;
+      stopNativeChatPolling();
+      applySessionViewMode('terminal');
+      history.replaceState({ duocliRoot: true }, '', location.pathname);
+      closeTerminal();
+      mobilePromptExpanded = false;
+      renderMobilePromptBanner();
+      leaveToSessionList(id);
+    } else {
+      renderSessionList();
+    }
     await refreshSessions();
   } catch (e) {
-    alert('关闭失败: ' + (e.message || e));
+    showCopyToast('关闭失败: ' + (e.message || e));
+    await refreshSessions();
   } finally {
     sessionCloseInProgress = false;
   }
@@ -2420,9 +4245,25 @@ function bindSessionCard(card) {
   let offset = 0;
   let swiping = false;
   let dragged = false;
+  let axis = '';
+
+  const actions = card.querySelector('.session-card-actions');
+  const closeBtn = card.querySelector('.session-close-action');
+  const pinBtn = card.querySelector('.session-pin-action');
+  const isActionTarget = (target) =>
+    !!(actions && target && (target === actions || (typeof target.closest === 'function' && actions.contains(target))));
 
   card.addEventListener('touchstart', (e) => {
     if (e.touches.length !== 1) return;
+    // 点置顶/关闭按钮时不要走左滑手势逻辑
+    if (isActionTarget(e.target)) {
+      axis = 'action';
+      return;
+    }
+    if (Date.now() - sessionListScrollAt < SESSION_SWIPE_SCROLL_GUARD_MS) {
+      axis = 'y';
+      return;
+    }
     if (swipedSessionId && swipedSessionId !== id) closeSwipedSessionCard();
     startX = e.touches[0].clientX;
     startY = e.touches[0].clientY;
@@ -2430,24 +4271,29 @@ function bindSessionCard(card) {
     offset = baseOffset;
     swiping = false;
     dragged = false;
+    axis = '';
   }, { passive: true });
 
   card.addEventListener('touchmove', (e) => {
     if (e.touches.length !== 1) return;
+    if (axis === 'action' || axis === 'y') return;
     const touch = e.touches[0];
     if (!touch) return;
     const dx = touch.clientX - startX;
     const dy = touch.clientY - startY;
+    const ax = Math.abs(dx);
+    const ay = Math.abs(dy);
     if (!swiping) {
-      const horizontalDistance = Math.abs(dx);
-      const horizontalIntent = horizontalDistance >= SESSION_SWIPE_TRIGGER
-        && horizontalDistance >= Math.abs(dy) * SESSION_SWIPE_DIRECTION_RATIO;
-      // A closed card only responds to a deliberate left swipe. An already
-      // open card accepts either direction so a right swipe can close it.
-      const allowedDirection = baseOffset < 0 || dx < 0;
-      // Keep the gesture with the browser until both distance and direction
-      // are clear; this prevents tiny diagonal movements from revealing red.
-      if (!horizontalIntent || !allowedDirection) return;
+      if (axis !== 'x') {
+        if (ax < SESSION_SWIPE_TRIGGER && ay < SESSION_SWIPE_TRIGGER) return;
+        if (ay >= ax * SESSION_SWIPE_DIRECTION_RATIO || (ay >= SESSION_SWIPE_TRIGGER && ay > ax)) {
+          axis = 'y';
+          return;
+        }
+        const allowedDirection = baseOffset < 0 || dx < 0;
+        if (!allowedDirection || ax < SESSION_SWIPE_TRIGGER || ax < ay * SESSION_SWIPE_DIRECTION_RATIO) return;
+        axis = 'x';
+      }
       swiping = true;
       dragged = true;
       card.classList.add('dragging');
@@ -2461,76 +4307,155 @@ function bindSessionCard(card) {
   }, { passive: false });
 
   const endSwipe = () => {
-    if (!swiping) return;
+    if (!swiping) {
+      axis = '';
+      return;
+    }
     swiping = false;
+    axis = '';
     card.classList.remove('dragging');
-    if (offset <= -SESSION_SWIPE_REVEAL / 2) {
+    if (offset <= -SESSION_SWIPE_OPEN) {
       setSessionCardSwipe(card, -SESSION_SWIPE_REVEAL);
       swipedSessionId = id;
     } else {
       closeSessionCardSwipe(card);
     }
   };
-  card.addEventListener('touchend', endSwipe, { passive: true });
+  card.addEventListener('touchend', (e) => {
+    if (axis === 'action' || isActionTarget(e.target)) {
+      axis = '';
+      // 交给按钮自己处理，绝不能在这里收起左滑或 cancel click
+      return;
+    }
+    if (swiping) {
+      endSwipe();
+      return;
+    }
+    if (swipedSessionId === id) {
+      closeSessionCardSwipe(card);
+      dragged = true;
+      if (e.cancelable) e.preventDefault();
+    }
+  }, { passive: false });
   card.addEventListener('touchcancel', endSwipe, { passive: true });
 
-  card.onclick = () => {
+  card.onclick = (e) => {
+    if (isActionTarget(e.target)) return;
     if (dragged) { dragged = false; return; }
     if (swipedSessionId === id) { closeSessionCardSwipe(card); return; }
     openSession(id);
   };
 
-  const closeBtn = card.querySelector('.session-close-action');
+  if (pinBtn) {
+    let pinHandledAt = 0;
+    const runPin = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const now = Date.now();
+      if (now - pinHandledAt < 500) return;
+      pinHandledAt = now;
+      const pinned = toggleSessionPin(id);
+      showCopyToast(pinned ? '已置顶' : '已取消置顶');
+      swipedSessionId = null;
+      renderSessionList();
+    };
+    pinBtn.addEventListener('touchend', (e) => {
+      if (e.touches && e.touches.length > 0) return;
+      runPin(e);
+    }, { passive: false });
+    pinBtn.addEventListener('click', runPin);
+  }
+
   if (closeBtn) {
-    closeBtn.onclick = (e) => {
+    const runClose = (e) => {
+      e.preventDefault();
       e.stopPropagation();
       const title = card.querySelector('.session-title')?.textContent || '对话';
       void closeSessionFromList(id, title);
     };
+    closeBtn.addEventListener('touchend', (e) => {
+      if (e.touches && e.touches.length > 0) return;
+      runClose(e);
+    }, { passive: false });
+    closeBtn.addEventListener('click', runClose);
+  }
+}
+
+function statusAfterViewing(status) {
+  if (status === 'running') return 'running';
+  if (status === 'exited') return 'exited';
+  return 'inactive';
+}
+
+function markSessionSeenLocally(id) {
+  const s = activeSessionsCache.find(x => x.id === id);
+  if (s) s.status = statusAfterViewing(s.status);
+  if ($('detail-status') && currentSessionId === id) {
+    $('detail-status').className = `status-dot ${s ? statusAfterViewing(s.status) : 'inactive'}`;
   }
 }
 
 function renderSessionList() {
   const list = $('session-list');
   const empty = $('empty-state');
-  const sessions = activeSessionsCache;
+  prunePinnedSessions(activeSessionsCache.map((s) => s.id));
+  const query = ($('session-search')?.value || '').trim().toLocaleLowerCase();
+  document.querySelector('.workspace-navigation').hidden = !activeSessionsCache.length && !closedSessions.length && !query;
+  const matches = session => [session.title, session.cwd, session.displayName, session.presetCommand]
+    .join(' ').toLocaleLowerCase().includes(query);
+  const matchingClosed = closedSessions.filter(matches);
+  const sessions = activeSessionsCache.filter(matches).sort((a, b) => {
+    const ap = isSessionPinned(a.id) ? 0 : 1;
+    const bp = isSessionPinned(b.id) ? 0 : 1;
+    if (ap !== bp) return ap - bp;
+    const aRecent = Math.max(a.lastSubmittedAt || 0, a.createdAt || 0);
+    const bRecent = Math.max(b.lastSubmittedAt || 0, b.createdAt || 0);
+    return bRecent - aRecent || (b.createdAt || 0) - (a.createdAt || 0);
+  });
+  if ($('workspace-session-count')) $('workspace-session-count').textContent = String(sessions.length);
+  if ($('session-search-empty')) $('session-search-empty').hidden = !query || sessions.length > 0 || matchingClosed.length > 0;
 
   const activeCards = sessions.map(s => {
     const dn = s.displayName || '';
-    const [tagColor, tagBg] = dn ? getCliTagColors(dn) : ['', ''];
-    
-    // 构建 CLI 标签 HTML（带 logo）
-    let tagHtml = '';
-    if (dn) tagHtml = cliTagHtml(dn, tagColor, tagBg);
+    const pinned = isSessionPinned(s.id);
+    const tagHtml = dn ? cliTagHtml(dn) : '';
+    const projectName = sessionProjectName(s.cwd);
     return `
-    <div class="session-card" data-id="${s.id}">
-      <button type="button" class="session-close-action" aria-hidden="true" aria-label="关闭对话">
-        ${iconSvg('trash', 18)}<span>关闭</span>
-      </button>
+    <div class="session-card${s.id === currentSessionId ? ' is-current' : ''}${pinned ? ' is-pinned' : ''}" data-id="${s.id}">
       <div class="session-card-body">
         <div class="status-dot ${s.status}"></div>
         <div class="session-info">
           <div class="session-title-row">
+            ${pinned ? `<span class="session-pin-badge" title="已置顶">${iconSvg('pin', 12)}</span>` : ''}
             <div class="session-title">${escHtml(s.title || s.presetCommand || '终端')}</div>
-            ${tagHtml}
+            ${sessionThemeSwatchHtml(s.themeId)}
           </div>
           <div class="session-meta">
+            ${projectName ? `<span class="session-cwd">${escHtml(projectName)}</span>` : ''}
+            ${tagHtml}
             <span class="session-time">${formatTime(s.createdAt)}</span>
-            <span class="session-cwd">${escHtml(String(s.cwd || '').split('/').pop() || s.cwd || '')}</span>
           </div>
         </div>
         <div class="session-arrow">›</div>
+      </div>
+      <div class="session-card-actions">
+        <button type="button" class="session-pin-action" aria-hidden="true" aria-label="${pinned ? '取消置顶' : '置顶'}" tabindex="-1">
+          ${iconSvg('pin', 18)}<span>${pinned ? '取消' : '置顶'}</span>
+        </button>
+        <button type="button" class="session-close-action" aria-hidden="true" aria-label="关闭对话" tabindex="-1">
+          ${iconSvg('trash', 18)}<span>关闭</span>
+        </button>
       </div>
     </div>`;
   }).join('');
 
   let closedHtml = '';
-  if (closedSessions.length > 0) {
-    const sorted = [...closedSessions].sort((a, b) => b.closedAt - a.closedAt);
-    const cards = closedSessionsCollapsed ? '' : sorted.map(renderClosedSessionCard).join('');
+  if (matchingClosed.length > 0) {
+    const sorted = [...matchingClosed].sort((a, b) => (b.updatedAt || b.closedAt) - (a.updatedAt || a.closedAt));
+    const cards = closedSessionsCollapsed && !query ? '' : sorted.map(renderClosedSessionCard).join('');
     closedHtml = `
       <div class="closed-sessions-header">
-        <div class="closed-sessions-label">${iconSvg('archive', 14)}<span>已关闭 (${closedSessions.length})</span></div>
+        <div class="closed-sessions-label">${iconSvg('archive', 14)}<span>已关闭 (${matchingClosed.length})</span></div>
         <div class="closed-sessions-tools">
           <button type="button" class="closed-toggle-btn" title="${closedSessionsCollapsed ? '展开' : '收起'}" aria-label="${closedSessionsCollapsed ? '展开' : '收起'}">
             ${iconSvg(closedSessionsCollapsed ? 'chevron-right' : 'chevron-down', 16)}
@@ -2546,7 +4471,7 @@ function renderSessionList() {
   if (!sessions.length && !closedSessions.length) {
     list.innerHTML = '';
     list.hidden = true;
-    empty.style.display = 'flex';
+    empty.style.display = query ? 'none' : 'flex';
     return;
   }
 
@@ -2555,11 +4480,13 @@ function renderSessionList() {
   list.innerHTML = activeCards + closedHtml;
 
   list.querySelectorAll('.session-card[data-id]').forEach(card => bindSessionCard(card));
-  // 列表刚被整体重建，之前滑开的卡片要立刻恢复展开态，否则用户点不到「关闭」。
-  if (swipedSessionId) {
-    const swiped = findSessionCard(swipedSessionId);
-    if (swiped) setSessionCardSwipe(swiped, -SESSION_SWIPE_REVEAL, true);
-    else swipedSessionId = null;
+  closeSwipedSessionCard();
+  if (!list.dataset.swipeScrollBound) {
+    list.dataset.swipeScrollBound = '1';
+    list.addEventListener('scroll', () => {
+      sessionListScrollAt = Date.now();
+      closeSwipedSessionCard();
+    }, { passive: true });
   }
 
   const toggleBtn = list.querySelector('.closed-toggle-btn');
@@ -2607,18 +4534,30 @@ function startSSE() {
   sseSource = new EventSource(`${API}/api/events?token=${encodeURIComponent(token)}`);
   sseSource.onopen = () => {
     sseReconnectAttempt = 0;
+    void syncQuickCommands();
   };
+  sseSource.addEventListener('quick-commands', e => {
+    try {
+      const state = JSON.parse(e.data);
+      if (!state.initialized) return;
+      quickCommandState = state.commands;
+      quickCommandsLoaded = true;
+      renderQuickCommands();
+    } catch {}
+  });
   sseSource.addEventListener('sessions', e => {
     try {
       activeSessionsCache = JSON.parse(e.data);
-      if ($('main-page').classList.contains('active') || $('main-page').classList.contains('landscape-drawer-open')) {
-        renderSessionList();
-      }
-      if (currentSessionId) {
+      if (currentSessionId && $('detail-page')?.classList.contains('active')) {
         const s = activeSessionsCache.find(x => x.id === currentSessionId);
         if (s) {
+          s.status = statusAfterViewing(s.status);
           $('detail-status').className = `status-dot ${s.status}`;
+          applyRemoteUserPrompt(s);
         }
+      }
+      if ($('main-page').classList.contains('active') || $('main-page').classList.contains('landscape-drawer-open')) {
+        renderSessionList();
       }
     } catch {}
   });
@@ -2630,29 +4569,33 @@ function startSSE() {
       }
     } catch {}
   });
+  sseSource.addEventListener('tasks', e => {
+    try {
+      const snapshot = JSON.parse(e.data);
+      if (!Array.isArray(snapshot?.tasks) || (snapshot.revision || 0) < terminalTaskSnapshot.revision) return;
+      terminalTaskSnapshot = snapshot;
+      if ($('task-queue-modal')?.classList.contains('active')) renderTaskQueue();
+    } catch {}
+  });
   sseSource.onerror = () => {
     stopSSE();
     if (navigator.onLine === false) return;
     if (sseReconnectTimer) clearTimeout(sseReconnectTimer);
-    // Token 被桌面端轮换后，SSE 会断；先探测 API，401 则回登录页重新授权
+    // Token 被桌面端轮换后，SSE 会断；先用同一套有界请求探测 API。
     void (async () => {
       try {
-        const r = await fetch(`${API}/api/sessions`, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
-        });
-        if (r.status === 401) {
-          logout();
-          return;
-        }
+        await api('/api/sessions', { timeout: 5000 });
       } catch { /* ignore */ }
       if (!token) return;
       const delay = Math.min(profile.sseRetryBaseMs * Math.pow(2, sseReconnectAttempt), profile.sseRetryMaxMs) + Math.floor(Math.random() * 600);
       sseReconnectAttempt++;
       sseReconnectTimer = setTimeout(() => {
         sseReconnectTimer = null;
-        // 会话主页或横屏会话侧栏可见时维持 SSE，保证列表可实时切换。
+        // 会话主页、详情页或横屏会话侧栏可见时维持 SSE，保证返回列表和状态更新不滞后。
         if (!token) return;
-        if ($('main-page').classList.contains('active') || $('main-page').classList.contains('landscape-drawer-open')) {
+        if ($('main-page').classList.contains('active')
+            || $('detail-page').classList.contains('active')
+            || $('main-page').classList.contains('landscape-drawer-open')) {
           startSSE();
         }
       }, delay);
@@ -2818,9 +4761,95 @@ async function renderFileBrowseTree(force = false) {
   });
 }
 
+function downloadSessionFileUrl(filePath) {
+  return `${API}/api/sessions/${encodeURIComponent(currentSessionId)}/file-download?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(token)}`;
+}
+
+function canShareDownloadFile(file) {
+  const ua = navigator.userAgent || '';
+  const iOS = /iPhone|iPad|iPod/i.test(ua)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (!iOS || typeof navigator.canShare !== 'function') return false;
+  try { return navigator.canShare({ files: [file] }); } catch { return false; }
+}
+
+async function downloadSessionFile(filePath) {
+  if (!currentSessionId || !filePath) return;
+  const filename = String(filePath).split(/[\\/]/).pop() || 'download';
+  const url = downloadSessionFileUrl(filePath);
+  try {
+    const res = await fetch(url, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      credentials: 'omit',
+    });
+    if (res.status === 401) { logout(); return; }
+    const contentType = res.headers.get('content-type') || '';
+    const buffer = await res.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const helpers = globalThis.DuoFilePreviewHelpers;
+    if (!res.ok || helpers?.isHtmlDownloadPayload?.(contentType, bytes)) {
+      let message = '下载失败';
+      if ((contentType || '').toLowerCase().includes('application/json')) {
+        try {
+          const data = JSON.parse(new TextDecoder().decode(bytes));
+          if (data && typeof data.error === 'string' && data.error.trim()) message = data.error.trim();
+        } catch {}
+      }
+      showCopyToast(message);
+      return;
+    }
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const file = typeof File === 'function'
+      ? new File([blob], filename, { type: 'application/octet-stream' })
+      : null;
+    if (file && canShareDownloadFile(file)) {
+      try {
+        await navigator.share({ files: [file] });
+        return;
+      } catch (error) {
+        if (error && error.name === 'AbortError') return;
+      }
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = objectUrl;
+    link.download = filename;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
+  } catch (error) {
+    showCopyToast(error && error.message ? error.message : '下载失败');
+  }
+}
+
+function setFilePreviewDownloadPath(filePath) {
+  filePreviewCurrentPath = String(filePath || '');
+  const visible = Boolean(filePreviewCurrentPath);
+  for (const id of ['file-preview-download-btn', 'mobile-file-preview-download-btn']) {
+    const btn = $(id);
+    if (btn) btn.hidden = !visible;
+  }
+}
+
+function stopFilePreviewPlayback() {
+  const helpers = globalThis.DuoFilePreviewHelpers;
+  for (const id of ['file-preview-media', 'mobile-file-preview-media']) {
+    const root = $(id);
+    helpers?.stopMediaElements?.(root);
+    if (root) root.innerHTML = '';
+  }
+  setFilePreviewDownloadPath('');
+}
+
 function openFilePreview(requestedPath, options = {}) {
   if (!currentSessionId) return;
   const helpers = globalThis.DuoFilePreviewHelpers;
+  if (helpers?.isDownloadableFileName?.(requestedPath)) {
+    void downloadSessionFile(requestedPath);
+    return;
+  }
   if (helpers?.isPreviewableFileName && !helpers.isPreviewableFileName(requestedPath)) {
     showCopyToast('该文件暂不支持在手机端预览');
     return;
@@ -2845,7 +4874,10 @@ function openFilePreview(requestedPath, options = {}) {
   meta.textContent = '正在读取…';
   content.textContent = '';
   content.style.display = '';
-  if (mediaBox) mediaBox.innerHTML = '';
+  if (mediaBox) {
+    helpers?.stopMediaElements?.(mediaBox);
+    mediaBox.innerHTML = '';
+  }
   if (legacyTitle) legacyTitle.textContent = baseName;
   if (legacyMeta) legacyMeta.textContent = '正在读取…';
   if (legacyContent) legacyContent.textContent = '';
@@ -2857,6 +4889,7 @@ function openFilePreview(requestedPath, options = {}) {
     openDevicePanel('preview');
     $('file-preview-page').classList.add('active', 'legacy-preview-active');
   }
+  setFilePreviewDownloadPath(requestedPath);
 
   const mediaKind = helpers?.getMediaKind?.(requestedPath);
   if (mediaKind) {
@@ -2871,9 +4904,15 @@ function openFilePreview(requestedPath, options = {}) {
       if (requestId !== mobileFilePreviewRequest || currentSessionId !== sessionId) return;
       title.textContent = data.name || requestedPath;
       meta.textContent = data.path || requestedPath;
-      content.textContent = typeof data.content === 'string' ? data.content : '';
       if (legacyTitle) legacyTitle.textContent = title.textContent;
       if (legacyMeta) legacyMeta.textContent = meta.textContent;
+      const htmlName = data.name || requestedPath;
+      if (/\.(?:html|htm|xhtml)$/i.test(htmlName)) {
+        renderHtmlPreview(typeof data.content === 'string' ? data.content : '', mediaBox, content, legacyContent);
+        return;
+      }
+      content.style.display = '';
+      content.textContent = typeof data.content === 'string' ? data.content : '';
       if (legacyContent) legacyContent.textContent = content.textContent;
     })
     .catch((error) => {
@@ -2881,6 +4920,25 @@ function openFilePreview(requestedPath, options = {}) {
       meta.textContent = '';
       showCopyToast(error.message || '文件预览失败');
     });
+}
+
+function renderHtmlPreview(html, mediaBox, content, legacyContent) {
+  if (content) {
+    content.textContent = '';
+    content.style.display = 'none';
+  }
+  if (legacyContent) legacyContent.textContent = '';
+  if (!mediaBox) return;
+  mediaBox.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'media-preview-wrap';
+  const iframe = document.createElement('iframe');
+  iframe.className = 'media-html';
+  iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation');
+  iframe.title = 'HTML 预览';
+  iframe.srcdoc = String(html || '');
+  wrap.appendChild(iframe);
+  mediaBox.appendChild(wrap);
 }
 
 // 按媒体类型渲染预览元素到 #file-preview-media
@@ -2943,6 +5001,7 @@ function clearMobileLinkHighlights() {
     mobileLinkHighlightTimer = null;
   }
   mobileLinkDecorations.forEach(deco => { try { deco.dispose(); } catch {} });
+  mobileLinkDecorations.forEach(deco => { try { deco.marker?.dispose(); } catch {} });
   mobileLinkDecorations = [];
 }
 
@@ -2968,7 +5027,7 @@ function createMobileLinkDecoration(line, x, width, kind) {
     foregroundColor: MOBILE_LINK_COLORS[kind] || MOBILE_LINK_COLORS.file,
     layer: 'top',
   });
-  if (!decoration) return;
+  if (!decoration) { marker.dispose(); return; }
   decoration.onRender((element) => {
     element.classList.add('xterm-mobile-link', kind === 'url' ? 'xterm-mobile-link-url' : 'xterm-mobile-link-file');
   });
@@ -2978,27 +5037,34 @@ function createMobileLinkDecoration(line, x, width, kind) {
 function addMobileLinkDecoration(range, kind) {
   const y1 = range.start.line;
   const y2 = range.end.line;
-  if (y1 === y2) {
-    createMobileLinkDecoration(y1, range.start.cell, range.end.cell - range.start.cell + 1, kind);
-    return;
+  const buffer = term.buffer.active;
+  const start = Math.max(y1, 0, buffer.viewportY - term.rows);
+  const end = Math.min(y2, buffer.length - 1, buffer.viewportY + term.rows * 2 - 1);
+  for (let y = start; y <= end; y++) {
+    const x = y === y1 ? range.start.cell : 0;
+    const width = (y === y2 ? range.end.cell + 1 : term.cols) - x;
+    createMobileLinkDecoration(y, x, width, kind);
   }
-  const cols = term.cols;
-  createMobileLinkDecoration(y1, range.start.cell, Math.max(1, cols - range.start.cell), kind);
-  for (let y = y1 + 1; y < y2; y++) createMobileLinkDecoration(y, 0, cols, kind);
-  createMobileLinkDecoration(y2, 0, range.end.cell + 1, kind);
 }
 
 function refreshMobileLinkHighlights() {
   if (!term || !terminalContentHelpers) return;
+  if (terminalTouchActive || panMomentumRunner?.active()) {
+    scheduleMobileLinkHighlights();
+    return;
+  }
   clearMobileLinkHighlights();
   const buffer = term.buffer.active;
   const seen = new Set();
-  const start = Math.max(0, buffer.length - 3000);
-  for (let y = start; y < buffer.length; ) {
+  // Markers/decorations are needed only around the current viewport. Scanning
+  // thousands of logical lines competes with touch input on the same thread.
+  const start = Math.max(0, buffer.viewportY - term.rows);
+  const end = Math.min(buffer.length, buffer.viewportY + term.rows * 2);
+  for (let y = start; y < end; ) {
     const logical = terminalContentHelpers.readLogicalLine(buffer, y);
     if (logical.text.trim()) {
       for (const match of terminalContentHelpers.findLinks(logical.text)) {
-        if (match.kind === 'file' && !globalThis.DuoFilePreviewHelpers?.isPreviewableFileName?.(match.filePath)) continue;
+        if (match.kind === 'file' && !globalThis.DuoFilePreviewHelpers?.isLinkableFileName?.(match.filePath)) continue;
         const range = terminalContentHelpers.matchRange(logical, match);
         if (!range) continue;
         const key = `${range.start.line}:${range.start.cell}-${range.end.line}:${range.end.cell}:${match.kind}`;
@@ -3018,7 +5084,7 @@ function registerMobileFileLinks() {
       const buffer = term.buffer.active;
       const logical = terminalContentHelpers.readLogicalLine(buffer, y - 1);
       const links = terminalContentHelpers.findLinks(logical.text).flatMap((match) => {
-        if (match.kind === 'file' && !globalThis.DuoFilePreviewHelpers.isPreviewableFileName(match.filePath)) return [];
+        if (match.kind === 'file' && !globalThis.DuoFilePreviewHelpers.isLinkableFileName(match.filePath)) return [];
         const range = terminalContentHelpers.matchRange(logical, match);
         if (!range) return [];
         return [{
@@ -3068,7 +5134,8 @@ function createTerminal() {
       brightWhite: '#ffffff',
     },
     cursorBlink: true,
-    scrollback: 5000,
+    // 实时区只保留最近几屏。更早输出走历史层懒加载，手指/滚动条只滚这一小段。
+    scrollback: LIVE_TERMINAL_SCROLLBACK,
     convertEol: false,
     allowProposedApi: true,
     // 禁用光标样式同步，减少渲染
@@ -3095,16 +5162,124 @@ function createTerminal() {
   const loading = $('terminal-loading');
   container.innerHTML = '';
   if (loading) container.appendChild(loading);
-  // 显示 loading
-  if (loading) loading.classList.remove('hidden');
   term.open(container);
+  if (terminalFoldViewApi) {
+    const foldingTerm = term;
+    const foldingSessionId = currentSessionId;
+    terminalFoldView = terminalFoldViewApi.createView(foldingTerm, container, {
+      getCli: () => activeSessionsCache.find(session => session.id === foldingSessionId)?.cli,
+      isInteracting: () => terminalTouchActive || panMomentumRunner?.active(),
+      onOlder: () => {
+        if (term !== foldingTerm) return;
+        if (usesPagedHistory() && terminalHasMoreHistory) {
+          enterTerminalHistory(-terminalRowHeight() * 3);
+          return;
+        }
+        foldingTerm.scrollToTop();
+        isUserScrolling = true;
+        setTerminalUnreadOutput(true);
+      },
+    });
+    terminalFoldView.root.addEventListener('duocli-terminal-file', event => {
+      const path = event.detail?.path;
+      if (term === foldingTerm && globalThis.DuoFilePreviewHelpers?.isLinkableFileName?.(path)) {
+        openFilePreview(path);
+      }
+    });
+    let foldTimer = null;
+    const scheduleFoldRefresh = () => {
+      if (foldTimer) return;
+      foldTimer = setTimeout(() => {
+        foldTimer = null;
+        if (term === foldingTerm) terminalFoldView?.refresh();
+      }, 150);
+    };
+    foldingTerm.onWriteParsed(scheduleFoldRefresh);
+    foldingTerm.onResize(scheduleFoldRefresh);
+  }
+  const scrollingTerm = term;
+  alternateScreenScroller = terminalScrollHelpers.createAlternateScreenScroller(() => (
+    term === scrollingTerm ? {
+      bufferType: scrollingTerm.buffer.active.type,
+      rowHeight: terminalRowHeight(), rows: scrollingTerm.rows,
+    } : null
+  ), sendInputWithHexEnter);
+  term.buffer.onBufferChange?.(() => {
+    alternateScreenScroller?.reset();
+    syncAlternateScreenControls();
+  });
+  if (typeof term.attachCustomWheelEventHandler === 'function') {
+    const wheelTerm = term;
+    wheelTerm.attachCustomWheelEventHandler((event) => {
+      if (wheelTerm !== term || wheelTerm.buffer.active.type !== 'alternate') {
+        alternateScreenScroller?.reset();
+        return true;
+      }
+      if (event.shiftKey || !event.deltaY) return true;
+      const rowHeight = terminalRowHeight();
+      let deltaY = event.deltaY;
+      if (event.deltaMode === 1) deltaY *= rowHeight;
+      else if (event.deltaMode === 2) deltaY *= wheelTerm.rows * rowHeight;
+      alternateScreenScroller?.wheel(deltaY);
+      event.preventDefault();
+      event.stopPropagation();
+      return false;
+    });
+  }
   ensureTerminalScrollButton();
-  ensureTerminalCopyButton();
+  syncAlternateScreenControls();
   ensureTerminalSelectHandles();
+  ensureTerminalSelectionBar();
   registerMobileFileLinks();
+  if (terminalHistoryLayerApi) {
+    terminalHistoryLayer = terminalHistoryLayerApi.createHistoryLayer({
+      onRequest: (query) => requestHistoryPage(query),
+      onBackToLive: () => exitTerminalHistory(),
+      onKeepLiveFocus: () => {
+        const input = $('msg-input');
+        if (input && (document.activeElement === input || input.contains(document.activeElement))) return;
+        try { term?.focus?.(); } catch { /* unmounted terminal */ }
+      },
+      getTerminal: () => term,
+      findIndex: (items, text) => userPromptBanner?.findPromptItemIndex(items, text) ?? -1,
+      onResumeLive: ({ viewportY, deltaY, rowHeight }) => {
+        cancelTerminalHistoryRequest();
+        terminalScrollInteractionRevision++;
+        if (!term) return;
+        term.scrollToLine(Math.min(term.buffer.active.baseY, viewportY + Math.ceil(deltaY / rowHeight)));
+        isUserScrolling = !isAtBottom();
+        terminalHistoryIntent = false;
+        terminalHistoryGestureAccum = 0;
+        resetScrollAccum();
+        if (!isUserScrolling) {
+          jumpTerminalToLatest();
+          terminalFoldView?.returnFromOlder?.();
+        }
+        setTerminalUnreadOutput(isUserScrolling);
+      },
+      onSelectionLimit: () => showCopyToast('选择范围过大，已保留当前选区'),
+      onPanMove: (deltaY) => { getPanVelocityTracker()?.move(deltaY); },
+      onPanEnd: () => {
+        const velocity = getPanVelocityTracker()?.velocity() ?? 0;
+        getPanVelocityTracker()?.reset();
+        beginTerminalMomentum(velocity);
+      },
+      onPanCancel: () => { getPanVelocityTracker()?.reset(); },
+    });
+    container.appendChild(terminalHistoryLayer.root);
+  }
+  armConnectingPlaceholder();
 
   // 终端键盘输入 → WebSocket
+  mobileTypedLine = '';
+  mobilePromptMarker = null;
   term.onData((data) => {
+    if (userPromptBanner) {
+      const parsed = userPromptBanner.consumeTypedInput(mobileTypedLine, data);
+      mobileTypedLine = parsed.line;
+      const last = parsed.segments.filter((segment) => userPromptBanner.looksLikeUserPrompt(segment)).pop();
+      if (last) noteMobileUserPrompt(last);
+    }
     sendInputWithHexEnter(data);
   });
 
@@ -3118,9 +5293,14 @@ function createTerminal() {
 
   // 返回 Promise，确保终端完全 ready 后再做后续操作（如连接 WebSocket）
   // 双重 rAF 确保页面切换后 DOM 布局完成，避免 fit 算出 0 列 0 行
+  const creatingTerm = term;
+  const creatingFitAddon = fitAddon;
+  const creatingGeneration = terminalOpenGeneration;
   return new Promise((resolve) => {
     requestAnimationFrame(() => { requestAnimationFrame(() => {
-      fitAddon.fit();
+      if (term !== creatingTerm || fitAddon !== creatingFitAddon
+          || terminalOpenGeneration !== creatingGeneration) { resolve(); return; }
+      fitTerminalToVisibleBox(creatingTerm, creatingFitAddon);
       // 移动端：禁止点击终端区域弹出键盘
       const xtermTextarea = container.querySelector('.xterm-helper-textarea');
       if (xtermTextarea) {
@@ -3131,13 +5311,18 @@ function createTerminal() {
       // 在容器捕获阶段把手势交给 xterm 的公开滚动 API。
       term.onScroll(() => {
         scheduleTerminalSelectHandlesUpdate();
+        scheduleMobileLinkHighlights();
         // 输出写入也会触发 xterm 的 scroll 事件，不能误判为用户回看。
         // xterm v6 平滑滚动期间 onScroll 会异步多次触发，落在时间戳窗口内即视为程序化滚动。
         if (terminalTouchActive || terminalOutputWriteCount > 0) return;
         if (Date.now() < programmaticScrollUntil) {
-          isUserScrolling = false;
-          setTerminalUnreadOutput(false);
-          if (isAtBottom()) programmaticScrollUntil = 0;
+          // 跟尾窗口只在已经贴底时维持跟随。跳到历史位置时视口不在底部，
+          // 绝不能把 isUserScrolling 清掉，否则下一帧输出会把画面拽回去。
+          if (isAtBottom()) {
+            isUserScrolling = false;
+            setTerminalUnreadOutput(false);
+            programmaticScrollUntil = 0;
+          }
         } else if (terminalOutputWriteCount === 0) {
           markUserScrolling();
         } else if (isAtBottom()) {
@@ -3147,6 +5332,11 @@ function createTerminal() {
       });
 
       term.onSelectionChange(() => {
+        if (term?.hasSelection()) {
+          isUserScrolling = true;
+          terminalScrollInteractionRevision++;
+          programmaticScrollUntil = 0;
+        }
         updateTerminalCopyButton();
         scheduleTerminalSelectHandlesUpdate();
       });
@@ -3163,8 +5353,8 @@ function createTerminal() {
         clearTimeout(longPressTimer);
         longPressTimer = null;
       };
-      // 长按＝选中手指下的词，和普通文本选择一致；之后继续拖动可扩选，
-      // 松手后用手柄微调范围，只有点「复制」才写剪贴板。
+      // 长按＝选中手指下的词，和普通文本选择一致；之后继续拖动可扩选。
+      // 复制走系统 copy，不另放按钮。
       const armLongPress = () => {
         clearLongPress();
         longPressTimer = setTimeout(() => {
@@ -3175,12 +5365,29 @@ function createTerminal() {
           if (!word) return;
           touchGesture.mode = 'word';
           touchGesture.startCell = word.start;
+          // The initial long-press affordance must not wait for a queued
+          // animation frame while a native touch gesture is still held.
+          updateTerminalSelectHandles();
+          updateTerminalCopyButton();
           if (navigator.vibrate) navigator.vibrate(15);
         }, LONG_PRESS_MS);
       };
 
+      const isHistoryLayerTouch = (event) => Boolean(
+        (terminalHistoryLayer?.isVisible() && event.target?.closest?.('.terminal-history-layer'))
+        || (terminalFoldView?.isVisible() && event.target?.closest?.('.terminal-activity-view')),
+      );
+
       const onTouchStart = (e) => {
-        if (e.target?.closest?.('#terminal-copy-selection-btn')) {
+        // 任何新触摸（含历史层内的）都先终止上一段惯性，新手势立即接管。
+        stopTerminalMomentum();
+        if (isHistoryLayerTouch(e)) {
+          clearLongPress();
+          touchGesture = null;
+          terminalTouchActive = false;
+          return;
+        }
+        if (e.target?.closest?.('#terminal-selection-bar, #terminal-alt-controls')) {
           clearLongPress();
           touchGesture = null;
           return;
@@ -3229,6 +5436,8 @@ function createTerminal() {
         terminalTouchActive = true;
         terminalScrollInteractionRevision++;
         programmaticScrollUntil = 0;
+        terminalHistoryGestureAccum = 0;
+        terminalHistoryIntent = false;
         if (scrollToBottomRaf) {
           cancelAnimationFrame(scrollToBottomRaf);
           scrollToBottomRaf = 0;
@@ -3237,6 +5446,7 @@ function createTerminal() {
         armLongPress();
       };
       const onTouchMove = (e) => {
+        if (isHistoryLayerTouch(e)) return;
         if (!touchGesture) return;
         if (touchGesture.mode === 'handle') {
           if (e.touches.length !== 1) return;
@@ -3249,6 +5459,8 @@ function createTerminal() {
           const currentY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
           const deltaY = touchGesture.lastY - currentY;
           touchGesture.lastY = currentY;
+          getPanVelocityTracker()?.move(deltaY);
+          if (handlePagedHistoryPan(deltaY, e)) return;
           if (e.cancelable) e.preventDefault();
           if (deltaY !== 0) scrollTerminalByPixels(deltaY);
           return;
@@ -3261,7 +5473,7 @@ function createTerminal() {
           // 没长按就拖动＝回看滚动，抢成选区会打断手动滚动。
           clearLongPress();
           touchGesture.mode = 'pan';
-          touchGesture.lastY = t.clientY;
+          // 保留起点：快速滑动可能只有一次 touchmove，首段位移也必须滚动。
         } else if (touchGesture.mode === 'word' && moved >= SELECT_DRAG_THRESHOLD) {
           // 长按已经选中词，之后再拖动才是扩选。
           touchGesture.mode = 'select';
@@ -3275,33 +5487,48 @@ function createTerminal() {
           return;
         }
         if (touchGesture.mode !== 'pan') return;
-        if (e.cancelable) e.preventDefault();
         const deltaY = touchGesture.lastY - t.clientY;
         touchGesture.lastY = t.clientY;
+        getPanVelocityTracker()?.move(deltaY);
+        if (handlePagedHistoryPan(deltaY, e)) return;
+        if (e.cancelable) e.preventDefault();
         if (deltaY !== 0) scrollTerminalByPixels(deltaY);
       };
       const onTouchEnd = (e) => {
+        if (isHistoryLayerTouch(e)) return;
         clearLongPress();
         const mode = touchGesture?.mode;
+        if ((mode === 'pan' || mode === 'scroll') && term?.buffer?.active?.type === 'alternate') {
+          consumeAlternateScreenScroll(0, true);
+        }
         // 长按/拖手柄松手后，浏览器会补发 mousedown，xterm 收到就把刚选好的内容清掉。
         if ((mode === 'word' || mode === 'select' || mode === 'handle') && e?.cancelable) e.preventDefault();
         // 没长按也没拖动的单击＝取消选区，和普通文本一致。
         if (mode === 'pending' && term?.hasSelection()) term.clearSelection();
+        const panMode = mode === 'pan' || mode === 'scroll';
+        const flingVelocity = panMode ? (getPanVelocityTracker()?.velocity() ?? 0) : 0;
+        getPanVelocityTracker()?.reset();
         touchGesture = null;
+        // touchcancel 不是用户手势，不启动惯性。
+        if (e?.type !== 'touchcancel' && beginTerminalMomentum(flingVelocity)) return;
         terminalTouchActive = false;
-        if (term && isAtBottom()) {
-          isUserScrolling = false;
-          setTerminalUnreadOutput(false);
-        } else if (term) {
-          isUserScrolling = true;
-        }
+        finishTerminalPanGesture();
       };
-      const onWheel = () => {
+      const onWheel = (event) => {
+        if (event.target?.closest?.('.terminal-history-layer, .terminal-activity-view')) return;
+        stopTerminalMomentum();
         terminalScrollInteractionRevision++;
         programmaticScrollUntil = 0;
         if (scrollToBottomRaf) {
           cancelAnimationFrame(scrollToBottomRaf);
           scrollToBottomRaf = 0;
+        }
+        if (event?.deltaY < 0 && terminalHistoryLayerApi) {
+          const pixels = terminalHistoryLayerApi.wheelPixels(event, terminalRowHeight(), container.clientHeight);
+          // At the archive boundary the history layer owns the rest of the gesture.
+          // Leaving it passive lets xterm scroll the same distance again.
+          if (handlePagedHistoryPan(pixels, event)) return;
+          maybeRequestTerminalHistory(true, pixels);
         }
       };
 
@@ -3309,7 +5536,7 @@ function createTerminal() {
       container.addEventListener('touchmove', onTouchMove, { passive: false, capture: true });
       container.addEventListener('touchend', onTouchEnd, { passive: false, capture: true });
       container.addEventListener('touchcancel', onTouchEnd, { passive: false, capture: true });
-      container.addEventListener('wheel', onWheel, { passive: true, capture: true });
+      container.addEventListener('wheel', onWheel, { passive: false, capture: true });
       terminalTouchCleanup = () => {
         clearLongPress();
         container.removeEventListener('touchstart', onTouchStart, true);
@@ -3341,7 +5568,8 @@ function createTerminal() {
         }, { passive: true });
         container.addEventListener('touchend', (e) => {
           if (!term || !globalThis.DuoFilePreviewHelpers || !terminalContentHelpers) return;
-          if (e.target?.closest?.('.terminal-select-handle, #terminal-copy-selection-btn')) return;
+          if (e.target?.closest?.('.terminal-activity-view')) return;
+          if (e.target?.closest?.('.terminal-select-handle, #terminal-selection-bar')) return;
           const elapsed = Date.now() - tapStartTime;
           // 真实手机点击可能在 30ms 内完成；只需排除长按，不能把快速点击
           // 当成误触，否则短路径链接在移动端会悄悄失效。
@@ -3353,42 +5581,14 @@ function createTerminal() {
           const cell = getCellFromTouch(t.clientX, t.clientY);
           if (!cell) return;
           const buffer = term.buffer.active;
-          const lineIndex = cell.row;
-
-          const logical = terminalContentHelpers.readLogicalLine(buffer, lineIndex);
-          const matches = terminalContentHelpers.findLinks(logical.text).filter(match =>
-            match.kind === 'file' && globalThis.DuoFilePreviewHelpers.isPreviewableFileName(match.filePath));
-          if (!matches.length) return;
-
-          const tapCol = cell.col;
-          let tapCharIndex = -1;
-          for (let i = 0; i < logical.positions.length; i++) {
-            const position = logical.positions[i];
-            if (position && position.line === lineIndex && position.cell >= tapCol) {
-              tapCharIndex = i;
-              break;
-            }
-          }
-          if (tapCharIndex < 0) tapCharIndex = logical.positions.length - 1;
-
-          let best = null;
-          let bestDist = Infinity;
-          for (const m of matches) {
-            const mStart = m.index;
-            const mEnd = m.index + m.length;
-            let dist;
-            if (tapCharIndex >= mStart && tapCharIndex < mEnd) {
-              dist = 0;
-            } else {
-              dist = Math.min(Math.abs(tapCharIndex - mStart), Math.abs(tapCharIndex - mEnd));
-            }
-            if (dist < bestDist) {
-              bestDist = dist;
-              best = m;
-            }
-          }
-
-          if (best && bestDist <= 15) {
+          const logical = terminalContentHelpers.readLogicalLine(buffer, cell.row);
+          const best = terminalContentHelpers.findLinkAtCell(logical, cell, {
+            cols: term.cols,
+            maxDistance: 2,
+            predicate: (match) => match.kind === 'file'
+              && globalThis.DuoFilePreviewHelpers.isLinkableFileName(match.filePath),
+          });
+          if (best) {
             linkTapAt = Date.now();
             openFilePreview(best.filePath);
           }
@@ -3408,21 +5608,22 @@ function createTerminal() {
 }
 
 function handleResize() {
-  if (!fitAddon || !term) return;
-  clearTimeout(resizeSendTimer);
-  // 在键盘/工具栏动画结束后请求最终行列数。实际尺寸由 PTY 快照确认，
-  // 避免客户端先 fit、CLI 仍按旧坐标重绘的窗口。
+  if (!fitAddon || !term || resizeSendTimer !== null) return;
+  const resizingTerm = term;
+  const resizingFit = fitAddon;
+  // Coalesce continuous keyboard/toolbar layout events without postponing
+  // the ACK indefinitely. Read the latest dimensions when the timer fires.
   resizeSendTimer = setTimeout(() => {
     resizeSendTimer = null;
-    if (!fitAddon || !term) return;
-    const dims = fitAddon.proposeDimensions();
+    if (term !== resizingTerm || fitAddon !== resizingFit) return;
+    const dims = resizingFit.proposeDimensions();
     if (!dims || dims.cols < 2 || dims.rows < 1) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (dims.cols === lastSentCols && dims.rows === lastSentRows) return;
     lastSentCols = dims.cols;
     lastSentRows = dims.rows;
     wsSend({ type: 'resize', cols: dims.cols, rows: dims.rows });
-  }, 250);
+  }, 100);
 }
 
 function closeTerminal() {
@@ -3461,23 +5662,31 @@ function interceptSpinnerData(rawData) {
 // ========== WebSocket ==========
 
 function connectWebSocket(sessionId) {
+  cancelTerminalHistoryRequest();
+  if (pendingRecreateViewport == null && isUserScrolling && term && terminalSequence >= 0) {
+    pendingRecreateViewport = term.buffer.active.viewportY;
+  }
   closeWebSocket();
   setTerminalInputReady(false);
   hideWeakNetworkPrompt();
   const profile = getNetworkProfile();
+  const generation = ++wsConnectionGeneration;
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`;
-  ws = new WebSocket(wsUrl);
+  const socket = new WebSocket(wsUrl);
+  ws = socket;
+  wsSessionId = sessionId;
 
-  ws.onopen = () => {
+  socket.onopen = () => {
+    if (generation !== wsConnectionGeneration || ws !== socket) return;
     console.log('[ws] onopen, term exists=', !!term);
     hideWeakNetworkPrompt();
     wsReconnectAttempt = 0;
     wsLastPongAt = Date.now();
     // 保留旧屏幕直到快照到达，断网时不把用户视口重置到顶部。
     // 订阅会话
-    wsSend({ type: 'subscribe', sessionId });
+    wsSend({ type: 'subscribe', sessionId, requestId: `sub-${generation}` });
     // 发送当前终端尺寸（过滤无效值，避免 pty resize(0,0) 异常）
     if (term && term.cols > 0 && term.rows > 0) {
       console.log('[ws] sending resize', term.cols, term.rows);
@@ -3511,11 +5720,16 @@ function connectWebSocket(sessionId) {
       hideTerminalLoading();
       writeTerminalOutput('\r\n\x1b[33m⚠ 连接超时，正在重连...\x1b[0m\r\n');
       showWeakNetworkPrompt('连接超时，正在重试');
-      if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+      // CONNECTING sockets do not reliably emit a useful error on mobile
+      // browsers. Close this exact attempt so the normal retry path runs.
+      if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
     }
   }, profile.wsConnectTimeoutMs);
 
-  ws.onmessage = (event) => {
+  socket.onmessage = (event) => {
+    if (generation !== wsConnectionGeneration || ws !== socket) return;
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === 'submitted') {
@@ -3531,76 +5745,103 @@ function connectWebSocket(sessionId) {
         return;
       }
 
+      if (msg.missingSession) {
+        setTerminalInputReady(false);
+        showCopyToast('会话已结束，可在已关闭记录中恢复');
+        leaveSessionDetail();
+        return;
+      }
+
       if (msg.type === 'replay') {
         replayReceived = true;
+        if (wsReplayRetryTimer) { clearTimeout(wsReplayRetryTimer); wsReplayRetryTimer = null; }
         if (wsConnectTimeoutTimer) { clearTimeout(wsConnectTimeoutTimer); wsConnectTimeoutTimer = null; }
         hideWeakNetworkPrompt();
         console.log('[ws] replay received, data length=', (msg.data || '').length);
-        setTerminalInputReady(true);
         if (Number.isInteger(msg.sequence)) terminalSequence = msg.sequence;
-        if (msg.data) {
-          restoreTerminalSnapshot(msg);
-        } else {
-          hideTerminalLoading();
-          applyTerminalSnapshotGeometry(msg);
-          if (wsReplayRetryTimer || wsReplayRetryCount >= 3) return;
-          // 新建会话 pty 刚启动时 buffer 可能仍为空，延迟重新订阅。
-          wsReplayRetryCount++;
-          wsReplayRetryTimer = setTimeout(() => {
-            wsReplayRetryTimer = null;
-            if (ws && ws.readyState === WebSocket.OPEN && currentSessionId === sessionId) {
-              wsSend({ type: 'subscribe', sessionId });
-            }
-          }, 800);
-        }
+        noteTerminalHistoryMeta(msg);
+        terminalResyncing = false;
+        // Empty is an authoritative blank screen too. Serialize its reset
+        // through the parser queue so old content and callbacks cannot survive.
+        restoreTerminalSnapshot(msg);
+      } else if (msg.type === 'historyPage') {
+        applyTerminalHistoryPage(msg, terminalOpenGeneration);
+      } else if (msg.type === 'history') {
+        if (Number.isInteger(msg.sequence)) terminalSequence = Math.max(terminalSequence, msg.sequence);
+        applyTerminalHistorySnapshot(msg);
       } else if (msg.type === 'output') {
-        if (Number.isInteger(msg.sequence)) {
-          if (msg.sequence <= terminalSequence) return;
-          terminalSequence = msg.sequence;
+        const toSeq = Number.isInteger(msg.toSequence) ? msg.toSequence : msg.sequence;
+        const fromSeq = Number.isInteger(msg.fromSequence) ? msg.fromSequence : toSeq;
+        if (Number.isInteger(toSeq) && toSeq <= terminalSequence) return;
+        if (terminalResyncing) return;
+        if (terminalSequence >= 0 && Number.isInteger(fromSeq) && fromSeq > terminalSequence + 1) {
+          if (!terminalResyncing && ws && ws.readyState === WebSocket.OPEN) {
+            terminalResyncing = true;
+            setTerminalInputReady(false);
+            wsReplayRetryTimer = setTimeout(() => {
+              wsReplayRetryTimer = null;
+              if (generation === wsConnectionGeneration && ws === socket && terminalResyncing) socket.close();
+            }, profile.wsConnectTimeoutMs);
+            wsSend({ type: 'subscribe', sessionId, requestId: `resync-${Date.now()}` });
+          }
+          return;
         }
+        if (Number.isInteger(toSeq)) terminalSequence = toSeq;
         hideTerminalLoading();
         hideWeakNetworkPrompt();
-        setTerminalInputReady(true);
+        if (!$('terminal-container')?.classList.contains('terminal-reveal-pending')) {
+          setTerminalInputReady(true);
+        }
+        terminalFirstLatestPaint = true;
 
-        let writeData = interceptSpinnerData(msg.data);
+        const writeData = interceptSpinnerData(msg.data);
 
         if (writeData !== null) {
-          writeTerminalOutput(writeData, !isUserScrolling);
+          const follow = !isUserScrolling && !terminalHistoryLayer?.isVisible();
+          writeTerminalOutput(writeData, follow);
+          if (terminalHistoryLayer?.isVisible()) {
+            terminalHistoryLayer.noteLiveOutput();
+            if (!terminalHistoryLayer.viewingLiveEdge?.()) setTerminalUnreadOutput(true);
+          }
         }
       }
     } catch {}
   };
 
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (generation !== wsConnectionGeneration || ws !== socket) return;
     setTerminalInputReady(false);
     clearInterval(wsHeartbeat);
+    if (wsReplayRetryTimer) { clearTimeout(wsReplayRetryTimer); wsReplayRetryTimer = null; }
     if (wsConnectTimeoutTimer) { clearTimeout(wsConnectTimeoutTimer); wsConnectTimeoutTimer = null; }
     if (navigator.onLine === false) return;
     // 如果还在详情页，尝试重连
-    if (currentSessionId === sessionId && $('detail-page').classList.contains('active')) {
+    if (currentSessionId === sessionId && $('detail-page').classList.contains('active') && sessionViewMode !== 'chat') {
       if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
       const delay = Math.min(profile.wsRetryBaseMs * Math.pow(2, wsReconnectAttempt), profile.wsRetryMaxMs) + Math.floor(Math.random() * 500);
       wsReconnectAttempt++;
       showWeakNetworkPrompt('连接中断，正在重试');
       wsReconnectTimer = setTimeout(() => {
         wsReconnectTimer = null;
-        if (currentSessionId === sessionId && $('detail-page').classList.contains('active')) {
+        if (currentSessionId === sessionId && $('detail-page').classList.contains('active') && sessionViewMode !== 'chat') {
           connectWebSocket(sessionId);
         }
       }, delay);
     }
   };
 
-  ws.onerror = () => {
+  socket.onerror = () => {
+    if (generation !== wsConnectionGeneration || ws !== socket) return;
     setTerminalInputReady(false);
     // 某些浏览器弱网下只触发 onerror 不触发 onclose，主动 close 统一走重连逻辑
-    if (ws && ws.readyState !== WebSocket.CLOSED) {
-      ws.close();
+    if (socket.readyState !== WebSocket.CLOSED) {
+      socket.close();
     }
   };
 }
 
 function closeWebSocket() {
+  wsConnectionGeneration++;
   clearInterval(wsHeartbeat);
   setTerminalInputReady(false);
   hideWeakNetworkPrompt();
@@ -3608,6 +5849,7 @@ function closeWebSocket() {
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
   if (wsReplayRetryTimer) { clearTimeout(wsReplayRetryTimer); wsReplayRetryTimer = null; }
   wsReplayRetryCount = 0;
+  wsSessionId = null;
   if (ws) {
     // close() 是异步的，关闭过程中已在路上的帧仍会调用旧 ws 的 onmessage，
     // 全置 null 避免会话切换时旧 session 的输出写入新 term
@@ -3644,34 +5886,391 @@ function wsSend(data) {
 
 // ========== 会话详情 ==========
 
-async function openSession(id) {
+function sessionChatPrefKey(id) {
+  return `${CHAT_VIEW_PREF_KEY}:${id}`;
+}
+
+function sessionChatPref(id) {
+  return sessionStorage.getItem(sessionChatPrefKey(id));
+}
+
+function stopNativeChatPolling() {
+  chatPollGeneration += 1;
+  if (chatPollTimer) clearTimeout(chatPollTimer);
+  chatPollTimer = null;
+  chatRefreshController?.abort();
+  chatRefreshController = null;
+}
+
+function renderShortcutMode() {
+  const keys = shortcutMode === 'keys' && sessionViewMode === 'terminal';
+  $('shortcut-bar').hidden = !keys;
+  $('quick-commands').hidden = keys;
+  const toggle = $('shortcut-mode-toggle');
+  toggle.hidden = sessionViewMode === 'chat';
+  toggle.textContent = keys ? '组合键 ⇄' : '快捷语 ⇄';
+  toggle.setAttribute('aria-label', keys ? '切换为快捷语' : '切换为组合键');
+  toggle.setAttribute('aria-controls', 'shortcut-bar quick-commands');
+}
+
+$('shortcut-mode-toggle').addEventListener('click', () => {
+  shortcutMode = shortcutMode === 'keys' ? 'commands' : 'keys';
+  renderShortcutMode();
+  scheduleTerminalResize();
+});
+renderShortcutMode();
+
+function applySessionViewMode(mode) {
+  sessionViewMode = mode === 'chat' ? 'chat' : 'terminal';
+  const chat = $('chat-container');
+  const termEl = $('terminal-container');
+  document.body.classList.toggle('native-chat-mode', sessionViewMode === 'chat');
+  if (chat) chat.hidden = sessionViewMode !== 'chat';
+  if (termEl) termEl.hidden = sessionViewMode === 'chat';
+  renderShortcutMode();
+  const returnChat = $('terminal-return-chat');
+  if (returnChat) {
+    returnChat.hidden = !currentSessionChatCapable;
+    returnChat.setAttribute('aria-pressed', String(sessionViewMode === 'chat'));
+  }
+  $('session-terminal-tab')?.setAttribute('aria-pressed', String(sessionViewMode === 'terminal'));
+  updateComposerAvailability();
+}
+
+function isChatPinnedToBottom() {
+  const el = $('chat-transcript');
+  if (!el) return true;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+}
+
+function captureChatScrollAnchor() {
+  const scroller = $('chat-transcript');
+  if (!scroller) return null;
+  const top = scroller.getBoundingClientRect().top;
+  const node = [...scroller.querySelectorAll('.native-chat-msg')]
+    .find(item => item.getBoundingClientRect().bottom > top);
+  return node ? { key: node.dataset.chatKey, offset: node.getBoundingClientRect().top - top } : null;
+}
+
+function restoreChatScrollAnchor(anchor) {
+  if (!anchor?.key) return;
+  const scroller = $('chat-transcript');
+  const node = [...(scroller?.querySelectorAll('.native-chat-msg') || [])]
+    .find(item => item.dataset.chatKey === anchor.key);
+  if (!scroller || !node) return;
+  scroller.scrollTop += node.getBoundingClientRect().top - scroller.getBoundingClientRect().top - anchor.offset;
+}
+
+async function refreshNativeChat(sessionId, generation, waitForChanges = false) {
+  if (generation !== chatPollGeneration || currentSessionId !== sessionId || sessionViewMode !== 'chat') return;
+  const request = ++chatRefreshRequest;
+  chatRefreshController?.abort();
+  const controller = new AbortController();
+  chatRefreshController = controller;
+  const previous = chatSnapshots.get(sessionId);
+  const waiting = waitForChanges && !!previous?.revision;
+  const revisionQuery = previous?.revision
+    ? `?revision=${encodeURIComponent(previous.revision)}${waiting ? '&wait=10000' : ''}` : '';
+  let snapshot;
+  try {
+    snapshot = await api(`/api/sessions/${encodeURIComponent(sessionId)}/chat${revisionQuery}`, {
+      signal: controller.signal, cache: 'no-store', ...(waiting ? { timeout: 15000 } : {}),
+    });
+  } catch (error) {
+    if (controller.signal.aborted || request !== chatRefreshRequest || generation !== chatPollGeneration) return false;
+    setChatStatus('对话更新失败，正在重试：' + (error.message || error), 'error');
+    chatPollFailures++;
+    return false;
+  } finally {
+    if (chatRefreshController === controller) chatRefreshController = null;
+  }
+  if (request !== chatRefreshRequest || generation !== chatPollGeneration || currentSessionId !== sessionId || sessionViewMode !== 'chat') return;
+  if (snapshot.error && !snapshot.notFound) {
+    setChatStatus('对话更新失败，正在重试：' + snapshot.error, 'error');
+    chatPollFailures++;
+    return false;
+  }
+  if (snapshot.notFound && previous?.ready && (previous.sessionId === snapshot.sessionId || (snapshot.unbound && !snapshot.sessionId))
+      && previous.messages?.length) {
+    setChatStatus('对话记录暂时无法读取，已显示的消息会保留，正在重试…', 'error');
+    chatPollFailures++;
+    return false;
+  }
+  chatPollFailures = 0;
+  // Old servers ignore `wait`; keep their normal polling interval rather than
+  // spinning requests. New servers hold the next request until a change arrives.
+  const nextPollDelay = snapshot.waitSupported && snapshot.revision ? 0 : 1000;
+  const localDeliveryState = () => {
+    const local = chatLocalMessages.get(sessionId) || [];
+    if (local.some(item => /未确认|失败/.test(item.status || ''))) return 'error';
+    if (local.some(item => /发送中|等待/.test(item.status || ''))) return 'updating';
+    return 'synced';
+  };
+  const updateSyncStatus = () => {
+    const state = localDeliveryState();
+    if (state === 'error') setChatStatus('有消息发送状态未确认，原文已保留', 'error');
+    else if (state === 'updating') setChatStatus('正在更新对话，等待新内容…', 'updating');
+    else setChatStatus('');
+  };
+  if (snapshot.unchanged) {
+    updateSyncStatus();
+    return { nextPollDelay };
+  }
+  const stick = isChatPinnedToBottom();
+  const anchor = stick ? null : captureChatScrollAnchor();
+  const currentSnapshot = chatSnapshots.get(sessionId);
+  if (currentSnapshot?.sessionId === snapshot.sessionId && currentSnapshot?.paged && snapshot.paged && currentSnapshot.startIndex < snapshot.startIndex
+      && (currentSnapshot.messages?.length || 0) > snapshot.startIndex - currentSnapshot.startIndex
+      && currentSnapshot.messages.slice(snapshot.startIndex - currentSnapshot.startIndex).every((message, index) =>
+        message.id === snapshot.messages?.[index]?.id && message.role === snapshot.messages[index].role)) {
+    const retainedCount = snapshot.startIndex - currentSnapshot.startIndex;
+    snapshot = {
+      ...snapshot,
+      startIndex: currentSnapshot.startIndex,
+      hasMore: currentSnapshot.hasMore,
+      messages: (currentSnapshot.messages || []).slice(0, retainedCount).concat(snapshot.messages || []),
+    };
+  }
+  const contentChanged = JSON.stringify(currentSnapshot?.messages || []) !== JSON.stringify(snapshot.messages || []);
+  chatSnapshots.set(sessionId, snapshot);
+  renderCurrentChat(sessionId);
+  updateSyncStatus();
+  const scroller = $('chat-transcript');
+  if (stick && scroller) scroller.scrollTop = scroller.scrollHeight;
+  else restoreChatScrollAnchor(anchor);
+  const newButton = $('chat-new-messages');
+  if (newButton) {
+    if (stick) newButton.hidden = true;
+    else if (contentChanged) newButton.hidden = false;
+  }
+  return { nextPollDelay };
+}
+
+function renderCurrentChat(sessionId) {
+  if (sessionId !== currentSessionId || sessionViewMode !== 'chat' || !nativeChatView) return;
+  const result = nativeChatView.mergeLocalMessages(chatSnapshots.get(sessionId), chatLocalMessages.get(sessionId) || []);
+  chatLocalMessages.set(sessionId, result.pending);
+  nativeChatView.render($('chat-transcript'), result.snapshot);
+}
+
+async function loadOlderChatMessages(sessionId) {
+  const current = chatSnapshots.get(sessionId);
+  if (!current?.paged || !current.hasMore || chatOlderLoads.has(sessionId)) return;
+  chatOlderLoads.add(sessionId);
+  const viewGeneration = sessionViewGeneration;
+  const isCurrent = () => currentSessionId === sessionId && sessionViewMode === 'chat'
+    && sessionViewGeneration === viewGeneration;
+  const scroller = $('chat-transcript');
+  setChatStatus('正在加载更早消息…', 'loading');
+  try {
+    const older = await api(`/api/sessions/${encodeURIComponent(sessionId)}/chat?before=${current.startIndex}&limit=300`);
+    if (!isCurrent()) return;
+    if (older.error || older.ready === false || !older.paged || !Array.isArray(older.messages)) {
+      throw new Error(older.error || '暂时无法读取更早消息');
+    }
+    const latest = chatSnapshots.get(sessionId);
+    // Polling may have appended messages while the older page was in flight.
+    // A changed start index means this response no longer fits the current page.
+    if (!latest || latest.sessionId !== current.sessionId || older.sessionId !== latest.sessionId
+        || latest.startIndex !== current.startIndex
+        || (older.revision && latest.revision && older.revision !== latest.revision)
+        || !Number.isInteger(older.startIndex)
+        || older.startIndex + older.messages.length !== latest.startIndex) {
+      setChatStatus('对话已更新，可继续加载更早消息', 'success');
+      return;
+    }
+    // Preserve the reader's position at delivery time. They may have scrolled
+    // and polling may have changed row heights while this request was pending.
+    const anchor = captureChatScrollAnchor();
+    const beforeHeight = scroller?.scrollHeight || 0;
+    const beforeTop = scroller?.scrollTop || 0;
+    chatSnapshots.set(sessionId, {
+      ...latest,
+      startIndex: older.startIndex,
+      hasMore: older.hasMore,
+      messages: (older.messages || []).concat(latest.messages || []),
+    });
+    renderCurrentChat(sessionId);
+    if (anchor) restoreChatScrollAnchor(anchor);
+    else if (scroller) scroller.scrollTop = beforeTop + scroller.scrollHeight - beforeHeight;
+    setChatStatus(`已加载更早消息 · 共 ${chatSnapshots.get(sessionId)?.messages?.length || 0} 条`, 'success');
+  } catch (error) {
+    if (isCurrent()) setChatStatus('加载更早消息失败：' + (error.message || error), 'error');
+  } finally {
+    chatOlderLoads.delete(sessionId);
+  }
+}
+
+function startNativeChatPolling(sessionId) {
+  stopNativeChatPolling();
+  chatPollFailures = 0;
+  const generation = chatPollGeneration;
+  let waitForChanges = false;
+  const poll = async () => {
+    const result = !document.hidden ? await refreshNativeChat(sessionId, generation, waitForChanges) : null;
+    waitForChanges = true;
+    if (generation === chatPollGeneration) {
+      const delay = document.hidden ? 5000 : chatPollFailures
+        ? Math.min(8000, 1000 * Math.pow(2, chatPollFailures)) : result?.nextPollDelay ?? 1000;
+      chatPollTimer = setTimeout(poll, delay);
+    }
+  };
+  void poll();
+}
+
+function setChatStatus(text, state) {
+  const status = $('chat-status');
+  if (!status) return;
+  status.textContent = text;
+  const inferredState = /失败|错误/.test(text) ? 'error'
+    : /正在|等待|发送/.test(text) ? 'updating'
+      : /已同步|已加载|已上传|已更新/.test(text) ? 'success' : 'info';
+  status.dataset.state = state || inferredState;
+  status.hidden = !text;
+}
+
+async function openNativeChatView(id) {
+  const viewRequest = ++sessionViewGeneration;
+  applySessionViewMode('chat');
+  closeTerminal();
+  if (viewRequest !== sessionViewGeneration || currentSessionId !== id) return;
+  renderCurrentChat(id);
+  const scroller = $('chat-transcript');
+  if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  if ($('chat-new-messages')) $('chat-new-messages').hidden = true;
+  setChatStatus('');
+  startNativeChatPolling(id);
+}
+
+function switchCurrentSessionView(mode) {
+  if (!currentSessionId || !currentSessionChatCapable) return;
+  sessionStorage.setItem(sessionChatPrefKey(currentSessionId), mode);
+  if (mode === 'chat') void openNativeChatView(currentSessionId);
+  else void openRawTerminalView(currentSessionId, terminalOpenRequest);
+}
+
+async function openRawTerminalView(id, requestId) {
+  const viewRequest = ++sessionViewGeneration;
+  stopNativeChatPolling();
+  applySessionViewMode('terminal');
+  console.log('[openSession] creating terminal...');
+  await createTerminal();
+  if (requestId !== terminalOpenRequest || viewRequest !== sessionViewGeneration
+      || currentSessionId !== id || sessionViewMode !== 'terminal') return;
+  console.log('[openSession] terminal ready, cols=', term?.cols, 'rows=', term?.rows);
+  connectWebSocket(id);
+}
+
+function leaveSessionDetail() {
+  const endedId = currentSessionId;
+  saveCurrentMobileDraft();
+  pendingTerminalSendIntent = null;
+  terminalOpenRequest++;
+  sessionViewGeneration++;
+  currentSessionId = null;
+  currentSessionChatCapable = false;
+  stopNativeChatPolling();
+  applySessionViewMode('terminal');
+  closeTerminal();
+  leaveToSessionList(endedId);
+}
+
+async function openSession(id, fromHistory = false) {
   console.log('[openSession] start, id=', id);
   const requestId = ++terminalOpenRequest;
+  terminalOpenGeneration += 1;
+  sessionViewGeneration += 1;
+  if (!fromHistory && history.state?.duocliSession !== id) {
+    history.pushState({ duocliSession: id }, '', `${location.pathname}#session=${encodeURIComponent(id)}`);
+  }
+  saveCurrentMobileDraft();
+  pendingTerminalSendIntent = null;
+  // Freeze the old route before the UI starts representing the new session.
+  stopNativeChatPolling();
+  closeTerminal();
+  setTerminalInputReady(false);
+  composerComposing = false;
+  submitAfterComposition = null;
   currentSessionId = id;
+  currentSessionChatCapable = false;
+  applySessionViewMode('terminal');
+  setTerminalRevealPending(true);
+  showTerminalLoading('正在加载会话…');
+  markSessionSeenLocally(id);
+  void api(`/api/sessions/${encodeURIComponent(id)}/seen`, { method: 'POST', body: '{}' }).catch(() => {});
+  failedSubmission = mobilePendingSubmissions.get(id) || null;
+  composerSubmission = composerSubmissions.get(id) || null;
+  restoreMobileDraft(id);
+  const recovered = mobilePendingSubmissions.get(id);
+  if (recovered && nativeChatView && !nativeChatView.slashCommandText?.(recovered.text)) {
+    const local = chatLocalMessages.get(id) || [];
+    if (!local.some(item => item.id === recovered.id)) local.push({
+      id: recovered.id, text: recovered.text, occurrence: 1,
+      status: '上次发送未确认，编辑后可重试',
+    });
+    chatLocalMessages.set(id, local);
+  }
+  mobilePromptExpanded = false;
+  mobilePromptMarker = null;
+  mobileTypedLine = '';
+  let sessionInfo = activeSessionsCache.find(x => x.id === id) || null;
+  if (sessionInfo) {
+    $('detail-name').textContent = sessionInfo.title || sessionInfo.presetCommand || '终端';
+    setDetailCliLogo(sessionInfo.displayName || sessionInfo.presetCommand || '');
+    $('detail-status').className = `status-dot ${statusAfterViewing(sessionInfo.status)}`;
+    lastKnownSessionCwd = sessionInfo.cwd || '';
+    applyRemoteUserPrompt(sessionInfo);
+  }
+  else if (userPromptBanner) userPromptBanner.writeStoredPrompt(id, '');
+  renderMobilePromptBanner();
   resetFileTreeState(mobileFileTree);
   resetFileTreeState(fileBrowseTree);
   mobileFilePreviewRequest++;
   showPage('detail-page');
+  syncCurrentSessionCard();
 
-  // 更新标题（不阻塞 WebSocket 连接）
-  api('/api/sessions').then(sessions => {
-    const s = sessions.find(x => x.id === id);
-    if (s && currentSessionId === id) {
-      $('detail-name').textContent = s.title || s.presetCommand || '终端';
-      $('detail-status').className = `status-dot ${s.status}`;
-      lastKnownSessionCwd = s.cwd || '';
-    }
-  }).catch(() => {});
-
-  // 创建终端并连接 WebSocket（等终端 ready 后再连，避免 replay 数据丢失）
-  console.log('[openSession] creating terminal...');
-  await createTerminal();
+  const hadCachedSession = Boolean(sessionInfo);
+  const refreshSessionInfo = async () => {
+    try {
+      const sessions = await api('/api/sessions');
+      if (requestId !== terminalOpenRequest || currentSessionId !== id) return false;
+      if (Array.isArray(sessions)) {
+        activeSessionsCache = sessions;
+        sessionInfo = sessions.find(x => x.id === id) || null;
+        if (!sessionInfo) {
+          showCopyToast('会话已结束，可在已关闭记录中恢复');
+          if (history.state?.duocliSession === id) history.replaceState({ duocliRoot: true }, '', location.pathname);
+          leaveSessionDetail();
+          return false;
+        }
+        $('detail-name').textContent = sessionInfo.title || sessionInfo.presetCommand || '终端';
+        setDetailCliLogo(sessionInfo.displayName || sessionInfo.presetCommand || '');
+        $('detail-status').className = `status-dot ${statusAfterViewing(sessionInfo.status)}`;
+        lastKnownSessionCwd = sessionInfo.cwd || '';
+        applyRemoteUserPrompt(sessionInfo);
+        currentSessionChatCapable = Boolean(sessionInfo.chatCapable);
+      }
+    } catch { /* cached details remain usable while the list request retries */ }
+    return true;
+  };
+  const sessionRefresh = refreshSessionInfo();
+  // The list already supplied this session's details. Begin its view while
+  // refreshing metadata, so a slow list request does not block replay/chat.
+  if (!hadCachedSession && !await sessionRefresh) return;
   if (requestId !== terminalOpenRequest || currentSessionId !== id) return;
-  console.log('[openSession] terminal ready, cols=', term?.cols, 'rows=', term?.rows);
-  connectWebSocket(id);
-  console.log('[openSession] connectWebSocket called');
+  currentSessionChatCapable = Boolean(sessionInfo?.chatCapable);
+  const viewPref = sessionChatPref(id);
+  if (requestId !== terminalOpenRequest || currentSessionId !== id) return;
+  const viewMode = nativeChatView?.chooseSessionViewMode({
+    chatCapable: currentSessionChatCapable,
+    pref: viewPref,
+  }) || 'terminal';
+  if (viewMode === 'chat') {
+    await openNativeChatView(id);
+  } else {
+    await openRawTerminalView(id, requestId);
+  }
 
-  // 初始化催工 UI（从桌面端读取配置）
   getAutoContinueConfig(id).then(config => {
     if (requestId === terminalOpenRequest && currentSessionId === id) {
       updateDetailAutoContinueUI(config);
@@ -3700,12 +6299,26 @@ $('detail-name').onclick = async () => {
 
 // 返回按钮
 $('back-btn').onclick = () => {
-  terminalOpenRequest++;
-  currentSessionId = null;
-  closeTerminal();
-  showPage('main-page');
-  refreshSessions();
+  // This control returns to the list even after visiting several sessions;
+  // browser Back still restores individual sessions through popstate.
+  history.replaceState({ duocliRoot: true }, '', location.pathname);
+  leaveSessionDetail();
 };
+
+window.addEventListener('popstate', (event) => {
+  const sessionId = event.state?.duocliSession;
+  if (sessionId) {
+    if (currentSessionId !== sessionId) void openSession(sessionId, true);
+    return;
+  }
+  if ($('detail-page').classList.contains('active')) {
+    if (supportsLandscapeWorkspace()) {
+      applyLandscapeWorkspaceChrome();
+      return;
+    }
+    leaveSessionDetail();
+  }
+});
 
 $('file-preview-back-btn').onclick = () => {
   const returnPage = filePreviewReturnPage || 'detail-page';
@@ -3717,6 +6330,17 @@ $('file-preview-back-btn').onclick = () => {
     });
   }
 };
+
+function handleFilePreviewDownload() {
+  if (!filePreviewCurrentPath) {
+    showCopyToast('当前没有可下载的文件');
+    return;
+  }
+  void downloadSessionFile(filePreviewCurrentPath);
+}
+
+$('file-preview-download-btn')?.addEventListener('click', () => handleFilePreviewDownload());
+$('mobile-file-preview-download-btn')?.addEventListener('click', () => handleFilePreviewDownload());
 
 // ========== 项目文件浏览页 ==========
 function updateFileBrowseFilterUI() {
@@ -3736,6 +6360,21 @@ function openFileBrowse() {
   updateFileBrowseFilterUI();
   showPage('media-browse-page');
   void renderFileBrowseTree(true);
+}
+
+function showSessionPicker() {
+  const sessions = activeSessionsCache.filter(session => session?.id);
+  if (sessions.length <= 1) {
+    showCopyToast('当前只有一个活跃会话');
+    return;
+  }
+  const items = sessions.map(session => ({
+    label: session.id === currentSessionId ? `✓ ${session.title || '终端'}` : (session.title || session.presetCommand || '终端'),
+    action: () => {
+      if (session.id !== currentSessionId) openSession(session.id);
+    },
+  }));
+  showMobileContextMenu(Math.max(12, window.innerWidth / 2 - 84), 58, items);
 }
 
 $('media-browse-back-btn').onclick = () => {
@@ -3760,7 +6399,7 @@ document.querySelectorAll('.file-browse-filter').forEach((btn) => {
   });
 });
 
-// 详情页「更多」下拉：项目文件 / 计划设置 / 手机设备
+// 详情页「更多」下拉：终端 / 对话 / 项目文件 / 计划设置 / 手机设备
 const detailMoreBtn = $('detail-more-btn');
 const detailMoreMenu = $('detail-more-menu');
 function closeDetailMoreMenu() {
@@ -3785,6 +6424,63 @@ document.addEventListener('click', (event) => {
 $('detail-menu-files-btn').onclick = () => {
   openFileBrowse();
 };
+$('chat-terminal-action')?.addEventListener('click', () => switchCurrentSessionView('terminal'));
+$('terminal-return-chat')?.addEventListener('click', () => {
+  if (sessionViewMode !== 'chat') switchCurrentSessionView('chat');
+});
+$('session-terminal-tab')?.addEventListener('click', () => {
+  if (sessionViewMode !== 'terminal') switchCurrentSessionView('terminal');
+});
+$('session-search')?.addEventListener('input', () => renderSessionList());
+$('session-search')?.addEventListener('keydown', event => {
+  if (event.key === 'Escape') { $('session-search').value = ''; renderSessionList(); }
+});
+$('chat-stop-btn')?.addEventListener('click', async () => {
+  const sessionId = currentSessionId;
+  const generation = sessionViewGeneration;
+  if (!sessionId || sessionViewMode !== 'chat') return;
+  try {
+    await api(`/api/sessions/${encodeURIComponent(sessionId)}/key`, {
+      method: 'POST', body: JSON.stringify({ key: '\u0003', source: 'chat' }),
+    });
+    if (currentSessionId === sessionId && generation === sessionViewGeneration) setChatStatus('已发送停止指令，等待状态更新…');
+  } catch (error) {
+    if (currentSessionId === sessionId && generation === sessionViewGeneration) setChatStatus('停止失败：' + (error.message || error));
+  }
+});
+$('chat-new-messages')?.addEventListener('click', () => {
+  const scroller = $('chat-transcript');
+  if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  $('chat-new-messages').hidden = true;
+});
+$('chat-refresh-btn')?.addEventListener('click', () => {
+  if (currentSessionId && sessionViewMode === 'chat') {
+    setChatStatus('正在同步最新对话…', 'loading');
+    startNativeChatPolling(currentSessionId);
+  }
+});
+$('chat-transcript')?.addEventListener('scroll', () => {
+  if (isChatPinnedToBottom()) $('chat-new-messages').hidden = true;
+}, { passive: true });
+$('chat-transcript')?.addEventListener('duocli-chat-file', event => {
+  const filePath = event.detail?.path;
+  if (filePath) openFilePreview(filePath);
+});
+$('chat-transcript')?.addEventListener('duocli-chat-older', () => {
+  if (currentSessionId) void loadOlderChatMessages(currentSessionId);
+});
+$('chat-transcript')?.addEventListener('duocli-chat-copy', async event => {
+  const ok = await copyTextToClipboard(event.detail?.text);
+  showCopyToast(ok ? event.detail?.kind === 'message' ? '已复制消息全文' : '已复制到剪贴板' : '复制失败');
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (currentSessionId && sessionViewMode === 'chat') {
+    if (document.visibilityState === 'visible') startNativeChatPolling(currentSessionId);
+    else stopNativeChatPolling();
+  }
+});
+$('detail-session-picker-btn').onclick = () => { showSessionPicker(); };
 $('detail-menu-plan-btn').onclick = () => {
   if (currentSessionId) showAutoContinueConfigModal(currentSessionId);
 };
@@ -3805,8 +6501,27 @@ document.querySelectorAll('.device-panel-tab').forEach(button => {
 $('mobile-file-tree-refresh').onclick = () => { void renderMobileFileTree(true); };
 setDevicePanel('device');
 $('main-drawer-close').onclick = () => { void toggleLandscapeSessionsPanel(); };
+$('landscape-device-pull')?.addEventListener('click', () => { void toggleLandscapeDevicePanel(); });
 window.addEventListener('resize', () => {
-  if (!supportsLandscapePanels()) closeLandscapePanels();
+  if ($('login-page').classList.contains('active')) return;
+  if (supportsLandscapeWorkspace()) {
+    if ($('main-page').classList.contains('active')) {
+      landscapeSessionsCollapsed = false;
+      const sessionId = currentSessionId || activeSessionsCache[0]?.id || null;
+      showPage('detail-page');
+      if (sessionId && currentSessionId !== sessionId) void openSession(sessionId);
+      else if (!sessionId) showLandscapeEmptyTerminal();
+    } else {
+      applyLandscapeWorkspaceChrome();
+    }
+  } else {
+    document.body.classList.remove('landscape-workspace');
+    if (!window.matchMedia('(orientation: landscape)').matches) {
+      landscapeSessionsCollapsed = false;
+      closeLandscapePanels();
+    }
+  }
+  if (!supportsLandscapeWorkspace()) placeNetModeButton();
   syncLandscapePanelButtons();
   requestAnimationFrame(fitAndroidSurfaces);
 });
@@ -3820,6 +6535,14 @@ $('detail-ac-label').onclick = () => {
 // 催工配置弹窗：自动同意 checkbox 联动
 $('ac-auto-agree').onchange = () => {
   $('ac-agree-delay-row').style.display = $('ac-auto-agree').checked ? '' : 'none';
+};
+
+$('ac-loop-enabled').onchange = () => {
+  const enabled = $('ac-loop-enabled').checked;
+  $('ac-loop-fields').hidden = !enabled;
+  if (enabled && (!$('ac-max-loops').value || $('ac-max-loops').value === '1')) {
+    $('ac-max-loops').value = '-1';
+  }
 };
 
 // 催工配置弹窗：取消
@@ -3846,18 +6569,24 @@ $('ac-save').onclick = async () => {
   if (!currentSessionId) return;
   const msgs = $('ac-message').value.split('\n').map(m => m.trim()).filter(Boolean);
   if (!msgs.length) { $('ac-message').focus(); return; }
-  const intervalMinutes = parseInt($('ac-interval').value, 10);
-  if (isNaN(intervalMinutes) || intervalMinutes < 1) { $('ac-interval').focus(); return; }
+  const loopEnabled = $('ac-loop-enabled').checked;
+  let intervalMinutes = parseInt($('ac-interval').value, 10);
+  let maxLoops = parseInt($('ac-max-loops')?.value || '-1', 10);
+  if (loopEnabled) {
+    if (isNaN(intervalMinutes) || intervalMinutes < 1) { $('ac-interval').focus(); return; }
+    if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { $('ac-max-loops').focus(); return; }
+  } else {
+    if (isNaN(intervalMinutes) || intervalMinutes < 1) intervalMinutes = 10;
+    maxLoops = -1;
+  }
   const initialDelayMinutes = parseInt($('ac-initial-delay').value || '0', 10);
   if (isNaN(initialDelayMinutes) || initialDelayMinutes < 0) { $('ac-initial-delay').focus(); return; }
   const agreeDelay = parseInt($('ac-agree-delay').value, 10);
   const cmdIntervalSec = parseInt($('ac-cmd-interval')?.value || '2', 10);
   const sendDelaySec = parseInt($('ac-send-delay')?.value || '2', 10);
-  const maxLoops = parseInt($('ac-max-loops')?.value || '-1', 10);
   if ($('ac-auto-agree').checked && (isNaN(agreeDelay) || agreeDelay < 0)) { $('ac-agree-delay').focus(); return; }
   if (isNaN(cmdIntervalSec) || cmdIntervalSec < 0) { $('ac-cmd-interval').focus(); return; }
   if (isNaN(sendDelaySec) || sendDelaySec < 0) { $('ac-send-delay').focus(); return; }
-  if (isNaN(maxLoops) || maxLoops === 0 || maxLoops < -1) { $('ac-max-loops').focus(); return; }
 
   const config = {
     enabled: true,
@@ -3866,6 +6595,7 @@ $('ac-save').onclick = async () => {
     initialDelayMs: initialDelayMinutes * 60000,
     commandIntervalMs: cmdIntervalSec * 1000,
     sendDelaySec,
+    loopEnabled,
     maxLoops,
     autoAgree: $('ac-auto-agree').checked,
     autoAgreeDelaySec: isNaN(agreeDelay) ? 5 : agreeDelay,
@@ -3878,91 +6608,356 @@ $('ac-save').onclick = async () => {
 
 // 点击与键盘共用一次提交；回车快捷键仍可单独发送原始 Enter。
 let composerComposing = false;
-let submitAfterComposition = false;
+let submitAfterComposition = null;
+let suppressSendClickUntil = 0;
 let allowComposerLineBreak = false;
 let failedSubmission = null;
 const pendingSubmissions = new Map();
+const userPromptBanner = globalThis.DuoUserPromptBanner;
+let mobilePromptBanner = null;
+let mobilePromptExpanded = false;
+let mobilePromptMarker = null;
+let mobileTypedLine = '';
+const lastLocalPromptAtBySession = new Map();
 
-function requestSubmission(sessionId, text, id) {
+function currentMobilePromptText() {
+  return userPromptBanner?.readStoredPrompt(currentSessionId) || '';
+}
+
+function renderMobilePromptBanner() {
+  if (!userPromptBanner || !mobilePromptBanner) return;
+  userPromptBanner.renderBanner(mobilePromptBanner, {
+    text: currentMobilePromptText(),
+    expanded: mobilePromptExpanded,
+  });
+  scheduleTerminalResize();
+}
+
+function bindMobilePromptBanner() {
+  if (!userPromptBanner) return;
+  const root = $('user-prompt-banner');
+  if (!root) return;
+  if (mobilePromptBanner?.element === root) {
+    renderMobilePromptBanner();
+    return;
+  }
+  mobilePromptBanner = userPromptBanner.bindExistingBanner(root);
+  mobilePromptBanner?.moreBtn?.addEventListener('click', () => {
+    mobilePromptExpanded = !mobilePromptExpanded;
+    renderMobilePromptBanner();
+  });
+  mobilePromptBanner?.jumpBtn?.addEventListener('click', () => { void jumpToMobileUserPrompt(); });
+  renderMobilePromptBanner();
+}
+
+function applyRemoteUserPrompt(session) {
+  if (!userPromptBanner || !session?.id) return;
+  const incoming = userPromptBanner.normalizePrompt(session.lastUserPrompt);
+  // Server is source of truth: empty lastUserPrompt must clear recycled-id leftovers.
+  if (!incoming) {
+    if (!userPromptBanner.readStoredPrompt(session.id)) return;
+    userPromptBanner.writeStoredPrompt(session.id, '');
+    if (session.id === currentSessionId) {
+      mobilePromptExpanded = false;
+      renderMobilePromptBanner();
+    }
+    return;
+  }
+  const localAt = lastLocalPromptAtBySession.get(session.id) || 0;
+  if (session.id === currentSessionId && Date.now() - localAt < 3000) return;
+  if (incoming === userPromptBanner.readStoredPrompt(session.id)) return;
+  userPromptBanner.writeStoredPrompt(session.id, incoming);
+  if (session.id === currentSessionId) {
+    mobilePromptExpanded = false;
+    renderMobilePromptBanner();
+  }
+}
+
+function noteMobileUserPrompt(text) {
+  if (!userPromptBanner?.looksLikeUserPrompt(text) || !currentSessionId) return;
+  const normalized = userPromptBanner.normalizePrompt(text);
+  try { mobilePromptMarker?.dispose(); } catch {}
+  mobilePromptExpanded = false;
+  lastLocalPromptAtBySession.set(currentSessionId, Date.now());
+  userPromptBanner.writeStoredPrompt(currentSessionId, normalized);
+  mobilePromptMarker = term ? term.registerMarker(0) : null;
+  renderMobilePromptBanner();
+}
+
+function rebindMobilePromptMarker() {
+  if (!term || !userPromptBanner) return;
+  const text = currentMobilePromptText();
+  if (!text) return;
+  const line = userPromptBanner.promptBlockStartLine(term.buffer.active, text);
+  if (line < 0) return;
+  try { mobilePromptMarker?.dispose(); } catch {}
+  mobilePromptMarker = userPromptBanner.markerAtLine(term, line);
+}
+
+function pauseOutputFollowForHistoryJump() {
+  terminalScrollInteractionRevision++;
+  programmaticScrollUntil = 0;
+  if (scrollToBottomRaf) {
+    cancelAnimationFrame(scrollToBottomRaf);
+    scrollToBottomRaf = 0;
+  }
+  isUserScrolling = true;
+}
+
+async function jumpToMobileUserPrompt() {
+  if (!term || !userPromptBanner) return;
+  const text = currentMobilePromptText();
+  if (!text) return;
+  rebindMobilePromptMarker();
+  const line = userPromptBanner.resolvePromptJumpLine(term.buffer.active, text, mobilePromptMarker);
+  if (line >= 0) {
+    pauseOutputFollowForHistoryJump();
+    userPromptBanner.scrollLineToTop(term, line);
+    isUserScrolling = true;
+    setTerminalUnreadOutput(!isAtBottom());
+    return;
+  }
+  if (!usesPagedHistory() || !terminalHistoryLayer) {
+    showCopyToast('这段内容不在当前已加载范围');
+    return;
+  }
+  if (terminalHistoryLayer.isVisible()) {
+    const historyIndex = terminalHistoryLayer.findText(text);
+    if (historyIndex >= 0) {
+      pauseOutputFollowForHistoryJump();
+      terminalHistoryLayer.scrollToItem(historyIndex);
+      return;
+    }
+  } else if (!terminalArchiveHasMore && !terminalHasMoreHistory) {
+    showCopyToast('这段内容不在当前已加载范围');
+    return;
+  }
+  pauseOutputFollowForHistoryJump();
+  enterTerminalHistory();
+  const found = await terminalHistoryLayer.seekText(text);
+  if (found >= 0 || terminalHistoryLayer.isSeeking() || !terminalHistoryLayer.isVisible()) return;
+  showCopyToast('这段内容不在当前已加载范围');
+}
+
+function requestSubmission(sessionId, text, id, sourceMode = sessionViewMode) {
   return new Promise((resolve, reject) => {
     const fallback = () => {
       pendingSubmissions.delete(id);
-      if (!isTerminalInputReady()) {
-        reject(new Error('终端连接已中断，请稍后重试'));
+      if (navigator.onLine === false) {
+        reject(new Error('网络已中断，请稍后重试'));
         return;
       }
-      api(`/api/sessions/${sessionId}/input`, {
-        method: 'POST', body: JSON.stringify({ input: text, submissionId: id }),
+      api(`/api/sessions/${encodeURIComponent(sessionId)}/input`, {
+        method: 'POST', body: JSON.stringify({
+          input: text, submissionId: id, source: sourceMode === 'chat' ? 'chat' : 'mobile',
+        }),
       }).then(resolve, reject);
     };
-    if (!ws || ws.readyState !== WebSocket.OPEN) { fallback(); return; }
+    if (sourceMode === 'chat' || !ws || ws.readyState !== WebSocket.OPEN || wsSessionId !== sessionId) { fallback(); return; }
     const timer = setTimeout(fallback, 5000);
     pendingSubmissions.set(id, {
       resolve: () => { clearTimeout(timer); pendingSubmissions.delete(id); resolve(); },
       reject: error => { clearTimeout(timer); pendingSubmissions.delete(id); reject(error); },
     });
-    wsSend({ type: 'submit', id, text });
+    wsSend({ type: 'submit', sessionId, id, text });
+  });
+}
+
+function waitForComposerPaint() {
+  return new Promise(resolve => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve();
+    };
+    const timeout = setTimeout(done, 80);
+    requestAnimationFrame(done);
   });
 }
 
 async function sendMessage() {
+  if (globalThis.duocliNetworkSwitching) return;
   const input = $('msg-input');
-  if (!currentSessionId || composerSubmission) return;
+  const sessionId = currentSessionId;
+  const viewGeneration = sessionViewGeneration;
+  const sourceMode = sessionViewMode;
+  if (!sessionId || composerSubmissions.has(sessionId) || pendingTerminalSendIntent?.sessionId === sessionId) return;
   if (!isTerminalInputReady()) {
-    showCopyToast('终端连接中，请稍候再发送');
+    if (sourceMode !== 'terminal' || !term || navigator.onLine === false
+        || ws?.readyState !== WebSocket.OPEN || wsSessionId !== sessionId || !input.value.trim()) {
+      showCopyToast('终端连接中，请稍候再发送');
+      updateComposerAvailability();
+      return;
+    }
+    // A resize or snapshot can briefly close the send gate after the button
+    // was tapped. Keep this explicit intent only while its session and draft
+    // are unchanged, and never turn a later reconnection into a stale send.
+    const intent = { sessionId, viewGeneration, text: input.value };
+    pendingTerminalSendIntent = intent;
     updateComposerAvailability();
-    return;
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline && !isTerminalInputReady()
+        && currentSessionId === sessionId && sessionViewGeneration === viewGeneration
+        && input.value === intent.text) {
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
+    if (pendingTerminalSendIntent === intent) pendingTerminalSendIntent = null;
+    updateComposerAvailability();
+    if (currentSessionId !== sessionId || sessionViewGeneration !== viewGeneration || input.value !== intent.text) return;
+    if (!isTerminalInputReady()) {
+      showCopyToast('终端连接中，请稍候再发送');
+      return;
+    }
   }
   if (composerComposing) {
-    submitAfterComposition = true;
+    submitAfterComposition = { sessionId, viewGeneration };
     input.blur(); // 让输入法提交组合文字后，再读取最终文本。
     return;
   }
   const text = input.value.replace(/\r\n?/g, '\n');
   if (!text.trim()) return;
-  const sessionId = currentSessionId;
-  const retry = failedSubmission?.sessionId === sessionId && failedSubmission?.text === text;
-  const id = retry ? failedSubmission.id : (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  composerSubmission = { id, sessionId };
+  if (text.length > MAX_SUBMISSION_LENGTH) {
+    showCopyToast(`消息不能超过 ${MAX_SUBMISSION_LENGTH} 个字符`);
+    return;
+  }
+  const keepKeyboard = document.activeElement === input;
+  const savedFailure = mobilePendingSubmissions.get(sessionId);
+  // An unconfirmed send may already have executed. Retain its id on every retry.
+  const retry = savedFailure?.text === text;
+  const command = nativeChatView?.terminalCommand(text) || null;
+  // 任意斜杠命令（含未知技能）都不进聊天气泡：发送成功后临时切到终端看执行，
+  // 视图偏好不变，用户点「对话」即回。
+  const slashCommand = command || nativeChatView?.slashCommandText?.(text) || null;
+  const id = retry ? savedFailure.id : (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const submission = { id, sessionId, viewGeneration };
+  composerSubmissions.set(sessionId, submission);
+  composerSubmission = submission;
+  mobilePendingSubmissions.set(sessionId, {
+    id, sessionId, text, retryCount: retry ? savedFailure.retryCount || 0 : 0,
+  });
+  saveMobilePendingSubmissions();
   input.value = '';
+  saveMobileDraft(sessionId, '');
   updateComposerAvailability();
-  scrollTerminalToBottom();
+  let paintPromise = Promise.resolve();
+  if (sourceMode === 'chat' && nativeChatView && !slashCommand) {
+    const pending = chatLocalMessages.get(sessionId) || [];
+    const occurrence = nativeChatView.countUserText(chatSnapshots.get(sessionId)?.messages, text)
+      + pending.filter(item => item.text.trim() === text.trim()).length + 1;
+    const existingLocal = pending.find(item => item.id === id);
+    if (existingLocal) {
+      existingLocal.text = text;
+      existingLocal.status = '发送中…';
+    } else {
+      pending.push({ id, text, occurrence, status: '发送中…' });
+    }
+    chatLocalMessages.set(sessionId, pending);
+    renderCurrentChat(sessionId);
+    const scroller = $('chat-transcript');
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    setChatStatus('正在发送消息…', 'loading');
+    paintPromise = waitForComposerPaint();
+  }
+  if (sessionViewMode !== 'chat' && !terminalHistoryLayer?.isVisible()) scrollTerminalToBottom();
   try {
-    await requestSubmission(sessionId, text, id);
+    const request = requestSubmission(sessionId, text, id, sourceMode).then(
+      () => ({ ok: true }),
+      error => ({ ok: false, error }),
+    );
+    await paintPromise;
+    const outcome = await request;
+    if (!outcome.ok) throw outcome.error;
+    const local = chatLocalMessages.get(sessionId)?.find(item => item.id === id);
+    if (local) local.status = '已送达终端，等待对话记录更新…';
+    renderCurrentChat(sessionId);
+    if (currentSessionId === sessionId && sessionViewMode === 'chat') setChatStatus('正在更新对话，等待新内容…', 'updating');
     failedSubmission = null;
+    if (currentSessionId === sessionId) noteMobileUserPrompt(text);
+    const submittedSession = activeSessionsCache.find(session => session.id === sessionId);
+    if (submittedSession) {
+      submittedSession.lastSubmittedAt = Math.max(...activeSessionsCache.map(session =>
+        Math.max(session.lastSubmittedAt || 0, session.createdAt || 0)), 0) + 1;
+      renderSessionList();
+    }
+    mobilePendingSubmissions.delete(sessionId);
+    saveMobilePendingSubmissions();
+    if (currentSessionId === sessionId) saveMobileDraft(sessionId, input.value);
+    if (sourceMode === 'chat' && slashCommand && currentSessionId === sessionId
+        && sessionViewGeneration === viewGeneration && sessionViewMode === 'chat') {
+      if (command) shortcutMode = 'keys';
+      showCopyToast(command
+        ? '使用 ↑ ↓ 选择、↵ 确认、Esc 取消，完成后返回对话'
+        : '命令已在终端执行，完成后从三个点菜单返回「对话」');
+      void openRawTerminalView(sessionId, terminalOpenRequest).catch(() => {
+        if (currentSessionId === sessionId) showCopyToast('命令已送达，请重新打开终端查看');
+      });
+    }
   } catch (error) {
-    failedSubmission = { id, sessionId, text };
+    const local = (chatLocalMessages.get(sessionId) || []).find(item => item.id === id);
+    if (local) local.status = '发送状态未确认 · 原文已保留';
+    renderCurrentChat(sessionId);
+    const retryCount = (retry ? savedFailure.retryCount || 0 : 0) + 1;
+    failedSubmission = { id, sessionId, text, retryCount };
+    saveMobileDraft(sessionId, currentSessionId === sessionId ? input.value || text : mobileDrafts.get(sessionId) || text);
     if (currentSessionId === sessionId && !input.value) input.value = text;
-    showCopyToast('发送未确认：' + (error.message || error));
+    mobilePendingSubmissions.set(sessionId, { id, sessionId, text, retryCount });
+    saveMobilePendingSubmissions();
+    if (currentSessionId === sessionId && sessionViewMode === 'chat') setChatStatus('消息发送状态未确认，请检查后重试', 'error');
+    if (currentSessionId === sessionId) showCopyToast('发送未确认；重试会核对同一条消息：' + (error.message || error));
   } finally {
-    if (composerSubmission?.id === id) {
+    if (composerSubmissions.get(sessionId)?.id === id) composerSubmissions.delete(sessionId);
+    const stillCurrent = currentSessionId === sessionId && sessionViewGeneration === viewGeneration;
+    if (currentSessionId === sessionId) updateComposerAvailability();
+    if (stillCurrent) {
       composerSubmission = null;
       updateComposerAvailability();
+      if (keepKeyboard) input.focus({ preventScroll: true });
+      resetMobileKeyboardLayout();
     }
-    input.blur();
-    resetMobileKeyboardLayout();
-    scheduleDelayedTerminalResize();
+    if (stillCurrent && sessionViewMode === 'chat') {
+      const generation = chatPollGeneration;
+      void refreshNativeChat(sessionId, generation).catch(() => {});
+    } else if (stillCurrent) {
+      scheduleDelayedTerminalResize();
+    }
   }
 }
 
 updateComposerAvailability();
+bindMobilePromptBanner();
 
 $('msg-input').addEventListener('blur', () => {
+  saveCurrentMobileDraft();
   resetMobileKeyboardLayout();
   scheduleDelayedTerminalResize();
 });
 
 $('send-btn').addEventListener('touchend', event => {
   event.preventDefault();
+  suppressSendClickUntil = Date.now() + 800;
   void sendMessage();
+}, { passive: false });
+$('send-btn').onclick = event => {
+  if (event.detail > 0 && Date.now() < suppressSendClickUntil) return;
+  void sendMessage();
+};
+$('newline-btn')?.addEventListener('click', () => {
+  const input = $('msg-input');
+  input.setRangeText('\n', input.selectionStart, input.selectionEnd, 'end');
+  input.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: '\n', bubbles: true }));
+  input.focus({ preventScroll: true });
 });
-$('send-btn').onclick = () => { void sendMessage(); };
 $('msg-input').addEventListener('compositionstart', () => { composerComposing = true; });
 $('msg-input').addEventListener('compositionend', () => {
   composerComposing = false;
-  if (submitAfterComposition) {
-    submitAfterComposition = false;
-    queueMicrotask(() => { void sendMessage(); });
+  const intent = submitAfterComposition;
+  submitAfterComposition = null;
+  if (intent && intent.sessionId === currentSessionId && intent.viewGeneration === sessionViewGeneration) {
+    queueMicrotask(() => {
+      if (intent.sessionId === currentSessionId && intent.viewGeneration === sessionViewGeneration) void sendMessage();
+    });
   }
 });
 $('msg-input').addEventListener('keydown', event => {
@@ -3971,6 +6966,9 @@ $('msg-input').addEventListener('keydown', event => {
   if (event.shiftKey) return;
   event.preventDefault();
   void sendMessage();
+});
+$('msg-input').addEventListener('keyup', event => {
+  if (event.key === 'Enter' || event.key === 'Shift') allowComposerLineBreak = false;
 });
 $('msg-input').addEventListener('beforeinput', event => {
   if (!['insertLineBreak', 'insertParagraph'].includes(event.inputType) || event.isComposing || composerComposing) return;
@@ -3981,6 +6979,9 @@ $('msg-input').addEventListener('beforeinput', event => {
   }
 });
 $('msg-input').addEventListener('input', event => {
+  resizeComposer();
+  saveCurrentMobileDraft();
+  updateComposerAvailability();
   if (!['insertLineBreak', 'insertParagraph'].includes(event.inputType) || event.isComposing || composerComposing) return;
   // 部分软键盘只发 input；只移除此次插入的换行，不破坏粘贴的多行文字。
   if (allowComposerLineBreak) { allowComposerLineBreak = false; return; }
@@ -4003,6 +7004,9 @@ function wsSendHex(hexStr) {
 if (window.visualViewport) {
   const vv = window.visualViewport;
   function adjustForKeyboard() {
+    // Pinch/input zoom also shrinks visualViewport. It is not keyboard height;
+    // applying it as a bottom inset can push navigation off screen.
+    if (Math.abs(vv.scale - 1) > 0.01) return;
     const detailPage = $('detail-page');
     if (!detailPage || !detailPage.classList.contains('active')) return;
 
@@ -4046,75 +7050,229 @@ if (window.visualViewport) {
 const QCMD_STORAGE_KEY = 'duocli_quick_commands';
 const QCMD_DEFAULTS = ['/new', '/help', '/compact', '/unicloud-log-viewer', '/uniapp-dev'];
 
-function loadQuickCommands() {
+let quickCommandState = [...QCMD_DEFAULTS];
+let quickCommandsLoaded = false;
+
+async function syncQuickCommands() {
   try {
-    const saved = localStorage.getItem(QCMD_STORAGE_KEY);
-    if (saved) return JSON.parse(saved);
-  } catch {}
-  return [...QCMD_DEFAULTS];
+    let state = await api('/api/quick-commands');
+    if (!state.initialized) {
+      const saved = localStorage.getItem(QCMD_STORAGE_KEY);
+      if (saved) state = await api('/api/quick-commands', {
+        method: 'POST', body: JSON.stringify({ action: 'migrate', commands: JSON.parse(saved) }),
+      });
+    }
+    quickCommandState = state.commands;
+    quickCommandsLoaded = true;
+    renderQuickCommands();
+  } catch (error) {
+    showCopyToast(error.message || '快捷命令同步失败');
+  }
 }
 
-function saveQuickCommands(cmds) {
-  localStorage.setItem(QCMD_STORAGE_KEY, JSON.stringify(cmds));
+async function updateQuickCommands(operation) {
+  try {
+    const state = await api('/api/quick-commands', { method: 'POST', body: JSON.stringify(operation) });
+    quickCommandState = state.commands;
+    renderQuickCommands();
+  } catch (error) { showCopyToast(error.message || '快捷命令保存失败'); }
+}
+
+function formatQuickCommandLabel(command) {
+  const text = String(command || '');
+  if (text.length <= 10) return text;
+  return `${text.slice(0, 10)}…`;
+}
+
+const QCMD_LONG_PRESS_MS = 420;
+const QCMD_MOVE_CANCEL_PX = 8;
+let quickCommandPointer = null;
+let quickCommandHandlersBound = false;
+
+function collectQuickCommandOrder(bar) {
+  return [...bar.querySelectorAll('[data-command]')]
+    .map(node => node.dataset.command || '')
+    .filter(Boolean);
+}
+
+function getQuickCommandAfterElement(bar, x) {
+  const items = [...bar.querySelectorAll('[data-command]:not(.dragging)')];
+  return items.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = x - box.left - box.width / 2;
+    if (offset < 0 && offset > closest.offset) return { offset, element: child };
+    return closest;
+  }, { offset: Number.NEGATIVE_INFINITY, element: null }).element;
+}
+
+function clearQuickCommandPointer(session, persist) {
+  if (!session) return;
+  if (session.timer != null) clearTimeout(session.timer);
+  session.button.classList.remove('dragging');
+  session.button.style.touchAction = '';
+  session.bar.classList.remove('is-sorting');
+  if (session.sorting && persist) void persistQuickCommandOrder(session.bar);
+  if (quickCommandPointer === session) quickCommandPointer = null;
+}
+
+async function persistQuickCommandOrder(bar) {
+  const commands = collectQuickCommandOrder(bar);
+  if (commands.length === quickCommandState.length && commands.every((command, index) => command === quickCommandState[index])) return;
+  try {
+    await updateQuickCommands({ action: 'reorder', commands });
+  } catch (error) {
+    showCopyToast('顺序保存失败');
+    void syncQuickCommands();
+  }
+}
+
+function confirmQuickCommandSend(command) {
+  return new Promise((resolve) => {
+    document.getElementById('mobile-confirm-dialog')?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'mobile-confirm-dialog';
+    overlay.className = 'modal active';
+    overlay.style.zIndex = '13000';
+    overlay.innerHTML = `
+      <div class="modal-content" role="dialog" aria-modal="true">
+        <h3>发送快捷命令</h3>
+        <p class="confirm-mobile-message"></p>
+        <pre class="quick-command-confirm-text"></pre>
+        <div class="modal-actions">
+          <button type="button" class="btn-secondary" data-confirm="delete">删除</button>
+          <button type="button" class="btn-secondary" data-confirm="no">取消</button>
+          <button type="button" class="btn-primary" data-confirm="yes">发送</button>
+        </div>
+      </div>`;
+    overlay.querySelector('.confirm-mobile-message').textContent = '是否将以下内容发送到当前会话？';
+    overlay.querySelector('.quick-command-confirm-text').textContent = command;
+    const finish = (action) => {
+      overlay.remove();
+      resolve(action);
+    };
+    overlay.addEventListener('click', (event) => {
+      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const button = target?.closest('[data-confirm]');
+      if (button) {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(button.getAttribute('data-confirm') || 'no');
+        return;
+      }
+      if (event.target === overlay) finish('no');
+    });
+    document.body.appendChild(overlay);
+  });
+}
+
+function applyQuickCommandToInput(command) {
+  const input = $('msg-input');
+  if (!input) return;
+  input.setRangeText(command, input.selectionStart, input.selectionEnd, 'end');
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  input.focus();
+}
+
+function bindQuickCommandSort(bar) {
+  if (quickCommandHandlersBound) return;
+  quickCommandHandlersBound = true;
+
+  const eventElement = (event) => {
+    const target = event.target;
+    return target instanceof Element ? target : target?.parentElement || null;
+  };
+
+  bar.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    const button = eventElement(event)?.closest('[data-command]');
+    if (!button || !bar.contains(button)) return;
+    if (event.pointerType === 'mouse') event.preventDefault();
+    clearQuickCommandPointer(quickCommandPointer, false);
+    const session = {
+      bar,
+      button,
+      command: button.dataset.command || '',
+      startX: event.clientX,
+      startY: event.clientY,
+      pointerId: event.pointerId,
+      sorting: false,
+      timer: setTimeout(() => {
+        if (quickCommandPointer !== session) return;
+        session.sorting = true;
+        session.button.classList.add('dragging');
+        session.button.style.touchAction = 'none';
+        bar.classList.add('is-sorting');
+        try { session.button.setPointerCapture(event.pointerId); } catch {}
+      }, QCMD_LONG_PRESS_MS),
+    };
+    quickCommandPointer = session;
+  });
+
+  bar.addEventListener('pointermove', (event) => {
+    if (!quickCommandPointer || quickCommandPointer.pointerId !== event.pointerId) return;
+    const dx = event.clientX - quickCommandPointer.startX;
+    const dy = event.clientY - quickCommandPointer.startY;
+    if (!quickCommandPointer.sorting) {
+      if (Math.hypot(dx, dy) > QCMD_MOVE_CANCEL_PX && quickCommandPointer.timer != null) {
+        clearTimeout(quickCommandPointer.timer);
+        quickCommandPointer.timer = null;
+      }
+      return;
+    }
+    event.preventDefault();
+    const after = getQuickCommandAfterElement(bar, event.clientX);
+    const add = bar.querySelector('.qcmd-add');
+    if (after) bar.insertBefore(quickCommandPointer.button, after);
+    else if (add) bar.insertBefore(quickCommandPointer.button, add);
+    else bar.appendChild(quickCommandPointer.button);
+  });
+
+  bar.addEventListener('pointerup', async (event) => {
+    if (!quickCommandPointer || quickCommandPointer.pointerId !== event.pointerId) return;
+    const session = quickCommandPointer;
+    const moved = Math.hypot(event.clientX - session.startX, event.clientY - session.startY) > QCMD_MOVE_CANCEL_PX;
+    const wasSorting = session.sorting;
+    clearQuickCommandPointer(session, wasSorting);
+    if (wasSorting || moved || !session.command) return;
+    const action = await confirmQuickCommandSend(session.command);
+    if (action === 'yes') applyQuickCommandToInput(session.command);
+    if (action === 'delete') void updateQuickCommands({ action: 'remove', command: session.command });
+  });
+
+  bar.addEventListener('pointercancel', (event) => {
+    if (!quickCommandPointer || quickCommandPointer.pointerId !== event.pointerId) return;
+    clearQuickCommandPointer(quickCommandPointer, quickCommandPointer.sorting);
+  });
 }
 
 function renderQuickCommands() {
   const bar = $('quick-commands');
   if (!bar) return;
+  clearQuickCommandPointer(quickCommandPointer, false);
   bar.innerHTML = '';
-  const cmds = loadQuickCommands();
 
-  cmds.forEach((cmd, idx) => {
+  quickCommandState.forEach((cmd, index) => {
     const btn = document.createElement('button');
     btn.className = 'qcmd-btn';
-    btn.textContent = cmd;
-    // 必须走 submit 通道：裸写会被 CLI 的斜杠补全菜单吞掉回车，导致命令重复执行
-    btn.onclick = () => {
-      if (!currentSessionId) return;
-      if (!isTerminalInputReady()) {
-        showCopyToast('终端连接中，请稍候再发送');
-        return;
-      }
-      if (!confirm(`确定发送快捷指令「${cmd}」到当前终端吗？`)) return;
-      const sessionId = currentSessionId;
-      const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      scrollTerminalToBottom();
-      void requestSubmission(sessionId, cmd, id).catch((error) => {
-        showCopyToast('发送未确认：' + (error.message || error));
-      });
-    };
-    // 长按 → 删除
-    let longTimer = null;
-    btn.addEventListener('touchstart', (e) => {
-      longTimer = setTimeout(() => {
-        longTimer = null;
-        if (confirm(`删除快捷命令「${cmd}」？`)) {
-          const list = loadQuickCommands();
-          list.splice(idx, 1);
-          saveQuickCommands(list);
-          renderQuickCommands();
-        }
-      }, 600);
-    }, { passive: true });
-    btn.addEventListener('touchend', () => { if (longTimer) clearTimeout(longTimer); });
-    btn.addEventListener('touchmove', () => { if (longTimer) clearTimeout(longTimer); });
+    btn.dataset.command = cmd;
+    btn.dataset.index = String(index);
+    btn.textContent = formatQuickCommandLabel(cmd);
+    btn.title = cmd;
+    btn.addEventListener('mousedown', e => e.preventDefault());
+    btn.oncontextmenu = e => e.preventDefault();
     bar.appendChild(btn);
   });
 
-  // 添加按钮
-  const addBtn = document.createElement('button');
-  addBtn.className = 'qcmd-btn qcmd-add';
-  addBtn.textContent = '+ 添加';
-  addBtn.onclick = () => {
-    const cmd = prompt('输入快捷命令：');
-    if (cmd && cmd.trim()) {
-      const list = loadQuickCommands();
-      list.push(cmd.trim());
-      saveQuickCommands(list);
-      renderQuickCommands();
-    }
+  const add = document.createElement('button');
+  add.className = 'qcmd-btn qcmd-add';
+  add.textContent = '+ 添加';
+  add.disabled = !quickCommandsLoaded;
+  add.onclick = () => {
+    const command = prompt('输入快捷命令（点击后确认，再发送到当前会话）：');
+    if (command?.trim()) void updateQuickCommands({ action: 'add', command: command.trim() });
   };
-  bar.appendChild(addBtn);
+  bar.appendChild(add);
+  bindQuickCommandSort(bar);
 }
 
 renderQuickCommands();
@@ -4126,37 +7284,69 @@ $('upload-btn').onclick = () => {
 
 $('file-input').onchange = async (e) => {
   const files = e.target.files;
-  if (!files || !files.length || !currentSessionId) return;
+  const targetSessionId = currentSessionId;
+  if (!files || !files.length || !targetSessionId) return;
+
+  saveCurrentMobileDraft();
+  let targetDraft = mobileDrafts.get(targetSessionId) || '';
+  let renderedDraft = currentSessionId === targetSessionId ? $('msg-input').value : null;
 
   const btn = $('upload-btn');
   btn.classList.add('uploading');
 
   for (const file of files) {
+    let uploadTimeout = null;
     try {
-      const res = await fetch(`${API}/api/sessions/${currentSessionId}/upload`, {
+      const controller = new AbortController();
+      uploadTimeout = setTimeout(() => controller.abort(), weakNetworkMode ? 60_000 : 30_000);
+      const res = await fetch(`${API}/api/sessions/${encodeURIComponent(targetSessionId)}/upload`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/octet-stream',
           'X-Filename': encodeURIComponent(file.name),
         },
+        signal: controller.signal,
         body: file,
       });
-      const data = await res.json();
+      let data = {};
+      try { data = await res.json(); } catch { data = {}; }
+      clearTimeout(uploadTimeout);
+      uploadTimeout = null;
+      if (!res.ok) throw new Error(data.error || `请求失败 (${res.status})`);
       if (data.ok) {
         // 在终端显示上传成功提示
-        writeTerminalOutput(`\r\n\x1b[32m✓ 已上传: ${file.name} (${formatSize(data.size)})\x1b[0m\r\n`);
+        if (currentSessionId === targetSessionId) {
+          if (sessionViewMode === 'chat') setChatStatus(`已上传 ${file.name}（${formatSize(data.size)}）`);
+          else writeTerminalOutput(`\r\n\x1b[32m✓ 已上传: ${file.name} (${formatSize(data.size)})\x1b[0m\r\n`);
+        }
         // 把文件路径填入输入框，方便用户直接发送给 AI
         if (data.path) {
-          const input = $('msg-input');
-          const prev = input.value.trim();
-          input.value = prev ? prev + ' ' + data.path : data.path;
+          targetDraft = targetDraft.trim() ? `${targetDraft.trim()} ${data.path}` : data.path;
+          saveMobileDraft(targetSessionId, targetDraft);
+          if (currentSessionId === targetSessionId) {
+            const input = $('msg-input');
+            if (renderedDraft === null || input.value === renderedDraft) {
+              input.value = targetDraft;
+              resizeComposer();
+              renderedDraft = targetDraft;
+            }
+          }
         }
       } else {
-        writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${data.error}\x1b[0m\r\n`);
+        if (currentSessionId === targetSessionId) {
+          const message = `上传失败：${file.name} - ${data.error || '未知错误'}`;
+          if (sessionViewMode === 'chat') setChatStatus(message);
+          else writeTerminalOutput(`\r\n\x1b[31m✗ ${message}\x1b[0m\r\n`);
+        }
       }
     } catch (err) {
-      writeTerminalOutput(`\r\n\x1b[31m✗ 上传失败: ${file.name} - ${err.message}\x1b[0m\r\n`);
+      if (uploadTimeout) clearTimeout(uploadTimeout);
+      if (currentSessionId === targetSessionId) {
+        const message = `上传失败：${file.name} - ${err.name === 'AbortError' ? '上传超时' : err.message}`;
+        if (sessionViewMode === 'chat') setChatStatus(message);
+        else writeTerminalOutput(`\r\n\x1b[31m✗ ${message}\x1b[0m\r\n`);
+      }
     }
   }
 
@@ -4170,7 +7360,7 @@ function formatSize(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
-document.querySelectorAll('.key-btn').forEach(btn => {
+document.querySelectorAll('.key-btn[data-key]').forEach(btn => {
   // 用 click 统一处理桌面和移动端，辅以 touch-action: manipulation 消除 300ms 延迟
   btn.addEventListener('click', (e) => {
     e.preventDefault();
@@ -4184,47 +7374,29 @@ document.querySelectorAll('.key-btn').forEach(btn => {
   });
 });
 
-// 删除会话
-$('delete-btn').onclick = async () => {
-  if (!currentSessionId) return;
-  if (!confirm('确定终止此会话？')) return;
-  try {
-    await api(`/api/sessions/${currentSessionId}`, { method: 'DELETE' });
-    currentSessionId = null;
-    closeTerminal();
-    showPage('main-page');
-    refreshSessions();
-  } catch (e) {
-    alert('删除失败: ' + e.message);
-  }
-};
+(function bindDeleteSessionButton() {
+  const btn = $('delete-btn');
+  if (!btn) return;
+  const run = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    void closeCurrentMobileSession();
+  };
+  btn.addEventListener('touchend', (e) => {
+    if (e.touches && e.touches.length > 0) return;
+    run(e);
+  }, { passive: false });
+  btn.addEventListener('click', run);
+})();
 
 // 手机浏览器不会经过 Electron 的 before-input-event。拦截 Command/Ctrl+W，
 // 只关闭当前终端会话，避免浏览器直接关闭标签页或退出当前页面。
-let mobileCloseInProgress = false;
 async function closeCurrentMobileSession() {
-  if (mobileCloseInProgress) return;
   if (!currentSessionId || !$('detail-page').classList.contains('active')) {
     showCopyToast('当前没有可关闭的终端');
     return;
   }
-  const sessionId = currentSessionId;
-  const title = $('detail-name').textContent || '终端';
-  if (!confirm(`确定关闭当前终端「${title}」吗？`)) return;
-  mobileCloseInProgress = true;
-  try {
-    await api(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
-    if (currentSessionId !== sessionId) return;
-    terminalOpenRequest++;
-    currentSessionId = null;
-    closeTerminal();
-    showPage('main-page');
-    await refreshSessions();
-  } catch (e) {
-    alert('关闭失败: ' + (e.message || e));
-  } finally {
-    mobileCloseInProgress = false;
-  }
+  await closeSessionFromList(currentSessionId, $('detail-name').textContent || '终端');
 }
 
 // ========== 自定义预设 ==========
@@ -4593,6 +7765,8 @@ async function openNewSessionModal() {
   const themeSelect = $('new-theme');
   if (themeSelect) themeSelect.value = localStorage.getItem(MOBILE_THEME_KEY) || 'default';
   $('new-session-modal').classList.add('active');
+  await refreshSessions();
+  renderTaskDependencyOptions();
 }
 
 $('new-session-btn').onclick = () => { void openNewSessionModal(); };
@@ -4610,9 +7784,38 @@ $('modal-create').onclick = async () => {
   const preset = $('new-preset').value;
   const themeId = $('new-theme')?.value || 'default';
   localStorage.setItem(MOBILE_THEME_KEY, themeId);
-  $('new-session-modal').classList.remove('active');
 
   try {
+    if ($('new-task-enabled')?.checked) {
+      const name = $('new-task-name').value.trim();
+      const instruction = $('new-task-instruction').value.trim();
+      if (!name) throw new Error('请输入任务名称');
+      if (!instruction) throw new Error('请输入首条任务指令');
+      const dependency = $('new-task-dependency').value;
+      const timeValue = $('new-task-time').value;
+      await api('/api/tasks', {
+        method: 'POST',
+        body: JSON.stringify({
+          requestId: crypto.randomUUID(),
+          name,
+          cwd: cwd || undefined,
+          presetCommand: preset,
+          themeId,
+          instruction,
+          notBefore: timeValue ? new Date(timeValue).getTime() : undefined,
+          dependsOnTaskId: dependency.startsWith('task:') ? dependency.slice(5) : undefined,
+          dependsOnSessionId: dependency.startsWith('session:') ? dependency.slice(8) : undefined,
+          quietMs: Math.round(Number($('new-task-quiet').value || '10') * 1000),
+        }),
+      });
+      $('new-session-modal').classList.remove('active');
+      $('new-task-name').value = '';
+      $('new-task-instruction').value = '';
+      await refreshSessions();
+      showCopyToast('已加入任务队列');
+      return;
+    }
+    $('new-session-modal').classList.remove('active');
     const session = await api('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({ cwd: cwd || undefined, presetCommand: preset, themeId }),
@@ -4624,6 +7827,20 @@ $('modal-create').onclick = async () => {
   } catch (e) {
     alert('创建失败: ' + e.message);
   }
+};
+
+$('new-task-enabled').onchange = () => {
+  $('new-task-fields').hidden = !$('new-task-enabled').checked;
+  $('modal-create').textContent = $('new-task-enabled').checked ? '加入队列' : '创建';
+};
+$('task-queue-btn').onclick = async () => {
+  await refreshSessions();
+  renderTaskQueue();
+  $('task-queue-modal').classList.add('active');
+};
+$('task-queue-close').onclick = () => $('task-queue-modal').classList.remove('active');
+$('task-queue-modal').onclick = (event) => {
+  if (event.target === $('task-queue-modal')) $('task-queue-modal').classList.remove('active');
 };
 
 $('new-session-modal').onclick = (e) => {
@@ -4682,15 +7899,40 @@ let isRecreating = false;
 async function forceTerminalRecreate() {
   // 只在会话详情页且有当前会话时才重建
   if (!currentSessionId || !$('detail-page').classList.contains('active')) return;
+  if (sessionViewMode === 'chat') return;
   if (isRecreating) return;
   isRecreating = true;
   console.log('[黑屏修复] 重建终端, session=', currentSessionId);
   const sid = currentSessionId;
   const viewport = isUserScrolling && term ? term.buffer.active.viewportY : null;
+  const history = terminalHistoryLayer?.isVisible() ? {
+    items: terminalHistoryLayer.getItems(),
+    anchor: terminalHistoryLayer.captureAnchor(),
+    nextCursor: terminalHistoryLayer.state.nextCursor,
+    hasMore: terminalHistoryLayer.state.hasMore,
+    truncated: terminalHistoryLayer.state.truncated,
+    liveUnread: terminalHistoryLayer.state.liveUnread,
+    epoch: terminalEpoch,
+    capabilityVersion: terminalCapabilityVersion,
+  } : null;
   try {
-    await createTerminal();
-    pendingRecreateViewport = viewport;
-    isUserScrolling = viewport != null;
+    const created = await createTerminal();
+    if (!created || term !== created || currentSessionId !== sid) return;
+    pendingRecreateViewport = history ? null : viewport;
+    isUserScrolling = Boolean(history) || viewport != null;
+    if (history && terminalHistoryLayer) {
+      terminalEpoch = history.epoch;
+      terminalCapabilityVersion = history.capabilityVersion;
+      terminalHasMoreHistory = history.items.length > 0 || history.hasMore;
+      // Rebuild the existing page chain without issuing a duplicate request.
+      // A logical line anchor survives a fresh one-screen xterm snapshot;
+      // the old xterm viewportY does not.
+      terminalHistoryLayer.show({ hasMore: false, nextCursor: history.nextCursor });
+      terminalHistoryLayer.prepend({ items: history.items, hasMore: history.hasMore,
+        nextCursor: history.nextCursor, truncated: history.truncated, stale: false });
+      terminalHistoryLayer.restoreAnchor(history.anchor);
+      terminalHistoryLayer.setLiveUnread(history.liveUnread);
+    }
     connectWebSocket(sid);
   } finally {
     isRecreating = false;
@@ -4718,10 +7960,18 @@ function isCanvasContextLost() {
 
 function recoverVisibleTerminal() {
   if (!currentSessionId || !$('detail-page').classList.contains('active')) return;
-  wsLastPongAt = Date.now();
+  if (sessionViewMode === 'chat') return;
   if (term) term.refresh(0, term.rows - 1);
   if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
     connectWebSocket(currentSessionId);
+  } else if (ws.readyState === WebSocket.OPEN) {
+    const generation = wsConnectionGeneration;
+    wsLastPongAt = Date.now();
+    wsSend({ type: 'ping', foreground: true });
+    setTimeout(() => {
+      if (document.visibilityState !== 'visible' || generation !== wsConnectionGeneration) return;
+      if (ws && ws.readyState === WebSocket.OPEN && Date.now() - wsLastPongAt > 3500) ws.close();
+    }, 4000);
   }
   setTimeout(() => {
     if (isCanvasContextLost()) scheduleRepaint();
@@ -4729,7 +7979,7 @@ function recoverVisibleTerminal() {
 }
 
 function recoverAndroidMedia() {
-  const deviceId = androidMirrorDevice || $('device-select')?.value || '';
+  const deviceId = androidControlDeviceId();
   const overlayOpen = $('fullscreen-overlay')?.style.display === 'flex';
   const deviceVisible = $('device-page')?.classList.contains('active')
     || $('device-page')?.classList.contains('landscape-drawer-open')
@@ -4817,33 +8067,25 @@ document.addEventListener('keydown', (e) => {
   }
 }, { capture: true });
 
-async function loadServerInfo() {
-  try {
-    const res = await fetch(`${API}/api/server-info`);
-    const info = await res.json();
-    const el = $('server-info');
-    el.innerHTML = `
-      <div><span class="label">主机: </span><span class="value">${info.hostname}</span></div>
-      <div><span class="label">局域网: </span><span class="value">http://${info.ip}:${info.port}</span></div>
-    `;
-  } catch {
-    $('server-info').innerHTML = '<div style="color:var(--accent)">无法连接服务器</div>';
-  }
-}
-
-loadServerInfo();
-
-if (token) {
-  api('/api/sessions').then(() => enterMain()).catch(() => showPage('login-page'));
-} else {
-  showPage('login-page');
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    const sessionId = event.data?.type === 'open-session' ? event.data.sessionId : '';
+    if (!sessionId || !token) return;
+    if ($('detail-page').classList.contains('active') && currentSessionId === sessionId) return;
+    if ($('main-page').classList.contains('active') || supportsLandscapeWorkspace()) {
+      openSession(sessionId);
+    } else {
+      pendingSessionToOpen = sessionId;
+      enterMain().catch(() => {});
+    }
+  });
 }
 
 window.addEventListener('online', () => {
   if (($('main-page').classList.contains('active') || $('main-page').classList.contains('landscape-drawer-open')) && token && !sseSource) {
     startSSE();
   }
-  if (currentSessionId && $('detail-page').classList.contains('active')
+  if (currentSessionId && $('detail-page').classList.contains('active') && sessionViewMode !== 'chat'
       && (!ws || ws.readyState !== WebSocket.OPEN || !terminalInputReady)) {
     connectWebSocket(currentSessionId);
   }
@@ -4858,7 +8100,28 @@ window.addEventListener('offline', () => {
 // ========== 初始化：自动验证 token 并进入主页 ==========
 
 async function init() {
+  if (networkHandoffTicket && token) {
+    try {
+      const state = await api(`/api/network-handoff?ticket=${encodeURIComponent(networkHandoffTicket)}`, { timeout: 8000 });
+      if (typeof state.sessionId === 'string') {
+        pendingSessionToOpen = state.sessionId;
+        saveMobileDraft(state.sessionId, typeof state.draft === 'string' ? state.draft : '');
+        const pending = state.pendingSubmission;
+        if (pending && pending.sessionId === state.sessionId && typeof pending.id === 'string'
+            && typeof pending.text === 'string' && pending.text.length <= MAX_SUBMISSION_LENGTH) {
+          mobilePendingSubmissions.set(state.sessionId, pending);
+          saveMobilePendingSubmissions();
+        }
+      }
+      if (state.viewPreference) localStorage.setItem(CHAT_VIEW_PREF_KEY, state.viewPreference);
+      if (state.lanInfo) localStorage.setItem('duocli_lan_info', state.lanInfo);
+      if (state.lastLanIp) localStorage.setItem('duocli_last_lan_ip', state.lastLanIp);
+    } catch (error) {
+      showCopyToast('切换状态未恢复，请返回原线路查看保留的草稿');
+    }
+  }
   const savedToken = localStorage.getItem('duocli_token');
+  $('token-input').value = savedToken || '';
   if (!savedToken) {
     showPage('login-page');
     return;
@@ -4866,23 +8129,73 @@ async function init() {
 
   // 验证 token 是否有效
   try {
-    const res = await fetch(`${API}/api/auth`, {
+    const data = await api('/api/auth', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: savedToken }),
+      timeout: 8000,
     });
-    const data = await res.json();
     if (data.ok) {
       token = savedToken;
       enterMain();
+      
+      await initializeMacDesktop();
     } else {
-      localStorage.removeItem('duocli_token');
+      $('login-error').textContent = 'Token 已失效，请修改后重试';
       showPage('login-page');
     }
   } catch (e) {
-    // 网络错误时仍显示登录页
+    // A cached LAN PWA can reopen outside Wi-Fi. Keep its token and recover
+    // through the public origin even though initial authentication timed out.
     showPage('login-page');
+    if (e.message === 'Token 错误') $('login-error').textContent = 'Token 已失效，请修改后重试';
+    if (token) LanSwitcher.start();
   }
 }
+
+/**
+ * 初始化 Mac 远程桌面客户端（手机端设备列表里的「电脑」入口会用到）
+ */
+async function initializeMacDesktop() {
+  try {
+    // 等待 DOM 加载完成且 noVNC bundle 已加载
+    if (typeof window.MacDesktopClient === 'undefined') {
+      console.log('[MacDesktop] Waiting for noVNC to load...');
+      return;
+    }
+    
+    console.log('[MacDesktop] Creating client instance...');
+    macDesktopClient = new window.MacDesktopClient();
+    await macDesktopClient.init();
+    
+    // 订阅能力变化事件
+    subscribeToMacDesktopCapabilities();
+  } catch (error) {
+    console.error('[MacDesktop] Initialization failed:', error);
+  }
+}
+
+/**
+ * 订阅 Mac 桌面能力变化
+ */
+function subscribeToMacDesktopCapabilities() {
+  if (subscribeToMacDesktopCapabilities.bound) return;
+  subscribeToMacDesktopCapabilities.bound = true;
+  // 每 30 秒刷新一次能力状态
+  setInterval(() => {
+    if (macDesktopClient && macDesktopClient.state !== 'active') {
+      macDesktopClient.fetchCapabilities();
+    }
+  }, 30000);
+  
+  // 页面可见时尝试恢复连接
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && macDesktopClient) {
+      if (macDesktopClient.state === 'suspended') {
+        void macDesktopClient.resume();
+      }
+    }
+  });
+}
+
 
 init();

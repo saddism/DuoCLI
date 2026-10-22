@@ -2,6 +2,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { stripLeadingEnvAssignments } from './dsh-host';
 
 export interface BuiltinPreset {
   value: string;
@@ -16,12 +17,18 @@ export const BUILTIN_PRESETS: BuiltinPreset[] = [
   { value: 'devin --permission-mode bypass', label: 'Devin (全自动)' },
   { value: 'kimi --auto', label: 'Kimi (全自动)' },
   { value: 'gemini --yolo', label: 'Gemini (全自动)' },
+  { value: 'qwen --yolo', label: 'Qwen (全自动)' },
+  { value: 'pi', label: 'Pi' },
   { value: 'qodercli --dangerously-skip-permissions', label: 'Qoder (全自动)' },
   { value: 'qodercn --dangerously-skip-permissions', label: 'QoderCN (全自动)' },
   { value: 'opencode', label: 'OpenCode' },
   { value: 'kiro-cli chat --trust-all-tools', label: 'Kiro (全自动)' },
   { value: 'agent --force --approve-mcps', label: 'Cursor (全自动)' },
   { value: 'agy --dangerously-skip-permissions', label: 'Antigravity (全自动)' },
+  { value: 'dsh-tui', label: 'DSH' },
+  { value: 'dsh tui', label: 'DSH' },
+  // npm install -g @zhipu/zcode
+  { value: 'zcode', label: 'ZCode' },
 ];
 
 const existsCache = new Map<string, boolean>();
@@ -30,6 +37,7 @@ function candidatePaths(bin: string): string[] {
   const home = os.homedir();
   return [
     path.join(home, '.local', 'bin', bin),
+    path.join(home, '.npm-global', 'bin', bin),
     path.join(home, '.opencode', 'bin', bin),
     path.join(home, '.kimi-code', 'bin', bin),
     path.join(home, '.qoder', 'bin', bin),
@@ -80,7 +88,7 @@ export function commandExists(bin: string): boolean {
 }
 
 export function extractCommandBin(presetCommand: string): string {
-  const trimmed = presetCommand.trim();
+  const trimmed = stripLeadingEnvAssignments(presetCommand);
   if (!trimmed) return '';
   return trimmed.split(/\s+/)[0] || '';
 }
@@ -110,6 +118,7 @@ export function isPresetCliAvailable(presetCommand: string): boolean {
 export function getAvailableBuiltinPresets(): BuiltinPreset[] {
   return BUILTIN_PRESETS.flatMap((preset) => {
     if (!preset.value) return [preset];
+    if (preset.value === 'dsh tui' && commandExists('dsh-tui')) return [];
     const bin = extractCommandBin(preset.value);
     const resolved = resolveAvailableBin(bin);
     if (!resolved) return [];

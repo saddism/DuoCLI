@@ -48,6 +48,14 @@ const CLI_PATTERNS: Record<CliKind, CLIPatterns> = {
     user: /(?:^|\n)(?:>>>|User:)\s+(.*)/gmi,
     assistant: /(?:^|\n)(?:Model:|Gemini:|>\s*)(.*)/gmi,
   },
+  qwen: {
+    user: /(?:^|\n)(?:>>>|User:|❯)\s+(.*)/gmi,
+    assistant: /(?:^|\n)(?:Model:|Qwen:|>\s*)(.*)/gmi,
+  },
+  pi: {
+    user: /(?:^|\n)>\s+(.*)/gm,
+    assistant: /(?:^|\n)(?:Assistant:|AI:)\s*(.*)/gmi,
+  },
   
   // Kimi: 类似普通对话
   kimi: {
@@ -83,6 +91,18 @@ const CLI_PATTERNS: Record<CliKind, CLIPatterns> = {
   agy: {
     user: /(?:^|\n)>?\s*(?:User:|用户：)?\s*(.*)/gmi,
     assistant: /(?:^|\n)(?:Assistant:|助手：|AI:)?\s*(.*)/gmi,
+  },
+
+  // DSH / dsh-tui
+  dsh: {
+    user: /(?:^|\n)(?::w|>>>|User:)\s+(.*)/gmi,
+    assistant: /(?:^|\n)(?!>>>|:w)[^\n]+/gm,
+  },
+
+  // ZCode（@zhipu/zcode）：交互输出格式未公开，先用通用兜底
+  zcode: {
+    user: /.*/m,
+    assistant: /.*/m,
   },
   
   // Devin:

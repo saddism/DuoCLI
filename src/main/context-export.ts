@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { ClosedSession, ContextHistoryEntry } from './closed-sessions';
-import { CliKind } from './session-resume';
+import { CliKind, identifyCli } from './session-resume';
 
 /** 导出的完整上下文结构（JSON） */
 export interface ExportedContext {
@@ -305,21 +305,7 @@ export function listExports(): Array<{ path: string; context: ExportedContext }>
  * 根据 presetCommand 识别 CLI 类型
  */
 function identifyCliFromCommand(presetCommand: string): CliKind {
-  const first = (presetCommand.trim().match(/^(?:env\s+)?(?:[A-Za-z_][\w.-]*[\/])?([^\s]+)/)?.[1] || '');
-  const bin = path.basename(first).toLowerCase();
-  
-  if (bin === 'claude') return 'claude';
-  if (bin === 'codex') return 'codex';
-  if (bin === 'devin') return 'devin';
-  if (bin === 'kimi') return 'kimi';
-  if (bin === 'gemini') return 'gemini';
-  if (bin === 'qoder' || bin === 'qodercli') return 'qoder';
-  if (bin === 'qodercn' || bin === 'qoderclicn') return 'qodercn';
-  if (bin === 'opencode') return 'opencode';
-  if (bin === 'kiro-cli' || bin === 'kiro') return 'kiro';
-  if (bin === 'agent' || bin === 'cursor-agent') return 'cursor';
-  if (bin === 'agy' || bin === 'antigravity') return 'agy';
-  return 'unknown';
+  return identifyCli(presetCommand);
 }
 
 /**

@@ -1,6 +1,9 @@
-import { createEmptyLayout, validateLayout, type WorkspaceLayout } from './pane-layout';
+import { countPanes, createEmptyLayout, validateLayout, type WorkspaceLayout } from './pane-layout';
 
 const STORAGE_KEY = 'duocli_workspace_layouts_v1';
+
+/** Single shared split layout across all projects. */
+export const GLOBAL_WORKSPACE_KEY = '__global__';
 
 function normalizeWorkspaceKey(cwd: string): string {
   let value = cwd.trim().replace(/\\/g, '/');
@@ -39,8 +42,44 @@ function writeAll(value: LayoutMap): void {
   }
 }
 
+function isEmptyLayout(layout: WorkspaceLayout): boolean {
+  return layout.root.type === 'pane' && layout.root.content.kind === 'empty';
+}
+
+/**
+ * Prefer an existing global layout. If missing, migrate the densest
+ * non-empty per-project layout so users keep their current splits once.
+ */
+export function loadGlobalWorkspaceLayout(): WorkspaceLayout {
+  const all = readAll();
+  const existing = all[GLOBAL_WORKSPACE_KEY];
+  if (existing && !isEmptyLayout(existing)) return existing;
+
+  let best: WorkspaceLayout | null = null;
+  let bestCount = 0;
+  for (const [key, layout] of Object.entries(all)) {
+    if (key === GLOBAL_WORKSPACE_KEY) continue;
+    if (isEmptyLayout(layout)) continue;
+    const count = countPanes(layout.root);
+    if (count > bestCount) {
+      best = layout;
+      bestCount = count;
+    }
+  }
+  if (best) {
+    all[GLOBAL_WORKSPACE_KEY] = best;
+    writeAll(all);
+    return best;
+  }
+  return createEmptyLayout();
+}
+
 export function loadWorkspaceLayout(cwd: string): WorkspaceLayout {
-  return readAll()[normalizeWorkspaceKey(cwd)] || createEmptyLayout();
+  const key = normalizeWorkspaceKey(cwd);
+  if (key === GLOBAL_WORKSPACE_KEY || key === '__default__') {
+    return loadGlobalWorkspaceLayout();
+  }
+  return readAll()[key] || createEmptyLayout();
 }
 
 export function saveWorkspaceLayout(cwd: string, layout: WorkspaceLayout): void {

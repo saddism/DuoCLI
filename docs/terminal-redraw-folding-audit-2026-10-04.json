@@ -1,0 +1,105 @@
+{
+  "date": "2026-10-04",
+  "scope": "桌面终端提示行重影，以及工具调用、命令输出和修改详情默认折叠。",
+  "findings": [
+    {
+      "problem": "桌面 TerminalManager 没有接入活动折叠视图；共享折叠模块默认跳过 alternate screen，而实际 Codex 会话使用该缓冲区。",
+      "fix": "接入桌面折叠，允许识别全屏 Codex 当前画面；Viewed image、Explored、Edited、Ran、带退出码的 Failed 和 Used/Using computer 操作详情默认收起，正文继续显示。失败退出码留在摘要中。"
+    },
+    {
+      "problem": "本地 fit 和共享 PTY 的行列不同，光标定位的局部重绘会写到错误行，留下旧提示行。确定性浏览器复现产生两个 Ask Codex 提示行。",
+      "fix": "通过尺寸通知和 resize 回执确认源端几何；按照实际 PTY 行列解析，尺寸变化后重建快照，并拒绝捕获期间已经过期的快照。尺寸较大的原生终端使用独立视口，确保输入仍可见。",
+      "evidence": "模拟错配产生 2 个提示行；同步后连续局部重绘及尺寸切换均保留 1 个。尚不能据此确定用户上传截图那一次重影的唯一原因。"
+    },
+    {
+      "problem": "全屏投影若包含输入提示，会遮住原生编辑器并显示第二份提示。",
+      "fix": "折叠投影截止到当前输入行；原生输入、光标和 CLI 页脚继续由 xterm 显示。折叠刷新由输出、尺寸和滚动事件触发，避免光标闪烁引起重扫描。"
+    },
+    {
+      "problem": "真实前端恢复时曾出现同步未完成提示，重新选择会话后恢复。隔离夹具可重现连续尺寸变动使三次快照失效。",
+      "fix": "对恢复期间尺寸变化引发的同步失败，等待两个布局帧后自动重试一次；保留会话及显示代次保护、快照与序号校验，最终失败仍允许明确重试。记录同步失败阶段以便后续定位。",
+      "evidence": "前三次快照刻意失效后，第四次稳定快照自动恢复，无需重新选择；旧主进程 true 尺寸回执兼容测试通过。最终真实前端重新加载没有同步失败提示。尚未确定现场每次提示的唯一原因。"
+    }
+  ],
+  "validation": {
+    "unit": {
+      "passed": 410,
+      "failed": 0,
+      "log": "/tmp/duocli-ghost-unit-final.log"
+    },
+    "browserSuites": {
+      "suites": 11,
+      "status": "pass",
+      "log": "/tmp/duocli-ghost-e2e.log"
+    },
+    "finalFailedCommandAndFileLinkRegression": "/tmp/duocli-ghost-fold-final.log",
+    "buildMainPreloadRenderer": "pass",
+    "whitespaceAndSyntax": "pass",
+    "globalTypecheck": "存在既有 Android/WebRTC 与旧右键链接调用的类型错误，未声称整个仓库类型检查通过。",
+    "screenshot": "tests/.artifacts/desktop-scroll/codex-folded-tools.png",
+    "finalDesktopScenarios": {
+      "passed": 31,
+      "failed": 0,
+      "log": "/tmp/duocli-ghost-desktop-final.log"
+    },
+    "finalHistoryRecovery": {
+      "passed": 16,
+      "failed": 0,
+      "log": "/tmp/duocli-ghost-recovery-final.log"
+    },
+    "finalSharedFold": {
+      "status": "pass",
+      "log": "/tmp/duocli-ghost-fold-shared-final.log"
+    }
+  },
+  "liveEvidence": {
+    "application": "源码 Electron，dist/renderer/index.html，主进程 PID 43579，远程服务 9800。",
+    "frontendReload": "最终通过 View > Reload 重新加载前端，实际窗口显示默认关闭的工具及 computer 操作详情；原生输入区和左侧当前会话蓝色高亮仍正常。再次核对 10 个会话 ID 和创建时间完全一致，PID 43579 保持运行。",
+    "sessionsBefore": 10,
+    "sessionsAfter": 10,
+    "sessionIdsAndCreationTimesUnchanged": true,
+    "cliRestarted": false,
+    "mainProcessRestarted": false,
+    "finalSessionCheck": "/tmp/duocli-after-final-frontend-reload.json"
+  },
+  "limits": [
+    "当前主进程未重启，新加的主进程尺寸事件要在下次正常启动后完整生效；现用前端兼容旧 resize 回执并重新读取快照。",
+    "实际窗口已验证折叠和输入区显示；尚未做用户手机同时接管尺寸的实机复现。",
+    "真实会话未发送任何测试输入；键盘、文件链接、复制与重绘测试使用隔离浏览器夹具。"
+  ],
+  "rightEdgeFollowup": {
+    "problem": "原样终端保留共享 PTY 列数，但窗口更窄时未适配绘制宽度。复现中源端画布宽 1306px、视口宽 808px，右侧超出可见区域。",
+    "fix": "保留源端行列解析，同时使用 xterm 字体度量适配可见宽度；窗口恢复宽度后恢复原字号。PTY 尺寸请求始终使用原字号度量，防止缩小字形后反向扩列形成循环。折叠阅读正文仍使用正常字号换行。",
+    "validation": {
+      "desktop": {
+        "passed": 32,
+        "failed": 0,
+        "log": "/tmp/duocli-width-desktop.log"
+      },
+      "copyAndInput": {
+        "passed": 16,
+        "failed": 0,
+        "log": "/tmp/duocli-width-copy.log"
+      },
+      "checks": [
+        "完整显示最右侧 RIGHT_EDGE",
+        "鼠标精确选中并复制末尾文本",
+        "进一步缩窄后仍完整显示",
+        "放宽后恢复字号 14",
+        "连续 fit 不产生重复 PTY 尺寸请求",
+        "源端列数和原文未改变"
+      ],
+      "buildRendererAndCopyAssets": "pass",
+      "screenshot": "tests/.artifacts/desktop-scroll/wide-pty-right-edge.png"
+    },
+    "live": {
+      "frontendReloaded": true,
+      "nativeViewInspected": true,
+      "sessionsBefore": 10,
+      "sessionsAfter": 10,
+      "idsAndCreationUnchanged": true,
+      "cliRestarted": false
+    },
+    "limitation": "实机检查覆盖当前原样终端显示；未在真实手机同时接管尺寸时重新执行该用例。"
+  }
+}

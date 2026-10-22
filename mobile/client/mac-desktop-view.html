@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#000000" />
+  <title>电脑桌面 · DuoCLI</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --chrome: rgba(15, 23, 42, 0.82);
+      --line: rgba(148, 163, 184, 0.28);
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      color: var(--text);
+      font-family: "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+      overflow: hidden;
+      touch-action: none;
+    }
+    #stage {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+    }
+    #desktop {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+      pointer-events: none;
+      user-select: none;
+    }
+    #chrome {
+      position: fixed;
+      top: max(10px, env(safe-area-inset-top));
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 5;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--chrome);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+    }
+    #status {
+      min-width: 7em;
+      padding: 0 8px;
+      font-size: 13px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    #chrome button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 8px 14px;
+      background: rgba(56, 189, 248, 0.16);
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #chrome button:active {
+      transform: scale(0.98);
+    }
+    #hint {
+      position: fixed;
+      left: 50%;
+      bottom: max(16px, env(safe-area-inset-bottom));
+      transform: translateX(-50%);
+      z-index: 5;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.72);
+      color: var(--muted);
+      font-size: 12px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 160ms ease;
+    }
+    #hint.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="chrome">
+    <span id="status">连接中…</span>
+    <button id="fit-btn" type="button">刷新</button>
+    <button id="close-btn" type="button">关闭</button>
+  </div>
+  <div id="stage">
+    <img id="desktop" alt="电脑桌面" />
+  </div>
+  <div id="hint">点击画面即可操作电脑</div>
+  <script src="android-pointer-helpers.js"></script>
+  <script src="mac-desktop-view.js"></script>
+</body>
+</html>

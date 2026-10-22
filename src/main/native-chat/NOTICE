@@ -1,0 +1,6 @@
+Vendored transcript decoders from Orca (https://github.com/stablyai/orca),
+MIT License, Copyright (c) 2026 Lovecast Inc.
+
+DuoCLI keeps the JSONL → NativeChatMessage mapping and local file discovery.
+WSL gates, AI Vault, structured-session ownership, and Orca's renderer were
+not copied.

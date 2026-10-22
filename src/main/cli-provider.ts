@@ -73,6 +73,8 @@ export function getCliProvider(presetCommand: string): string | null {
   if (presetCommand.startsWith('codex')) return 'OpenAI';
   if (presetCommand.startsWith('kimi')) return 'Moonshot';
   if (presetCommand.startsWith('gemini')) return 'Google';
+  if (presetCommand.startsWith('qwen')) return 'Qwen';
+  if (/^pi(?:\s|$)/.test(presetCommand)) return 'Pi';
 
   if (presetCommand.startsWith('opencode')) {
     const cfgPath = path.join(home, '.config', 'opencode', 'opencode.json');
@@ -92,6 +94,8 @@ export function getCliProvider(presetCommand: string): string | null {
   if (presetCommand.startsWith('kiro-cli')) return 'Kiro';
   if (presetCommand.startsWith('agent') || presetCommand.includes('cursor')) return 'Cursor';
   if (presetCommand.startsWith('agy')) return 'Antigravity';
+  if (/\bdsh(?:-tui)?\b/i.test(presetCommand)) return 'DeepSeek';
+  if (/(?:^|\s)zcode\b/.test(presetCommand)) return 'GLM';
 
   return null;
 }

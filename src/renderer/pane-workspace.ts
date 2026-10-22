@@ -1,7 +1,6 @@
 import {
   closePane,
   arrangeTiled,
-  createEmptyLayout,
   dropStaleSessionPanes,
   findPane,
   listPanes,
@@ -14,7 +13,15 @@ import {
   type LayoutNode,
   type WorkspaceLayout,
 } from './pane-layout';
-import { loadWorkspaceLayout, saveWorkspaceLayout } from './pane-layout-store';
+import { loadGlobalWorkspaceLayout, saveWorkspaceLayout, GLOBAL_WORKSPACE_KEY } from './pane-layout-store';
+
+const { getLogoUrl, getDefaultLogoUrl, getLetterLogoUrl, hasLogo, logoNeedsInvert } = require('../../mobile/client/cli-logos.js') as {
+  getLogoUrl: (cliName: string) => string;
+  getDefaultLogoUrl: () => string;
+  getLetterLogoUrl: (cliName: string) => string;
+  hasLogo: (cliName: string) => boolean;
+  logoNeedsInvert: (cliName: string) => boolean;
+};
 
 export interface PaneWorkspaceCallbacks {
   onContentMount: (paneId: string, content: PaneContent, body: HTMLElement) => void;
@@ -22,7 +29,7 @@ export interface PaneWorkspaceCallbacks {
   onFocus?: (paneId: string, content: PaneContent) => void;
   onRequestClose?: (paneId: string, content: PaneContent) => void;
   onLayoutChange?: (layout: WorkspaceLayout) => void;
-  getAgentTagColors?: (agentLabel: string) => [string, string];
+  onExpandActivities?: (sessionId: string, expanded: boolean) => void;
 }
 
 export function paneContentKey(content: PaneContent): string {
@@ -49,24 +56,31 @@ export class PaneWorkspace {
   private contentKeys = new Map<string, string>();
   private mountedContents = new Map<string, PaneContent>();
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Pane id being dragged for swap; kept in memory because some hosts clear dataTransfer until drop. */
+  private draggingPaneId: string | null = null;
+  private menuAnchor: HTMLElement | null = null;
+  private closeMenu: (() => void) | null = null;
 
-  constructor(root: HTMLElement, cwd: string, callbacks: PaneWorkspaceCallbacks) {
+  constructor(root: HTMLElement, _cwd: string, callbacks: PaneWorkspaceCallbacks) {
     this.root = root;
     this.callbacks = callbacks;
     this.root.classList.add('pane-workspace-root');
-    this.layout = createEmptyLayout();
-    if (cwd.trim()) this.setWorkspace(cwd);
-    else this.render();
+    // Split board is global: one layout hosts terminals from every project.
+    this.workspaceKey = GLOBAL_WORKSPACE_KEY;
+    this.layout = this.sanitizedLayout(loadGlobalWorkspaceLayout());
+    this.render();
   }
 
-  setWorkspace(cwd: string): void {
-    const nextKey = cwd.trim();
-    if (nextKey === this.workspaceKey) return;
+  /**
+   * Kept for call-site compatibility. Changing the toolbar project/cwd must
+   * not tear down panes — splits stay global across projects.
+   */
+  setWorkspace(_cwd: string): void {
+    if (this.workspaceKey === GLOBAL_WORKSPACE_KEY) return;
     if (this.workspaceKey) this.flushSave();
     this.unmountAll();
-    this.workspaceKey = nextKey;
-    this.layout = nextKey ? loadWorkspaceLayout(nextKey) : createEmptyLayout();
-    this.layout = this.sanitizedLayout(this.layout);
+    this.workspaceKey = GLOBAL_WORKSPACE_KEY;
+    this.layout = this.sanitizedLayout(loadGlobalWorkspaceLayout());
     this.render();
   }
 
@@ -161,11 +175,16 @@ export class PaneWorkspace {
             && current.kind === 'terminal'
             && content.agentLabel !== undefined
             && current.agentLabel !== content.agentLabel;
-          if (labelChanged || agentChanged) {
+          const projectChanged = content.kind === 'terminal'
+            && current.kind === 'terminal'
+            && content.projectLabel !== undefined
+            && current.projectLabel !== content.projectLabel;
+          if (labelChanged || agentChanged || projectChanged) {
             this.layout = setPaneContent(this.layout, existingId, {
               ...current,
               ...(labelChanged ? { label: content.label } : {}),
               ...(agentChanged ? { agentLabel: content.agentLabel } : {}),
+              ...(projectChanged ? { projectLabel: content.projectLabel } : {}),
             } as PaneContent);
             this.render();
           }
@@ -201,16 +220,16 @@ export class PaneWorkspace {
     return next.focusedPaneId;
   }
 
-  splitFocused(direction: PaneDirection, content: PaneContent = { kind: 'empty' }): string | null {
+  splitFocused(direction: PaneDirection, content: PaneContent = { kind: 'empty' }, insertBefore = false): string | null {
     let base = this.layout;
     let targetId = base.focusedPaneId;
-    let next = splitPane(base, targetId, direction, content);
+    let next = splitPane(base, targetId, direction, content, undefined, undefined, insertBefore);
     if (!next && listPanes(base.root).length < 4) {
       // 深度达到上限时先整理成平铺布局，再从一个浅层 Pane 拆分；
       // 这样“3 个纵向 Pane 再右拆分”仍然能创建第 4 个窗口。
       base = arrangeTiled(base);
       targetId = listPanes(base.root).at(-1)?.id || base.focusedPaneId;
-      next = splitPane(base, targetId, direction, content);
+      next = splitPane(base, targetId, direction, content, undefined, undefined, insertBefore);
     }
     if (!next) return null;
     this.layout = next;
@@ -266,17 +285,21 @@ export class PaneWorkspace {
     this.renderPaneTitleDom(paneId);
   }
 
-  /** Sync terminal pane header text (session title + agent badge). */
+  /** Sync terminal pane title and project without remounting its content. */
   updateTerminalPaneMeta(
     sessionId: string,
-    meta: { label?: string; agentLabel?: string },
+    meta: { label?: string; projectLabel?: string; agentLabel?: string },
   ): void {
     const paneId = this.getPaneIdForContent('terminal', sessionId);
     if (!paneId) return;
     const pane = findPane(this.layout.root, paneId);
     if (!pane || pane.content.kind !== 'terminal') return;
     const next = { ...pane.content, ...meta };
-    if (next.label === pane.content.label && next.agentLabel === pane.content.agentLabel) return;
+    if (
+      next.label === pane.content.label
+      && next.projectLabel === pane.content.projectLabel
+      && next.agentLabel === pane.content.agentLabel
+    ) return;
     this.layout = setPaneContent(this.layout, paneId, next);
     this.renderPaneTitleDom(paneId);
   }
@@ -293,6 +316,7 @@ export class PaneWorkspace {
   }
 
   private render(): void {
+    this.closeMenu?.();
     const liveLeaves = new Set<string>();
     const liveSplits = new Set<string>();
     const renderNode = (node: LayoutNode, parent: HTMLElement): void => {
@@ -306,18 +330,40 @@ export class PaneWorkspace {
           const header = document.createElement('div');
           header.className = 'pane-header';
           header.draggable = true;
+          header.title = '拖到其他 Pane 上交换位置';
           const title = document.createElement('span');
           title.className = 'pane-title';
           const actions = document.createElement('div');
           actions.className = 'pane-actions';
-          const splitRight = this.makeButton('右拆分', '⇥', () => {
-            this.focusPane(node.id);
-            this.splitFocused('horizontal');
+          const split = this.makeButton('拆分窗口', 'split', () => {
+            const directions: Array<{ label: string; direction: PaneDirection; before: boolean }> = [
+              { label: '向上拆分', direction: 'vertical', before: true },
+              { label: '向下拆分', direction: 'vertical', before: false },
+              { label: '向左拆分', direction: 'horizontal', before: true },
+              { label: '向右拆分', direction: 'horizontal', before: false },
+            ];
+            this.showPaneMenu(split, directions.map(item => ({
+              label: item.label,
+              disabled: listPanes(this.layout.root).length >= 4,
+              action: () => {
+                this.focusPane(node.id);
+                this.splitFocused(item.direction, { kind: 'empty' }, item.before);
+              },
+            })));
           });
-          const splitDown = this.makeButton('下拆分', '⇵', () => {
-            this.focusPane(node.id);
-            this.splitFocused('vertical');
+          split.setAttribute('aria-haspopup', 'menu');
+          split.setAttribute('aria-expanded', 'false');
+          const more = this.makeButton('更多操作', '⋯', () => {
+            const current = findPane(this.layout.root, node.id)?.content;
+            if (current?.kind !== 'terminal') return;
+            this.showPaneMenu(more, [
+              { label: '展开全部记录', action: () => this.callbacks.onExpandActivities?.(current.sessionId, true) },
+              { label: '折叠全部记录', action: () => this.callbacks.onExpandActivities?.(current.sessionId, false) },
+            ]);
           });
+          more.setAttribute('aria-haspopup', 'menu');
+          more.setAttribute('aria-expanded', 'false');
+          more.dataset.terminalOnly = 'true';
           const close = this.makeButton('关闭 Pane', '×', () => {
             const current = findPane(this.layout.root, node.id);
             if (!current) return;
@@ -327,33 +373,71 @@ export class PaneWorkspace {
               this.closePane(current.id);
             }
           });
-          actions.append(splitRight, splitDown, close);
+          actions.append(split, more, close);
           header.append(title, actions);
           const body = document.createElement('div');
           body.className = 'pane-body';
           leaf.append(header, body);
+          const paneElement = leaf;
           header.addEventListener('click', () => this.focusPane(node.id));
           body.addEventListener('pointerdown', () => this.focusPane(node.id));
+          // Only the header starts a drag. Drop targets the whole leaf so
+          // vertical splits work: the lower header is easy to miss, but the
+          // pane body is a large target (same as left/right header-to-header).
           header.addEventListener('dragstart', (event) => {
+            if ((event.target as HTMLElement | null)?.closest('.pane-action')) {
+              event.preventDefault();
+              return;
+            }
+            this.draggingPaneId = node.id;
+            paneElement.classList.add('pane-leaf-dragging');
             event.dataTransfer?.setData('text/plain', node.id);
+            event.dataTransfer?.setData('application/x-duocli-pane', node.id);
             if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
           });
-          header.addEventListener('dragover', (event) => {
-            event.preventDefault();
-            if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+          header.addEventListener('dragend', () => {
+            this.draggingPaneId = null;
+            paneElement.classList.remove('pane-leaf-dragging');
+            this.clearDropTargets();
           });
-          header.addEventListener('drop', (event) => {
+          leaf.addEventListener('dragover', (event) => {
+            const types = event.dataTransfer?.types;
+            const isPaneDrag = Boolean(
+              this.draggingPaneId
+              || (types && [...types].includes('application/x-duocli-pane')),
+            );
+            if (!isPaneDrag) return;
             event.preventDefault();
-            const sourceId = event.dataTransfer?.getData('text/plain');
+            event.stopPropagation();
+            if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+            if (this.draggingPaneId && this.draggingPaneId !== node.id) {
+              paneElement.classList.add('pane-leaf-drop-target');
+            }
+          });
+          leaf.addEventListener('dragleave', (event) => {
+            const next = event.relatedTarget as Node | null;
+            if (next && paneElement.contains(next)) return;
+            paneElement.classList.remove('pane-leaf-drop-target');
+          });
+          leaf.addEventListener('drop', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            paneElement.classList.remove('pane-leaf-drop-target');
+            const sourceId = this.draggingPaneId
+              || event.dataTransfer?.getData('application/x-duocli-pane')
+              || event.dataTransfer?.getData('text/plain');
+            this.draggingPaneId = null;
+            this.clearDropTargets();
             if (sourceId && sourceId !== node.id) this.swapPanes(sourceId, node.id);
           });
           this.leafElements.set(node.id, leaf);
         }
         this.renderPaneTitleDom(node.id, node.content);
+        const more = leaf.querySelector<HTMLButtonElement>('[data-terminal-only]');
+        if (more) more.hidden = node.content.kind !== 'terminal';
         leaf.classList.toggle('pane-leaf-focused', this.layout.focusedPaneId === node.id);
         parent.appendChild(leaf);
         const body = leaf.querySelector<HTMLElement>('.pane-body')!;
-        body.dataset.workspaceKey = this.workspaceKey;
         return;
       }
 
@@ -451,29 +535,78 @@ export class PaneWorkspace {
     const paneContent = content || findPane(this.layout.root, paneId)?.content;
     if (!paneContent) return;
     title.replaceChildren();
+
+    this.appendKindIcon(title, paneContent);
+
     if (paneContent.kind === 'terminal') {
-      const agent = paneContent.agentLabel?.trim();
-      if (agent) {
-        const tag = document.createElement('span');
-        tag.className = 'pane-agent-tag';
-        tag.textContent = agent;
-        tag.title = agent;
-        const [tagColor, tagBg] = this.callbacks.getAgentTagColors?.(agent) || ['', ''];
-        if (tagColor) {
-          tag.style.setProperty('--cli-tag-color', tagColor);
-          tag.style.setProperty('--cli-tag-bg', tagBg);
-        }
-        title.appendChild(tag);
-      }
       const label = document.createElement('span');
       label.className = 'pane-session-label';
       const text = paneContent.label || '终端';
       label.textContent = text;
       label.title = text;
       title.appendChild(label);
+      const project = paneContent.projectLabel?.trim();
+      if (project) {
+        const projectEl = document.createElement('span');
+        projectEl.className = 'pane-project-label';
+        projectEl.textContent = project;
+        projectEl.title = project;
+        title.appendChild(projectEl);
+      }
       return;
     }
-    title.textContent = this.titleFor(paneContent);
+    const label = document.createElement('span');
+    label.className = 'pane-session-label';
+    const text = this.titleFor(paneContent);
+    label.textContent = text;
+    label.title = text;
+    title.appendChild(label);
+  }
+
+  private appendCliLogo(parent: HTMLElement, cliName: string): void {
+    const fallback = getLetterLogoUrl(cliName) || getDefaultLogoUrl();
+    const img = document.createElement('img');
+    img.className = 'cli-logo'
+      + (hasLogo(cliName) ? '' : ' cli-logo-default')
+      + (logoNeedsInvert(cliName) ? ' cli-logo-invert' : '');
+    img.src = getLogoUrl(cliName);
+    img.alt = '';
+    img.referrerPolicy = 'no-referrer';
+    img.addEventListener('error', () => {
+      if (img.src !== fallback) {
+        img.src = fallback;
+        img.classList.add('cli-logo-default');
+        img.classList.remove('cli-logo-invert');
+      }
+    });
+    parent.appendChild(img);
+  }
+
+  private appendKindIcon(title: HTMLElement, content: PaneContent): void {
+    const kindIcon = document.createElement('span');
+    kindIcon.className = 'pane-kind-icon';
+    kindIcon.setAttribute('aria-hidden', 'true');
+    const agent = content.kind === 'terminal' ? content.agentLabel?.trim() : '';
+    if (agent) {
+      kindIcon.title = agent;
+      this.appendCliLogo(kindIcon, agent);
+    } else {
+      kindIcon.innerHTML = this.kindIconSvg(content.kind);
+    }
+    title.appendChild(kindIcon);
+  }
+
+  private kindIconSvg(kind: PaneContent['kind']): string {
+    if (kind === 'terminal') {
+      return '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"></rect><polyline points="7 9 10 12 7 15"></polyline><line x1="13" y1="15" x2="17" y2="15"></line></svg>';
+    }
+    if (kind === 'file') {
+      return '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>';
+    }
+    if (kind === 'android') {
+      return '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="2"></rect><line x1="11" y1="18" x2="13" y2="18"></line></svg>';
+    }
+    return '<svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"></rect></svg>';
   }
 
   private titleFor(content: PaneContent): string {
@@ -483,14 +616,22 @@ export class PaneWorkspace {
     return '空 Pane';
   }
 
+  private clearDropTargets(): void {
+    for (const leaf of this.leafElements.values()) {
+      leaf.classList.remove('pane-leaf-drop-target', 'pane-leaf-dragging');
+    }
+  }
+
   private makeButton(title: string, text: string, handler: () => void): HTMLButtonElement {
     const button = document.createElement('button');
     button.className = 'pane-action';
     button.type = 'button';
     button.title = title;
+    button.setAttribute('aria-label', title);
+    button.draggable = false;
     const iconByText: Record<string, string> = {
-      '⇥': '<svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h10a3 3 0 0 1 3 3v8"></path><polyline points="13 13 17 17 21 13"></polyline></svg>',
-      '⇵': '<svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4v16"></path><polyline points="3 8 7 4 11 8"></polyline><polyline points="3 16 7 20 11 16"></polyline><path d="M17 4v16"></path></svg>',
+      'split': '<svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><line x1="12" y1="4" x2="12" y2="20"></line></svg>',
+      '⋯': '<svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="2"></circle><circle cx="12" cy="12" r="2"></circle><circle cx="19" cy="12" r="2"></circle></svg>',
       '×': '<svg class="ui-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>',
     };
     button.innerHTML = iconByText[text] || text;
@@ -499,6 +640,64 @@ export class PaneWorkspace {
       handler();
     });
     return button;
+  }
+
+  private showPaneMenu(anchor: HTMLButtonElement, items: Array<{ label: string; action: () => void; disabled?: boolean }>): void {
+    const wasOpen = this.menuAnchor === anchor;
+    this.closeMenu?.();
+    if (wasOpen) return;
+    const menu = document.createElement('div');
+    menu.className = 'term-context-menu pane-menu';
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', anchor.title);
+    menu.tabIndex = -1;
+    const events = new AbortController();
+    const close = () => {
+      menu.remove();
+      events.abort();
+      anchor.setAttribute('aria-expanded', 'false');
+      this.menuAnchor = null;
+      this.closeMenu = null;
+    };
+    this.menuAnchor = anchor;
+    this.closeMenu = close;
+    anchor.setAttribute('aria-haspopup', 'menu');
+    anchor.setAttribute('aria-expanded', 'true');
+    for (const item of items) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'term-context-item';
+      button.setAttribute('role', 'menuitem');
+      button.setAttribute('aria-label', item.label);
+      button.textContent = item.label;
+      button.disabled = !!item.disabled;
+      button.addEventListener('click', () => { close(); item.action(); });
+      menu.appendChild(button);
+    }
+    const rect = anchor.getBoundingClientRect();
+    menu.style.left = `${rect.right}px`;
+    menu.style.top = `${rect.bottom + 4}px`;
+    document.body.appendChild(menu);
+    const bounds = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(rect.right - bounds.width, window.innerWidth - bounds.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - bounds.height - 8))}px`;
+    document.addEventListener('pointerdown', event => {
+      if (!menu.contains(event.target as Node) && !anchor.contains(event.target as Node)) close();
+    }, { capture: true, signal: events.signal });
+    menu.addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+        anchor.focus();
+      } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        const buttons = Array.from(menu.querySelectorAll<HTMLButtonElement>('button:not(:disabled)'));
+        const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+        buttons[(index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus();
+      }
+    });
+    (menu.querySelector<HTMLButtonElement>('button:not(:disabled)') || menu).focus();
   }
 
   private installDivider(divider: HTMLElement, splitId: string, direction: PaneDirection): void {

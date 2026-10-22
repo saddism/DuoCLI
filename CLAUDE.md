@@ -5,8 +5,8 @@ Electron 桌面端 + 手机 PWA。桌面用 node-pty 跑各家 AI CLI，手机�
 ## Architecture
 - 主进程：`src/main/` — 窗口、PTY、会话恢复、远程 HTTP/WS、Android adb
 - 预加载：`src/preload/index.ts` — `window.duocli` IPC
-- 渲染进程：`src/renderer/` — 多 Pane 工作区、xterm、Chat
-- 手机端：`mobile/client/` — PWA，连远程服务器回放终端
+- 渲染进程：`src/renderer/` — 全局多 Pane 工作区、xterm、文件预览、Android 镜像
+- 手机端：`mobile/client/` — PWA，远程终端、会话草稿、文件与 Android 控制
 - 配置：Electron `userData`，手机端 `~/.duocli-mobile/config.json`
 
 ## Build & Run
